@@ -60,6 +60,10 @@ Each non-empty active-agent rail starts with exactly one decorative live indicat
 
 The chip has room for one label and spends it on the model family, so an agent's own name is named beside its model in the tooltip; an agent with no model falls back to its name as the chip label, and one with neither reads as an unknown model.
 
+## Pi Agent Model Families
+
+A mixed Pi rail uses the same short Claude and Codex family labels as native sessions while accessible tooltip identity retains each raw model id.
+
 ## Observed-Only Sessions Presentation
 
 Frontend provenance formatting renders unavailable synthetic tokens as an em dash and omits the false zero-turn tooltip claim while retained rows keep real metrics.

@@ -23,7 +23,7 @@ const AGENTS_TEMPLATE_FILE: &str = "agents-md-section.md";
 const QUILL_EXTENSION_MARKER: &str = "quill-managed:pi";
 const PAYLOAD_MARKER: &str = "quill-managed-pi-payload: 2";
 const CONTEXT_HTTP_ENABLED_KEY: &str = "context_http.enabled";
-const FEATURES_PLACEHOLDER: &str = "const FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };";
+const FEATURES_DECLARATION: &str = "const FEATURES";
 const AGENTS_BLOCK_START: &str = "<!-- quill-managed:pi:start -->";
 const AGENTS_BLOCK_END: &str = "<!-- quill-managed:pi:end -->";
 
@@ -476,23 +476,35 @@ fn current_stamp(
     )
 }
 
+/// Byte range of the payload's `const FEATURES = { … };` declaration.
+///
+/// The bundled payload is formatter-owned: any tool that rewraps it splits a
+/// one-line declaration across several lines. Matching the exact bytes made
+/// deployment fail closed on a pure reformat — install refused the payload and
+/// left the previous extension in place — so the marker is the declaration
+/// itself rather than its layout. Rendering always emits the one-line form.
+fn features_declaration(source: &str) -> Option<std::ops::Range<usize>> {
+    let start = source.find(FEATURES_DECLARATION)?;
+    let end = start + source[start..].find("};")? + 2;
+    Some(start..end)
+}
+
 fn render_extension(bundle: &Path, features: IntegrationFeatures) -> Result<Vec<u8>, String> {
-    let source = fs::read_to_string(bundle.join(EXTENSION_FILE))
+    let mut source = fs::read_to_string(bundle.join(EXTENSION_FILE))
         .map_err(|error| format!("Failed to read bundled Pi extension: {error}"))?;
-    if !source.contains(FEATURES_PLACEHOLDER) {
+    let Some(declaration) = features_declaration(&source) else {
         return Err("Bundled Pi extension feature marker is missing".to_string());
-    }
-    Ok(source
-        .replace(
-            FEATURES_PLACEHOLDER,
-            &format!(
-                "const FEATURES = {{ context_preservation: {}, activity_tracking: {}, context_telemetry: {} }};",
-                features.context_preservation,
-                features.activity_tracking,
-                features.context_telemetry,
-            ),
-        )
-        .into_bytes())
+    };
+    source.replace_range(
+        declaration,
+        &format!(
+            "const FEATURES = {{ context_preservation: {}, activity_tracking: {}, context_telemetry: {} }};",
+            features.context_preservation,
+            features.activity_tracking,
+            features.context_telemetry,
+        ),
+    );
+    Ok(source.into_bytes())
 }
 
 fn pi_bundle(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -520,7 +532,11 @@ fn verify_bundle(bundle: &Path) -> Result<(), String> {
     if !contains_bytes(&payload, PAYLOAD_MARKER.as_bytes()) {
         return Err("Bundled Pi extension payload marker is missing".to_string());
     }
-    if !contains_bytes(&payload, FEATURES_PLACEHOLDER.as_bytes()) {
+    if std::str::from_utf8(&payload)
+        .ok()
+        .and_then(features_declaration)
+        .is_none()
+    {
         return Err("Bundled Pi extension feature marker is missing".to_string());
     }
     Ok(())
@@ -1435,5 +1451,40 @@ mod tests {
             telemetry_disabled,
             &harness.storage,
         ));
+    }
+
+    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Feature-gated Payload]]
+    #[test]
+    fn a_reformatted_feature_declaration_still_renders_and_verifies() {
+        // A formatter rewrapping the payload must not fail deployment closed:
+        // the exact-bytes marker did, silently stranding the old extension.
+        let harness = Harness::new();
+        let wrapped = PAYLOAD.replace(
+            "const FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };",
+            "const FEATURES = {\n  context_preservation: true,\n  activity_tracking: true,\n  context_telemetry: true,\n};",
+        );
+        fs::write(harness.bundle.join(EXTENSION_FILE), &wrapped).unwrap();
+
+        verify_bundle(&harness.bundle).expect("reformatted payload keeps its feature marker");
+        let features = IntegrationFeatures {
+            context_preservation: false,
+            ..IntegrationFeatures::default()
+        };
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
+
+        let installed = fs::read_to_string(harness.paths.extension_path()).unwrap();
+        assert!(installed.contains(
+            "const FEATURES = { context_preservation: false, activity_tracking: true, context_telemetry: true };"
+        ));
+        // The rewrapped declaration is replaced, not left beside the rendered one.
+        assert!(!installed.contains("context_preservation: true"));
+        assert_eq!(installed.matches("const FEATURES").count(), 1);
     }
 }

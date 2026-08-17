@@ -160,7 +160,7 @@ Flat config format (v9+) in `eslint.config.js`. Base: `@eslint/js` recommended +
 `.pre-commit-config.yaml` runs on every commit:
 
 | Hook | Scope | Purpose |
-|------|-------|---------|
+| ------ | ------- | --------- |
 | trailing-whitespace | All | Strip trailing spaces |
 | end-of-file-fixer | All | Ensure newline at EOF |
 | check-yaml, check-json | All | Syntax validation |
@@ -268,7 +268,7 @@ First install records whether `mcpServers.quill` existed and, if so, its exact p
 Files and directories created during first-launch auto-deployment.
 
 | Target | Content |
-|--------|---------|
+| -------- | --------- |
 | `~/.config/quill/scripts/` | Base CJS hook scripts for token reporting, session sync, and qbuild edit guarding. `observe.cjs` is added when activity tracking is enabled (default on). Context routing is added when context preservation is enabled, plus `context-telemetry.cjs` when context telemetry is also on (default on, gated on context preservation) |
 | `~/.config/quill/mcp/` | Python MCP server for session querying; working-context tools only when context preservation is enabled |
 | `<Claude config>/commands/` | Custom CLI commands; `<Claude config>` is `CLAUDE_CONFIG_DIR` or `~/.claude` |
@@ -290,7 +290,7 @@ Deployment stamps hash the bundled managed assets and enabled features. Any chan
 Claude hook coverage is explicit and limited to events that drive Quill behavior.
 
 | Gate | Event / matcher | Handlers and timeout |
-|------|-----------------|----------------------|
+| ------ | ----------------- | ---------------------- |
 | Always | `PreToolUse` / `Edit\|Write\|NotebookEdit` | `qbuild-guard.cjs` (5s) |
 | Always | `Stop` / all | `report-tokens.cjs` (5s), `session-sync.cjs` (10s) |
 | Always | `StopFailure` / all | `session-sync.cjs` (10s) |
@@ -318,7 +318,7 @@ Files and config entries created when the Codex provider is enabled.
 Deployment is allowlisted to token and sync scripts by default, plus the shared `lib.cjs` helper (config load, local-only guard, and timeout-bounded HTTP POST) they and `hook-observe.cjs` require. `observe.cjs` and `hook-observe.cjs` are added when activity tracking is enabled. Context routing is deployed only when context preservation is enabled, with `context-telemetry.cjs` further gated on the context telemetry flag. The Claude-only `qbuild-guard.sh` is never copied into Codex assets.
 
 | Target | Content |
-|--------|---------|
+| -------- | --------- |
 | `~/.config/quill/codex/scripts/` | Base hook scripts for token reporting and session sync. `observe.cjs` is added when activity tracking is enabled (default on); `hook-observe.cjs` rides with the same flag and ships hook-fire telemetry for the Now-tab Hooks breakdown via `POST /api/v1/hooks/observed`. Context routing is added when context preservation is enabled, plus `context-telemetry.cjs` when context telemetry is also on |
 | `~/.config/quill/codex/mcp/` | Python MCP server copied from the bundled Quill MCP assets; working-context tools only when context preservation is enabled |
 | `~/.config/quill/codex/templates/` | Managed AGENTS template block |
@@ -392,9 +392,9 @@ The npm trusted-publisher record must name `sharaf-nassar/quill` and that exact 
 
 The single-file Pi extension is Pi's production tracking reporter and exposes Quill's local history and working-context APIs.
 
-Install renders `context_preservation`, `activity_tracking`, and `context_telemetry` into the owned payload and deployment stamp. Context preservation registers eight plain-JSON-Schema `quill_` tools plus Pi's context router; activity tracking registers lifecycle, agent, turn, message, tool-execution, model, and input handlers.
+Install renders `context_preservation`, `activity_tracking`, and `context_telemetry` into the owned payload and deployment stamp. [[src-tauri/src/integrations/pi.rs#features_declaration]] locates the payload's `const FEATURES` declaration by its bounds rather than by exact bytes, and rendering always emits the one-line form. The payload is formatter-owned, so an exact-byte marker made install fail closed on a pure reformat and silently strand the previously deployed extension. Context preservation registers eight plain-JSON-Schema `quill_` tools plus Pi's context router; activity tracking registers lifecycle, agent, turn, message, tool-execution, model, and input handlers.
 
-Session start sends a protocol-1 handshake and lifecycle event to `/api/v1/pi/track`, resolves lineage from one bounded parent-header read, and notifies indexing only for persisted transcripts. Runtime evidence uses `/api/v1/sessions/messages`; payloads contain empty content because analytics needs identities, roles, event kinds, and timestamps, not conversation text.
+Session start sends a protocol-1 handshake and lifecycle event to `/api/v1/pi/track`, resolves lineage from one bounded parent-header read, and notifies indexing only for transcripts already written to disk. Pi names the session file at start but writes it once the first assistant message lands, so notify defers to the turn-end repeat rather than naming a path that does not exist yet. Runtime evidence uses `/api/v1/sessions/messages`; payloads contain empty content because analytics needs identities, roles, event kinds, and timestamps, not conversation text.
 
 Every send uses the shared 1500 ms timeout. Hot handlers defer work and never await requests; only shutdown awaits its bounded lifecycle send. Stable hashed identities make the attempted request and any spool record identical across asynchronous failure handling.
 

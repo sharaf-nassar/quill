@@ -42,6 +42,8 @@ The Sessions identity renders a neutral, accessible EPHEMERAL badge only for row
 
 One atomic settings write records the handshake protocol, extension version, minimum Quill version, last report time, and typed last error.
 
+An unchanged handshake repeated inside the refresh window writes nothing, while any changed field writes through at once.
+
 ## Tracking Request Validation
 
 The Pi tracking boundary rejects bad bearer authentication with `401`, protocol mismatch with a typed `400`, and control characters in hostname identity before mutation.

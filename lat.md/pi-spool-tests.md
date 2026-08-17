@@ -20,7 +20,9 @@ File, directory, and age caps record a typed drop gap; dead files can be claimed
 
 ## Ingest throttling
 
-Four 15-second passes consume at most half of each Pi ingest window, leaving 2,000 requests per minute for live tracking and runtime traffic; throttled files retain their claimed remainder.
+Four 15-second passes consume at most half of each Pi ingest window, leaving 2,000 requests per minute for live tracking and runtime traffic.
+
+A throttled file retains its claimed remainder and the next pass resumes at the record the budget stopped on rather than replaying the records it already spent.
 
 ## Typed health gap
 

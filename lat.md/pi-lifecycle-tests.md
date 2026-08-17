@@ -77,3 +77,5 @@ Install enables the setting-gated loopback context listener, uninstall clears it
 ## Feature-gated Payload
 
 Deployment renders Pi's context preservation, activity tracking, and context telemetry flags into `quill.ts`; changing any flag invalidates the payload stamp until reinstall.
+
+The payload is formatter-owned, so rendering and bundle verification locate the `const FEATURES` declaration by its bounds and always emit the one-line form: a rewrapped declaration still deploys instead of failing closed and stranding the previously installed extension.

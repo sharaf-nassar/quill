@@ -35,11 +35,12 @@ export function formatRecency(timestamp: string, nowMs: number): string {
 function agentModelFamily(provider: IntegrationProvider, modelId: string) {
 	const matches = (family: string) =>
 		new RegExp(`(^|[-_.])${family}($|[-_.])`, "i").test(modelId);
-	const known = provider === "claude"
-		? [["Opus", 0], ["Sonnet", 1], ["Haiku", 2], ["Fable", 3]] as const
-		: provider === "codex"
-			? [["Sol", 0], ["Terra", 1], ["Luna", 2]] as const
-			: [];
+	const claude = [["Opus", 0], ["Sonnet", 1], ["Haiku", 2], ["Fable", 3]] as const;
+	const codex = [["Sol", 0], ["Terra", 1], ["Luna", 2]] as const;
+	const known = provider === "claude" ? claude
+		: provider === "codex" ? codex
+			: provider === "pi" ? [...claude, ...codex]
+				: [];
 	const family = known.find(([label]) => matches(label));
 	return family ? { label: family[0], rank: family[1] } : { label: modelId, rank: 100 };
 }

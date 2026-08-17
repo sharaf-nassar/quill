@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -118,6 +118,7 @@ struct ServerState {
     session_rate_limiter: Mutex<VecDeque<Instant>>,
     pi_session_rate_limiter: Mutex<VecDeque<Instant>>,
     pi_track_rate_limiter: Mutex<VecDeque<Instant>>,
+    pi_spool_offsets: Mutex<PiSpoolOffsets>,
     pending_session_notifies: Mutex<HashMap<String, PendingSessionNotify>>,
     pending_validation_retries: Mutex<HashMap<String, PendingValidationRetry>>,
     app_handle: tauri::AppHandle,
@@ -157,6 +158,7 @@ pub async fn start_server(
         session_rate_limiter: Mutex::new(VecDeque::new()),
         pi_session_rate_limiter: Mutex::new(VecDeque::new()),
         pi_track_rate_limiter: Mutex::new(VecDeque::new()),
+        pi_spool_offsets: Mutex::new(PiSpoolOffsets::new()),
         pending_session_notifies: Mutex::new(HashMap::new()),
         pending_validation_retries: Mutex::new(HashMap::new()),
         app_handle,
@@ -876,11 +878,24 @@ fn record_pi_spool_gap(storage: &Storage, gap: &'static str) -> Result<(), PiSpo
         .map_err(PiSpoolDrainError::Ingest)
 }
 
+/// Bytes of each spool file this drain has already ingested.
+///
+/// A live writer's file is never removed, so without this every pass would
+/// re-read it from byte 0 and burn the per-pass record budget on records
+/// already ingested. That starves the newest files — a freshly spawned
+/// sub-agent sorts last by mtime — and its `session_start` is the one event
+/// no later event can reconstruct.
+type PiSpoolOffsets = HashMap<PathBuf, u64>;
+
+// Every parameter is an injected seam the drain tests substitute, so grouping
+// them would only move the same list behind a struct.
+#[allow(clippy::too_many_arguments)]
 fn drain_pi_spool_once_with(
     storage: &Storage,
     live_tracker: &crate::live_tracker::LiveTracker,
     track_limiter: &Mutex<VecDeque<Instant>>,
     message_limiter: &Mutex<VecDeque<Instant>>,
+    offsets: &Mutex<PiSpoolOffsets>,
     root: &Path,
     limits: PiSpoolLimits,
     process_alive: impl Fn(u32) -> bool,
@@ -957,6 +972,13 @@ fn drain_pi_spool_once_with(
     let mut track_records = 0;
     let mut message_records = 0;
     let mut gap = directory_overflow.then_some(PI_SPOOL_DROP_GAP);
+    let mut offsets = offsets.lock().unwrap();
+    // Seeded from the whole enumeration, not per iteration: a pass that stops
+    // early on throttle must not discard the offsets of files it never reached.
+    let mut known_paths = files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<HashSet<_>>();
 
     for mut file in files {
         let live = !file.claimed && process_alive(file.pid);
@@ -972,21 +994,42 @@ fn drain_pi_spool_once_with(
             if !live {
                 claim_dead_pi_spool_file(&mut file)?;
                 remove_pi_spool_file(&file.path)?;
+                offsets.remove(&file.path);
                 remaining_bytes = remaining_bytes.saturating_sub(file.size);
             }
             continue;
         }
+        let claimed_from = file.path.clone();
         if !live {
             claim_dead_pi_spool_file(&mut file)?;
+            if file.path != claimed_from
+                && let Some(offset) = offsets.remove(&claimed_from)
+            {
+                offsets.insert(file.path.clone(), offset);
+            }
+            known_paths.insert(file.path.clone());
         }
 
-        let mut bytes = Vec::with_capacity(file.size as usize);
-        fs::File::open(&file.path)
+        // A shorter file than the offset means a recycled PID reused the name,
+        // so the remembered position no longer addresses the same records.
+        let start = offsets
+            .get(&file.path)
+            .copied()
+            .filter(|offset| *offset <= file.size)
+            .unwrap_or(0);
+        let mut handle = fs::File::open(&file.path).map_err(|error| PiSpoolDrainError::File {
+            path: file.path.clone(),
+            error,
+        })?;
+        handle
+            .seek(SeekFrom::Start(start))
             .map_err(|error| PiSpoolDrainError::File {
                 path: file.path.clone(),
                 error,
-            })?
-            .take(file.size)
+            })?;
+        let mut bytes = Vec::with_capacity((file.size - start) as usize);
+        handle
+            .take(file.size - start)
             .read_to_end(&mut bytes)
             .map_err(|error| PiSpoolDrainError::File {
                 path: file.path.clone(),
@@ -994,8 +1037,14 @@ fn drain_pi_spool_once_with(
             })?;
         let trailing_partial = !bytes.is_empty() && !bytes.ends_with(b"\n");
         let mut complete = true;
+        // Byte position of the first record this pass has not ingested, so a
+        // throttled or partially written file resumes exactly there.
+        let mut consumed = 0usize;
         for line in bytes.split(|byte| *byte == b'\n') {
+            let line_start = line.as_ptr() as usize - bytes.as_ptr() as usize;
+            let line_end = line_start + line.len();
             if line.is_empty() {
+                consumed = (line_end + 1).min(bytes.len());
                 continue;
             }
             if trailing_partial && line.as_ptr_range().end == bytes.as_ptr_range().end {
@@ -1005,8 +1054,12 @@ fn drain_pi_spool_once_with(
                 }
                 outcome.corrupt_records += 1;
                 gap = Some(PI_SPOOL_CORRUPT_GAP);
+                consumed = line_end;
                 continue;
             }
+            // Past the committed-line checks the record is accounted for; a
+            // throttled record rewinds this to its own start below.
+            consumed = line_end + 1;
             let record: PiSpoolRecord = match serde_json::from_slice(line) {
                 Ok(record) => record,
                 Err(_) => {
@@ -1020,6 +1073,7 @@ fn drain_pi_spool_once_with(
                     if track_records >= limits.max_track_records_per_pass {
                         outcome.throttled = true;
                         complete = false;
+                        consumed = line_start;
                         break;
                     }
                     track_records += 1;
@@ -1038,6 +1092,7 @@ fn drain_pi_spool_once_with(
                     ) {
                         outcome.throttled = true;
                         complete = false;
+                        consumed = line_start;
                         break;
                     }
                     match crate::with_ingest_write_permit(|| {
@@ -1055,6 +1110,7 @@ fn drain_pi_spool_once_with(
                     if message_records >= limits.max_message_records_per_pass {
                         outcome.throttled = true;
                         complete = false;
+                        consumed = line_start;
                         break;
                     }
                     message_records += 1;
@@ -1081,6 +1137,7 @@ fn drain_pi_spool_once_with(
                     ) {
                         outcome.throttled = true;
                         complete = false;
+                        consumed = line_start;
                         break;
                     }
                     crate::with_rollup_backfill_write_permit(|| {
@@ -1097,12 +1154,19 @@ fn drain_pi_spool_once_with(
         }
         if complete && !live {
             remove_pi_spool_file(&file.path)?;
+            offsets.remove(&file.path);
             remaining_bytes = remaining_bytes.saturating_sub(file.size);
+        } else {
+            offsets.insert(file.path.clone(), start + consumed as u64);
         }
         if outcome.throttled {
             break;
         }
     }
+    // Files the enumeration no longer lists are gone for good; drop their
+    // offsets rather than leaking a map entry per departed writer.
+    offsets.retain(|path, _| known_paths.contains(path));
+    drop(offsets);
     if let Some(gap) = gap {
         record_pi_spool_gap(storage, gap)?;
     }
@@ -1132,6 +1196,7 @@ fn spawn_pi_spool_drain(state: Arc<ServerState>) {
                     &drain_state.live_tracker,
                     &drain_state.pi_track_rate_limiter,
                     &drain_state.pi_session_rate_limiter,
+                    &drain_state.pi_spool_offsets,
                     &pi_spool_root(),
                     PiSpoolLimits::default(),
                     pi_spool_process_alive,
@@ -3358,12 +3423,14 @@ mod observed_subagent_tests {
         let tracker = crate::live_tracker::LiveTracker::new(None);
         let track_limiter = Mutex::new(VecDeque::new());
         let message_limiter = Mutex::new(VecDeque::new());
+        let offsets = Mutex::new(PiSpoolOffsets::new());
 
         let first = drain_pi_spool_once_with(
             &storage,
             &tracker,
             &track_limiter,
             &message_limiter,
+            &offsets,
             &spool,
             PiSpoolLimits::default(),
             |_| true,
@@ -3371,7 +3438,14 @@ mod observed_subagent_tests {
         .unwrap();
         assert_eq!(first.ingested_records, 2);
         assert!(path.exists());
-        let appended = spool_line("/api/v1/pi/track", spool_track_payload("appended-session"));
+        // A repeat of an already-ingested record plus a new one: the pass must
+        // resume past the bytes it consumed, and the repeat must dedupe rather
+        // than double-count.
+        let appended = format!(
+            "{}{}",
+            spool_line("/api/v1/pi/track", spool_track_payload("live-session")),
+            spool_line("/api/v1/pi/track", spool_track_payload("appended-session"))
+        );
         let mut live_file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -3384,12 +3458,13 @@ mod observed_subagent_tests {
             &tracker,
             &track_limiter,
             &message_limiter,
+            &offsets,
             &spool,
             PiSpoolLimits::default(),
             |_| true,
         )
         .unwrap();
-        assert_eq!(second.ingested_records, 3);
+        assert_eq!(second.ingested_records, 2);
         assert!(path.exists());
 
         let rows = tracker.overlay(
@@ -3433,6 +3508,7 @@ mod observed_subagent_tests {
             &tracker,
             &Mutex::new(VecDeque::new()),
             &Mutex::new(VecDeque::new()),
+            &Mutex::new(PiSpoolOffsets::new()),
             &spool,
             PiSpoolLimits::default(),
             |_| false,
@@ -3478,6 +3554,7 @@ mod observed_subagent_tests {
             &tracker,
             &Mutex::new(VecDeque::new()),
             &Mutex::new(VecDeque::new()),
+            &Mutex::new(PiSpoolOffsets::new()),
             &spool,
             limits,
             |pid| pid == 4245,
@@ -3538,12 +3615,14 @@ mod observed_subagent_tests {
             max_track_records_per_pass: 1,
             ..PiSpoolLimits::default()
         };
+        let offsets = Mutex::new(PiSpoolOffsets::new());
 
         let outcome = drain_pi_spool_once_with(
             &storage,
             &tracker,
             &Mutex::new(VecDeque::new()),
             &Mutex::new(VecDeque::new()),
+            &offsets,
             &spool,
             limits,
             |_| false,
@@ -3554,17 +3633,20 @@ mod observed_subagent_tests {
         assert!(outcome.throttled);
         assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 1);
 
+        // The remainder resumes at the throttled record instead of replaying
+        // the record the budget already spent.
         let resumed = drain_pi_spool_once_with(
             &storage,
             &tracker,
             &Mutex::new(VecDeque::new()),
             &Mutex::new(VecDeque::new()),
+            &offsets,
             &spool,
             PiSpoolLimits::default(),
-            |_| true,
+            |_| false,
         )
         .unwrap();
-        assert_eq!(resumed.ingested_records, 2);
+        assert_eq!(resumed.ingested_records, 1);
         assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 0);
     }
 
@@ -3594,6 +3676,7 @@ mod observed_subagent_tests {
                 &tracker,
                 &Mutex::new(VecDeque::new()),
                 &Mutex::new(VecDeque::new()),
+                &Mutex::new(PiSpoolOffsets::new()),
                 &spool,
                 PiSpoolLimits::default(),
                 |_| false,

@@ -30,6 +30,10 @@ Handlers push versioned lifecycle, per-message usage, model, activity, and runti
 
 Session start sends the handshake, resolves one stable parent header id, and notifies indexing only when a transcript path exists.
 
+## Deferred transcript notify
+
+Pi names the session file at start but writes it only once the first assistant message lands, so a named-but-absent transcript sends the lifecycle handshake without notifying; turn end delivers the deferred notify once the file exists.
+
 ## Environment Agent Lineage
 
 A Pi process marked as a subagent uses its validated parent-session environment id when its fresh session header has no parent path, and pushes explicit agent lineage to tracking and search notify.
@@ -84,11 +88,11 @@ Pi lifecycle events map to the existing hook vocabulary with provider `pi`, and 
 
 ## Context router parity
 
-Pi applies the canonical context-router cases that fit Pi tool names, including raw fetch denial, API/page guidance, fetch-to-file taint, reader boundaries, session isolation, and the 256-path cap.
+Pi applies the canonical context-router cases that fit Pi tool names, including `fetch_content`, raw fetch denial, API/page guidance, fetch-to-file taint, reader boundaries, session isolation, and the 256-path cap.
 
 ## Ready URL rewrites
 
-Every blocked URL has a nonempty reason with an exact `quill_fetch_and_index(url=...)` call that preserves the extracted URL.
+Every blocked URL has a nonempty reason with an exact `quill_fetch_and_index(url=...)` call; `fetch_content` preserves its single `url` or every entry in `urls`.
 
 ## Routing feature gate
 

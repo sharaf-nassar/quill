@@ -5247,7 +5247,20 @@ pub struct Storage {
     db_path: PathBuf,
     model_usage_overview_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelUsageOverviewResponse>>>,
     context_savings_analytics_cache: Mutex<HashMap<CacheKey, CacheEntry<ContextSavingsAnalytics>>>,
+    pi_extension_health_written: Mutex<Option<(PiExtensionHandshake, Instant)>>,
 }
+
+/// The handshake fields a Pi envelope restates on every send.
+type PiExtensionHandshake = (String, String, String, String);
+
+/// How long an unchanged Pi handshake may go without rewriting `last_seen`.
+///
+/// Every accepted envelope used to rewrite five settings rows in a transaction
+/// on the one primary connection, so a busy fleet serialized all Pi ingest
+/// behind pure bookkeeping. Provider status resolves liveness at two- and
+/// fifteen-minute boundaries, so this stays far below the coarsest thing that
+/// reads it while removing nearly every write.
+const PI_EXTENSION_HEALTH_REFRESH: Duration = Duration::from_secs(15);
 
 /// Result of a user-triggered database compaction attempt.
 ///
@@ -8759,6 +8772,7 @@ impl Storage {
             db_path: path,
             model_usage_overview_cache: Mutex::new(HashMap::new()),
             context_savings_analytics_cache: Mutex::new(HashMap::new()),
+            pi_extension_health_written: Mutex::new(None),
         };
 
         if production_startup {
@@ -15046,6 +15060,10 @@ impl Storage {
     }
 
     /// Store the newest Pi extension handshake as one settings transaction.
+    ///
+    /// An unchanged handshake only refreshes `last_seen` once per
+    /// [`PI_EXTENSION_HEALTH_REFRESH`]; any changed field writes through at
+    /// once so typed health never lags the extension that reported it.
     pub(crate) fn store_pi_extension_health(
         &self,
         protocol: u32,
@@ -15054,6 +15072,20 @@ impl Storage {
         last_error: Option<&str>,
     ) -> Result<(), String> {
         let protocol = protocol.to_string();
+        let handshake = (
+            protocol.clone(),
+            extension_version.to_owned(),
+            min_quill_version.to_owned(),
+            last_error.unwrap_or("").to_owned(),
+        );
+        let mut written = self.pi_extension_health_written.lock().unwrap();
+        if written.as_ref().is_some_and(|(previous, at)| {
+            *previous == handshake && at.elapsed() < PI_EXTENSION_HEALTH_REFRESH
+        }) {
+            return Ok(());
+        }
+        *written = Some((handshake, Instant::now()));
+        drop(written);
         let last_seen = Utc::now().to_rfc3339();
         self.set_settings_atomically(&[
             ("pi_extension.last_seen", &last_seen),
@@ -20478,11 +20510,32 @@ mod tests {
         ] {
             assert_eq!(storage.get_setting(key).unwrap().as_deref(), Some(expected));
         }
-        assert!(
+        let first_seen = storage.get_setting("pi_extension.last_seen").unwrap();
+        assert!(first_seen.is_some());
+
+        // An unchanged handshake must not rewrite five settings rows per
+        // envelope; a changed field still writes through immediately.
+        storage
+            .store_pi_extension_health(1, "1.2.3", "0.9.0", Some("spool_corrupt"))
+            .expect("repeat unchanged Pi extension health");
+        assert_eq!(
+            storage.get_setting("pi_extension.last_seen").unwrap(),
+            first_seen
+        );
+
+        storage
+            .store_pi_extension_health(1, "1.2.3", "0.9.0", None)
+            .expect("store cleared Pi extension error");
+        assert_eq!(
             storage
-                .get_setting("pi_extension.last_seen")
+                .get_setting("pi_extension.last_error")
                 .unwrap()
-                .is_some()
+                .as_deref(),
+            Some("")
+        );
+        assert_ne!(
+            storage.get_setting("pi_extension.last_seen").unwrap(),
+            first_seen
         );
         drop(storage);
         clear_env();

@@ -103,6 +103,20 @@ test("formats every open agent with ordered model and runtime identity", () => {
 	);
 });
 
+// @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Pi Agent Model Families]]
+test("Pi agent rails reuse native model family labels", () => {
+	assert.deepEqual(
+		formatObservedSessionAgents("pi", [
+			{ agent_id: "sol", model_id: "gpt-5.6-sol", agent_type: null, runtime_secs: 1, runtime_active: false },
+			{ agent_id: "opus", model_id: "claude-opus-5", agent_type: null, runtime_secs: 1, runtime_active: false },
+		], 1_000, 3_000).map(({ model, ariaLabel }) => ({ model, ariaLabel })),
+		[
+			{ model: "Opus", ariaLabel: "claude-opus-5, agent opus, 1s active runtime" },
+			{ model: "Sol", ariaLabel: "gpt-5.6-sol, agent sol, 1s active runtime" },
+		],
+	);
+});
+
 // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Agent Rail Tooltip Identity]]
 test("agent tooltips name the agent alongside its model", () => {
 	assert.deepEqual(

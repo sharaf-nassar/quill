@@ -33,7 +33,10 @@ function configRoot(config) {
   const path = join(root, ".config", "quill", "config.json");
   mkdirSync(dirname(path), { recursive: true });
   if (config !== undefined) {
-    writeFileSync(path, typeof config === "string" ? config : JSON.stringify(config));
+    writeFileSync(
+      path,
+      typeof config === "string" ? config : JSON.stringify(config),
+    );
   }
   return root;
 }
@@ -84,10 +87,26 @@ function context(sessionId = "pi-session", options = {}) {
         id: sessionId,
         timestamp: "2026-08-14T08:00:00.000Z",
         cwd: "/tmp/project",
-        ...(options.parentSession ? { parentSession: options.parentSession } : {}),
+        ...(options.parentSession
+          ? { parentSession: options.parentSession }
+          : {}),
       }),
     },
   };
+}
+
+// Mirrors `features_declaration` in src-tauri/src/integrations/pi.rs: match the
+// declaration, not its layout, so a formatter rewrapping quill.ts cannot turn
+// feature rendering into a silent no-op.
+function renderFeatures(source, flags) {
+  const start = source.indexOf("const FEATURES");
+  const end = source.indexOf("};", start) + 2;
+  assert.ok(start !== -1 && end > start, "payload declares const FEATURES");
+  return (
+    source.slice(0, start) +
+    `const FEATURES = { context_preservation: ${flags.context_preservation}, activity_tracking: ${flags.activity_tracking}, context_telemetry: ${flags.context_telemetry} };` +
+    source.slice(end)
+  );
 }
 
 async function flushRequests() {
@@ -206,7 +225,12 @@ test("coexisting copies register and emit each stable event once", async () => {
       const oldFetch = globalThis.fetch;
       globalThis.fetch = async (url, options) => {
         calls.push({ url: String(url), body: JSON.parse(options.body) });
-        return { ok: true, status: 202, json: async () => ({}), body: { cancel: async () => {} } };
+        return {
+          ok: true,
+          status: 202,
+          json: async () => ({}),
+          body: { cancel: async () => {} },
+        };
       };
       const ctx = context("coexistence-session");
       try {
@@ -231,7 +255,13 @@ test("coexisting copies register and emit each stable event once", async () => {
                 cacheRead: 0,
                 cacheWrite: 0,
                 totalTokens: 5,
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                cost: {
+                  input: 0,
+                  output: 0,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  total: 0,
+                },
               },
             },
           },
@@ -247,9 +277,16 @@ test("coexisting copies register and emit each stable event once", async () => {
           .filter((call) => call.url.endsWith("/api/v1/pi/track"))
           .flatMap((call) => call.body.events);
         for (const type of ["session_start", "model", "usage", "session_end"]) {
-          assert.equal(events.filter((event) => event.type === type).length, 1, type);
+          assert.equal(
+            events.filter((event) => event.type === type).length,
+            1,
+            type,
+          );
         }
-        assert.equal(new Set(events.map((event) => event.event_uuid)).size, events.length);
+        assert.equal(
+          new Set(events.map((event) => event.event_uuid)).size,
+          events.length,
+        );
       } finally {
         globalThis.fetch = oldFetch;
       }
@@ -268,27 +305,56 @@ test("tracking handlers emit versioned lifecycle, usage, and runtime envelopes",
       const oldFetch = globalThis.fetch;
       globalThis.fetch = async (url, options) => {
         calls.push({ url: String(url), body: JSON.parse(options.body) });
-        return { ok: true, status: 202, json: async () => ({}), body: { cancel: async () => {} } };
+        return {
+          ok: true,
+          status: 202,
+          json: async () => ({}),
+          body: { cancel: async () => {} },
+        };
       };
       const ctx = context("session-track", {
         model: { provider: "anthropic", id: "claude-sonnet" },
       });
       try {
-        pi.handlers.get("session_start")[0]({ type: "session_start", reason: "startup" }, ctx);
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "startup" },
+          ctx,
+        );
         pi.handlers.get("agent_start")[0]({ type: "agent_start" }, ctx);
         pi.handlers.get("agent_settled")[0]({ type: "agent_settled" }, ctx);
-        pi.handlers.get("input")[0]({ type: "input", text: "secret prompt", source: "interactive" }, ctx);
-        pi.handlers.get("turn_start")[0]({ type: "turn_start", turnIndex: 0, timestamp: 1_765_699_201_000 }, ctx);
+        pi.handlers.get("input")[0](
+          { type: "input", text: "secret prompt", source: "interactive" },
+          ctx,
+        );
+        pi.handlers.get("turn_start")[0](
+          { type: "turn_start", turnIndex: 0, timestamp: 1_765_699_201_000 },
+          ctx,
+        );
         pi.handlers.get("tool_execution_start")[0](
-          { type: "tool_execution_start", toolCallId: "tool-1", toolName: "read", args: { path: "/secret" } },
+          {
+            type: "tool_execution_start",
+            toolCallId: "tool-1",
+            toolName: "read",
+            args: { path: "/secret" },
+          },
           ctx,
         );
         pi.handlers.get("tool_execution_end")[0](
-          { type: "tool_execution_end", toolCallId: "tool-1", toolName: "read", result: "secret", isError: false },
+          {
+            type: "tool_execution_end",
+            toolCallId: "tool-1",
+            toolName: "read",
+            result: "secret",
+            isError: false,
+          },
           ctx,
         );
         pi.handlers.get("model_select")[0](
-          { type: "model_select", model: { provider: "openai", id: "gpt-5" }, source: "set" },
+          {
+            type: "model_select",
+            model: { provider: "openai", id: "gpt-5" },
+            source: "set",
+          },
           ctx,
         );
         const assistant = {
@@ -304,10 +370,19 @@ test("tracking handlers emit versioned lifecycle, usage, and runtime envelopes",
             cacheRead: 3,
             cacheWrite: 2,
             totalTokens: 23,
-            cost: { input: 0.1, output: 0.2, cacheRead: 0.03, cacheWrite: 0.02, total: 0.35 },
+            cost: {
+              input: 0.1,
+              output: 0.2,
+              cacheRead: 0.03,
+              cacheWrite: 0.02,
+              total: 0.35,
+            },
           },
         };
-        pi.handlers.get("message_end")[0]({ type: "message_end", message: assistant }, ctx);
+        pi.handlers.get("message_end")[0](
+          { type: "message_end", message: assistant },
+          ctx,
+        );
         const nextAssistant = {
           ...assistant,
           responseId: "response-2",
@@ -318,29 +393,69 @@ test("tracking handlers emit versioned lifecycle, usage, and runtime envelopes",
             cacheRead: 1,
             cacheWrite: 6,
             totalTokens: 16,
-            cost: { input: 0.05, output: 0.08, cacheRead: 0.01, cacheWrite: 0.06, total: 0.2 },
+            cost: {
+              input: 0.05,
+              output: 0.08,
+              cacheRead: 0.01,
+              cacheWrite: 0.06,
+              total: 0.2,
+            },
           },
         };
-        pi.handlers.get("message_end")[0]({ type: "message_end", message: nextAssistant }, ctx);
-        pi.handlers.get("message_end")[0]({ type: "message_end", message: nextAssistant }, ctx);
-        pi.handlers.get("turn_end")[0](
-          { type: "turn_end", turnIndex: 0, message: assistant, toolResults: [] },
+        pi.handlers.get("message_end")[0](
+          { type: "message_end", message: nextAssistant },
           ctx,
         );
-        await pi.handlers.get("session_shutdown")[0]({ type: "session_shutdown", reason: "quit" }, ctx);
+        pi.handlers.get("message_end")[0](
+          { type: "message_end", message: nextAssistant },
+          ctx,
+        );
+        pi.handlers.get("turn_end")[0](
+          {
+            type: "turn_end",
+            turnIndex: 0,
+            message: assistant,
+            toolResults: [],
+          },
+          ctx,
+        );
+        await pi.handlers.get("session_shutdown")[0](
+          { type: "session_shutdown", reason: "quit" },
+          ctx,
+        );
         await flushRequests();
 
-        const track = calls.filter((call) => call.url.endsWith("/api/v1/pi/track"));
+        const track = calls.filter((call) =>
+          call.url.endsWith("/api/v1/pi/track"),
+        );
         assert.ok(track.length >= 8);
         assert.ok(track.every(({ body }) => body.protocol === 1));
-        assert.ok(track.every(({ body }) => typeof body.extension_version === "string"));
+        assert.ok(
+          track.every(({ body }) => typeof body.extension_version === "string"),
+        );
         assert.ok(track.every(({ body }) => body.min_quill_version));
         const events = track.flatMap(({ body }) => body.events);
-        assert.ok(events.some((event) => event.type === "session_start" && event.lineage.kind === "root"));
-        assert.ok(events.some((event) => event.type === "session_end" && event.reason === "quit"));
-        assert.ok(events.some((event) => event.type === "model" && event.model === "gpt-5"));
+        assert.ok(
+          events.some(
+            (event) =>
+              event.type === "session_start" && event.lineage.kind === "root",
+          ),
+        );
+        assert.ok(
+          events.some(
+            (event) => event.type === "session_end" && event.reason === "quit",
+          ),
+        );
+        assert.ok(
+          events.some(
+            (event) => event.type === "model" && event.model === "gpt-5",
+          ),
+        );
         const usageBatches = track.filter(({ body }) =>
-          body.events.some((event) => event.event_uuid === "pi_e56c5118f3692e9dabf155823c5a9cbb")
+          body.events.some(
+            (event) =>
+              event.event_uuid === "pi_e56c5118f3692e9dabf155823c5a9cbb",
+          ),
         );
         assert.equal(usageBatches.length, 2);
         assert.deepEqual(usageBatches[0].body, {
@@ -379,17 +494,35 @@ test("tracking handlers emit versioned lifecycle, usage, and runtime envelopes",
             },
           ],
         });
-        assert.equal(usageBatches[1].body.events[1].event_uuid, usageBatches[0].body.events[1].event_uuid);
+        assert.equal(
+          usageBatches[1].body.events[1].event_uuid,
+          usageBatches[0].body.events[1].event_uuid,
+        );
 
         const messages = calls
           .filter((call) => call.url.endsWith("/api/v1/sessions/messages"))
           .flatMap((call) => call.body.messages);
-        assert.ok(messages.some((message) => message.event_kinds.includes("user_text")));
-        assert.ok(messages.some((message) => message.event_kinds.includes("asst_text")));
-        assert.ok(messages.some((message) => message.event_kinds.includes("asst_tool_use")));
-        assert.ok(messages.some((message) => message.event_kinds.includes("user_tool_result")));
+        assert.ok(
+          messages.some((message) => message.event_kinds.includes("user_text")),
+        );
+        assert.ok(
+          messages.some((message) => message.event_kinds.includes("asst_text")),
+        );
+        assert.ok(
+          messages.some((message) =>
+            message.event_kinds.includes("asst_tool_use"),
+          ),
+        );
+        assert.ok(
+          messages.some((message) =>
+            message.event_kinds.includes("user_tool_result"),
+          ),
+        );
         assert.ok(messages.every((message) => message.content === ""));
-        assert.equal(new Set(messages.map((message) => message.uuid)).size, messages.length);
+        assert.equal(
+          new Set(messages.map((message) => message.uuid)).size,
+          messages.length,
+        );
       } finally {
         globalThis.fetch = oldFetch;
       }
@@ -399,302 +532,477 @@ test("tracking handlers emit versioned lifecycle, usage, and runtime envelopes",
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Handshake and lineage]]
 test("session start resolves lineage once and notifies only persisted sessions", async () => {
-  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
-    const parent = join(process.env.HOME, "parent.jsonl");
-    const child = join(process.env.HOME, "child.jsonl");
-    writeFileSync(parent, `${JSON.stringify({ type: "session", id: "parent-id" })}\nignored\n`);
-    writeFileSync(child, `${JSON.stringify({ type: "session", id: "child-id" })}\n`);
-    const pi = fakePi();
-    quill(pi.api);
-    const calls = [];
-    const oldFetch = globalThis.fetch;
-    globalThis.fetch = async (url, options) => {
-      calls.push({ url: String(url), body: JSON.parse(options.body) });
-      return { ok: true, status: 202, body: { cancel: async () => {} } };
-    };
-    try {
-      const ctx = context("child-id", { sessionFile: child, parentSession: parent });
-      pi.handlers.get("session_start")[0]({ type: "session_start", reason: "fork", previousSessionFile: parent }, ctx);
-      await flushRequests();
-      const start = calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body.events[0];
-      assert.deepEqual(start.lineage, { kind: "linked", parent_session_id: "parent-id" });
-      assert.equal(start.previous_session_id, "parent-id");
-      const notify = calls.find((call) => call.url.endsWith("/api/v1/sessions/notify"));
-      assert.deepEqual(notify.body.lineage, { kind: "linked", parent_session_id: "parent-id" });
-      assert.equal(calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify")).length, 1);
-
-      pi.handlers.get("session_start")[0]({ type: "session_start", reason: "resume", previousSessionFile: parent }, ctx);
-      await flushRequests();
-      assert.deepEqual(
-        calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify")).at(-1).body.lineage,
-        { kind: "linked", parent_session_id: "parent-id" },
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const parent = join(process.env.HOME, "parent.jsonl");
+      const child = join(process.env.HOME, "child.jsonl");
+      writeFileSync(
+        parent,
+        `${JSON.stringify({ type: "session", id: "parent-id" })}\nignored\n`,
       );
-
-      pi.handlers.get("session_start")[0](
-        { type: "session_start", reason: "startup" },
-        context("ephemeral"),
+      writeFileSync(
+        child,
+        `${JSON.stringify({ type: "session", id: "child-id" })}\n`,
       );
-      await flushRequests();
-      assert.equal(calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify")).length, 2);
-    } finally {
-      globalThis.fetch = oldFetch;
-    }
-  });
+      const pi = fakePi();
+      quill(pi.api);
+      const calls = [];
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        calls.push({ url: String(url), body: JSON.parse(options.body) });
+        return { ok: true, status: 202, body: { cancel: async () => {} } };
+      };
+      try {
+        const ctx = context("child-id", {
+          sessionFile: child,
+          parentSession: parent,
+        });
+        pi.handlers.get("session_start")[0](
+          {
+            type: "session_start",
+            reason: "fork",
+            previousSessionFile: parent,
+          },
+          ctx,
+        );
+        await flushRequests();
+        const start = calls.find((call) =>
+          call.url.endsWith("/api/v1/pi/track"),
+        ).body.events[0];
+        assert.deepEqual(start.lineage, {
+          kind: "linked",
+          parent_session_id: "parent-id",
+        });
+        assert.equal(start.previous_session_id, "parent-id");
+        const notify = calls.find((call) =>
+          call.url.endsWith("/api/v1/sessions/notify"),
+        );
+        assert.deepEqual(notify.body.lineage, {
+          kind: "linked",
+          parent_session_id: "parent-id",
+        });
+        assert.equal(
+          calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify"))
+            .length,
+          1,
+        );
+
+        pi.handlers.get("session_start")[0](
+          {
+            type: "session_start",
+            reason: "resume",
+            previousSessionFile: parent,
+          },
+          ctx,
+        );
+        await flushRequests();
+        assert.deepEqual(
+          calls
+            .filter((call) => call.url.endsWith("/api/v1/sessions/notify"))
+            .at(-1).body.lineage,
+          { kind: "linked", parent_session_id: "parent-id" },
+        );
+
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "startup" },
+          context("ephemeral"),
+        );
+        await flushRequests();
+        assert.equal(
+          calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify"))
+            .length,
+          2,
+        );
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Environment Agent Lineage]]
 test("env-marked Pi child reports agent lineage without a parent header", async () => {
-  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
-    const child = join(process.env.HOME, "child.jsonl");
-    writeFileSync(child, `${JSON.stringify({ type: "session", id: "child-id" })}\n`);
-    const pi = fakePi();
-    quill(pi.api);
-    const calls = [];
-    const oldFetch = globalThis.fetch;
-    const oldChild = process.env.PI_SUBAGENT_CHILD;
-    const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
-    process.env.PI_SUBAGENT_CHILD = "1";
-    process.env.PI_SUBAGENT_PARENT_SESSION = "parent-id";
-    globalThis.fetch = async (url, options) => {
-      calls.push({ url: String(url), body: JSON.parse(options.body) });
-      return { ok: true, status: 202, body: { cancel: async () => {} } };
-    };
-    try {
-      pi.handlers.get("session_start")[0](
-        { type: "session_start", reason: "startup" },
-        context("child-id", { sessionFile: child }),
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const child = join(process.env.HOME, "child.jsonl");
+      writeFileSync(
+        child,
+        `${JSON.stringify({ type: "session", id: "child-id" })}\n`,
       );
-      await flushRequests();
+      const pi = fakePi();
+      quill(pi.api);
+      const calls = [];
+      const oldFetch = globalThis.fetch;
+      const oldChild = process.env.PI_SUBAGENT_CHILD;
+      const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
+      process.env.PI_SUBAGENT_CHILD = "1";
+      process.env.PI_SUBAGENT_PARENT_SESSION = "parent-id";
+      globalThis.fetch = async (url, options) => {
+        calls.push({ url: String(url), body: JSON.parse(options.body) });
+        return { ok: true, status: 202, body: { cancel: async () => {} } };
+      };
+      try {
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "startup" },
+          context("child-id", { sessionFile: child }),
+        );
+        await flushRequests();
 
-      const lineage = { kind: "agent", parent_session_id: "parent-id" };
-      assert.deepEqual(
-        calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body.events[0].lineage,
-        lineage,
-      );
-      assert.deepEqual(
-        calls.find((call) => call.url.endsWith("/api/v1/sessions/notify")).body.lineage,
-        lineage,
-      );
-    } finally {
-      globalThis.fetch = oldFetch;
-      if (oldChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
-      else process.env.PI_SUBAGENT_CHILD = oldChild;
-      if (oldParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
-      else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
-    }
-  });
+        const lineage = { kind: "agent", parent_session_id: "parent-id" };
+        assert.deepEqual(
+          calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body
+            .events[0].lineage,
+          lineage,
+        );
+        assert.deepEqual(
+          calls.find((call) => call.url.endsWith("/api/v1/sessions/notify"))
+            .body.lineage,
+          lineage,
+        );
+      } finally {
+        globalThis.fetch = oldFetch;
+        if (oldChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+        else process.env.PI_SUBAGENT_CHILD = oldChild;
+        if (oldParent === undefined)
+          delete process.env.PI_SUBAGENT_PARENT_SESSION;
+        else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
+      }
+    },
+  );
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Invalid Environment Agent Lineage]]
 test("env-marked Pi child with an invalid parent reports unresolved lineage", async () => {
-  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
-    const pi = fakePi();
-    quill(pi.api);
-    const calls = [];
-    const oldFetch = globalThis.fetch;
-    const oldChild = process.env.PI_SUBAGENT_CHILD;
-    const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
-    process.env.PI_SUBAGENT_CHILD = "1";
-    process.env.PI_SUBAGENT_PARENT_SESSION = " parent-id ";
-    globalThis.fetch = async (url, options) => {
-      calls.push({ url: String(url), body: JSON.parse(options.body) });
-      return { ok: true, status: 202, body: { cancel: async () => {} } };
-    };
-    try {
-      pi.handlers.get("session_start")[0](
-        { type: "session_start", reason: "startup" },
-        context("child-id"),
-      );
-      await flushRequests();
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const calls = [];
+      const oldFetch = globalThis.fetch;
+      const oldChild = process.env.PI_SUBAGENT_CHILD;
+      const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
+      process.env.PI_SUBAGENT_CHILD = "1";
+      process.env.PI_SUBAGENT_PARENT_SESSION = " parent-id ";
+      globalThis.fetch = async (url, options) => {
+        calls.push({ url: String(url), body: JSON.parse(options.body) });
+        return { ok: true, status: 202, body: { cancel: async () => {} } };
+      };
+      try {
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "startup" },
+          context("child-id"),
+        );
+        await flushRequests();
 
-      assert.deepEqual(
-        calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body.events[0].lineage,
-        { kind: "unresolved", reason: "subagent_parent_unavailable" },
-      );
-    } finally {
-      globalThis.fetch = oldFetch;
-      if (oldChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
-      else process.env.PI_SUBAGENT_CHILD = oldChild;
-      if (oldParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
-      else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
-    }
-  });
+        assert.deepEqual(
+          calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body
+            .events[0].lineage,
+          { kind: "unresolved", reason: "subagent_parent_unavailable" },
+        );
+      } finally {
+        globalThis.fetch = oldFetch;
+        if (oldChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+        else process.env.PI_SUBAGENT_CHILD = oldChild;
+        if (oldParent === undefined)
+          delete process.env.PI_SUBAGENT_PARENT_SESSION;
+        else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
+      }
+    },
+  );
 });
 
 // Break: trusting a header-derived parent id lets a marked child parent itself.
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Invalid Header Agent Lineage]]
 test("env-marked Pi child rejects its own header-derived parent id", async () => {
-  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
-    const parent = join(process.env.HOME, "parent.jsonl");
-    writeFileSync(parent, `${JSON.stringify({ type: "session", id: "child-id" })}\n`);
-    const pi = fakePi();
-    quill(pi.api);
-    const calls = [];
-    const oldFetch = globalThis.fetch;
-    const oldChild = process.env.PI_SUBAGENT_CHILD;
-    const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
-    process.env.PI_SUBAGENT_CHILD = "1";
-    delete process.env.PI_SUBAGENT_PARENT_SESSION;
-    globalThis.fetch = async (url, options) => {
-      calls.push({ url: String(url), body: JSON.parse(options.body) });
-      return { ok: true, status: 202, body: { cancel: async () => {} } };
-    };
-    try {
-      pi.handlers.get("session_start")[0](
-        { type: "session_start", reason: "startup" },
-        context("child-id", { parentSession: parent }),
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const parent = join(process.env.HOME, "parent.jsonl");
+      writeFileSync(
+        parent,
+        `${JSON.stringify({ type: "session", id: "child-id" })}\n`,
       );
-      await flushRequests();
+      const pi = fakePi();
+      quill(pi.api);
+      const calls = [];
+      const oldFetch = globalThis.fetch;
+      const oldChild = process.env.PI_SUBAGENT_CHILD;
+      const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
+      process.env.PI_SUBAGENT_CHILD = "1";
+      delete process.env.PI_SUBAGENT_PARENT_SESSION;
+      globalThis.fetch = async (url, options) => {
+        calls.push({ url: String(url), body: JSON.parse(options.body) });
+        return { ok: true, status: 202, body: { cancel: async () => {} } };
+      };
+      try {
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "startup" },
+          context("child-id", { parentSession: parent }),
+        );
+        await flushRequests();
 
-      assert.deepEqual(
-        calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body.events[0].lineage,
-        { kind: "unresolved", reason: "subagent_parent_unavailable" },
-      );
-    } finally {
-      globalThis.fetch = oldFetch;
-      if (oldChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
-      else process.env.PI_SUBAGENT_CHILD = oldChild;
-      if (oldParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
-      else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
-    }
-  });
+        assert.deepEqual(
+          calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body
+            .events[0].lineage,
+          { kind: "unresolved", reason: "subagent_parent_unavailable" },
+        );
+      } finally {
+        globalThis.fetch = oldFetch;
+        if (oldChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+        else process.env.PI_SUBAGENT_CHILD = oldChild;
+        if (oldParent === undefined)
+          delete process.env.PI_SUBAGENT_PARENT_SESSION;
+        else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
+      }
+    },
+  );
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Turn-end search freshness]]
 test("turn end repeats the start notify with unchanged lineage", async () => {
-  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
-    const parent = join(process.env.HOME, "parent.jsonl");
-    const child = join(process.env.HOME, "child.jsonl");
-    writeFileSync(parent, `${JSON.stringify({ type: "session", id: "parent-id" })}\n`);
-    writeFileSync(child, `${JSON.stringify({ type: "session", id: "child-id" })}\n`);
-    const pi = fakePi();
-    quill(pi.api);
-    const calls = [];
-    const oldFetch = globalThis.fetch;
-    globalThis.fetch = async (url, options) => {
-      calls.push({ url: String(url), body: JSON.parse(options.body) });
-      return { ok: true, status: 202, body: { cancel: async () => {} } };
-    };
-    try {
-      const ctx = context("child-id", { sessionFile: child, parentSession: parent });
-      pi.handlers.get("session_start")[0](
-        { type: "session_start", reason: "fork", previousSessionFile: parent },
-        ctx,
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const parent = join(process.env.HOME, "parent.jsonl");
+      const child = join(process.env.HOME, "child.jsonl");
+      writeFileSync(
+        parent,
+        `${JSON.stringify({ type: "session", id: "parent-id" })}\n`,
       );
-      await flushRequests();
-      writeFileSync(parent, "malformed");
-      pi.handlers.get("turn_end")[0]({ type: "turn_end", turnIndex: 0 }, ctx);
-      await flushRequests();
+      writeFileSync(
+        child,
+        `${JSON.stringify({ type: "session", id: "child-id" })}\n`,
+      );
+      const pi = fakePi();
+      quill(pi.api);
+      const calls = [];
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        calls.push({ url: String(url), body: JSON.parse(options.body) });
+        return { ok: true, status: 202, body: { cancel: async () => {} } };
+      };
+      try {
+        const ctx = context("child-id", {
+          sessionFile: child,
+          parentSession: parent,
+        });
+        pi.handlers.get("session_start")[0](
+          {
+            type: "session_start",
+            reason: "fork",
+            previousSessionFile: parent,
+          },
+          ctx,
+        );
+        await flushRequests();
+        writeFileSync(parent, "malformed");
+        pi.handlers.get("turn_end")[0]({ type: "turn_end", turnIndex: 0 }, ctx);
+        await flushRequests();
 
-      const notifies = calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify"));
-      assert.equal(notifies.length, 2);
-      assert.deepEqual(notifies[1].body, notifies[0].body);
-      assert.deepEqual(notifies[1].body.lineage, {
-        kind: "linked",
-        parent_session_id: "parent-id",
-      });
-    } finally {
-      globalThis.fetch = oldFetch;
-    }
-  });
+        const notifies = calls.filter((call) =>
+          call.url.endsWith("/api/v1/sessions/notify"),
+        );
+        assert.equal(notifies.length, 2);
+        assert.deepEqual(notifies[1].body, notifies[0].body);
+        assert.deepEqual(notifies[1].body.lineage, {
+          kind: "linked",
+          parent_session_id: "parent-id",
+        });
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Deferred transcript notify]]
+test("a named but unwritten transcript defers notify to turn end", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      // Pi names the session file at start and only writes it once the first
+      // assistant message lands, so the path exists before the file does.
+      const child = join(process.env.HOME, "unwritten.jsonl");
+      const pi = fakePi();
+      quill(pi.api);
+      const calls = [];
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        calls.push({ url: String(url), body: JSON.parse(options.body) });
+        return { ok: true, status: 202, body: { cancel: async () => {} } };
+      };
+      const notifies = () =>
+        calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify"));
+      try {
+        const ctx = context("child-id", { sessionFile: child });
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "startup" },
+          ctx,
+        );
+        await flushRequests();
+
+        assert.equal(notifies().length, 0);
+        const start = calls.find((call) =>
+          call.url.endsWith("/api/v1/pi/track"),
+        ).body.events[0];
+        assert.equal(start.type, "session_start");
+        assert.equal(start.ephemeral, false);
+
+        writeFileSync(
+          child,
+          `${JSON.stringify({ type: "session", id: "child-id" })}\n`,
+        );
+        pi.handlers.get("turn_end")[0]({ type: "turn_end", turnIndex: 0 }, ctx);
+        await flushRequests();
+
+        assert.equal(notifies().length, 1);
+        assert.equal(notifies()[0].body.jsonl_path, child);
+        assert.deepEqual(notifies()[0].body.lineage, { kind: "root" });
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Stable teardown identity]]
 test("session event identity survives extension teardown", async () => {
-  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
-    const ids = [];
-    const oldFetch = globalThis.fetch;
-    globalThis.fetch = async (url, options) => {
-      if (String(url).endsWith("/api/v1/pi/track")) {
-        const event = JSON.parse(options.body).events[0];
-        if (event.type === "session_start") ids.push(event.event_uuid);
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const ids = [];
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        if (String(url).endsWith("/api/v1/pi/track")) {
+          const event = JSON.parse(options.body).events[0];
+          if (event.type === "session_start") ids.push(event.event_uuid);
+        }
+        return { ok: true, status: 202, body: { cancel: async () => {} } };
+      };
+      try {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const pi = fakePi();
+          quill(pi.api);
+          pi.handlers.get("session_start")[0](
+            { type: "session_start", reason: "reload" },
+            context("stable-session"),
+          );
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          await pi.handlers.get("session_shutdown")[0](
+            { type: "session_shutdown", reason: "reload" },
+            context("stable-session"),
+          );
+        }
+        assert.equal(ids.length, 2);
+        assert.equal(ids[0], ids[1]);
+      } finally {
+        globalThis.fetch = oldFetch;
       }
-      return { ok: true, status: 202, body: { cancel: async () => {} } };
-    };
-    try {
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        const pi = fakePi();
-        quill(pi.api);
-        pi.handlers.get("session_start")[0](
-          { type: "session_start", reason: "reload" },
-          context("stable-session"),
-        );
-        await new Promise((resolve) => setTimeout(resolve, 5));
-        await pi.handlers.get("session_shutdown")[0](
-          { type: "session_shutdown", reason: "reload" },
-          context("stable-session"),
-        );
-      }
-      assert.equal(ids.length, 2);
-      assert.equal(ids[0], ids[1]);
-    } finally {
-      globalThis.fetch = oldFetch;
-    }
-  });
+    },
+  );
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Spool durability]]
 test("failed sends lazily create bounded private spool and log files", async () => {
-  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
-    const pi = fakePi();
-    quill(pi.api);
-    const spool = join(process.env.HOME, ".config", "quill", "pi-spool");
-    assert.equal(readdirSync(join(process.env.HOME, ".config", "quill")).includes("pi-spool"), false);
-    const oldFetch = globalThis.fetch;
-    globalThis.fetch = () => Promise.reject(new Error("connection refused"));
-    try {
-      const handler = pi.handlers.get("model_select")[0];
-      for (let index = 0; index < 1800; index += 1) {
-        handler(
-          { type: "model_select", model: { provider: "openai", id: `gpt-${index}` }, source: "set" },
-          context("spool-session"),
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const spool = join(process.env.HOME, ".config", "quill", "pi-spool");
+      assert.equal(
+        readdirSync(join(process.env.HOME, ".config", "quill")).includes(
+          "pi-spool",
+        ),
+        false,
+      );
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = () => Promise.reject(new Error("connection refused"));
+      try {
+        const handler = pi.handlers.get("model_select")[0];
+        for (let index = 0; index < 1800; index += 1) {
+          handler(
+            {
+              type: "model_select",
+              model: { provider: "openai", id: `gpt-${index}` },
+              source: "set",
+            },
+            context("spool-session"),
+          );
+        }
+        await flushRequests();
+        assert.equal(statSync(spool).mode & 0o777, 0o700);
+        const files = readdirSync(spool).filter((file) =>
+          file.endsWith(".jsonl"),
         );
+        assert.equal(files.length, 1);
+        const path = join(spool, files[0]);
+        assert.equal(statSync(path).mode & 0o777, 0o600);
+        assert.ok(statSync(path).size <= 1024 * 1024);
+        const text = readFileSync(path, "utf8");
+        assert.match(text, /event_uuid/);
+        assert.doesNotMatch(
+          text,
+          /secret prompt|secret answer|connection refused/,
+        );
+        const log = join(
+          process.env.HOME,
+          ".config",
+          "quill",
+          "pi-extension.log",
+        );
+        assert.ok(statSync(log).size <= 256 * 1024);
+      } finally {
+        globalThis.fetch = oldFetch;
       }
-      await flushRequests();
-      assert.equal(statSync(spool).mode & 0o777, 0o700);
-      const files = readdirSync(spool).filter((file) => file.endsWith(".jsonl"));
-      assert.equal(files.length, 1);
-      const path = join(spool, files[0]);
-      assert.equal(statSync(path).mode & 0o777, 0o600);
-      assert.ok(statSync(path).size <= 1024 * 1024);
-      const text = readFileSync(path, "utf8");
-      assert.match(text, /event_uuid/);
-      assert.doesNotMatch(text, /secret prompt|secret answer|connection refused/);
-      const log = join(process.env.HOME, ".config", "quill", "pi-extension.log");
-      assert.ok(statSync(log).size <= 256 * 1024);
-    } finally {
-      globalThis.fetch = oldFetch;
-    }
-  });
+    },
+  );
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Protocol degradation]]
 test("protocol mismatch becomes a typed bounded failure without escaping", async () => {
-  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
-    const pi = fakePi();
-    quill(pi.api);
-    const oldFetch = globalThis.fetch;
-    globalThis.fetch = async () => ({
-      ok: false,
-      status: 400,
-      json: async () => ({ error: "protocol_mismatch", message: "unsupported" }),
-      body: { cancel: async () => {} },
-    });
-    try {
-      assert.doesNotThrow(() =>
-        pi.handlers.get("session_start")[0]({ type: "session_start", reason: "startup" }, context()),
-      );
-      await flushRequests();
-      const log = readFileSync(
-        join(process.env.HOME, ".config", "quill", "pi-extension.log"),
-        "utf8",
-      );
-      assert.match(log, /ProtocolMismatchError/);
-      assert.ok(statSync(join(process.env.HOME, ".config", "quill", "pi-extension.log")).size <= 256 * 1024);
-    } finally {
-      globalThis.fetch = oldFetch;
-    }
-  });
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async () => ({
+        ok: false,
+        status: 400,
+        json: async () => ({
+          error: "protocol_mismatch",
+          message: "unsupported",
+        }),
+        body: { cancel: async () => {} },
+      });
+      try {
+        assert.doesNotThrow(() =>
+          pi.handlers.get("session_start")[0](
+            { type: "session_start", reason: "startup" },
+            context(),
+          ),
+        );
+        await flushRequests();
+        const log = readFileSync(
+          join(process.env.HOME, ".config", "quill", "pi-extension.log"),
+          "utf8",
+        );
+        assert.match(log, /ProtocolMismatchError/);
+        assert.ok(
+          statSync(
+            join(process.env.HOME, ".config", "quill", "pi-extension.log"),
+          ).size <=
+            256 * 1024,
+        );
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Tool registration boundary]]
@@ -723,18 +1031,38 @@ test("rendered feature flags independently gate tools and telemetry", async () =
   await withHome(
     { url: "http://localhost:19876", secret: "secret" },
     async () => {
-      const source = readFileSync(join(import.meta.dirname, "quill.ts"), "utf8");
+      const source = readFileSync(
+        join(import.meta.dirname, "quill.ts"),
+        "utf8",
+      );
       const oldFetch = globalThis.fetch;
-      globalThis.fetch = async () => ({ ok: true, status: 202, body: { cancel: async () => {} } });
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 202,
+        body: { cancel: async () => {} },
+      });
       try {
         for (const [flags, expectedTools, requiredHandlers] of [
           [
-            { context_preservation: false, activity_tracking: true, context_telemetry: true },
+            {
+              context_preservation: false,
+              activity_tracking: true,
+              context_telemetry: true,
+            },
             0,
-            ["session_start", "session_shutdown", "message_end", "tool_execution_start"],
+            [
+              "session_start",
+              "session_shutdown",
+              "message_end",
+              "tool_execution_start",
+            ],
           ],
           [
-            { context_preservation: true, activity_tracking: false, context_telemetry: false },
+            {
+              context_preservation: true,
+              activity_tracking: false,
+              context_telemetry: false,
+            },
             8,
             ["tool_call", "session_shutdown"],
           ],
@@ -743,22 +1071,21 @@ test("rendered feature flags independently gate tools and telemetry", async () =
             process.env.HOME,
             `rendered-${flags.context_preservation}-${flags.activity_tracking}.mjs`,
           );
-          writeFileSync(
-            path,
-            source.replace(
-              "const FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };",
-              `const FEATURES = { context_preservation: ${flags.context_preservation}, activity_tracking: ${flags.activity_tracking}, context_telemetry: ${flags.context_telemetry} };`,
-            ),
-          );
+          writeFileSync(path, renderFeatures(source, flags));
           const rendered = (await import(pathToFileURL(path).href)).default;
           const pi = fakePi();
           rendered(pi.api);
           assert.equal(pi.tools.size, expectedTools);
           assert.deepEqual(
-            [...pi.handlers.keys()].filter((name) => requiredHandlers.includes(name)).sort(),
+            [...pi.handlers.keys()]
+              .filter((name) => requiredHandlers.includes(name))
+              .sort(),
             requiredHandlers.toSorted(),
           );
-          assert.equal(pi.handlers.has("session_start"), flags.activity_tracking);
+          assert.equal(
+            pi.handlers.has("session_start"),
+            flags.activity_tracking,
+          );
           await pi.handlers.get("session_shutdown")[0](
             { type: "session_shutdown", reason: "reload" },
             context(),
@@ -788,7 +1115,13 @@ test("registration and handler exceptions never escape", async () => {
       };
       try {
         for (const tool of pi.tools.values()) {
-          const result = await tool.execute("call", {}, undefined, undefined, context());
+          const result = await tool.execute(
+            "call",
+            {},
+            undefined,
+            undefined,
+            context(),
+          );
           assert.equal(result.isError, true);
           assert.equal(result.details.ok, false);
           assert.equal(result.details.error.type, "quill_unavailable");
@@ -796,7 +1129,17 @@ test("registration and handler exceptions never escape", async () => {
         }
         for (const handler of allHandlers(pi)) {
           assert.doesNotThrow(() =>
-            handler({}, { cwd: "/tmp", sessionManager: { getSessionId: () => { throw new Error("bad session"); } } }),
+            handler(
+              {},
+              {
+                cwd: "/tmp",
+                sessionManager: {
+                  getSessionId: () => {
+                    throw new Error("bad session");
+                  },
+                },
+              },
+            ),
           );
         }
       } finally {
@@ -827,23 +1170,30 @@ test("tools call the local session and context APIs with typed results", async (
         };
       };
       try {
-        const history = await pi.tools.get("quill_search_history").execute(
-          "history",
-          { query: "needle", project: "/tmp/project", limit: 3 },
-          undefined,
-          undefined,
-          context(),
-        );
-        const indexed = await pi.tools.get("quill_index_context").execute(
-          "index",
-          { content: "large output" },
-          undefined,
-          undefined,
-          context(),
-        );
+        const history = await pi.tools
+          .get("quill_search_history")
+          .execute(
+            "history",
+            { query: "needle", project: "/tmp/project", limit: 3 },
+            undefined,
+            undefined,
+            context(),
+          );
+        const indexed = await pi.tools
+          .get("quill_index_context")
+          .execute(
+            "index",
+            { content: "large output" },
+            undefined,
+            undefined,
+            context(),
+          );
         assert.equal(history.isError, undefined);
         assert.equal(indexed.details.ok, true);
-        assert.match(calls[0].url, /^http:\/\/\[::1\]:19876\/api\/v1\/sessions\/search\?/);
+        assert.match(
+          calls[0].url,
+          /^http:\/\/\[::1\]:19876\/api\/v1\/sessions\/search\?/,
+        );
         assert.match(calls[0].url, /q=needle/);
         assert.match(calls[0].url, /page_size=3/);
         assert.equal(calls[1].url, "http://[::1]:19877/api/v1/context/index");
@@ -861,36 +1211,35 @@ test("tools call the local session and context APIs with typed results", async (
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Bounded synchronous work]]
 test("tool and telemetry handlers return from synchronous work in single-digit milliseconds", async () => {
-  await withHome(
-    { url: "http://127.0.0.1:19876", secret: "secret" },
-    () => {
-      const pi = fakePi();
-      quill(pi.api);
-      const oldFetch = globalThis.fetch;
-      globalThis.fetch = () => new Promise(() => {});
-      try {
-        let started = performance.now();
-        void pi.tools.get("quill_context_stats").execute("stats", {}, undefined, undefined, context());
-        assert.ok(performance.now() - started < 10);
-        started = performance.now();
-        routingHandler(pi)(
-          {
-            type: "tool_call",
-            toolName: "bash",
-            toolCallId: "call",
-            input: { command: "curl https://example.com" },
-          },
-          context(),
-        );
-        assert.ok(performance.now() - started < 10);
-        started = performance.now();
-        pi.handlers.get("turn_end")[0]({}, context());
-        assert.ok(performance.now() - started < 10);
-      } finally {
-        globalThis.fetch = oldFetch;
-      }
-    },
-  );
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, () => {
+    const pi = fakePi();
+    quill(pi.api);
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = () => new Promise(() => {});
+    try {
+      let started = performance.now();
+      void pi.tools
+        .get("quill_context_stats")
+        .execute("stats", {}, undefined, undefined, context());
+      assert.ok(performance.now() - started < 10);
+      started = performance.now();
+      routingHandler(pi)(
+        {
+          type: "tool_call",
+          toolName: "bash",
+          toolCallId: "call",
+          input: { command: "curl https://example.com" },
+        },
+        context(),
+      );
+      assert.ok(performance.now() - started < 10);
+      started = performance.now();
+      pi.handlers.get("turn_end")[0]({}, context());
+      assert.ok(performance.now() - started < 10);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Telemetry mapping and timeout]]
@@ -938,14 +1287,24 @@ test("telemetry maps Pi events and uses the shared local timeout", async () => {
           Object.values(mapping).sort(),
         );
         assert.ok(payloads.every((payload) => payload.provider === "pi"));
-        assert.ok(payloads.every((payload) => payload.session_id === "pi-session"));
+        assert.ok(
+          payloads.every((payload) => payload.session_id === "pi-session"),
+        );
         assert.ok(payloads.every((payload) => payload.hostname === "pi-host"));
 
         const lib = readFileSync(
-          join(import.meta.dirname, "..", "codex-integration", "scripts", "lib.cjs"),
+          join(
+            import.meta.dirname,
+            "..",
+            "codex-integration",
+            "scripts",
+            "lib.cjs",
+          ),
           "utf8",
         );
-        const sharedTimeout = Number(lib.match(/const LOCAL_TIMEOUT_MS = (\d+);/)[1]);
+        const sharedTimeout = Number(
+          lib.match(/const LOCAL_TIMEOUT_MS = (\d+);/)[1],
+        );
         assert.ok(timeouts.length >= Object.keys(mapping).length);
         assert.ok(timeouts.every((timeout) => timeout === sharedTimeout));
       } finally {
@@ -960,7 +1319,9 @@ test("telemetry maps Pi events and uses the shared local timeout", async () => {
 test("context routing matches canonical Pi-applicable policy cases", async (t) => {
   const oldFetch = globalThis.fetch;
   globalThis.fetch = async () => ({ body: { cancel: async () => {} } });
-  t.after(() => { globalThis.fetch = oldFetch; });
+  t.after(() => {
+    globalThis.fetch = oldFetch;
+  });
   await withHome(
     { url: "http://127.0.0.1:19876", secret: "secret" },
     async () => {
@@ -970,21 +1331,39 @@ test("context routing matches canonical Pi-applicable policy cases", async (t) =
       assert.equal(typeof route, "function");
 
       const call = (toolName, input, sessionId = `pi-${Math.random()}`) =>
-        route({ type: "tool_call", toolName, toolCallId: "call", input }, context(sessionId));
+        route(
+          { type: "tool_call", toolName, toolCallId: "call", input },
+          context(sessionId),
+        );
       const deny = async (toolName, input, expected) => {
         const result = await call(toolName, input);
-        assert.equal(result?.block, true, `${toolName} ${JSON.stringify(input)} should be denied`);
-        assert.ok(result.reason?.includes(expected), `deny reason missing ${expected}: ${result.reason}`);
+        assert.equal(
+          result?.block,
+          true,
+          `${toolName} ${JSON.stringify(input)} should be denied`,
+        );
+        assert.ok(
+          result.reason?.includes(expected),
+          `deny reason missing ${expected}: ${result.reason}`,
+        );
       };
 
-      await deny("web_fetch", { url: "https://example.com" }, "quill_fetch_and_index");
+      await deny(
+        "web_fetch",
+        { url: "https://example.com" },
+        "quill_fetch_and_index",
+      );
       for (const command of [
         "curl -sS https://example.com/api | jq .",
         "wget -q -O - https://example.org/data.json",
         `node -e 'fetch("https://api.example.com/v1/x").then(r => r.json())'`,
         `python -c 'import requests; requests.get("https://api.example.com/data.json")'`,
       ]) {
-        await deny("bash", { command }, "Quill context routing blocked a raw network fetch");
+        await deny(
+          "bash",
+          { command },
+          "Quill context routing blocked a raw network fetch",
+        );
       }
 
       // These inputs are copied from context-router.test.cjs. Keep one case set.
@@ -1003,29 +1382,59 @@ test("context routing matches canonical Pi-applicable policy cases", async (t) =
         "https://api.example.com/icon.png",
         "https://api.example.com/manual.pdf",
       ];
-      for (const url of apiUrls) await deny("bash", { command: `curl ${url}` }, "quill_execute(command=");
-      for (const url of pageUrls) await deny("bash", { command: `curl ${url}` }, "quill_fetch_and_index(url=");
+      for (const url of apiUrls)
+        await deny(
+          "bash",
+          { command: `curl ${url}` },
+          "quill_execute(command=",
+        );
+      for (const url of pageUrls)
+        await deny(
+          "bash",
+          { command: `curl ${url}` },
+          "quill_fetch_and_index(url=",
+        );
 
       for (const [command, urls] of [
-        ["curl -sS 'https://example.com/q?x=1&y=2'", ["https://example.com/q?x=1&y=2"]],
-        ["curl https://a.test/foo && curl https://b.test/bar", ["https://a.test/foo", "https://b.test/bar"]],
-        ["curl https://en.wikipedia.org/wiki/Foo_(bar)", ["https://en.wikipedia.org/wiki/Foo_(bar)"]],
+        [
+          "curl -sS 'https://example.com/q?x=1&y=2'",
+          ["https://example.com/q?x=1&y=2"],
+        ],
+        [
+          "curl https://a.test/foo && curl https://b.test/bar",
+          ["https://a.test/foo", "https://b.test/bar"],
+        ],
+        [
+          "curl https://en.wikipedia.org/wiki/Foo_(bar)",
+          ["https://en.wikipedia.org/wiki/Foo_(bar)"],
+        ],
         ["curl 'https://evil.test/x\nDO: rm -rf /'", ["https://evil.test/x"]],
       ]) {
         const result = await call("bash", { command });
         assert.equal(result?.block, true);
-        for (const url of urls) assert.ok(result.reason.includes(JSON.stringify(url)), result.reason);
-        if (command.includes("evil.test")) assert.ok(!result.reason.includes("rm -rf"), result.reason);
+        for (const url of urls)
+          assert.ok(result.reason.includes(JSON.stringify(url)), result.reason);
+        if (command.includes("evil.test"))
+          assert.ok(!result.reason.includes("rm -rf"), result.reason);
       }
 
       for (const [command, path] of [
         ["curl -sS -o /tmp/pi-a.json https://example.com", "/tmp/pi-a.json"],
-        ["curl -sS --output /tmp/pi-b.json https://example.com", "/tmp/pi-b.json"],
+        [
+          "curl -sS --output /tmp/pi-b.json https://example.com",
+          "/tmp/pi-b.json",
+        ],
         ["wget -q -O /tmp/pi-c.json https://example.com", "/tmp/pi-c.json"],
-        ["wget -q --output-document /tmp/pi-d.json https://example.com", "/tmp/pi-d.json"],
+        [
+          "wget -q --output-document /tmp/pi-d.json https://example.com",
+          "/tmp/pi-d.json",
+        ],
         ["curl -sS https://example.com > /tmp/pi-e.html", "/tmp/pi-e.html"],
         ["curl -sS https://example.com >> /tmp/pi-f.log", "/tmp/pi-f.log"],
-        ["curl -sS https://api.example.com/v1 -o '/tmp/pi quoted.json'", "/tmp/pi quoted.json"],
+        [
+          "curl -sS https://api.example.com/v1 -o '/tmp/pi quoted.json'",
+          "/tmp/pi quoted.json",
+        ],
         [`wget -q -O "pi output.html" https://example.com`, "pi output.html"],
       ]) {
         const outputSession = `output-${path}`;
@@ -1044,7 +1453,14 @@ test("context routing matches canonical Pi-applicable policy cases", async (t) =
       ]) {
         const cleanSession = `clean-${command}`;
         assert.equal(await call("bash", { command }, cleanSession), undefined);
-        assert.equal(await call("read", { path: "https://example.com/a.tgz" }, cleanSession), undefined);
+        assert.equal(
+          await call(
+            "read",
+            { path: "https://example.com/a.tgz" },
+            cleanSession,
+          ),
+          undefined,
+        );
       }
       for (const command of [
         "curl -sSO https://example.com/a.tgz",
@@ -1057,35 +1473,68 @@ test("context routing matches canonical Pi-applicable policy cases", async (t) =
       assert.equal(
         await call(
           "bash",
-          { command: "curl -sS -o /tmp/quill-pi-router.json https://api.example.com/foo" },
+          {
+            command:
+              "curl -sS -o /tmp/quill-pi-router.json https://api.example.com/foo",
+          },
           sid,
         ),
         undefined,
       );
-      const taintedBash = await call("bash", { command: "jq . /tmp/quill-pi-router.json" }, sid);
+      const taintedBash = await call(
+        "bash",
+        { command: "jq . /tmp/quill-pi-router.json" },
+        sid,
+      );
       assert.equal(taintedBash?.block, true);
       assert.match(taintedBash.reason, /earlier curl\/wget/);
-      const taintedRead = await call("read", { path: "/tmp/quill-pi-router.json" }, sid);
+      const taintedRead = await call(
+        "read",
+        { path: "/tmp/quill-pi-router.json" },
+        sid,
+      );
       assert.equal(taintedRead?.block, true);
       assert.match(taintedRead.reason, /quill_search_context/);
 
-      for (const command of ["rm -f /tmp/quill-pi-router.json", "bash /tmp/quill-pi-router.json"] ) {
+      for (const command of [
+        "rm -f /tmp/quill-pi-router.json",
+        "bash /tmp/quill-pi-router.json",
+      ]) {
         assert.equal(await call("bash", { command }, sid), undefined);
       }
-      assert.equal(await call("read", { path: "/tmp/not-tainted.txt" }, sid), undefined);
+      assert.equal(
+        await call("read", { path: "/tmp/not-tainted.txt" }, sid),
+        undefined,
+      );
 
-      const quotedRead = await call("bash", { command: "cat '/tmp/quill-pi-router.json'" }, sid);
+      const quotedRead = await call(
+        "bash",
+        { command: "cat '/tmp/quill-pi-router.json'" },
+        sid,
+      );
       assert.equal(quotedRead?.block, true);
       assert.equal(
-        await call("bash", { command: "cat /tmp/quill-pi-router.json.bak" }, sid),
+        await call(
+          "bash",
+          { command: "cat /tmp/quill-pi-router.json.bak" },
+          sid,
+        ),
         undefined,
       );
       assert.equal(
-        await call("bash", { command: "echo 'next: cat /tmp/quill-pi-router.json'" }, sid),
+        await call(
+          "bash",
+          { command: "echo 'next: cat /tmp/quill-pi-router.json'" },
+          sid,
+        ),
         undefined,
       );
       assert.equal(
-        await call("read", { path: "/tmp/quill-pi-router.json" }, "pi-other-session"),
+        await call(
+          "read",
+          { path: "/tmp/quill-pi-router.json" },
+          "pi-other-session",
+        ),
         undefined,
       );
 
@@ -1093,7 +1542,9 @@ test("context routing matches canonical Pi-applicable policy cases", async (t) =
       for (let index = 0; index < 260; index += 1) {
         await call(
           "bash",
-          { command: `curl -sS -o /tmp/pi-bounded-${index}.json https://example.com` },
+          {
+            command: `curl -sS -o /tmp/pi-bounded-${index}.json https://example.com`,
+          },
           boundedSession,
         );
       }
@@ -1120,16 +1571,36 @@ test("context routing matches canonical Pi-applicable policy cases", async (t) =
 test("every URL block has a nonempty ready-to-paste Pi rewrite", async (t) => {
   const oldFetch = globalThis.fetch;
   globalThis.fetch = async () => ({ body: { cancel: async () => {} } });
-  t.after(() => { globalThis.fetch = oldFetch; });
+  t.after(() => {
+    globalThis.fetch = oldFetch;
+  });
   await withHome(
     { url: "http://127.0.0.1:19876", secret: "secret" },
     async () => {
       const pi = fakePi();
       quill(pi.api);
       const route = routingHandler(pi);
-      for (const [toolName, input, url] of [
-        ["web_fetch", { url: "https://example.com/docs" }, "https://example.com/docs"],
-        ["bash", { command: "curl https://api.example.com/v1/items.json" }, "https://api.example.com/v1/items.json"],
+      for (const [toolName, input, urls] of [
+        [
+          "web_fetch",
+          { url: "https://example.com/docs" },
+          ["https://example.com/docs"],
+        ],
+        [
+          "fetch_content",
+          { url: "https://example.com/article" },
+          ["https://example.com/article"],
+        ],
+        [
+          "fetch_content",
+          { urls: ["https://example.com/one", "https://example.com/two"] },
+          ["https://example.com/one", "https://example.com/two"],
+        ],
+        [
+          "bash",
+          { command: "curl https://api.example.com/v1/items.json" },
+          ["https://api.example.com/v1/items.json"],
+        ],
       ]) {
         const result = await route(
           { type: "tool_call", toolName, toolCallId: "call", input },
@@ -1137,10 +1608,14 @@ test("every URL block has a nonempty ready-to-paste Pi rewrite", async (t) => {
         );
         assert.equal(result?.block, true);
         assert.ok(result.reason?.trim());
-        assert.ok(
-          result.reason.includes(`quill_fetch_and_index(url=${JSON.stringify(url)})`),
-          result.reason,
-        );
+        for (const url of urls) {
+          assert.ok(
+            result.reason.includes(
+              `quill_fetch_and_index(url=${JSON.stringify(url)})`,
+            ),
+            result.reason,
+          );
+        }
       }
     },
   );
@@ -1151,14 +1626,18 @@ test("context preservation off registers no router or routing telemetry", async 
   await withHome(
     { url: "http://127.0.0.1:19876", secret: "secret" },
     async () => {
-      const source = readFileSync(join(import.meta.dirname, "quill.ts"), "utf8");
+      const source = readFileSync(
+        join(import.meta.dirname, "quill.ts"),
+        "utf8",
+      );
       const path = join(process.env.HOME, "context-off.mjs");
       writeFileSync(
         path,
-        source.replace(
-          "const FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };",
-          "const FEATURES = { context_preservation: false, activity_tracking: false, context_telemetry: true };",
-        ),
+        renderFeatures(source, {
+          context_preservation: false,
+          activity_tracking: false,
+          context_telemetry: true,
+        }),
       );
       const rendered = (await import(pathToFileURL(path).href)).default;
       const pi = fakePi();
@@ -1262,14 +1741,18 @@ test("context telemetry off preserves routing without posting", async () => {
   await withHome(
     { url: "http://127.0.0.1:19876", secret: "secret" },
     async () => {
-      const source = readFileSync(join(import.meta.dirname, "quill.ts"), "utf8");
+      const source = readFileSync(
+        join(import.meta.dirname, "quill.ts"),
+        "utf8",
+      );
       const path = join(process.env.HOME, "telemetry-off.mjs");
       writeFileSync(
         path,
-        source.replace(
-          "const FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };",
-          "const FEATURES = { context_preservation: true, activity_tracking: false, context_telemetry: false };",
-        ),
+        renderFeatures(source, {
+          context_preservation: true,
+          activity_tracking: false,
+          context_telemetry: false,
+        }),
       );
       const rendered = (await import(pathToFileURL(path).href)).default;
       const pi = fakePi();
@@ -1304,53 +1787,68 @@ test("sustains 1000 events per minute without turn delay or unbounded RSS", asyn
   const minutes = Number(process.env.QUILL_PI_LOAD_MINUTES || "0.01");
   const total = Math.max(1, Math.round(minutes * 1000));
   const intervalMs = (minutes * 60_000) / total;
-  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
-    const pi = fakePi();
-    quill(pi.api);
-    let requests = 0;
-    let maxHandlerMs = 0;
-    const rssStart = process.memoryUsage().rss;
-    let rssMax = rssStart;
-    const oldFetch = globalThis.fetch;
-    globalThis.fetch = async () => {
-      requests += 1;
-      return { ok: true, status: 202, body: { cancel: async () => {} } };
-    };
-    try {
-      await new Promise((resolve) => {
-        let sent = 0;
-        const timer = setInterval(() => {
-          const started = performance.now();
-          pi.handlers.get("model_select")[0](
-            { type: "model_select", model: { provider: "probe", id: `model-${sent % 2}` }, source: "set" },
-            context("load-session"),
-          );
-          maxHandlerMs = Math.max(maxHandlerMs, performance.now() - started);
-          rssMax = Math.max(rssMax, process.memoryUsage().rss);
-          sent += 1;
-          if (sent === total) {
-            clearInterval(timer);
-            resolve();
-          }
-        }, intervalMs);
-      });
-      await flushRequests();
-      assert.equal(requests, total);
-      assert.ok(maxHandlerMs < 10, `max handler delay ${maxHandlerMs.toFixed(3)}ms`);
-      assert.ok(rssMax - rssStart < 64 * 1024 * 1024, `RSS grew ${rssMax - rssStart} bytes`);
-      console.log(
-        `PI_LOAD_RESULT minutes=${minutes} events=${total} max_handler_ms=${maxHandlerMs.toFixed(3)} rss_delta=${rssMax - rssStart}`,
-      );
-    } finally {
-      globalThis.fetch = oldFetch;
-    }
-  });
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      let requests = 0;
+      let maxHandlerMs = 0;
+      const rssStart = process.memoryUsage().rss;
+      let rssMax = rssStart;
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async () => {
+        requests += 1;
+        return { ok: true, status: 202, body: { cancel: async () => {} } };
+      };
+      try {
+        await new Promise((resolve) => {
+          let sent = 0;
+          const timer = setInterval(() => {
+            const started = performance.now();
+            pi.handlers.get("model_select")[0](
+              {
+                type: "model_select",
+                model: { provider: "probe", id: `model-${sent % 2}` },
+                source: "set",
+              },
+              context("load-session"),
+            );
+            maxHandlerMs = Math.max(maxHandlerMs, performance.now() - started);
+            rssMax = Math.max(rssMax, process.memoryUsage().rss);
+            sent += 1;
+            if (sent === total) {
+              clearInterval(timer);
+              resolve();
+            }
+          }, intervalMs);
+        });
+        await flushRequests();
+        assert.equal(requests, total);
+        assert.ok(
+          maxHandlerMs < 10,
+          `max handler delay ${maxHandlerMs.toFixed(3)}ms`,
+        );
+        assert.ok(
+          rssMax - rssStart < 64 * 1024 * 1024,
+          `RSS grew ${rssMax - rssStart} bytes`,
+        );
+        console.log(
+          `PI_LOAD_RESULT minutes=${minutes} events=${total} max_handler_ms=${maxHandlerMs.toFixed(3)} rss_delta=${rssMax - rssStart}`,
+        );
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Real Pi session]]
 test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", async () => {
   const piBin = process.env.QUILL_PI_BIN || "pi";
-  const piVersion = execFileSync(piBin, ["--version"], { encoding: "utf8" }).trim();
+  const piVersion = execFileSync(piBin, ["--version"], {
+    encoding: "utf8",
+  }).trim();
   assert.equal(piVersion, "0.84.2");
   const root = mkdtempSync(join(tmpdir(), "quill-real-pi-"));
   const configDir = join(root, "pi-agent");
@@ -1395,7 +1893,9 @@ test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", a
               delta: { role: "assistant", content: "Quill probe complete." },
               finish_reason: "stop",
             };
-      response.write(`data: ${JSON.stringify({ id: `probe-${modelCalls}`, choices: [choice] })}\n\n`);
+      response.write(
+        `data: ${JSON.stringify({ id: `probe-${modelCalls}`, choices: [choice] })}\n\n`,
+      );
       response.write(
         `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } })}\n\n`,
       );
@@ -1516,11 +2016,21 @@ test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", a
     assert.ok(trackEvents.some((event) => event.type === "session_start"));
     assert.ok(trackEvents.some((event) => event.type === "usage"));
     assert.ok(trackEvents.some((event) => event.type === "session_end"));
-    assert.ok(runtimeBodies.flatMap((body) => body.messages).some((message) => message.role === "assistant"));
+    assert.ok(
+      runtimeBodies
+        .flatMap((body) => body.messages)
+        .some((message) => message.role === "assistant"),
+    );
     assert.match(stdout, /Quill probe complete/);
     assert.match(stdout, /"sources":7/);
-    assert.ok(readdirSync(sessionDir, { recursive: true }).some((entry) => entry.endsWith(".jsonl")));
-    console.log(`REAL_PI_RESULT version=${piVersion} context_calls=1 session_ms=${sessionMs}`);
+    assert.ok(
+      readdirSync(sessionDir, { recursive: true }).some((entry) =>
+        entry.endsWith(".jsonl"),
+      ),
+    );
+    console.log(
+      `REAL_PI_RESULT version=${piVersion} context_calls=1 session_ms=${sessionMs}`,
+    );
   } finally {
     server.close();
     await once(server, "close");

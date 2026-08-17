@@ -2,12 +2,15 @@
 // quill-managed-pi-payload: 2
 // Quill-managed Pi integration, payload/stamp 2.
 // Disable Pi in Quill to remove this file.
+// @ts-nocheck - untyped Node payload loaded by Pi, outside this repo's TS
+// program (tsconfig covers src/ only and there is no @types/node).
 
 import { createHash, randomUUID } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
   closeSync,
+  existsSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -23,7 +26,11 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 // Keep equal to LOCAL_TIMEOUT_MS in ../codex-integration/scripts/lib.cjs.
 const LOCAL_TIMEOUT_MS = 1500;
 const CONTEXT_PORT = "19877";
-const FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };
+const FEATURES = {
+  context_preservation: true,
+  activity_tracking: true,
+  context_telemetry: true,
+};
 const PROTOCOL_VERSION = 1;
 export const EXTENSION_VERSION = "0.1.0";
 const MIN_QUILL_VERSION = "0.9.0";
@@ -95,7 +102,12 @@ const TOOLS = [
         enum: ["auto", "text", "markdown", "json", "code"],
         default: "auto",
       },
-      max_bytes: integer("Maximum input bytes.", 1024, 5 * 1024 * 1024, 5 * 1024 * 1024),
+      max_bytes: integer(
+        "Maximum input bytes.",
+        1024,
+        5 * 1024 * 1024,
+        5 * 1024 * 1024,
+      ),
     }),
   },
   {
@@ -108,7 +120,12 @@ const TOOLS = [
         url: string("HTTP(S) URL to fetch."),
         source: string("Optional source label."),
         force: boolean("Bypass the 24-hour cache.", false),
-        max_bytes: integer("Maximum response bytes.", 1024, 2 * 1024 * 1024, 2 * 1024 * 1024),
+        max_bytes: integer(
+          "Maximum response bytes.",
+          1024,
+          2 * 1024 * 1024,
+          2 * 1024 * 1024,
+        ),
       },
       ["url"],
     ),
@@ -123,8 +140,18 @@ const TOOLS = [
       {
         command: string("Shell command to execute."),
         cwd: string("Working directory."),
-        timeout_ms: integer("Execution timeout in milliseconds.", 100, 120000, 30000),
-        max_output_bytes: integer("Maximum stdout and stderr bytes.", 1024, 512 * 1024, 512 * 1024),
+        timeout_ms: integer(
+          "Execution timeout in milliseconds.",
+          100,
+          120000,
+          30000,
+        ),
+        max_output_bytes: integer(
+          "Maximum stdout and stderr bytes.",
+          1024,
+          512 * 1024,
+          512 * 1024,
+        ),
         index_output: boolean("Index large or truncated output.", true),
       },
       ["command"],
@@ -133,7 +160,8 @@ const TOOLS = [
   {
     name: "quill_search_context",
     label: "Search Quill context",
-    description: "Search indexed working-context chunks and return bounded refs.",
+    description:
+      "Search indexed working-context chunks and return bounded refs.",
     endpoint: "search",
     parameters: objectSchema(
       {
@@ -218,7 +246,9 @@ export class RegistrationError extends QuillExtensionError {}
 export class SpoolError extends QuillExtensionError {}
 
 function errorMessage(error) {
-  return error instanceof Error ? `${error.name}: ${error.message}` : `Error: ${String(error)}`;
+  return error instanceof Error
+    ? `${error.name}: ${error.message}`
+    : `Error: ${String(error)}`;
 }
 
 function localBase(value) {
@@ -238,18 +268,28 @@ function loadConfig() {
   const root = process.env.HOME || process.env.USERPROFILE || homedir();
   let config;
   try {
-    config = JSON.parse(readFileSync(join(root, ".config", "quill", "config.json"), "utf8"));
+    config = JSON.parse(
+      readFileSync(join(root, ".config", "quill", "config.json"), "utf8"),
+    );
   } catch (error) {
-    throw new ConfigError("Quill config is missing or malformed", { cause: error });
+    throw new ConfigError("Quill config is missing or malformed", {
+      cause: error,
+    });
   }
-  if (typeof config.url !== "string" || typeof config.secret !== "string" || !config.secret) {
+  if (
+    typeof config.url !== "string" ||
+    typeof config.secret !== "string" ||
+    !config.secret
+  ) {
     throw new ConfigError("Invalid Quill config");
   }
   let main;
   let context;
   try {
     main = localBase(config.url);
-    context = config.context_url ? localBase(config.context_url) : new URL(main);
+    context = config.context_url
+      ? localBase(config.context_url)
+      : new URL(main);
   } catch (error) {
     throw new ConfigError("Invalid Quill config URL", { cause: error });
   }
@@ -296,20 +336,25 @@ async function fetchJson(config, url, options) {
     headers: headers(config),
     signal: AbortSignal.timeout(LOCAL_TIMEOUT_MS),
   });
-  if (!response.ok) throw new TransportError(`Quill returned ${response.status}`);
+  if (!response.ok)
+    throw new TransportError(`Quill returned ${response.status}`);
   return response.json();
 }
 
 function safeSessionId(value) {
-  return String(value || "unknown").replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 120);
+  return String(value || "unknown")
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .slice(0, 120);
 }
 
 function trackedName(value) {
-  return typeof value === "string"
-    && value.length > 0
-    && value.trim() === value
-    && Buffer.byteLength(value) <= 256
-    && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.trim() === value &&
+    Buffer.byteLength(value) <= 256 &&
+    !/[\u0000-\u001f\u007f-\u009f]/.test(value)
+  );
 }
 
 function writeLog(config, error) {
@@ -334,7 +379,10 @@ function writeLog(config, error) {
 }
 
 function spoolFile(config, sessionId) {
-  return join(config.spoolRoot, `${safeSessionId(sessionId)}.${process.pid}.jsonl`);
+  return join(
+    config.spoolRoot,
+    `${safeSessionId(sessionId)}.${process.pid}.jsonl`,
+  );
 }
 
 function pruneSpool(config, incomingBytes, currentPath) {
@@ -348,7 +396,11 @@ function pruneSpool(config, incomingBytes, currentPath) {
     .sort((left, right) => left.mtimeMs - right.mtimeMs);
   let total = files.reduce((sum, file) => sum + file.size, 0);
   for (const file of files) {
-    if (file.path !== currentPath && (now - file.mtimeMs > SPOOL_MAX_AGE_MS || total + incomingBytes > SPOOL_DIR_MAX_BYTES)) {
+    if (
+      file.path !== currentPath &&
+      (now - file.mtimeMs > SPOOL_MAX_AGE_MS ||
+        total + incomingBytes > SPOOL_DIR_MAX_BYTES)
+    ) {
       unlinkSync(file.path);
       total -= file.size;
     }
@@ -360,7 +412,8 @@ function appendSpool(config, endpoint, payload) {
   const sessionId = payload.session_id || payload.events?.[0]?.session_id;
   const line = `${JSON.stringify({ endpoint, payload })}\n`;
   const bytes = Buffer.byteLength(line);
-  if (bytes > SPOOL_FILE_MAX_BYTES) throw new SpoolError("Spool record exceeds file cap");
+  if (bytes > SPOOL_FILE_MAX_BYTES)
+    throw new SpoolError("Spool record exceeds file cap");
   try {
     mkdirSync(config.spoolRoot, { recursive: true, mode: 0o700 });
     chmodSync(config.spoolRoot, 0o700);
@@ -379,7 +432,9 @@ function appendSpool(config, endpoint, payload) {
     chmodSync(path, 0o600);
   } catch (error) {
     if (error instanceof SpoolError) throw error;
-    throw new SpoolError("Failed to append Pi tracking spool", { cause: error });
+    throw new SpoolError("Failed to append Pi tracking spool", {
+      cause: error,
+    });
   }
 }
 
@@ -391,9 +446,13 @@ async function responseError(response) {
     body = null;
   }
   if (response.status === 400 && body?.error === "protocol_mismatch") {
-    return new ProtocolMismatchError(body.message || "Pi tracking protocol mismatch");
+    return new ProtocolMismatchError(
+      body.message || "Pi tracking protocol mismatch",
+    );
   }
-  return new TransportError(body?.message || `Quill returned ${response.status}`);
+  return new TransportError(
+    body?.message || `Quill returned ${response.status}`,
+  );
 }
 
 async function postPayload(config, endpoint, payload, retryAuth = true) {
@@ -416,7 +475,10 @@ async function postPayload(config, endpoint, payload, retryAuth = true) {
   try {
     await response.body?.cancel();
   } catch (error) {
-    writeLog(config, new TransportError("Failed to release Quill response", { cause: error }));
+    writeLog(
+      config,
+      new TransportError("Failed to release Quill response", { cause: error }),
+    );
   }
 }
 
@@ -430,9 +492,12 @@ function sendTracked(config, state, endpoint, payload) {
   return request.then(
     () => true,
     (error) => {
-      const failure = error instanceof QuillExtensionError
-        ? error
-        : new TransportError("Unexpected Pi tracking failure", { cause: error });
+      const failure =
+        error instanceof QuillExtensionError
+          ? error
+          : new TransportError("Unexpected Pi tracking failure", {
+              cause: error,
+            });
       state.lastError = failure.name;
       writeLog(config, failure);
       try {
@@ -484,7 +549,10 @@ function historyUrl(config, params) {
 }
 
 function stripHeredocs(command) {
-  return command.replace(/<<-?\s*["']?([A-Za-z0-9_]+)["']?[\s\S]*?\n\s*\1/g, "");
+  return command.replace(
+    /<<-?\s*["']?([A-Za-z0-9_]+)["']?[\s\S]*?\n\s*\1/g,
+    "",
+  );
 }
 
 function stripQuotedContent(command) {
@@ -504,25 +572,41 @@ function hasRawNetworkDump(command) {
   if (!/(^|\s|&&|\|\||;)(curl|wget)\s/i.test(stripped)) return false;
   return stripped.split(/\s*(?:&&|\|\||;)\s*/).some((segment) => {
     const value = segment.trim();
-    if (!/(^|\s)(curl|wget)\s/i.test(value) || /\s(-I|--head)(\s|$)/.test(value)) return false;
+    if (
+      !/(^|\s)(curl|wget)\s/i.test(value) ||
+      /\s(-I|--head)(\s|$)/.test(value)
+    )
+      return false;
     const curl = /\bcurl\b/i.test(value);
     const fileOutput = curl
-      ? /\s(-o|--output)\s+\S+/.test(value) || /\s(-O|--remote-name)(\s|$)/.test(value) || /\s>>?\s*\S+/.test(value)
-      : /\s(-O|--output-document)\s+\S+/.test(value) || /\s>>?\s*\S+/.test(value);
+      ? /\s(-o|--output)\s+\S+/.test(value) ||
+        /\s(-O|--remote-name)(\s|$)/.test(value) ||
+        /\s>>?\s*\S+/.test(value)
+      : /\s(-O|--output-document)\s+\S+/.test(value) ||
+        /\s>>?\s*\S+/.test(value);
     const quiet = curl
-      ? /(^|\s)-[A-Za-z]*s[A-Za-z]*(\s|$)/.test(value) || /\s--silent(\s|$)/.test(value)
-      : /(^|\s)-[A-Za-z]*q[A-Za-z]*(\s|$)/.test(value) || /\s--quiet(\s|$)/.test(value);
-    const verbose = /\s(-v|--verbose|--trace|--trace-ascii|-D\s+-)(\s|$)/.test(value);
-    const stdout = /\s(-o|--output|-O|--output-document)\s+(-|\/dev\/stdout)(\s|$)/.test(value);
+      ? /(^|\s)-[A-Za-z]*s[A-Za-z]*(\s|$)/.test(value) ||
+        /\s--silent(\s|$)/.test(value)
+      : /(^|\s)-[A-Za-z]*q[A-Za-z]*(\s|$)/.test(value) ||
+        /\s--quiet(\s|$)/.test(value);
+    const verbose = /\s(-v|--verbose|--trace|--trace-ascii|-D\s+-)(\s|$)/.test(
+      value,
+    );
+    const stdout =
+      /\s(-o|--output|-O|--output-document)\s+(-|\/dev\/stdout)(\s|$)/.test(
+        value,
+      );
     return !fileOutput || !quiet || verbose || stdout;
   });
 }
 
 function isInlineNetworkFetch(command) {
   const visible = stripHeredocs(command);
-  return /fetch\s*\(\s*["']https?:\/\//i.test(visible) ||
+  return (
+    /fetch\s*\(\s*["']https?:\/\//i.test(visible) ||
     /requests\.(get|post|put|patch)\s*\(/i.test(visible) ||
-    /http\.(get|request)\s*\(/i.test(visible);
+    /http\.(get|request)\s*\(/i.test(visible)
+  );
 }
 
 function splitTopLevel(command) {
@@ -575,7 +659,10 @@ function extractFetchOutputPaths(command) {
   const paths = [];
   for (const segment of splitTopLevel(stripHeredocs(command))) {
     const bare = stripQuotedContent(segment);
-    if (!/(?:^|\s)(?:curl|wget)(?:\s|$)/i.test(bare) || /(?:^|\s)(?:-I|--head)(?:\s|$)/.test(bare)) {
+    if (
+      !/(?:^|\s)(?:curl|wget)(?:\s|$)/i.test(bare) ||
+      /(?:^|\s)(?:-I|--head)(?:\s|$)/.test(bare)
+    ) {
       continue;
     }
     const wget = /(?:^|\s)wget(?:\s|$)/i.test(bare);
@@ -586,12 +673,14 @@ function extractFetchOutputPaths(command) {
     );
     for (const match of segment.matchAll(flagPattern)) {
       const path = unquoteToken(match[1]);
-      if (path && !["-", "/dev/stdout", "/dev/null"].includes(path)) paths.push(path);
+      if (path && !["-", "/dev/stdout", "/dev/null"].includes(path))
+        paths.push(path);
     }
     const redirectPattern = new RegExp(`(?:^|\\s)>>?\\s*${outputTarget}`, "g");
     for (const match of segment.matchAll(redirectPattern)) {
       const path = unquoteToken(match[1]);
-      if (path && !["/dev/stdout", "/dev/null"].includes(path)) paths.push(path);
+      if (path && !["/dev/stdout", "/dev/null"].includes(path))
+        paths.push(path);
     }
   }
   return paths;
@@ -610,14 +699,22 @@ function resolveLiteralPath(config, cwd, path) {
 }
 
 function taintedStatePath(config, sessionId) {
-  const safeSession = String(sessionId || "unknown").replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 120);
+  const safeSession = String(sessionId || "unknown")
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .slice(0, 120);
   return join(config.markerRoot, `pi-${safeSession}`, "tainted.json");
 }
 
 function loadTainted(config, sessionId) {
   try {
-    const state = JSON.parse(readFileSync(taintedStatePath(config, sessionId), "utf8"));
-    return new Set((Array.isArray(state.paths) ? state.paths : []).filter((path) => !isDegenerateTaint(path)));
+    const state = JSON.parse(
+      readFileSync(taintedStatePath(config, sessionId), "utf8"),
+    );
+    return new Set(
+      (Array.isArray(state.paths) ? state.paths : []).filter(
+        (path) => !isDegenerateTaint(path),
+      ),
+    );
   } catch (error) {
     return new Set();
   }
@@ -630,7 +727,10 @@ function saveTainted(config, sessionId, paths) {
     mkdirSync(dirname(statePath), { recursive: true });
     writeFileSync(statePath, JSON.stringify({ paths: bounded }), "utf8");
   } catch (error) {
-    writeLog(config, new QuillExtensionError("Taint persistence failed", { cause: error }));
+    writeLog(
+      config,
+      new QuillExtensionError("Taint persistence failed", { cause: error }),
+    );
   }
 }
 
@@ -641,7 +741,8 @@ function recordTainted(config, sessionId, cwd, paths) {
     if (isDegenerateTaint(path)) continue;
     tainted.add(path);
     const resolved = resolveLiteralPath(config, cwd, path);
-    if (resolved && resolved !== path && !isDegenerateTaint(resolved)) tainted.add(resolved);
+    if (resolved && resolved !== path && !isDegenerateTaint(resolved))
+      tainted.add(resolved);
   }
   saveTainted(config, sessionId, tainted);
 }
@@ -657,7 +758,9 @@ function commandReadsTaintedPath(command, tainted) {
   const unquoted = unquoteCommand(command);
   for (const path of tainted) {
     if (isDegenerateTaint(path)) continue;
-    const pattern = new RegExp(`(?:^|[\\s=])${escapeRegExp(path)}(?:[\\s)>;|&]|$)`);
+    const pattern = new RegExp(
+      `(?:^|[\\s=])${escapeRegExp(path)}(?:[\\s)>;|&]|$)`,
+    );
     if (pattern.test(stripped) || pattern.test(unquoted)) return path;
   }
   return null;
@@ -696,25 +799,31 @@ function extractFetchUrls(command) {
 }
 
 function looksLikeApiJson(url) {
-  return !BINARY_URL_EXT_RE.test(url) && (
-    /^https?:\/\/api\./i.test(url) || /[?&]format=json|\.json(\?|$)|\/api\//i.test(url)
+  return (
+    !BINARY_URL_EXT_RE.test(url) &&
+    (/^https?:\/\/api\./i.test(url) ||
+      /[?&]format=json|\.json(\?|$)|\/api\//i.test(url))
   );
 }
 
-function fetchDenyReason(command, explicitUrl) {
-  const urls = explicitUrl ? [explicitUrl] : extractFetchUrls(command);
+function fetchDenyReason(command, explicitUrls = []) {
+  const urls = explicitUrls.length ? explicitUrls : extractFetchUrls(command);
   const lines = ["Quill context routing blocked a raw network fetch."];
   if (urls.length) {
     lines.push("", "Run this instead:");
     for (const url of urls) {
       lines.push(`  quill_fetch_and_index(url=${JSON.stringify(url)})`);
       if (looksLikeApiJson(url)) {
-        lines.push(`  quill_execute(command=${JSON.stringify(`curl -sS ${url} | jq .`)})`);
+        lines.push(
+          `  quill_execute(command=${JSON.stringify(`curl -sS ${url} | jq .`)})`,
+        );
       }
     }
     lines.push("", "Then use quill_search_context to retrieve focused chunks.");
   } else {
-    lines.push("Use quill_execute for a bounded curl and jq workflow, or quill_fetch_and_index for pages.");
+    lines.push(
+      "Use quill_execute for a bounded curl and jq workflow, or quill_fetch_and_index for pages.",
+    );
   }
   lines.push(
     "",
@@ -771,11 +880,19 @@ function postRoutingTelemetry(config, event, ctx, reason, route) {
       body: JSON.stringify({ events: [body] }),
       signal: AbortSignal.timeout(LOCAL_TIMEOUT_MS),
     }).then(
-      (response) => response.body?.cancel().catch((error) => writeLog(config, error)),
-      (error) => writeLog(config, new TransportError("Routing telemetry failed", { cause: error })),
+      (response) =>
+        response.body?.cancel().catch((error) => writeLog(config, error)),
+      (error) =>
+        writeLog(
+          config,
+          new TransportError("Routing telemetry failed", { cause: error }),
+        ),
     );
   } catch (error) {
-    writeLog(config, new TransportError("Routing telemetry failed", { cause: error }));
+    writeLog(
+      config,
+      new TransportError("Routing telemetry failed", { cause: error }),
+    );
   }
 }
 
@@ -788,26 +905,56 @@ function routeToolCall(config, event, ctx) {
   if (!event || typeof event.toolName !== "string") return undefined;
   const sessionId = ctx.sessionManager.getSessionId();
   const input = event.input || {};
-  if (["fetch", "web_fetch", "webfetch"].includes(event.toolName)) {
-    const url = typeof input.url === "string" ? input.url : null;
-    return deny(config, event, ctx, fetchDenyReason("", url), "webfetch");
+  if (
+    ["fetch", "web_fetch", "webfetch", "fetch_content"].includes(event.toolName)
+  ) {
+    const urls = Array.isArray(input.urls)
+      ? input.urls.filter((url) => typeof url === "string")
+      : [];
+    if (!urls.length && typeof input.url === "string") urls.push(input.url);
+    return deny(config, event, ctx, fetchDenyReason("", urls), "webfetch");
   }
   if (event.toolName === "bash") {
     const command = typeof input.command === "string" ? input.command : "";
     if (!command) return undefined;
     if (hasRawNetworkDump(command) || isInlineNetworkFetch(command)) {
-      return deny(config, event, ctx, fetchDenyReason(command), "raw-network-fetch");
+      return deny(
+        config,
+        event,
+        ctx,
+        fetchDenyReason(command),
+        "raw-network-fetch",
+      );
     }
     const tainted = loadTainted(config, sessionId);
     const hit = commandReadsTaintedPath(command, tainted);
-    if (hit) return deny(config, event, ctx, taintedReadDenyReason("bash", hit), "tainted-read-bash");
+    if (hit)
+      return deny(
+        config,
+        event,
+        ctx,
+        taintedReadDenyReason("bash", hit),
+        "tainted-read-bash",
+      );
     recordTainted(config, sessionId, ctx.cwd, extractFetchOutputPaths(command));
     return undefined;
   }
   if (event.toolName === "read") {
     const path = typeof input.path === "string" ? input.path : "";
-    const hit = readTargetsTaintedPath(config, ctx.cwd, path, loadTainted(config, sessionId));
-    if (hit) return deny(config, event, ctx, taintedReadDenyReason("read", hit), "tainted-read");
+    const hit = readTargetsTaintedPath(
+      config,
+      ctx.cwd,
+      path,
+      loadTainted(config, sessionId),
+    );
+    if (hit)
+      return deny(
+        config,
+        event,
+        ctx,
+        taintedReadDenyReason("read", hit),
+        "tainted-read",
+      );
   }
   return undefined;
 }
@@ -830,14 +977,21 @@ function postTelemetry(config, event, ctx, hookEvent) {
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(LOCAL_TIMEOUT_MS),
   }).then(
-    (response) => response.body?.cancel().catch((error) => writeLog(config, error)),
-    (error) => writeLog(config, new TransportError("Hook telemetry failed", { cause: error })),
+    (response) =>
+      response.body?.cancel().catch((error) => writeLog(config, error)),
+    (error) =>
+      writeLog(
+        config,
+        new TransportError("Hook telemetry failed", { cause: error }),
+      ),
   );
 }
 
 function isoTimestamp(value) {
   const date = value === undefined ? new Date() : new Date(value);
-  return Number.isNaN(date.valueOf()) ? new Date().toISOString() : date.toISOString();
+  return Number.isNaN(date.valueOf())
+    ? new Date().toISOString()
+    : date.toISOString();
 }
 
 function stableId(prefix, ...parts) {
@@ -863,7 +1017,11 @@ function readSessionId(path) {
     const length = readSync(handle, buffer, 0, buffer.length, 0);
     const firstLine = buffer.toString("utf8", 0, length).split("\n", 1)[0];
     const header = JSON.parse(firstLine);
-    if (header?.type !== "session" || typeof header.id !== "string" || !header.id) {
+    if (
+      header?.type !== "session" ||
+      typeof header.id !== "string" ||
+      !header.id
+    ) {
       throw new ConfigError("Parent session header has no stable id");
     }
     return header.id;
@@ -876,7 +1034,9 @@ function readSessionId(path) {
 }
 
 function resolveStart(event, info) {
-  const parentPath = info.header?.parentSession || (event.reason === "fork" ? event.previousSessionFile : undefined);
+  const parentPath =
+    info.header?.parentSession ||
+    (event.reason === "fork" ? event.previousSessionFile : undefined);
   const subagent = process.env.PI_SUBAGENT_CHILD === "1";
   const resolved = new Map();
   const resolveId = (path) => {
@@ -888,11 +1048,17 @@ function resolveStart(event, info) {
   if (parentPath) {
     try {
       const headerParent = resolveId(parentPath);
-      if (trackedName(headerParent) && headerParent !== info.id) parentSessionId = headerParent;
+      if (trackedName(headerParent) && headerParent !== info.id)
+        parentSessionId = headerParent;
     } catch {}
   }
   const envParent = process.env.PI_SUBAGENT_PARENT_SESSION;
-  if (!parentSessionId && subagent && trackedName(envParent) && envParent !== info.id) {
+  if (
+    !parentSessionId &&
+    subagent &&
+    trackedName(envParent) &&
+    envParent !== info.id
+  ) {
     parentSessionId = envParent;
   }
   if (parentSessionId) {
@@ -903,11 +1069,16 @@ function resolveStart(event, info) {
   } else if (parentPath || subagent) {
     lineage = {
       kind: "unresolved",
-      reason: subagent ? "subagent_parent_unavailable" : "parent_header_unavailable",
+      reason: subagent
+        ? "subagent_parent_unavailable"
+        : "parent_header_unavailable",
     };
   }
   let previousSessionId;
-  if (["new", "resume", "fork"].includes(event.reason) && event.previousSessionFile) {
+  if (
+    ["new", "resume", "fork"].includes(event.reason) &&
+    event.previousSessionFile
+  ) {
     try {
       previousSessionId = resolveId(event.previousSessionFile);
     } catch (error) {
@@ -927,7 +1098,14 @@ function trackEnvelope(state, events) {
   };
 }
 
-function trackEvent(config, state, info, type, fields = {}, identity = randomUUID()) {
+function trackEvent(
+  config,
+  state,
+  info,
+  type,
+  fields = {},
+  identity = randomUUID(),
+) {
   const timestamp = fields.timestamp || isoTimestamp();
   const event = {
     type,
@@ -937,11 +1115,21 @@ function trackEvent(config, state, info, type, fields = {}, identity = randomUUI
     timestamp,
     ...fields,
   };
-  return sendTracked(config, state, "/api/v1/pi/track", trackEnvelope(state, [event]));
+  return sendTracked(
+    config,
+    state,
+    "/api/v1/pi/track",
+    trackEnvelope(state, [event]),
+  );
 }
 
 function trackEvents(config, state, info, events) {
-  return sendTracked(config, state, "/api/v1/pi/track", trackEnvelope(state, events));
+  return sendTracked(
+    config,
+    state,
+    "/api/v1/pi/track",
+    trackEnvelope(state, events),
+  );
 }
 
 function runtimeMessage(config, state, info, message) {
@@ -951,22 +1139,28 @@ function runtimeMessage(config, state, info, message) {
     session_id: info.id,
     project: info.cwd || "unknown",
     cwd: info.cwd,
-    messages: [{
-      uuid: message.uuid,
-      type: message.type,
-      timestamp: message.timestamp,
-      content: "",
-      role: message.role,
-      tools_used: message.tools || [],
-      files_modified: [],
-      event_kinds: message.eventKinds,
-    }],
+    messages: [
+      {
+        uuid: message.uuid,
+        type: message.type,
+        timestamp: message.timestamp,
+        content: "",
+        role: message.role,
+        tools_used: message.tools || [],
+        files_modified: [],
+        event_kinds: message.eventKinds,
+      },
+    ],
   };
   return sendTracked(config, state, "/api/v1/sessions/messages", payload);
 }
 
 function notifySession(config, state, info, lineage) {
-  if (!info.file) return Promise.resolve(true);
+  // Pi names the transcript at session start but only writes it once the first
+  // assistant message lands, so the path exists before the file does. Notifying
+  // the named-but-absent path is a guaranteed rejection; turn end repeats the
+  // notify with the same identity once the transcript is on disk.
+  if (!info.file || !existsSync(info.file)) return Promise.resolve(true);
   const payload = {
     provider: "pi",
     session_id: info.id,
@@ -991,7 +1185,10 @@ function defer(config, task) {
     try {
       void task();
     } catch (error) {
-      writeLog(config, new TransportError("Pi tracking handler failed", { cause: error }));
+      writeLog(
+        config,
+        new TransportError("Pi tracking handler failed", { cause: error }),
+      );
     }
   });
 }
@@ -1000,7 +1197,10 @@ function registerHandler(pi, config, event, handler) {
   try {
     pi.on(event, handler);
   } catch (error) {
-    writeLog(config, new RegistrationError(`Cannot register ${event}`, { cause: error }));
+    writeLog(
+      config,
+      new RegistrationError(`Cannot register ${event}`, { cause: error }),
+    );
   }
 }
 
@@ -1010,7 +1210,14 @@ function registerTracking(pi, config) {
     defer(config, () => {
       const info = sessionInfo(ctx);
       postTelemetry(config, event, ctx, EVENT_MAP[name]);
-      return trackEvent(config, state, info, "activity", {}, `${name}:${randomUUID()}`);
+      return trackEvent(
+        config,
+        state,
+        info,
+        "activity",
+        {},
+        `${name}:${randomUUID()}`,
+      );
     });
   };
 
@@ -1021,14 +1228,23 @@ function registerTracking(pi, config) {
       state.notify = { info, lineage };
       const timestamp = isoTimestamp(info.header?.timestamp);
       postTelemetry(config, event, ctx, EVENT_MAP.session_start);
-      const handshake = trackEvent(config, state, info, "session_start", {
-        timestamp,
-        cwd: info.cwd,
-        ephemeral: !info.file,
-        reason: event.reason,
-        ...(previousSessionId ? { previous_session_id: previousSessionId } : {}),
-        lineage,
-      }, `${event.reason}:${timestamp}`);
+      const handshake = trackEvent(
+        config,
+        state,
+        info,
+        "session_start",
+        {
+          timestamp,
+          cwd: info.cwd,
+          ephemeral: !info.file,
+          reason: event.reason,
+          ...(previousSessionId
+            ? { previous_session_id: previousSessionId }
+            : {}),
+          lineage,
+        },
+        `${event.reason}:${timestamp}`,
+      );
       void notifySession(config, state, info, lineage);
       return handshake;
     });
@@ -1037,22 +1253,45 @@ function registerTracking(pi, config) {
     try {
       const info = sessionInfo(ctx);
       postTelemetry(config, event, ctx, EVENT_MAP.session_shutdown);
-      await trackEvent(config, state, info, "session_end", { reason: event.reason }, `${event.reason}:${event.targetSessionFile || ""}`);
+      await trackEvent(
+        config,
+        state,
+        info,
+        "session_end",
+        { reason: event.reason },
+        `${event.reason}:${event.targetSessionFile || ""}`,
+      );
     } catch (error) {
-      writeLog(config, new TransportError("Pi shutdown tracking failed", { cause: error }));
+      writeLog(
+        config,
+        new TransportError("Pi shutdown tracking failed", { cause: error }),
+      );
     } finally {
       releaseReporter(config);
     }
   });
-  registerHandler(pi, config, "agent_start", (event, ctx) => activity(event, ctx, "agent_start"));
-  registerHandler(pi, config, "agent_settled", (event, ctx) => activity(event, ctx, "agent_settled"));
-  registerHandler(pi, config, "turn_start", (event, ctx) => activity(event, ctx, "turn_start"));
+  registerHandler(pi, config, "agent_start", (event, ctx) =>
+    activity(event, ctx, "agent_start"),
+  );
+  registerHandler(pi, config, "agent_settled", (event, ctx) =>
+    activity(event, ctx, "agent_settled"),
+  );
+  registerHandler(pi, config, "turn_start", (event, ctx) =>
+    activity(event, ctx, "turn_start"),
+  );
   registerHandler(pi, config, "input", (event, ctx) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
       const timestamp = isoTimestamp();
       postTelemetry(config, event, ctx, EVENT_MAP.input);
-      void trackEvent(config, state, info, "activity", { timestamp }, `input:${randomUUID()}`);
+      void trackEvent(
+        config,
+        state,
+        info,
+        "activity",
+        { timestamp },
+        `input:${randomUUID()}`,
+      );
       return runtimeMessage(config, state, info, {
         uuid: stableId("pi_msg", info.id, "input", timestamp),
         type: "user",
@@ -1067,7 +1306,14 @@ function registerTracking(pi, config) {
       const info = sessionInfo(ctx);
       const timestamp = isoTimestamp();
       postTelemetry(config, event, ctx, EVENT_MAP.tool_execution_start);
-      void trackEvent(config, state, info, "activity", { timestamp }, `tool-start:${event.toolCallId}`);
+      void trackEvent(
+        config,
+        state,
+        info,
+        "activity",
+        { timestamp },
+        `tool-start:${event.toolCallId}`,
+      );
       return runtimeMessage(config, state, info, {
         uuid: stableId("pi_msg", info.id, "tool-start", event.toolCallId),
         type: "assistant_tool_use",
@@ -1083,7 +1329,14 @@ function registerTracking(pi, config) {
       const info = sessionInfo(ctx);
       const timestamp = isoTimestamp();
       postTelemetry(config, event, ctx, EVENT_MAP.tool_execution_end);
-      void trackEvent(config, state, info, "activity", { timestamp }, `tool-end:${event.toolCallId}`);
+      void trackEvent(
+        config,
+        state,
+        info,
+        "activity",
+        { timestamp },
+        `tool-end:${event.toolCallId}`,
+      );
       return runtimeMessage(config, state, info, {
         uuid: stableId("pi_msg", info.id, "tool-end", event.toolCallId),
         type: "tool_result",
@@ -1096,10 +1349,17 @@ function registerTracking(pi, config) {
   registerHandler(pi, config, "model_select", (event, ctx) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
-      return trackEvent(config, state, info, "model", {
-        model_provider: event.model.provider,
-        model: event.model.id,
-      }, `model:${event.model.provider}:${event.model.id}:${randomUUID()}`);
+      return trackEvent(
+        config,
+        state,
+        info,
+        "model",
+        {
+          model_provider: event.model.provider,
+          model: event.model.id,
+        },
+        `model:${event.model.provider}:${event.model.id}:${randomUUID()}`,
+      );
     });
   });
   registerHandler(pi, config, "message_end", (event, ctx) => {
@@ -1109,7 +1369,15 @@ function registerTracking(pi, config) {
       const message = event.message;
       const timestamp = isoTimestamp(message.timestamp);
       const cost = message.usage.cost || {};
-      const identity = message.responseId || stableId("response", info.id, timestamp, message.provider, message.model);
+      const identity =
+        message.responseId ||
+        stableId(
+          "response",
+          info.id,
+          timestamp,
+          message.provider,
+          message.model,
+        );
       const common = {
         session_id: info.id,
         hostname: config.hostname,
@@ -1149,9 +1417,21 @@ function registerTracking(pi, config) {
       const info = sessionInfo(ctx);
       const timestamp = isoTimestamp(event.message?.timestamp);
       postTelemetry(config, event, ctx, EVENT_MAP.turn_end);
-      void trackEvent(config, state, info, "activity", { timestamp }, `turn:${event.turnIndex}`);
+      void trackEvent(
+        config,
+        state,
+        info,
+        "activity",
+        { timestamp },
+        `turn:${event.turnIndex}`,
+      );
       if (state.notify) {
-        void notifySession(config, state, state.notify.info, state.notify.lineage);
+        void notifySession(
+          config,
+          state,
+          state.notify.info,
+          state.notify.lineage,
+        );
       }
       return runtimeMessage(config, state, info, {
         uuid: stableId("pi_msg", info.id, "turn", event.turnIndex, timestamp),
@@ -1173,7 +1453,9 @@ export default function quill(pi) {
     const root = process.env.HOME || process.env.USERPROFILE || homedir();
     if (lastNoticeRoot !== root) {
       lastNoticeRoot = root;
-      console.warn("Quill Pi extension inactive: install or repair Quill config.");
+      console.warn(
+        "Quill Pi extension inactive: install or repair Quill config.",
+      );
     }
     return;
   }
@@ -1190,14 +1472,22 @@ export default function quill(pi) {
           async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
             try {
               if (tool.kind === "history") {
-                return success(await fetchJson(config, historyUrl(config, params), { method: "GET" }));
+                return success(
+                  await fetchJson(config, historyUrl(config, params), {
+                    method: "GET",
+                  }),
+                );
               }
               const payload = { ...params };
               if (tool.withCwd && !payload.cwd) payload.cwd = ctx.cwd;
-              const data = await fetchJson(config, `${config.context}/api/v1/context/${tool.endpoint}`, {
-                method: "POST",
-                body: JSON.stringify(payload),
-              });
+              const data = await fetchJson(
+                config,
+                `${config.context}/api/v1/context/${tool.endpoint}`,
+                {
+                  method: "POST",
+                  body: JSON.stringify(payload),
+                },
+              );
               return success(data);
             } catch (error) {
               return unavailable();
@@ -1205,14 +1495,22 @@ export default function quill(pi) {
           },
         });
       } catch (error) {
-        writeLog(config, new RegistrationError(`Cannot register ${tool.name}`, { cause: error }));
+        writeLog(
+          config,
+          new RegistrationError(`Cannot register ${tool.name}`, {
+            cause: error,
+          }),
+        );
       }
     }
     registerHandler(pi, config, "tool_call", (event, ctx) => {
       try {
         return routeToolCall(config, event, ctx);
       } catch (error) {
-        writeLog(config, new QuillExtensionError("Context routing failed", { cause: error }));
+        writeLog(
+          config,
+          new QuillExtensionError("Context routing failed", { cause: error }),
+        );
         return undefined;
       }
     });
@@ -1226,11 +1524,16 @@ export default function quill(pi) {
         try {
           postTelemetry(config, event, ctx, hookEvent);
         } catch (error) {
-          writeLog(config, new TransportError("Hook telemetry failed", { cause: error }));
+          writeLog(
+            config,
+            new TransportError("Hook telemetry failed", { cause: error }),
+          );
         }
       });
     }
   } else {
-    registerHandler(pi, config, "session_shutdown", () => releaseReporter(config));
+    registerHandler(pi, config, "session_shutdown", () =>
+      releaseReporter(config),
+    );
   }
 }
