@@ -197,7 +197,7 @@ Two categories of finding recur. A component that exports both `export function 
 
 Utility scripts for development, testing, and documentation tasks.
 
-`npm test` runs every `scripts/*.test.mjs` file through Node's native, quoted glob handling. Focused verification can invoke a test file directly with `node --test`.
+`npm test` runs every `scripts/*.test.mjs` file through Node's native, quoted glob handling, serialized with `--test-concurrency=1` because Vite-backed test files share process-external optimizer/HMR state (the `node_modules/.vite` cache directory and the default HMR port 24678), which concurrent test processes corrupt or contend over. Focused verification can invoke a test file directly with `node --test`.
 
 ### Screenshot Capture
 
