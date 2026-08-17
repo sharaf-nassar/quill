@@ -2625,6 +2625,7 @@ mod tests {
     /// `skill_usages` through this one builder, so the action-key fallback and
     /// the skill fan-out cannot drift apart per owner: only the identity
     /// columns each owner supplies may differ between the two row sets.
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Owned Row Builder Shared With Retained Parsing]]
     #[test]
     fn owned_tool_rows_differ_only_by_owner_identity() {
         let messages = [

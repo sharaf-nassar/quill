@@ -16,6 +16,12 @@ A Pi notify persists the parsed transcript's `tool_actions` and `skill_usages`, 
 
 Write and edit inputs carry their line counts through to code stats, a `tool_detail` row keeps its identity while its payload columns drop at the bind, and a SKILL.md read attributes to its skill. Re-notifying the same transcript replaces the rows instead of doubling them, and the rows still land when the search index is absent.
 
+## Owned Row Builder Shared With Retained Parsing
+
+Pi's notify path and the retained transcript parser build `tool_actions` and `skill_usages` rows through the same identity-aware builder, differing only in the owner identity each supplies.
+
+The action-key fallback chain and the skill fan-out produce identical shapes for both owners; only provider, source key, and chain identity — flat for Pi, native for the retained parser — stay owner-specific.
+
 ## Configured Root Containment
 
 Pi notify rejects a transcript outside the configured Pi session root and never admits it through the legacy search-only fallback.

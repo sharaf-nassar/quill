@@ -559,16 +559,21 @@ while its original was retained, which is silent data loss with no delete to
 account for it. The three outcomes are an enum rather than a boolean so the
 pass-through case cannot be collapsed into "not suppressed" by accident.
 
-Scope is deliberately narrow. `response_times`, `skill_usages` and
-`hook_invocations` are inserted unfiltered and keep full history — they are not
-retention targets, and the "All time" Breakdown toggles read two of them. The
-`transcript_analytics_sources` registry row is written exactly as an unfiltered
-replacement writes it, so the source stays registered and reconcilable; a
-per-source `retained_through` column is ruled out because
-`prune_transcript_analytics_sources_for_root` deletes the registry row it would
-live on. Live rows never reach this path at all: every other insert site
-(`store_live_session_analytics`, `ingest_session_events`, and
-`server.rs::persist_remote_session_analytics` through the first of them)
+Scope is deliberately narrow, and only for the retained snapshot writer.
+`response_times`, `skill_usages` and `hook_invocations` are inserted
+unfiltered there and keep full history — they are not retention targets, and
+the "All time" Breakdown toggles read two of them.
+[[src-tauri/src/storage.rs#Storage#replace_pi_transcript_tool_rows]] shares
+the same insert helpers but filters its `skill_usages` rows against the
+watermark before calling them, preserving the pre-cutoff suppression Pi's
+replacement already had — so `skill_usages` is unfiltered only on the
+retained path, never on Pi's. The `transcript_analytics_sources` registry row
+is written exactly as an unfiltered replacement writes it, so the source
+stays registered and reconcilable; a per-source `retained_through` column is
+ruled out because `prune_transcript_analytics_sources_for_root` deletes the
+registry row it would live on. Live rows never reach this path at all: every
+other insert site (`store_live_session_analytics`, `ingest_session_events`,
+and `server.rs::persist_remote_session_analytics` through the first of them)
 hard-codes `source_key NULL`, and live rows are excluded from retention.
 
 [[src-tauri/src/storage.rs#RetentionInsertFilterCounts]] rides back on
@@ -597,6 +602,17 @@ registry assertion covers its fingerprint, status and generation.
 This is the blast-radius spec: a filter that reached one table too far would
 silently delete history retention never promised to touch, and one that skipped
 the registry row would strand the source outside reconciliation.
+
+##### Pi Replacement Filters Both Owned Tables
+
+Under the same active watermark, `replace_pi_transcript_tool_rows` must
+suppress pre-cutoff rows in both `tool_actions` and `skill_usages`, unlike the
+retained snapshot writer's unfiltered `skill_usages` insert.
+
+Pi's replacement shares the snapshot writer's insert helpers but filters its
+`skill_usages` rows at the call site before handing them to the shared helper,
+so this spec pins the one place that suppression could silently regress to
+unfiltered.
 
 ##### Conformance Guard Pass-Through
 

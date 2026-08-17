@@ -28929,6 +28929,7 @@ mod tests {
     /// skill policy: a retained snapshot keeps every `skill_usages` row while
     /// Pi suppresses pre-cutoff rows in both of its tables. The distinction is
     /// invisible in the shared SQL, so it is pinned here.
+    // @lat: [[backend#Backend#Database#Insert-time watermark filtering#Insert-Time Watermark Test Specs#Pi Replacement Filters Both Owned Tables]]
     #[test]
     #[serial]
     fn pi_tool_row_replacement_suppresses_pre_cutoff_rows_in_both_tables() {
