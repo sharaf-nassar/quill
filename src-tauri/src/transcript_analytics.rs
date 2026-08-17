@@ -175,6 +175,87 @@ pub(crate) struct OwnedSkillUsage {
     pub(crate) hostname: String,
 }
 
+/// The identity every `tool_actions` and `skill_usages` row of one parse
+/// shares, supplied by whichever owner is building them.
+///
+/// Retained sources resolve it from their native chain identity; Pi's notify
+/// path has no sub-agent transcripts and so passes a flat one.
+pub(crate) struct OwnedToolRowIdentity<'a> {
+    pub(crate) provider: IntegrationProvider,
+    pub(crate) source_key: &'a str,
+    pub(crate) session_id: &'a str,
+    pub(crate) chain_id: &'a str,
+    pub(crate) parent_chain_id: Option<&'a str>,
+    pub(crate) agent_id: Option<&'a str>,
+    pub(crate) is_sidechain: bool,
+    pub(crate) hostname: &'a str,
+}
+
+/// Build one owner's `tool_actions` and `skill_usages` rows from extracted
+/// messages.
+///
+/// Both owned writers reach their rows through here, so the action-key
+/// fallback and the skill fan-out stay one implementation and both paths
+/// dedupe against the same partial unique indexes.
+pub(crate) fn owned_tool_rows(
+    identity: &OwnedToolRowIdentity<'_>,
+    messages: &[ExtractedMessage],
+) -> (Vec<OwnedToolAction>, Vec<OwnedSkillUsage>) {
+    let mut tool_actions = Vec::new();
+    let mut skill_usages = Vec::new();
+    for message in messages {
+        for action in &message.tool_actions {
+            let action_key = if action.tool_use_id.is_empty() {
+                if message.uuid.is_empty() {
+                    format!("record:{}:{}", action.source_ordinal, action.block_ordinal)
+                } else {
+                    format!("{}:{}", message.uuid, action.block_ordinal)
+                }
+            } else {
+                action.tool_use_id.clone()
+            };
+            tool_actions.push(OwnedToolAction {
+                provider: identity.provider,
+                source_key: identity.source_key.to_owned(),
+                action_key,
+                message_id: message.uuid.clone(),
+                session_id: identity.session_id.to_owned(),
+                chain_id: identity.chain_id.to_owned(),
+                parent_chain_id: identity.parent_chain_id.map(str::to_owned),
+                tool_name: action.tool_name.clone(),
+                category: action.category.clone(),
+                file_path: action.file_path.clone(),
+                summary: action.summary.clone(),
+                full_input: action.full_input.clone(),
+                full_output: action.full_output.clone(),
+                lines_added: action.lines_added,
+                lines_removed: action.lines_removed,
+                timestamp: action.timestamp.clone(),
+                is_sidechain: identity.is_sidechain,
+                agent_id: identity.agent_id.map(str::to_owned),
+                parent_uuid: message.parent_uuid.clone(),
+            });
+            for access in extract_skill_accesses_from_tool_action(action) {
+                skill_usages.push(OwnedSkillUsage {
+                    provider: identity.provider,
+                    source_key: identity.source_key.to_owned(),
+                    session_id: identity.session_id.to_owned(),
+                    chain_id: identity.chain_id.to_owned(),
+                    parent_chain_id: identity.parent_chain_id.map(str::to_owned),
+                    message_id: message.uuid.clone(),
+                    skill_name: access.skill_name,
+                    skill_path: access.skill_path,
+                    timestamp: action.timestamp.clone(),
+                    tool_name: action.tool_name.clone(),
+                    cwd: message.cwd.clone(),
+                    hostname: identity.hostname.to_owned(),
+                });
+            }
+        }
+    }
+    (tool_actions, skill_usages)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct OwnedHookInvocation {
     pub(crate) provider: IntegrationProvider,
@@ -1528,58 +1609,19 @@ fn parse_transcript_analytics_source_bytes(
         &native_identity,
         &extracted.messages,
     );
-    let mut tool_actions = Vec::new();
-    let mut skill_usages = Vec::new();
-    for message in &extracted.messages {
-        for action in &message.tool_actions {
-            let action_key = if action.tool_use_id.is_empty() {
-                if message.uuid.is_empty() {
-                    format!("record:{}:{}", action.source_ordinal, action.block_ordinal)
-                } else {
-                    format!("{}:{}", message.uuid, action.block_ordinal)
-                }
-            } else {
-                action.tool_use_id.clone()
-            };
-            tool_actions.push(OwnedToolAction {
-                provider: source.provider,
-                source_key: source_key.clone(),
-                action_key,
-                message_id: message.uuid.clone(),
-                session_id: native_identity.chain_id.clone(),
-                chain_id: native_identity.chain_id.clone(),
-                parent_chain_id: native_identity.parent_chain_id.clone(),
-                tool_name: action.tool_name.clone(),
-                category: action.category.clone(),
-                file_path: action.file_path.clone(),
-                summary: action.summary.clone(),
-                full_input: action.full_input.clone(),
-                full_output: action.full_output.clone(),
-                lines_added: action.lines_added,
-                lines_removed: action.lines_removed,
-                timestamp: action.timestamp.clone(),
-                is_sidechain: native_identity.is_sidechain,
-                agent_id: native_identity.agent_id.clone(),
-                parent_uuid: message.parent_uuid.clone(),
-            });
-            for access in extract_skill_accesses_from_tool_action(action) {
-                skill_usages.push(OwnedSkillUsage {
-                    provider: source.provider,
-                    source_key: source_key.clone(),
-                    session_id: native_identity.chain_id.clone(),
-                    chain_id: native_identity.chain_id.clone(),
-                    parent_chain_id: native_identity.parent_chain_id.clone(),
-                    message_id: message.uuid.clone(),
-                    skill_name: access.skill_name,
-                    skill_path: access.skill_path,
-                    timestamp: action.timestamp.clone(),
-                    tool_name: action.tool_name.clone(),
-                    cwd: message.cwd.clone(),
-                    hostname: hostname.to_owned(),
-                });
-            }
-        }
-    }
+    let (tool_actions, skill_usages) = owned_tool_rows(
+        &OwnedToolRowIdentity {
+            provider: source.provider,
+            source_key: &source_key,
+            session_id: &native_identity.chain_id,
+            chain_id: &native_identity.chain_id,
+            parent_chain_id: native_identity.parent_chain_id.as_deref(),
+            agent_id: native_identity.agent_id.as_deref(),
+            is_sidechain: native_identity.is_sidechain,
+            hostname,
+        },
+        &extracted.messages,
+    );
     let hook_invocations = extracted
         .hook_invocations
         .iter()
@@ -1710,6 +1752,7 @@ pub(crate) fn stamp_analytics_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sessions::ToolAction;
     use serde_json::json;
     use serial_test::serial;
     use std::fs::{File, FileTimes};
@@ -2535,5 +2578,201 @@ mod tests {
         assert_eq!(committed.result, TranscriptSourceResult::Replaced);
         assert_eq!(committed.skipped_records, 0);
         clear_env();
+    }
+
+    /// One message carrying one tool action, so a fixture can plant each
+    /// action-key fallback in turn.
+    fn tool_row_message(
+        uuid: &str,
+        tool_use_id: &str,
+        file_path: Option<&str>,
+    ) -> ExtractedMessage {
+        ExtractedMessage {
+            uuid: uuid.to_owned(),
+            session_id: "native-session".to_owned(),
+            parent_session_id: None,
+            role: "assistant".to_owned(),
+            content: String::new(),
+            timestamp: TEST_TIMESTAMP.to_owned(),
+            git_branch: String::new(),
+            tools_used: Vec::new(),
+            files_modified: Vec::new(),
+            code_changes: Vec::new(),
+            commands_run: Vec::new(),
+            tool_details: Vec::new(),
+            tool_actions: vec![ToolAction {
+                tool_use_id: tool_use_id.to_owned(),
+                source_ordinal: 7,
+                block_ordinal: 2,
+                tool_name: "Read".to_owned(),
+                category: "tool_detail".to_owned(),
+                file_path: file_path.map(str::to_owned),
+                summary: "read a file".to_owned(),
+                full_input: None,
+                full_output: None,
+                lines_added: None,
+                lines_removed: None,
+                timestamp: TEST_TIMESTAMP.to_owned(),
+            }],
+            is_sidechain: false,
+            agent_id: None,
+            parent_uuid: Some("parent-uuid".to_owned()),
+            cwd: Some("/work/quill".to_owned()),
+        }
+    }
+
+    /// The retained parser and Pi's notify path build their `tool_actions` and
+    /// `skill_usages` through this one builder, so the action-key fallback and
+    /// the skill fan-out cannot drift apart per owner: only the identity
+    /// columns each owner supplies may differ between the two row sets.
+    #[test]
+    fn owned_tool_rows_differ_only_by_owner_identity() {
+        let messages = [
+            tool_row_message("asst-1", "call-read", Some("/skills/unslop/SKILL.md")),
+            tool_row_message("asst-2", "", None),
+            tool_row_message("", "", None),
+        ];
+
+        let (retained_actions, retained_skills) = owned_tool_rows(
+            &OwnedToolRowIdentity {
+                provider: IntegrationProvider::Claude,
+                source_key: "claude:source",
+                session_id: "root-chain",
+                chain_id: "root-chain",
+                parent_chain_id: Some("parent-chain"),
+                agent_id: Some("agent-7"),
+                is_sidechain: true,
+                hostname: TEST_HOSTNAME,
+            },
+            &messages,
+        );
+        let (pi_actions, pi_skills) = owned_tool_rows(
+            &OwnedToolRowIdentity {
+                provider: IntegrationProvider::Pi,
+                source_key: "live:pi:pi-session",
+                session_id: "pi-session",
+                chain_id: "pi-session",
+                parent_chain_id: None,
+                agent_id: None,
+                is_sidechain: false,
+                hostname: TEST_HOSTNAME,
+            },
+            &messages,
+        );
+
+        let action_keys = |rows: &[OwnedToolAction]| {
+            rows.iter()
+                .map(|row| row.action_key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            action_keys(&retained_actions),
+            vec!["call-read", "asst-2:2", "record:7:2"],
+            "a missing tool id falls back to message identity, then to record ordinals"
+        );
+        assert_eq!(
+            action_keys(&pi_actions),
+            action_keys(&retained_actions),
+            "both owners dedupe on the same action keys"
+        );
+
+        let skill_shape = |rows: &[OwnedSkillUsage]| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.skill_name.clone(),
+                        row.skill_path.clone(),
+                        row.message_id.clone(),
+                        row.tool_name.clone(),
+                        row.timestamp.clone(),
+                        row.cwd.clone(),
+                        row.hostname.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            skill_shape(&pi_skills),
+            vec![(
+                "unslop".to_owned(),
+                "/skills/unslop/SKILL.md".to_owned(),
+                "asst-1".to_owned(),
+                "Read".to_owned(),
+                TEST_TIMESTAMP.to_owned(),
+                Some("/work/quill".to_owned()),
+                TEST_HOSTNAME.to_owned(),
+            )],
+            "only the SKILL.md read fans out, carrying the message cwd and host"
+        );
+        assert_eq!(skill_shape(&retained_skills), skill_shape(&pi_skills));
+
+        let action_owner = |row: &OwnedToolAction| {
+            (
+                row.provider,
+                row.source_key.clone(),
+                row.session_id.clone(),
+                row.chain_id.clone(),
+                row.parent_chain_id.clone(),
+                row.agent_id.clone(),
+                row.is_sidechain,
+            )
+        };
+        let skill_owner = |row: &OwnedSkillUsage| {
+            (
+                row.provider,
+                row.source_key.clone(),
+                row.session_id.clone(),
+                row.chain_id.clone(),
+                row.parent_chain_id.clone(),
+            )
+        };
+        assert_eq!(
+            action_owner(&retained_actions[0]),
+            (
+                IntegrationProvider::Claude,
+                "claude:source".to_owned(),
+                "root-chain".to_owned(),
+                "root-chain".to_owned(),
+                Some("parent-chain".to_owned()),
+                Some("agent-7".to_owned()),
+                true,
+            )
+        );
+        assert_eq!(
+            action_owner(&pi_actions[0]),
+            (
+                IntegrationProvider::Pi,
+                "live:pi:pi-session".to_owned(),
+                "pi-session".to_owned(),
+                "pi-session".to_owned(),
+                None,
+                None,
+                false,
+            ),
+            "Pi has no sub-agent transcripts, so its chain identity stays flat"
+        );
+        assert_eq!(
+            skill_owner(&retained_skills[0]),
+            (
+                IntegrationProvider::Claude,
+                "claude:source".to_owned(),
+                "root-chain".to_owned(),
+                "root-chain".to_owned(),
+                Some("parent-chain".to_owned()),
+            )
+        );
+        assert_eq!(
+            skill_owner(&pi_skills[0]),
+            (
+                IntegrationProvider::Pi,
+                "live:pi:pi-session".to_owned(),
+                "pi-session".to_owned(),
+                "pi-session".to_owned(),
+                None,
+            )
+        );
+
+        assert_eq!(pi_actions[0].message_id, "asst-1");
+        assert_eq!(pi_actions[0].parent_uuid.as_deref(), Some("parent-uuid"));
     }
 }

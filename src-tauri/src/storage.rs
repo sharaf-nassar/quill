@@ -4106,6 +4106,126 @@ fn bump_rollup_generation_in_transaction(tx: &rusqlite::Transaction<'_>) -> Resu
     Ok(())
 }
 
+/// Insert one owner's `tool_actions` rows, returning `(suppressed,
+/// non_conforming)` for the watermark filter's two outcomes.
+///
+/// Both owned writers — the five-table snapshot and Pi's two-table
+/// replacement — insert through here, so the retention filter and the
+/// `tool_detail` payload carve-out cannot drift apart between them. The
+/// statement is prepared once outside the loop and `INSERT OR IGNORE` matches
+/// the source-less live paths: an owned identity is the table's own dedupe
+/// key, so a legitimate repeat must not roll the whole replacement back.
+fn insert_owned_tool_actions_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    rows: &[crate::transcript_analytics::OwnedToolAction],
+    watermark: Option<&str>,
+) -> Result<(u64, u64), String> {
+    let mut suppressed = 0_u64;
+    let mut non_conforming = 0_u64;
+    let mut statement = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO tool_actions (
+                 provider, source_key, action_key, message_id,
+                 session_id, chain_id, parent_chain_id, tool_name,
+                 category, file_path, summary, full_input, full_output,
+                 timestamp, is_sidechain, agent_id, parent_uuid,
+                 lines_added, lines_removed
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19
+             )",
+        )
+        .map_err(|e| format!("Prepare owned tool actions: {e}"))?;
+    for row in rows {
+        match retention_insert_verdict(watermark, &row.timestamp) {
+            RetentionInsertVerdict::Suppress => {
+                suppressed = suppressed.saturating_add(1);
+                continue;
+            }
+            RetentionInsertVerdict::PassNonConforming => {
+                non_conforming = non_conforming.saturating_add(1);
+            }
+            RetentionInsertVerdict::Insert => {}
+        }
+        // Forward-only payload carve-out: a `tool_detail` row is written whole
+        // except for its two payload columns, which nothing ever reads back.
+        // The row itself must stay — the subagent breakdown and tree count
+        // `tool_actions` rows with no category filter. New locals, so `row` is
+        // untouched and `ToolAction.full_input` still reaches the in-memory
+        // skill-access extractor.
+        let (full_input, full_output) = if row.category == TOOL_DETAIL_CATEGORY {
+            (None, None)
+        } else {
+            (row.full_input.as_deref(), row.full_output.as_deref())
+        };
+        statement
+            .execute(params![
+                row.provider.as_str(),
+                row.source_key,
+                row.action_key,
+                row.message_id,
+                row.session_id,
+                row.chain_id,
+                row.parent_chain_id,
+                row.tool_name,
+                row.category,
+                row.file_path,
+                row.summary,
+                full_input,
+                full_output,
+                row.timestamp,
+                i64::from(row.is_sidechain),
+                row.agent_id,
+                row.parent_uuid,
+                row.lines_added,
+                row.lines_removed,
+            ])
+            .map_err(|e| format!("Insert tool action: {e}"))?;
+    }
+    Ok((suppressed, non_conforming))
+}
+
+/// Insert the owned `skill_usages` rows a caller hands over.
+///
+/// `skill_usages` is not a retention target, so this inserts every row given
+/// to it; the one caller that suppresses pre-cutoff rows — Pi's replacement —
+/// filters its own iterator rather than paying for a policy switch here.
+fn insert_owned_skill_usages_in_transaction<'a>(
+    tx: &rusqlite::Transaction<'_>,
+    rows: impl IntoIterator<Item = &'a crate::transcript_analytics::OwnedSkillUsage>,
+) -> Result<(), String> {
+    let mut statement = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO skill_usages (
+                 provider, source_key, session_id, chain_id,
+                 parent_chain_id, message_id, skill_name, skill_path,
+                 timestamp, tool_name, cwd, hostname
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+             )",
+        )
+        .map_err(|e| format!("Prepare owned skill usages: {e}"))?;
+    for row in rows {
+        statement
+            .execute(params![
+                row.provider.as_str(),
+                row.source_key,
+                row.session_id,
+                row.chain_id,
+                row.parent_chain_id,
+                row.message_id,
+                row.skill_name,
+                row.skill_path,
+                row.timestamp,
+                row.tool_name,
+                row.cwd,
+                row.hostname,
+            ])
+            .map_err(|e| format!("Insert skill usage: {e}"))?;
+    }
+    Ok(())
+}
+
 fn delete_model_rollups_for_sources_in_transaction(
     tx: &rusqlite::Transaction<'_>,
     sources: &[(String, String)],
@@ -5770,9 +5890,7 @@ impl Storage {
             .as_deref()
             .and_then(parse_watermark_setting);
         let mut suppressed_session_events = 0_u64;
-        let mut suppressed_tool_actions = 0_u64;
         let mut non_conforming_session_events = 0_u64;
-        let mut non_conforming_tool_actions = 0_u64;
         {
             // Every owned identity here IS the table's dedupe key, so a
             // repeat is benign and must not roll back the whole five-table
@@ -5853,98 +5971,6 @@ impl Storage {
                     .map_err(|e| format!("Insert response time: {e}"))?;
             }
 
-            let mut tool_action_stmt = tx
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO tool_actions (
-                         provider, source_key, action_key, message_id,
-                         session_id, chain_id, parent_chain_id, tool_name,
-                         category, file_path, summary, full_input, full_output,
-                         timestamp, is_sidechain, agent_id, parent_uuid,
-                         lines_added, lines_removed
-                     ) VALUES (
-                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                         ?13, ?14, ?15, ?16, ?17, ?18, ?19
-                     )",
-                )
-                .map_err(|e| format!("Prepare owned tool actions: {e}"))?;
-            for row in &snapshot.tool_actions {
-                match retention_insert_verdict(watermark.as_deref(), &row.timestamp) {
-                    RetentionInsertVerdict::Suppress => {
-                        suppressed_tool_actions = suppressed_tool_actions.saturating_add(1);
-                        continue;
-                    }
-                    RetentionInsertVerdict::PassNonConforming => {
-                        non_conforming_tool_actions = non_conforming_tool_actions.saturating_add(1);
-                    }
-                    RetentionInsertVerdict::Insert => {}
-                }
-                // Forward-only payload carve-out: a `tool_detail` row is
-                // written whole except for its two payload columns, which
-                // nothing ever reads back. The row itself must stay — the
-                // subagent breakdown and tree count `tool_actions` rows with
-                // no category filter. New locals, so `row` is untouched and
-                // `ToolAction.full_input` still reaches the in-memory
-                // skill-access extractor.
-                let (full_input, full_output) = if row.category == TOOL_DETAIL_CATEGORY {
-                    (None, None)
-                } else {
-                    (row.full_input.as_deref(), row.full_output.as_deref())
-                };
-                tool_action_stmt
-                    .execute(params![
-                        row.provider.as_str(),
-                        row.source_key,
-                        row.action_key,
-                        row.message_id,
-                        row.session_id,
-                        row.chain_id,
-                        row.parent_chain_id,
-                        row.tool_name,
-                        row.category,
-                        row.file_path,
-                        row.summary,
-                        full_input,
-                        full_output,
-                        row.timestamp,
-                        i64::from(row.is_sidechain),
-                        row.agent_id,
-                        row.parent_uuid,
-                        row.lines_added,
-                        row.lines_removed,
-                    ])
-                    .map_err(|e| format!("Insert tool action: {e}"))?;
-            }
-
-            let mut skill_usage_stmt = tx
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO skill_usages (
-                         provider, source_key, session_id, chain_id,
-                         parent_chain_id, message_id, skill_name, skill_path,
-                         timestamp, tool_name, cwd, hostname
-                     ) VALUES (
-                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
-                     )",
-                )
-                .map_err(|e| format!("Prepare owned skill usages: {e}"))?;
-            for row in &snapshot.skill_usages {
-                skill_usage_stmt
-                    .execute(params![
-                        row.provider.as_str(),
-                        row.source_key,
-                        row.session_id,
-                        row.chain_id,
-                        row.parent_chain_id,
-                        row.message_id,
-                        row.skill_name,
-                        row.skill_path,
-                        row.timestamp,
-                        row.tool_name,
-                        row.cwd,
-                        row.hostname,
-                    ])
-                    .map_err(|e| format!("Insert skill usage: {e}"))?;
-            }
-
             let mut hook_invocation_stmt = tx
                 .prepare_cached(
                     "INSERT OR IGNORE INTO hook_invocations (
@@ -5984,6 +6010,13 @@ impl Storage {
                     .map_err(|e| format!("Insert hook invocation: {e}"))?;
             }
         }
+        let (suppressed_tool_actions, non_conforming_tool_actions) =
+            insert_owned_tool_actions_in_transaction(
+                &tx,
+                &snapshot.tool_actions,
+                watermark.as_deref(),
+            )?;
+        insert_owned_skill_usages_in_transaction(&tx, &snapshot.skill_usages)?;
         if fold_runtime_rollup {
             refold_runtime_source(&tx, source)?;
         }
@@ -15115,96 +15148,18 @@ impl Storage {
             )
             .map_err(|e| format!("Delete Pi {table} source rows: {e}"))?;
         }
-        {
-            let mut tool_action_stmt = tx
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO tool_actions (
-                         provider, source_key, action_key, message_id,
-                         session_id, chain_id, parent_chain_id, tool_name,
-                         category, file_path, summary, full_input, full_output,
-                         timestamp, is_sidechain, agent_id, parent_uuid,
-                         lines_added, lines_removed
-                     ) VALUES (
-                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                         ?13, ?14, ?15, ?16, ?17, ?18, ?19
-                     )",
-                )
-                .map_err(|e| format!("Prepare Pi tool actions: {e}"))?;
-            for row in tool_actions {
-                if retention_insert_verdict(watermark.as_deref(), &row.timestamp)
-                    == RetentionInsertVerdict::Suppress
-                {
-                    continue;
-                }
-                // Same forward-only payload carve-out the snapshot writer
-                // applies: a `tool_detail` row keeps its identity and its place
-                // in the category-agnostic counts, but not the two columns no
-                // reader ever selects back.
-                let (full_input, full_output) = if row.category == TOOL_DETAIL_CATEGORY {
-                    (None, None)
-                } else {
-                    (row.full_input.as_deref(), row.full_output.as_deref())
-                };
-                tool_action_stmt
-                    .execute(params![
-                        row.provider.as_str(),
-                        row.source_key,
-                        row.action_key,
-                        row.message_id,
-                        row.session_id,
-                        row.chain_id,
-                        row.parent_chain_id,
-                        row.tool_name,
-                        row.category,
-                        row.file_path,
-                        row.summary,
-                        full_input,
-                        full_output,
-                        row.timestamp,
-                        i64::from(row.is_sidechain),
-                        row.agent_id,
-                        row.parent_uuid,
-                        row.lines_added,
-                        row.lines_removed,
-                    ])
-                    .map_err(|e| format!("Insert Pi tool action: {e}"))?;
-            }
-
-            let mut skill_usage_stmt = tx
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO skill_usages (
-                         provider, source_key, session_id, chain_id,
-                         parent_chain_id, message_id, skill_name, skill_path,
-                         timestamp, tool_name, cwd, hostname
-                     ) VALUES (
-                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
-                     )",
-                )
-                .map_err(|e| format!("Prepare Pi skill usages: {e}"))?;
-            for row in skill_usages {
-                if retention_insert_verdict(watermark.as_deref(), &row.timestamp)
-                    == RetentionInsertVerdict::Suppress
-                {
-                    continue;
-                }
-                skill_usage_stmt
-                    .execute(params![
-                        row.provider.as_str(),
-                        row.source_key,
-                        row.session_id,
-                        row.chain_id,
-                        row.parent_chain_id,
-                        row.message_id,
-                        row.skill_name,
-                        row.skill_path,
-                        row.timestamp,
-                        row.tool_name,
-                        row.cwd,
-                        row.hostname,
-                    ])
-                    .map_err(|e| format!("Insert Pi skill usage: {e}"))?;
-            }
-        }
+        insert_owned_tool_actions_in_transaction(&tx, tool_actions, watermark.as_deref())?;
+        // Retained snapshots insert every skill usage: the table is not a
+        // retention target. Pi restates the whole transcript on each notify,
+        // so a pre-cutoff row it re-derives is history a run already deleted,
+        // and it filters here rather than in the shared writer.
+        insert_owned_skill_usages_in_transaction(
+            &tx,
+            skill_usages.iter().filter(|row| {
+                retention_insert_verdict(watermark.as_deref(), &row.timestamp)
+                    != RetentionInsertVerdict::Suppress
+            }),
+        )?;
         tx.commit()
             .map_err(|e| format!("Commit Pi transcript tool replacement: {e}"))
     }
@@ -28964,6 +28919,93 @@ mod tests {
                 owned_timestamps(&storage, spec.provider, spec.source_key, table),
                 landed,
                 "{table} must retain every non-conforming row the delete guard skips"
+            );
+        }
+
+        clear_env();
+    }
+
+    /// Pi's writer reuses the snapshot writer's owned insert path, but not its
+    /// skill policy: a retained snapshot keeps every `skill_usages` row while
+    /// Pi suppresses pre-cutoff rows in both of its tables. The distinction is
+    /// invisible in the shared SQL, so it is pinned here.
+    #[test]
+    #[serial]
+    fn pi_tool_row_replacement_suppresses_pre_cutoff_rows_in_both_tables() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        storage
+            .advance_retention_watermark(INSERT_FILTER_WATERMARK)
+            .expect("advance watermark");
+
+        let source_key = pi_live_source_key("pi-session");
+        let pruned = "2026-01-01T00:00:00.000Z";
+        let kept = "2026-04-01T00:00:00.000Z";
+        let tool_action =
+            |timestamp: &str, marker: &str| crate::transcript_analytics::OwnedToolAction {
+                provider: IntegrationProvider::Pi,
+                source_key: source_key.clone(),
+                action_key: format!("{marker}-action"),
+                message_id: format!("{marker}-message"),
+                session_id: "pi-session".to_string(),
+                chain_id: "pi-session".to_string(),
+                parent_chain_id: None,
+                tool_name: "read".to_string(),
+                category: "read".to_string(),
+                file_path: None,
+                summary: format!("{marker} summary"),
+                full_input: None,
+                full_output: None,
+                lines_added: None,
+                lines_removed: None,
+                timestamp: timestamp.to_string(),
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+            };
+        let skill_usage =
+            |timestamp: &str, marker: &str| crate::transcript_analytics::OwnedSkillUsage {
+                provider: IntegrationProvider::Pi,
+                source_key: source_key.clone(),
+                session_id: "pi-session".to_string(),
+                chain_id: "pi-session".to_string(),
+                parent_chain_id: None,
+                message_id: format!("{marker}-message"),
+                skill_name: "unslop".to_string(),
+                skill_path: "/skills/unslop/SKILL.md".to_string(),
+                timestamp: timestamp.to_string(),
+                tool_name: "read".to_string(),
+                cwd: None,
+                hostname: "pi-host".to_string(),
+            };
+
+        storage
+            .replace_pi_transcript_tool_rows(
+                &source_key,
+                &[tool_action(pruned, "pruned"), tool_action(kept, "kept")],
+                &[skill_usage(pruned, "pruned"), skill_usage(kept, "kept")],
+            )
+            .expect("replace Pi transcript tool rows");
+
+        for table in ["tool_actions", "skill_usages"] {
+            assert_eq!(
+                owned_timestamps(&storage, IntegrationProvider::Pi, &source_key, table),
+                vec![kept.to_string()],
+                "Pi {table} must hold only the post-cutoff row"
+            );
+        }
+
+        // Delete before replace: a re-notify that no longer carries a row must
+        // drop it rather than leave the prior parse behind.
+        storage
+            .replace_pi_transcript_tool_rows(&source_key, &[], &[])
+            .expect("empty Pi replacement");
+        for table in ["tool_actions", "skill_usages"] {
+            assert!(
+                owned_timestamps(&storage, IntegrationProvider::Pi, &source_key, table).is_empty(),
+                "an empty Pi replacement must clear {table}"
             );
         }
 

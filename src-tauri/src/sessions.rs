@@ -3038,10 +3038,10 @@ pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<Skill
 ///
 /// Claude and Codex reach the identical row shape through
 /// `transcript_analytics::parse_transcript_analytics_source`, which Pi never
-/// enters. The action key, the skill fan-out and the ownership fields are
-/// kept deliberately identical to that builder so both paths dedupe against
-/// the same unique indexes. Pi has no sub-agent transcripts, so chain identity
-/// is flat: every row is the session's own.
+/// enters. Both go through the same builder, so the action key and the skill
+/// fan-out cannot drift apart and both paths dedupe against the same unique
+/// indexes. Pi has no sub-agent transcripts, so chain identity is flat: every
+/// row is the session's own.
 // @lat: [[data-flow#Session Indexing Pipeline#Enrichment]]
 pub(crate) fn pi_transcript_tool_rows(
     session_id: &str,
@@ -3051,60 +3051,19 @@ pub(crate) fn pi_transcript_tool_rows(
     Vec<crate::transcript_analytics::OwnedToolAction>,
     Vec<crate::transcript_analytics::OwnedSkillUsage>,
 ) {
-    let source_key = crate::storage::pi_live_source_key(session_id);
-    let mut tool_actions = Vec::new();
-    let mut skill_usages = Vec::new();
-    for message in messages {
-        for action in &message.tool_actions {
-            let action_key = if action.tool_use_id.is_empty() {
-                if message.uuid.is_empty() {
-                    format!("record:{}:{}", action.source_ordinal, action.block_ordinal)
-                } else {
-                    format!("{}:{}", message.uuid, action.block_ordinal)
-                }
-            } else {
-                action.tool_use_id.clone()
-            };
-            for access in extract_skill_accesses_from_tool_action(action) {
-                skill_usages.push(crate::transcript_analytics::OwnedSkillUsage {
-                    provider: IntegrationProvider::Pi,
-                    source_key: source_key.clone(),
-                    session_id: session_id.to_owned(),
-                    chain_id: session_id.to_owned(),
-                    parent_chain_id: None,
-                    message_id: message.uuid.clone(),
-                    skill_name: access.skill_name,
-                    skill_path: access.skill_path,
-                    timestamp: action.timestamp.clone(),
-                    tool_name: action.tool_name.clone(),
-                    cwd: message.cwd.clone(),
-                    hostname: hostname.to_owned(),
-                });
-            }
-            tool_actions.push(crate::transcript_analytics::OwnedToolAction {
-                provider: IntegrationProvider::Pi,
-                source_key: source_key.clone(),
-                action_key,
-                message_id: message.uuid.clone(),
-                session_id: session_id.to_owned(),
-                chain_id: session_id.to_owned(),
-                parent_chain_id: None,
-                tool_name: action.tool_name.clone(),
-                category: action.category.clone(),
-                file_path: action.file_path.clone(),
-                summary: action.summary.clone(),
-                full_input: action.full_input.clone(),
-                full_output: action.full_output.clone(),
-                lines_added: action.lines_added,
-                lines_removed: action.lines_removed,
-                timestamp: action.timestamp.clone(),
-                is_sidechain: false,
-                agent_id: None,
-                parent_uuid: message.parent_uuid.clone(),
-            });
-        }
-    }
-    (tool_actions, skill_usages)
+    crate::transcript_analytics::owned_tool_rows(
+        &crate::transcript_analytics::OwnedToolRowIdentity {
+            provider: IntegrationProvider::Pi,
+            source_key: &crate::storage::pi_live_source_key(session_id),
+            session_id,
+            chain_id: session_id,
+            parent_chain_id: None,
+            agent_id: None,
+            is_sidechain: false,
+            hostname,
+        },
+        messages,
+    )
 }
 
 /// Canonicalize a hook script command into a stable identity string used
