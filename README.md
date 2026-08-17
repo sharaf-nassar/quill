@@ -264,8 +264,13 @@ curl -X POST http://localhost:19876/api/v1/tokens \
 
 ```bash
 npm install
-cargo tauri dev
+npm run tauri -- dev
 ```
+
+This loads `src-tauri/tauri.dev.conf.json`, so a dev run identifies as
+`com.quilltoolkit.app.dev` and keeps its database, auth secret, session index,
+and single-instance lock separate from an installed Quill. Invoking the Tauri
+CLI directly (`cargo tauri dev`) skips that and writes to production state.
 
 ## Controls
 

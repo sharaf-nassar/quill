@@ -1749,8 +1749,9 @@ fn get_storage() -> Result<&'static Storage, String> {
 /// override) so anything reported to the user names the directory the database
 /// is actually opened from.
 fn app_data_dir() -> std::path::PathBuf {
-    let default_app_dir = crate::data_paths::default_app_data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp").join("com.quilltoolkit.app"));
+    let default_app_dir = crate::data_paths::default_app_data_dir().unwrap_or_else(|| {
+        std::path::PathBuf::from("/tmp").join(crate::data_paths::app_identifier())
+    });
     crate::data_paths::resolve_data_dir_with_default(default_app_dir)
 }
 
@@ -5656,6 +5657,9 @@ pub fn run() {
     wait_for_predecessor_exit();
 
     let context = tauri::generate_context!();
+    // Before storage, auth, or the session index resolve anything: a dev run
+    // loads `tauri.dev.conf.json` and must not touch the installed app's data.
+    data_paths::set_app_identifier(&context.config().identifier);
     if let Err(error) = appimage_integration::refresh_integrated_appimage(context.package_info()) {
         eprintln!("Could not refresh integrated AppImage: {error}");
     }

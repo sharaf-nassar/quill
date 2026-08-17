@@ -6,7 +6,7 @@ use std::path::PathBuf;
 fn secret_path() -> Result<PathBuf, String> {
     let default = dirs::data_local_dir()
         .ok_or_else(|| "cannot determine local data directory".to_string())?
-        .join("com.quilltoolkit.app");
+        .join(crate::data_paths::app_identifier());
     let data_dir = crate::data_paths::resolve_data_dir_with_default(default);
     Ok(data_dir.join("auth_secret"))
 }

@@ -17,14 +17,41 @@
 //! exits with code 2 rather than silently falling back to the real data dir.
 
 use std::path::PathBuf;
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 const DEMO_MODE_ENV: &str = "QUILL_DEMO_MODE";
 const DATA_DIR_ENV: &str = "QUILL_DATA_DIR";
 const RULES_DIR_ENV: &str = "QUILL_RULES_DIR";
 
-/// Platform-aware production app-data directory without demo-mode overrides.
-pub fn default_app_data_dir() -> Option<PathBuf> {
+/// The identifier shipped in `src-tauri/tauri.conf.json`. Every installed
+/// build resolves to this, and it stays the answer for any process that never
+/// records an identity (unit tests, `quill --init-database`).
+pub const PRODUCTION_IDENTIFIER: &str = "com.quilltoolkit.app";
+
+static APP_IDENTIFIER: OnceLock<String> = OnceLock::new();
+
+/// Record the Tauri identifier this process was generated with.
+///
+/// `src-tauri/tauri.dev.conf.json` overrides the identifier for development
+/// runs, so the identity is only known from the generated Tauri context. It
+/// must be recorded before storage initialization, because every Quill-owned
+/// data path below is derived from it and a late call would leave earlier
+/// resolutions pointing at the production install.
+pub fn set_app_identifier(identifier: &str) {
+    if let Err(existing) = APP_IDENTIFIER.set(identifier.to_string())
+        && existing != identifier
+    {
+        log::error!("BUG: app identifier already recorded as {existing}, ignoring {identifier}");
+    }
+}
+
+/// The identifier every Quill-owned path is derived from.
+pub fn app_identifier() -> &'static str {
+    APP_IDENTIFIER.get().map_or(PRODUCTION_IDENTIFIER, |id| id)
+}
+
+/// Platform-aware app-data directory for an explicit identity.
+fn app_data_dir_for(identifier: &str) -> Option<PathBuf> {
     dirs::data_local_dir()
         .or_else(|| {
             dirs::home_dir().map(|home| {
@@ -35,7 +62,12 @@ pub fn default_app_data_dir() -> Option<PathBuf> {
                 }
             })
         })
-        .map(|path| path.join("com.quilltoolkit.app"))
+        .map(|path| path.join(identifier))
+}
+
+/// Platform-aware app-data directory without demo-mode overrides.
+pub fn default_app_data_dir() -> Option<PathBuf> {
+    app_data_dir_for(app_identifier())
 }
 const CLAUDE_PROJECTS_DIR_ENV: &str = "QUILL_CLAUDE_PROJECTS_DIR";
 const CODEX_SESSIONS_DIR_ENV: &str = "QUILL_CODEX_SESSIONS_DIR";
@@ -129,8 +161,8 @@ pub fn resolve_data_dir_with_default(default: PathBuf) -> PathBuf {
 /// Resolve the data directory.
 ///
 /// Tauri's `app.path().app_data_dir()` is the production default — this
-/// matches the historical `dirs::data_local_dir().join("com.quilltoolkit.app")`
-/// behavior used elsewhere in the codebase.
+/// matches the `dirs::data_local_dir().join(app_identifier())` behavior used
+/// elsewhere in the codebase.
 pub fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
     use tauri::Manager;
     let default = app
@@ -298,7 +330,7 @@ fn peek_data_dir_for_banner() -> PathBuf {
     }
     // No AppHandle here, so fall back to the same computation Tauri's
     // app_data_dir() performs internally.
-    default_app_data_dir().unwrap_or_else(|| PathBuf::from("/tmp").join("com.quilltoolkit.app"))
+    default_app_data_dir().unwrap_or_else(|| PathBuf::from("/tmp").join(app_identifier()))
 }
 
 #[cfg(test)]
@@ -363,6 +395,63 @@ mod tests {
         unsafe {
             std::env::set_var(name, value);
         }
+    }
+
+    // ── app identity tests ────────────────────────────────────────────────
+
+    // @lat: [[infrastructure#Infrastructure#Build Configuration#Tauri Configuration#Development Identity]]
+    #[test]
+    fn dev_and_production_identities_own_separate_state_under_one_base() {
+        let prod = app_data_dir_for(PRODUCTION_IDENTIFIER).expect("production base");
+        let dev = app_data_dir_for("com.quilltoolkit.app.dev").expect("dev base");
+
+        assert_eq!(prod.parent(), dev.parent(), "same platform base");
+        assert!(prod.ends_with(PRODUCTION_IDENTIFIER));
+        assert!(
+            prod.ends_with("com.quilltoolkit.app"),
+            "production is unchanged"
+        );
+        assert!(dev.ends_with("com.quilltoolkit.app.dev"));
+        for leaf in ["usage.db", "auth_secret", "session-index"] {
+            assert_ne!(prod.join(leaf), dev.join(leaf), "{leaf} must not be shared");
+        }
+    }
+
+    // @lat: [[infrastructure#Infrastructure#Build Configuration#Tauri Configuration#Development Identity]]
+    #[test]
+    fn only_data_paths_knows_the_production_identifier() {
+        // Every other module derives its Quill-owned paths from
+        // `app_identifier()`, so a dev-config run relocates all of them at
+        // once. A second hardcoded copy would silently keep writing to the
+        // installed app's data directory.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && path.file_name().is_some_and(|name| name != "data_paths.rs")
+                    && std::fs::read_to_string(&path)
+                        .expect("read rust source")
+                        .contains(PRODUCTION_IDENTIFIER)
+                {
+                    offenders.push(
+                        path.strip_prefix(&src)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "hardcoded {PRODUCTION_IDENTIFIER} outside data_paths.rs: {offenders:?}"
+        );
     }
 
     // ── resolve_data_dir tests ────────────────────────────────────────────

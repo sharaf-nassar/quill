@@ -8,7 +8,7 @@
     "build": "tsc --noEmit && vite build && npm run verify:sentry-output",
     "test": "node --test \"scripts/*.test.mjs\"",
     "preview": "vite preview",
-    "tauri": "tauri",
+    "tauri": "node scripts/tauri.mjs",
     "typecheck": "tsc --noEmit",
     "verify:sentry-output": "node scripts/verify-sentry-output.mjs",
     "lint": "eslint src/",

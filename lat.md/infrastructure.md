@@ -38,6 +38,14 @@ The bundled SQLite driver (`rusqlite` with `bundled` feature) avoids system depe
 
 Bundle targets: macOS app bundle + DMG, Windows NSIS, Linux AppImage. The Linux `.deb` was dropped because Tauri's updater only self-updates AppImages, so deb installs were stranded on their installed version. The `bundle.linux.deb.desktopTemplate` (`desktop-template.desktop`) is deliberately retained even with no `.deb` shipped: the AppImage bundler builds its AppDir via the shared Debian data generator (`appimage`'s `linuxdeploy` calls `debian::generate_data`), so that template still drives the AppImage `.desktop` entry — do not remove it as "unused deb config." Auto-updater uses GitHub releases endpoint with minisign public key verification, and macOS update detection depends on shipping the signed `.app.tar.gz` updater bundle in addition to the DMG installer.
 
+#### Development Identity
+
+A development run claims `com.quilltoolkit.app.dev` so it cannot mutate the installed app's state.
+
+`src-tauri/tauri.dev.conf.json` overrides nothing but `identifier`, and `scripts/tauri.mjs` — the `npm run tauri` entry point — appends `--config src-tauri/tauri.dev.conf.json` when the subcommand is `dev` and the caller passed no `--config`/`-c` of their own. Injecting it there rather than behind a separate opt-in script is the point: `npm run tauri -- dev` is the command a maintainer reaches for, so isolation cannot be lost by omission. `build` and every other subcommand pass through untouched, so release output is byte-identical. The Tauri CLI hands the merged config to the build through `TAURI_CONFIG`, so `tauri::generate_context!()` embeds the dev identifier and the isolation survives `tauri dev --release` — `debug_assertions` deliberately plays no part.
+
+The identifier is the single identity that Tauri's own per-app directories (log dir, window state), the `tauri-plugin-single-instance` D-Bus name / named mutex, and every Quill-owned data path derive from; see [[backend#Backend#Data Paths#Development path isolation]]. `scripts/tauri-dev-identity.test.mjs` pins the two identifiers and the dev/build argument split.
+
 ## CI/CD Pipeline
 
 GitHub Actions workflow (`.github/workflows/release.yml`) triggers on `v*` tags or manual dispatch.

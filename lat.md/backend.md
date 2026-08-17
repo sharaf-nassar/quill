@@ -2060,6 +2060,18 @@ Key filesystem locations used by the backend for storage, config, and caching.
 | `~/.config/quill/` | All | Deployed hooks, MCP server, scripts |
 | `~/.claude/` | All | Claude Code config, credentials |
 
+The app-data leaf is the active Tauri identifier, not a literal: [[src-tauri/src/data_paths.rs#app_identifier]] is the one source, and [[src-tauri/src/data_paths.rs#default_app_data_dir]] joins it onto the platform base. `auth_secret`, `usage.db`, the session index, and the legacy-rules archive all hang off that one directory, so the identity decides all of them together.
+
+### Development path isolation
+
+A dev build's writes must never land in the installed app's data directory.
+
+[[src-tauri/src/lib.rs#run]] records `context.config().identifier` through [[src-tauri/src/data_paths.rs#set_app_identifier]] immediately after `generate_context!()` and before any plugin, storage, auth, or session-index resolution — a later call would leave earlier resolutions pointing at the production install. A process that never records one (unit tests, `quill --init-database`) resolves `PRODUCTION_IDENTIFIER`, so production paths are unchanged. The dev identifier itself comes from config, not `debug_assertions`, so `tauri dev --release` stays isolated; see [[infrastructure#Infrastructure#Build Configuration#Tauri Configuration#Development Identity]].
+
+Transcript source discovery is deliberately untouched: `~/.claude/`, `~/.codex/`, and the Pi session root are the agents' directories, not Quill's, so a dev run still reads the same transcripts. `~/.config/quill/` and the HTTP port are likewise shared — runtime endpoint coexistence is a separate concern.
+
+`only_data_paths_knows_the_production_identifier` scans `src-tauri/src` and fails if any module outside `data_paths.rs` hardcodes the production identifier, because a second copy would silently keep writing to the installed app's directory while everything else relocated.
+
 ### Demo-mode path override
 
 All call-sites that previously hard-coded the data dir, learned-rules dir, or Claude projects dir now route through [[src-tauri/src/data_paths.rs#resolve_data_dir_with_default]], [[src-tauri/src/data_paths.rs#resolve_rules_dir_with_default]], and [[src-tauri/src/data_paths.rs#resolve_claude_projects_dir_with_default]] so a maintainer can launch a sandboxed Quill instance against dummy data without touching their personal state.

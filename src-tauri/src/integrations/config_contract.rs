@@ -29,7 +29,7 @@ pub(crate) fn config_path() -> PathBuf {
 
 pub(crate) fn auth_secret_path() -> PathBuf {
     let default = crate::data_paths::default_app_data_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp").join("com.quilltoolkit.app"));
+        .unwrap_or_else(|| PathBuf::from("/tmp").join(crate::data_paths::app_identifier()));
     crate::data_paths::resolve_data_dir_with_default(default).join("auth_secret")
 }
 
