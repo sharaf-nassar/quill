@@ -1135,6 +1135,147 @@ Focused command: `node scripts/pi-agent-tracking-baseline.mjs`.
 
 Blocks every behavior-changing task.
 
+#### Measured baseline evidence
+
+The focused command passed with the aggregate report below. The profile uses
+the current extension's `model_select` handler plus isolated synthetic
+loopback, persisted-source, SQLite/WAL, reconciliation, and Sessions
+overlay fixtures. Temporary fixture data was deleted before exit. No prompt,
+message content, session ID, path, hostname, runtime state, or live Quill
+window was read, retained, or changed.
+
+<!-- pi-agent-tracking-baseline-report:start -->
+```json
+{
+  "schema": 1,
+  "command": "node scripts/pi-agent-tracking-baseline.mjs",
+  "profile": {
+    "kind": "isolated synthetic current-runtime shape",
+    "node": "v25.8.2",
+    "platform": "linux",
+    "arch": "x64",
+    "logical_cpus": 64,
+    "children": 64,
+    "requests_per_child": 16,
+    "handler_event": "model_select"
+  },
+  "handler_ms": {
+    "samples": 4096,
+    "median": 0.000311,
+    "p95": 0.002335,
+    "max": 0.835286
+  },
+  "event_loop_delay_ms": {
+    "samples": 109,
+    "median": 3.361736,
+    "p95": 14.591405,
+    "max": 82.991264
+  },
+  "fleet": {
+    "children": 64,
+    "requests": 1024,
+    "failures": 0,
+    "duration_ms": 470.004,
+    "requests_per_second": 2178.705,
+    "rss_start_bytes": 102973440,
+    "rss_growth_bytes": {
+      "samples": 73,
+      "median": 17825792,
+      "p95": 56229888,
+      "max": 58851328
+    },
+    "session_files": 64,
+    "session_file_growth_bytes": 89088
+  },
+  "inventory": {
+    "changed_sources": 64,
+    "latency_ms": {
+      "samples": 25,
+      "median": 0.283856,
+      "p95": 0.510411,
+      "max": 0.580336
+    }
+  },
+  "reconciliation": {
+    "initial_backlog": 64,
+    "peak_backlog": 64,
+    "remaining_backlog": 0,
+    "failures": 0,
+    "duration_ms": 7.32,
+    "sources_per_second": 8743.394,
+    "source_latency_ms": {
+      "samples": 64,
+      "median": 0.03168,
+      "p95": 0.070997,
+      "max": 4.877416
+    },
+    "backlog_age_ms": {
+      "samples": 64,
+      "median": 6.318502,
+      "p95": 7.225,
+      "max": 7.319431
+    }
+  },
+  "sessions": {
+    "rows": 64,
+    "read_ms": {
+      "samples": 100,
+      "median": 0.04963,
+      "p95": 0.069243,
+      "max": 0.084112
+    },
+    "overlay_ms": {
+      "samples": 100,
+      "median": 0.076863,
+      "p95": 0.105122,
+      "max": 0.144498
+    },
+    "read_overlay_ms": {
+      "samples": 100,
+      "median": 0.128092,
+      "p95": 0.161791,
+      "max": 0.220704
+    }
+  },
+  "database_growth": {
+    "db_bytes": 0,
+    "wal_bytes": 263712,
+    "total_bytes": 263712
+  },
+  "privacy": {
+    "retained_request_bodies": 0,
+    "identifying_fields": 0,
+    "fixture_cleanup": "automatic",
+    "live_quill_window_touched": false,
+    "runtime_source_touched": false
+  },
+  "checks": [
+    {
+      "name": "handler maximum <=10 ms",
+      "status": "pass",
+      "evidence": "0.835286 ms"
+    },
+    {
+      "name": "Sessions read/overlay maximum <=300 ms",
+      "status": "pass",
+      "evidence": "0.220704 ms"
+    },
+    {
+      "name": "64 synthetic children completed without failures",
+      "status": "pass",
+      "evidence": "1024 requests; 0 failures"
+    },
+    {
+      "name": "inventory and reconciliation converged",
+      "status": "pass",
+      "evidence": "64 sources; 0 remaining"
+    }
+  ],
+  "verdict": "pass"
+}
+```
+<!-- pi-agent-tracking-baseline-report:end -->
+
 ### Freeze protocol-v2 and persisted-entry contracts — P0
 
 Depends on baseline. Foundational shared primitive. Owns open-envelope and

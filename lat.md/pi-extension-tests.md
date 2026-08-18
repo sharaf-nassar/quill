@@ -114,6 +114,12 @@ A synchronous or asynchronous context-savings request failure cannot escape the 
 
 The reporter sustains 1,000 events per minute for a configurable ten-minute run with sub-10 ms handler work and bounded RSS growth.
 
+## Privacy-Safe Tracking Baseline
+
+The isolated baseline harness measures the current extension handler and 64-child synthetic loopback, persisted-source, SQLite/WAL, reconciliation, and Sessions fixtures.
+
+It reports aggregate statistics only, cleans every temporary artifact, and never starts or touches Quill's live window or runtime state.
+
 ## Real Pi session
 
 Installed Pi 0.84.2 loads the extension, pushes tracking and runtime envelopes, and calls `quill_context_stats` in an isolated persisted session.
