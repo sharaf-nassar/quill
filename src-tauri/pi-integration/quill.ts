@@ -34,6 +34,22 @@ const FEATURES = {
 const PROTOCOL_VERSION = 1;
 export const EXTENSION_VERSION = "0.1.0";
 const MIN_QUILL_VERSION = "0.9.0";
+
+// Protocol v2 is frozen here for fixture generation. Runtime emission remains
+// protocol v1 until the persisted-entry migration switches the live reporter.
+export const PI_PROTOCOL_V2 = 2;
+export const PI_PROTOCOL_V2_REPORTER_VERSION = EXTENSION_VERSION;
+export const PI_PROTOCOL_V2_QUILL_BUILD = "0.0.0-injected-by-ci";
+export const PI_PROTOCOL_V2_TRACKING_SCHEMA = 2;
+export const PI_PROTOCOL_V2_CAPABILITIES = Object.freeze([
+  "direct-lineage",
+  "lifecycle-occurrence",
+  "persisted-session-entry",
+  "typed-outcomes",
+]);
+export const PI_PROTOCOL_V2_CAPABILITY_DIGEST = createHash("sha256")
+  .update(PI_PROTOCOL_V2_CAPABILITIES.join("\n"))
+  .digest("hex");
 const SPOOL_FILE_MAX_BYTES = 1024 * 1024;
 const SPOOL_DIR_MAX_BYTES = 16 * SPOOL_FILE_MAX_BYTES;
 const SPOOL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1154,6 +1170,372 @@ function resolveStart(event, info) {
     }
   }
   return { lineage, previousSessionId };
+}
+
+export function buildProtocolV2Event(fields) {
+  const event = {
+    event_uuid: fields.event_uuid,
+    event: fields.event,
+    provider: fields.provider ?? "pi",
+    normalized_host: fields.normalized_host,
+    session_id: fields.session_id,
+    process_instance_id: fields.process_instance_id,
+    sequence: fields.sequence,
+    origin_at: fields.origin_at,
+    occurred_at: fields.occurred_at,
+    delivery_source: fields.delivery_source,
+  };
+  if (fields.event === "session_start") {
+    event.reason = fields.reason;
+    if (fields.previous_session_id !== undefined)
+      event.previous_session_id = fields.previous_session_id;
+    event.lineage = fields.lineage;
+    if (fields.agent_role !== undefined) event.agent_role = fields.agent_role;
+  } else if (fields.event === "session_end") {
+    event.reason = fields.reason;
+  } else if (fields.event === "lineage") {
+    event.lineage = fields.lineage;
+    if (fields.agent_role !== undefined) event.agent_role = fields.agent_role;
+  }
+  return event;
+}
+
+export function buildProtocolV2Envelope(events, generation = {}) {
+  return {
+    protocol: generation.protocol ?? PI_PROTOCOL_V2,
+    reporter_version:
+      generation.reporter_version ?? PI_PROTOCOL_V2_REPORTER_VERSION,
+    quill_build: generation.quill_build ?? PI_PROTOCOL_V2_QUILL_BUILD,
+    capability_digest:
+      generation.capability_digest ?? PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+    events,
+  };
+}
+
+export function buildQuillTrackingEntry(event, generation = {}) {
+  return {
+    type: "custom",
+    customType: "quill-tracking",
+    data: {
+      schema: generation.schema ?? PI_PROTOCOL_V2_TRACKING_SCHEMA,
+      ...event,
+      reporter: {
+        protocol: generation.protocol ?? PI_PROTOCOL_V2,
+        version:
+          generation.reporter_version ?? PI_PROTOCOL_V2_REPORTER_VERSION,
+        quill_build: generation.quill_build ?? PI_PROTOCOL_V2_QUILL_BUILD,
+        capability_digest:
+          generation.capability_digest ?? PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+      },
+    },
+  };
+}
+
+function fixtureEvent(index, fields = {}) {
+  return buildProtocolV2Event({
+    event_uuid: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+    event: "session_start",
+    normalized_host: "pi-host",
+    session_id: "session-root",
+    process_instance_id: "10000000-0000-4000-8000-000000000001",
+    sequence: index,
+    origin_at: "2026-08-18T02:00:00.000Z",
+    occurred_at: `2026-08-18T02:00:${String(index).padStart(2, "0")}.000Z`,
+    delivery_source: "live",
+    reason: "startup",
+    lineage: { kind: "root" },
+    ...fields,
+  });
+}
+
+export function protocolV2FixtureJsonl() {
+  const cases = [];
+  const add = (name, kind, expectation, coverage, value, error_code) => {
+    cases.push({
+      name,
+      kind,
+      expectation,
+      coverage,
+      ...(error_code ? { error_code } : {}),
+      wire: JSON.stringify(value),
+    });
+  };
+
+  const startCases = [
+    ["startup", "live", { kind: "root" }, {}],
+    [
+      "reload",
+      "live",
+      { kind: "linked", parent_session_id: "session-parent" },
+      {},
+    ],
+    [
+      "new",
+      "live",
+      { kind: "agent", parent_session_id: "session-parent" },
+      { previous_session_id: "session-old", agent_role: "reviewer" },
+    ],
+    [
+      "resume",
+      "reconciliation",
+      { kind: "unresolved", reason: "subagent_parent_unavailable" },
+      { previous_session_id: "session-old", agent_role: "researcher" },
+    ],
+    [
+      "fork",
+      "reconciliation",
+      { kind: "linked", parent_session_id: "session-parent" },
+      { previous_session_id: "session-old" },
+    ],
+  ];
+  startCases.forEach(([reason, delivery_source, lineage, options], offset) => {
+    const event = fixtureEvent(offset + 1, {
+      reason,
+      delivery_source,
+      lineage,
+      ...options,
+    });
+    add(
+      `envelope.start.${reason}`,
+      "envelope",
+      "accept",
+      [
+        `start:${reason}`,
+        `delivery:${delivery_source}`,
+        `lineage:${lineage.kind}`,
+        `option:previous_session_id:${options.previous_session_id ? "present" : "omitted"}`,
+        `option:agent_role:${options.agent_role ? "present" : "omitted"}`,
+      ],
+      buildProtocolV2Envelope([event]),
+    );
+  });
+
+  ["quit", "reload", "new", "resume", "fork"].forEach((reason, offset) => {
+    const event = fixtureEvent(offset + 6, {
+      event: "session_end",
+      reason,
+      delivery_source: offset === 4 ? "reconciliation" : "live",
+    });
+    add(
+      `envelope.end.${reason}`,
+      "envelope",
+      "accept",
+      [`end:${reason}`, `delivery:${event.delivery_source}`],
+      buildProtocolV2Envelope([event]),
+    );
+  });
+
+  const lineageEvents = [
+    { kind: "root" },
+    { kind: "linked", parent_session_id: "session-parent" },
+    { kind: "agent", parent_session_id: "session-parent" },
+    { kind: "unresolved", reason: "parent_header_unavailable" },
+  ];
+  lineageEvents.forEach((lineage, offset) => {
+    const event = fixtureEvent(offset + 11, {
+      event: "lineage",
+      lineage,
+      ...(lineage.kind === "agent" ? { agent_role: "reviewer" } : {}),
+    });
+    add(
+      `envelope.lineage.${lineage.kind}`,
+      "envelope",
+      "accept",
+      [
+        `lineage:${lineage.kind}`,
+        `option:agent_role:${event.agent_role ? "present" : "omitted"}`,
+      ],
+      buildProtocolV2Envelope([event]),
+    );
+  });
+
+  const entryEvent = fixtureEvent(15, {
+    reason: "new",
+    lineage: { kind: "agent", parent_session_id: "session-parent" },
+    previous_session_id: "session-old",
+    agent_role: "reviewer",
+  });
+  add(
+    "entry.valid",
+    "entry",
+    "accept",
+    ["entry:schema:2", "option:agent_role:present"],
+    buildQuillTrackingEntry(entryEvent),
+  );
+
+  const invalidEnvelope = buildProtocolV2Envelope([fixtureEvent(16)]);
+  invalidEnvelope.unexpected = true;
+  add(
+    "envelope.invalid_field",
+    "envelope",
+    "reject",
+    ["invalid:field", "invalid:envelope_field"],
+    invalidEnvelope,
+    "invalid_envelope",
+  );
+  const invalidEvent = { ...fixtureEvent(17), unexpected: true };
+  add(
+    "event.invalid_field",
+    "envelope",
+    "reject",
+    ["invalid:field", "invalid:event_field"],
+    buildProtocolV2Envelope([invalidEvent]),
+    "invalid_event",
+  );
+  const invalidLineageEvent = fixtureEvent(18, {
+    lineage: { kind: "root", unexpected: true },
+  });
+  add(
+    "lineage.invalid_field",
+    "envelope",
+    "reject",
+    ["invalid:field", "invalid:lineage_field"],
+    buildProtocolV2Envelope([invalidLineageEvent]),
+    "invalid_event",
+  );
+  const nullOptionEvent = fixtureEvent(19, {
+    reason: "new",
+    previous_session_id: null,
+  });
+  add(
+    "event.null_option",
+    "envelope",
+    "reject",
+    ["invalid:field", "invalid:optional_null"],
+    buildProtocolV2Envelope([nullOptionEvent]),
+    "invalid_event",
+  );
+
+  for (const [name, generation, coverage, error] of [
+    [
+      "protocol_older",
+      { protocol: 1 },
+      "mismatch:protocol:older",
+      "protocol_mismatch",
+    ],
+    [
+      "protocol_newer",
+      { protocol: 3 },
+      "mismatch:protocol:newer",
+      "protocol_mismatch",
+    ],
+    [
+      "reporter_version",
+      { reporter_version: "0.0.9" },
+      "mismatch:reporter_version",
+      "reporter_version_mismatch",
+    ],
+    [
+      "quill_build",
+      { quill_build: "0.0.1" },
+      "mismatch:quill_build",
+      "quill_build_mismatch",
+    ],
+    [
+      "capability_digest",
+      { capability_digest: "0".repeat(64) },
+      "mismatch:capability_digest",
+      "capability_mismatch",
+    ],
+  ]) {
+    add(
+      `envelope.${name}`,
+      "envelope",
+      "reject",
+      [coverage],
+      buildProtocolV2Envelope([fixtureEvent(20)], generation),
+      error,
+    );
+  }
+
+  for (const [schema, direction] of [
+    [1, "older"],
+    [3, "newer"],
+  ]) {
+    add(
+      `entry.schema_${direction}`,
+      "entry",
+      "reject",
+      [`mismatch:schema:${direction}`],
+      buildQuillTrackingEntry(entryEvent, { schema }),
+      "tracking_schema_mismatch",
+    );
+  }
+
+  add(
+    "response.accepted",
+    "response",
+    "accept",
+    [
+      "handshake:accepted",
+      "outcome:applied",
+      "outcome:duplicate",
+      "outcome:stale",
+    ],
+    {
+      status: "accepted",
+      quill_build: PI_PROTOCOL_V2_QUILL_BUILD,
+      protocol: PI_PROTOCOL_V2,
+      reporter_version: PI_PROTOCOL_V2_REPORTER_VERSION,
+      capability_digest: PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+      outcomes: ["applied", "duplicate", "stale"],
+    },
+  );
+  add(
+    "response.unknown_session",
+    "response",
+    "accept",
+    [
+      "outcome:unknown_session",
+      "response:409",
+      "option:required:omitted",
+      "option:retry_after_ms:omitted",
+    ],
+    {
+      status: "error",
+      code: "unknown_session",
+      message: "Session lifecycle must be reannounced",
+    },
+  );
+  add(
+    "response.exact_mismatch",
+    "response",
+    "accept",
+    [
+      "response:426",
+      "option:required:present",
+      "option:retry_after_ms:omitted",
+    ],
+    {
+      status: "error",
+      code: "protocol_mismatch",
+      message: "Install the exact Quill and reporter pair",
+      required: {
+        protocol: PI_PROTOCOL_V2,
+        reporter_version: PI_PROTOCOL_V2_REPORTER_VERSION,
+        quill_build: PI_PROTOCOL_V2_QUILL_BUILD,
+        capability_digest: PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+      },
+    },
+  );
+  add(
+    "response.rate_limited",
+    "response",
+    "accept",
+    [
+      "response:429",
+      "option:required:omitted",
+      "option:retry_after_ms:present",
+    ],
+    {
+      status: "error",
+      code: "rate_limited",
+      message: "Retry after the bounded delay",
+      retry_after_ms: 1500,
+    },
+  );
+
+  return `${cases.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
 }
 
 function trackEnvelope(state, events) {

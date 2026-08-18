@@ -136,6 +136,205 @@ pub enum PiLineage {
     Unresolved { reason: String },
 }
 
+pub const PI_PROTOCOL_V2: u32 = 2;
+pub const PI_PROTOCOL_V2_REPORTER_VERSION: &str = "0.1.0";
+pub const PI_PROTOCOL_V2_QUILL_BUILD: &str = env!("CARGO_PKG_VERSION");
+pub const PI_PROTOCOL_V2_TRACKING_SCHEMA: u32 = 2;
+pub const PI_PROTOCOL_V2_CAPABILITIES: [&str; 4] = [
+    "direct-lineage",
+    "lifecycle-occurrence",
+    "persisted-session-entry",
+    "typed-outcomes",
+];
+pub const PI_PROTOCOL_V2_CAPABILITY_DIGEST: &str =
+    "5cdd47afab5b26bf604c15338a43944373f40da3dec2543cef662e9988a2f3e7";
+
+/// Shallow compatibility metadata decoded before closed event variants.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PiProtocolV2OpenEnvelope {
+    pub protocol: u32,
+    pub reporter_version: String,
+    pub quill_build: String,
+    pub capability_digest: String,
+    pub events: Vec<serde_json::Value>,
+}
+
+/// Exact protocol-v2 envelope accepted after compatibility checks.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PiProtocolV2Envelope {
+    pub protocol: u32,
+    pub reporter_version: String,
+    pub quill_build: String,
+    pub capability_digest: String,
+    pub events: Vec<PiProtocolV2Event>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PiProtocolV2Provider {
+    Pi,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PiProtocolV2DeliverySource {
+    Live,
+    Reconciliation,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PiProtocolV2StartReason {
+    Startup,
+    Reload,
+    New,
+    Resume,
+    Fork,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PiProtocolV2EndReason {
+    Quit,
+    Reload,
+    New,
+    Resume,
+    Fork,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PiProtocolV2Lineage {
+    Root,
+    Linked { parent_session_id: String },
+    Agent { parent_session_id: String },
+    Unresolved { reason: String },
+}
+
+/// Canonical identity and lifecycle occurrence shared by live and persisted v2
+/// tracking records. Variant-specific fields are flattened onto the wire.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PiProtocolV2Event {
+    pub event_uuid: String,
+    pub provider: PiProtocolV2Provider,
+    pub normalized_host: String,
+    pub session_id: String,
+    pub process_instance_id: String,
+    pub sequence: u64,
+    pub origin_at: String,
+    pub occurred_at: String,
+    pub delivery_source: PiProtocolV2DeliverySource,
+    #[serde(flatten)]
+    pub kind: PiProtocolV2EventKind,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum PiProtocolV2EventKind {
+    SessionStart {
+        reason: PiProtocolV2StartReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_session_id: Option<String>,
+        lineage: PiProtocolV2Lineage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_role: Option<String>,
+    },
+    SessionEnd {
+        reason: PiProtocolV2EndReason,
+    },
+    Lineage {
+        lineage: PiProtocolV2Lineage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_role: Option<String>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PiProtocolV2Reporter {
+    pub protocol: u32,
+    pub version: String,
+    pub quill_build: String,
+    pub capability_digest: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PiProtocolV2TrackingData {
+    pub schema: u32,
+    #[serde(flatten)]
+    pub event: PiProtocolV2Event,
+    pub reporter: PiProtocolV2Reporter,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PiProtocolV2TrackingEntry {
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    #[serde(rename = "customType")]
+    pub custom_type: String,
+    pub data: PiProtocolV2TrackingData,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PiProtocolV2Outcome {
+    Applied,
+    Duplicate,
+    Stale,
+    UnknownSession,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PiProtocolV2ErrorCode {
+    MalformedJson,
+    InvalidEnvelope,
+    InvalidEvent,
+    InvalidEntry,
+    TrackingSchemaMismatch,
+    ProtocolMismatch,
+    ReporterVersionMismatch,
+    QuillBuildMismatch,
+    CapabilityMismatch,
+    Unauthorized,
+    UnknownSession,
+    ReannounceRequired,
+    RateLimited,
+    Unavailable,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PiProtocolV2Generation {
+    pub protocol: u32,
+    pub reporter_version: String,
+    pub quill_build: String,
+    pub capability_digest: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PiProtocolV2Response {
+    Accepted {
+        quill_build: String,
+        protocol: u32,
+        reporter_version: String,
+        capability_digest: String,
+        outcomes: Vec<PiProtocolV2Outcome>,
+    },
+    Error {
+        code: PiProtocolV2ErrorCode,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        required: Option<PiProtocolV2Generation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
+    },
+}
+
 // Time-series point for token charts
 #[derive(Serialize, Clone, Debug)]
 pub struct TokenDataPoint {

@@ -20,6 +20,7 @@ mod memory_optimizer;
 mod model_usage;
 mod models;
 mod pi_session;
+pub mod pi_tracking;
 mod prompt_utils;
 mod redaction;
 mod releases;

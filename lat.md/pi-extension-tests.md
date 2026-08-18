@@ -26,6 +26,12 @@ Compatible managed and npm copies elect one reporter, so every handler and stabl
 
 Handlers push versioned lifecycle, per-message usage, model, activity, and runtime envelopes without message bodies; Quill derives the stable live source from provider and session identity.
 
+## Protocol v2 fixture contract
+
+Deterministic TypeScript builders freeze the exact protocol-v2 generation and persisted-entry wire.
+
+The checked-in JSONL covers canonical identity, lifecycle occurrence fields, every start/end reason, delivery source, lineage state, optional field, exact-generation mismatch, and typed outcome. Valid `quill-tracking` entries contain no prompt, message, or tool output. Runtime emission remains protocol 1 until persisted-entry migration.
+
 ## Handshake and lineage
 
 Session start sends the handshake, resolves one stable parent header id, and notifies indexing only when a transcript path exists.

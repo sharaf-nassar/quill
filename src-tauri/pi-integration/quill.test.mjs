@@ -15,7 +15,16 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import quill from "./quill.ts";
+import quill, {
+  PI_PROTOCOL_V2,
+  PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+  PI_PROTOCOL_V2_QUILL_BUILD,
+  PI_PROTOCOL_V2_REPORTER_VERSION,
+  buildProtocolV2Envelope,
+  buildProtocolV2Event,
+  buildQuillTrackingEntry,
+  protocolV2FixtureJsonl,
+} from "./quill.ts";
 
 const TOOL_NAMES = [
   "quill_search_history",
@@ -117,15 +126,110 @@ async function flushRequests() {
 async function withHome(config, run) {
   const root = configRoot(config);
   const oldHome = process.env.HOME;
+  const oldChild = process.env.PI_SUBAGENT_CHILD;
+  const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
   process.env.HOME = root;
+  delete process.env.PI_SUBAGENT_CHILD;
+  delete process.env.PI_SUBAGENT_PARENT_SESSION;
   try {
     return await run();
   } finally {
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
+    if (oldChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+    else process.env.PI_SUBAGENT_CHILD = oldChild;
+    if (oldParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
+    else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
     rmSync(root, { recursive: true, force: true });
   }
 }
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Protocol v2 fixture contract]]
+test("protocol v2 fixture is deterministic and privacy-safe", () => {
+  const fixturePath = join(
+    dirname(new URL(import.meta.url).pathname),
+    "fixtures",
+    "protocol-v2.jsonl",
+  );
+  const fixture = readFileSync(fixturePath, "utf8");
+  assert.equal(protocolV2FixtureJsonl(), fixture);
+
+  const cases = fixture
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const coverage = new Set(cases.flatMap((entry) => entry.coverage));
+  for (const value of [
+    ...["startup", "reload", "new", "resume", "fork"].map(
+      (reason) => `start:${reason}`,
+    ),
+    ...["quit", "reload", "new", "resume", "fork"].map(
+      (reason) => `end:${reason}`,
+    ),
+    "delivery:live",
+    "delivery:reconciliation",
+    "lineage:root",
+    "lineage:linked",
+    "lineage:agent",
+    "lineage:unresolved",
+    "option:previous_session_id:omitted",
+    "option:previous_session_id:present",
+    "option:agent_role:omitted",
+    "option:agent_role:present",
+    "option:required:omitted",
+    "option:required:present",
+    "option:retry_after_ms:omitted",
+    "option:retry_after_ms:present",
+    "invalid:field",
+    "mismatch:protocol:older",
+    "mismatch:protocol:newer",
+    "mismatch:reporter_version",
+    "mismatch:quill_build",
+    "mismatch:capability_digest",
+    "outcome:applied",
+    "outcome:duplicate",
+    "outcome:stale",
+    "outcome:unknown_session",
+    "handshake:accepted",
+  ]) {
+    assert.ok(coverage.has(value), value);
+  }
+
+  for (const entry of cases.filter(
+    ({ kind, expectation }) => kind === "entry" && expectation === "accept",
+  )) {
+    assert.doesNotMatch(entry.wire, /prompt|message|tool_output/i);
+  }
+});
+
+test("protocol v2 builders share exact generation and omit absent options", () => {
+  const event = buildProtocolV2Event({
+    event_uuid: "00000000-0000-4000-8000-000000000001",
+    event: "session_start",
+    normalized_host: "pi-host",
+    session_id: "session-root",
+    process_instance_id: "10000000-0000-4000-8000-000000000001",
+    sequence: 1,
+    origin_at: "2026-08-18T02:00:00.000Z",
+    occurred_at: "2026-08-18T02:00:00.000Z",
+    delivery_source: "live",
+    reason: "startup",
+    lineage: { kind: "root" },
+  });
+  assert.deepEqual(buildProtocolV2Envelope([event]), {
+    protocol: PI_PROTOCOL_V2,
+    reporter_version: PI_PROTOCOL_V2_REPORTER_VERSION,
+    quill_build: PI_PROTOCOL_V2_QUILL_BUILD,
+    capability_digest: PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+    events: [event],
+  });
+  assert.equal("previous_session_id" in event, false);
+  assert.equal("agent_role" in event, false);
+  assert.equal(
+    buildQuillTrackingEntry(event).data.reporter.capability_digest,
+    PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+  );
+});
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Self disabling load]]
 test("missing, malformed, and remote config leave Pi unchanged", async () => {

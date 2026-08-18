@@ -48,6 +48,12 @@ An unchanged handshake repeated inside the refresh window writes nothing, while 
 
 The Pi tracking boundary rejects bad bearer authentication with `401`, protocol mismatch with a typed `400`, and control characters in hostname identity before mutation.
 
+## Protocol v2 decoder contract
+
+The pure Rust decoder accepts only the exact protocol-v2 generation and persisted-entry schema.
+
+It reads open generation metadata before closed lifecycle/lineage variants, rejects unknown or null optional fields, validates canonical Pi identity and occurrence ordering, and decodes typed accepted, mismatch, and unknown-session responses from the exact TypeScript fixture bytes.
+
 ## Agent Lineage Protocol
 
 The Pi tracking protocol accepts explicit agent lineage with a validated parent session id so the extension marker survives the HTTP boundary.
