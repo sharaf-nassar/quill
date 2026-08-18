@@ -398,7 +398,7 @@ mod tests {
         let session_dir = temp.path().join("saved-sessions");
         let state_path = temp.path().join("integration-state.json");
         let state = crate::integrations::pi::PiIntegrationState {
-            version: 1,
+            version: crate::integrations::pi::INTEGRATION_STATE_VERSION,
             config_dir: config_dir.clone(),
             session_dir: session_dir.clone(),
             pi_version: "0.84.0".to_string(),

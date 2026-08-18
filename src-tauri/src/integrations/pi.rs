@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::Manager;
 
-const INTEGRATION_STATE_VERSION: u8 = 2;
+pub(crate) const INTEGRATION_STATE_VERSION: u8 = 2;
 const MIN_PI_VERSION: (u64, u64, u64) = (0, 84, 0);
 const CONFIG_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
 const SESSION_DIR_ENV: &str = "PI_CODING_AGENT_SESSION_DIR";
