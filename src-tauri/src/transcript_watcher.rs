@@ -1,4 +1,4 @@
-//! Event-driven admission for retained Claude and Codex transcripts.
+//! Event-driven admission for retained Claude, Codex, and Pi transcripts.
 
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -70,7 +70,7 @@ impl PendingPaths {
 }
 
 fn transcript_roots() -> Vec<TranscriptRoot> {
-    vec![
+    let mut roots = vec![
         (
             IntegrationProvider::Claude,
             crate::data_paths::resolve_claude_projects_dir(),
@@ -79,15 +79,20 @@ fn transcript_roots() -> Vec<TranscriptRoot> {
             IntegrationProvider::Codex,
             crate::data_paths::resolve_codex_sessions_dir(),
         ),
-    ]
-    .into_iter()
-    .map(|(provider, resolved_path)| TranscriptRoot {
-        provider,
-        resolved_path,
-        canonical_path: None,
-        watched: false,
-    })
-    .collect()
+    ];
+    match crate::data_paths::resolve_pi_sessions_dir() {
+        Ok(path) => roots.push((IntegrationProvider::Pi, path)),
+        Err(error) => log::warn!("Pi transcript root is unavailable: {error}"),
+    }
+    roots
+        .into_iter()
+        .map(|(provider, resolved_path)| TranscriptRoot {
+            provider,
+            resolved_path,
+            canonical_path: None,
+            watched: false,
+        })
+        .collect()
 }
 
 fn retry_root_watches(
@@ -420,23 +425,29 @@ mod tests {
                 canonical_path: Some(PathBuf::from("/transcripts/codex")),
                 watched: true,
             },
+            TranscriptRoot {
+                provider: IntegrationProvider::Pi,
+                resolved_path: PathBuf::from("/transcripts/pi"),
+                canonical_path: Some(PathBuf::from("/transcripts/pi")),
+                watched: true,
+            },
         ]
     }
 
-    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Exclusion]]
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Recovery]]
     #[test]
-    fn configured_roots_exclude_notify_driven_pi() {
+    fn configured_roots_include_persisted_pi() {
         assert!(
             transcript_roots()
                 .iter()
-                .all(|root| root.provider != IntegrationProvider::Pi)
+                .any(|root| root.provider == IntegrationProvider::Pi)
         );
     }
 
-    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Search Recovery]]
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Recovery]]
     #[test]
     #[serial]
-    fn watcher_search_sync_refreshes_claude_and_codex() {
+    fn watcher_search_sync_refreshes_all_retained_providers() {
         struct DemoEnv;
         impl Drop for DemoEnv {
             fn drop(&mut self) {
@@ -444,6 +455,7 @@ mod tests {
                     std::env::remove_var("QUILL_DEMO_MODE");
                     std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
                     std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
+                    std::env::remove_var("QUILL_PI_SESSIONS_DIR");
                 }
             }
         }
@@ -451,8 +463,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("create watcher search fixture");
         let claude = temp.path().join("claude").join("-work-quill");
         let codex = temp.path().join("codex").join("2026/08/14");
+        let pi = temp.path().join("pi");
         std::fs::create_dir_all(&claude).expect("create Claude fixture root");
         std::fs::create_dir_all(&codex).expect("create Codex fixture root");
+        std::fs::create_dir_all(&pi).expect("create Pi fixture root");
         std::fs::write(
             claude.join("11111111-2222-3333-4444-555555555555.jsonl"),
             r#"{"type":"user","uuid":"claude-message","sessionId":"11111111-2222-3333-4444-555555555555","timestamp":"2026-08-14T08:00:00Z","message":{"role":"user","content":"claudewatcherrecoveryneedle"}}"#,
@@ -468,20 +482,32 @@ mod tests {
             ),
         )
         .expect("write Codex fixture");
+        std::fs::write(
+            pi.join("session.jsonl"),
+            concat!(
+                r#"{"type":"session","version":3,"id":"pi-watcher","timestamp":"2026-08-14T08:00:00Z","cwd":"/work/quill"}"#,
+                "\n",
+                r#"{"type":"message","id":"pi-message","parentId":null,"timestamp":"2026-08-14T08:00:01Z","message":{"role":"user","content":"piwatcherrecoveryneedle"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write Pi fixture");
         unsafe {
             std::env::set_var("QUILL_DEMO_MODE", "1");
             std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", temp.path().join("claude"));
             std::env::set_var("QUILL_CODEX_SESSIONS_DIR", temp.path().join("codex"));
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
         }
         let _env = DemoEnv;
         let index = crate::sessions::SessionIndex::open_or_create(&temp.path().join("index"))
             .expect("open watcher search index");
 
-        assert_eq!(sync_search_index_for_test(&index, None), Ok(2));
+        assert_eq!(sync_search_index_for_test(&index, None), Ok(3));
         index.reader.reload().expect("reload watcher search index");
         for (query, provider) in [
             ("claudewatcherrecoveryneedle", IntegrationProvider::Claude),
             ("codexwatcherrecoveryneedle", IntegrationProvider::Codex),
+            ("piwatcherrecoveryneedle", IntegrationProvider::Pi),
         ] {
             assert_eq!(
                 index
@@ -509,8 +535,9 @@ mod tests {
         let now = Instant::now();
         let claude = roots[0].resolved_path.join("project/session.jsonl");
         let codex = roots[1].resolved_path.join("2026/08/rollout.jsonl");
+        let pi = roots[2].resolved_path.join("session.jsonl");
         let mut pending = PendingPaths::default();
-        for path in [&claude, &claude, &codex] {
+        for path in [&claude, &claude, &codex, &pi] {
             collect_event_paths(
                 &roots,
                 &Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
@@ -519,12 +546,13 @@ mod tests {
                 now,
             );
         }
-        assert_eq!(pending.paths.len(), 2);
+        assert_eq!(pending.paths.len(), 3);
         assert_eq!(
             pending.paths.get(&claude),
             Some(&IntegrationProvider::Claude)
         );
         assert_eq!(pending.paths.get(&codex), Some(&IntegrationProvider::Codex));
+        assert_eq!(pending.paths.get(&pi), Some(&IntegrationProvider::Pi));
         assert_eq!(pending.timeout(now + MAX_DEBOUNCE), Duration::ZERO);
     }
 

@@ -49,8 +49,8 @@ pub(crate) enum ProviderRootEnumerationOutcome {
 
 /// A retained JSONL source discovered from a provider-owned filesystem root.
 ///
-/// The source key is derived from the provider-qualified root key and the
-/// canonical path, preventing Claude and Codex paths from colliding.
+/// The source key is derived from provider-native identity. Claude and Codex
+/// use provider-qualified canonical paths; Pi uses its header plus local host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DiscoveredRetainedJsonlSource {
     pub(crate) provider: IntegrationProvider,
@@ -236,10 +236,22 @@ pub(crate) fn validate_retained_notify_source(
             ),
         )?;
 
+    let source_key = retained_source_key(
+        provider,
+        source_root_key,
+        &canonical_path,
+        (provider == IntegrationProvider::Pi)
+            .then(SessionIndex::local_hostname)
+            .as_deref(),
+    )
+    .ok_or(RetainedNotifySourceValidationError::Invalid(
+        "jsonl_path does not contain a supported retained source identity",
+    ))?;
+
     Ok(Some(DiscoveredRetainedJsonlSource {
         provider,
         source_root_key,
-        source_key: canonical_source_key(source_root_key, &canonical_path),
+        source_key,
         filesystem_path: canonical_path.clone(),
         canonical_path,
         layout_hint,
@@ -337,15 +349,15 @@ fn is_claude_subagent_transcript(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".jsonl"))
 }
 
-/// Enumerate Claude and Codex transcript roots independently.
+/// Enumerate retained transcript roots independently.
 ///
 /// This inventory is intentionally separate from Session Search discovery so
-/// one unreadable provider root cannot suppress the other provider and cannot
-/// change existing indexing behavior.
+/// one unreadable provider root cannot suppress another provider.
 pub(crate) fn enumerate_retained_jsonl_source_roots() -> Vec<ProviderSourceRoot> {
     vec![
         enumerate_claude_retained_jsonl_source_root(),
         enumerate_codex_retained_jsonl_source_root(),
+        enumerate_pi_retained_jsonl_source_root(),
     ]
 }
 
@@ -357,6 +369,7 @@ pub(crate) fn retained_jsonl_source_root_identities() -> Vec<(IntegrationProvide
     vec![
         (IntegrationProvider::Claude, CLAUDE_SOURCE_ROOT_KEY),
         (IntegrationProvider::Codex, CODEX_SOURCE_ROOT_KEY),
+        (IntegrationProvider::Pi, PI_SOURCE_ROOT_KEY),
     ]
 }
 
@@ -380,8 +393,26 @@ pub(crate) fn enumerate_codex_retained_jsonl_source_root() -> ProviderSourceRoot
     )
 }
 
-/// Admit every retained transcript to the independent model-source
-/// reconciliation queue.
+pub(crate) fn enumerate_pi_retained_jsonl_source_root() -> ProviderSourceRoot {
+    match crate::data_paths::resolve_pi_sessions_dir() {
+        Ok(path) => enumerate_provider_source_root(
+            IntegrationProvider::Pi,
+            PI_SOURCE_ROOT_KEY,
+            path,
+            collect_pi_jsonl_candidates,
+        ),
+        Err(error) => finish_provider_source_root(
+            IntegrationProvider::Pi,
+            PI_SOURCE_ROOT_KEY,
+            PathBuf::new(),
+            None,
+            Some(format!("Pi transcript inventory unavailable: {error}")),
+            Vec::new(),
+        ),
+    }
+}
+
+/// Admit every retained Claude/Codex transcript to the model-source queue.
 ///
 /// App startup and Session Search scans both use this boundary so a completed
 /// one-time backfill does not leave later retained files dependent on opening
@@ -399,6 +430,9 @@ pub(crate) fn enqueue_startup_model_source_reconciliation(app_handle: &tauri::Ap
 
         for source in root.sources {
             let provider = source.provider;
+            if provider == IntegrationProvider::Pi {
+                continue;
+            }
             let source_root_key = source.source_root_key;
             if let Err(error) = crate::enqueue_model_usage_live_source(app_handle, source) {
                 log::warn!(
@@ -514,6 +548,7 @@ fn enumerate_provider_source_root(
     };
 
     let candidates = collect_candidates(&resolved_root_path, provider, &mut diagnostic).candidates;
+    let pi_hostname = (provider == IntegrationProvider::Pi).then(SessionIndex::local_hostname);
     let mut sources = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let canonical_path = match std::fs::canonicalize(&candidate.path) {
@@ -568,10 +603,18 @@ fn enumerate_provider_source_root(
             continue;
         };
 
+        let Some(source_key) = retained_source_key(
+            provider,
+            source_root_key,
+            &canonical_path,
+            pi_hostname.as_deref(),
+        ) else {
+            continue;
+        };
         sources.push(DiscoveredRetainedJsonlSource {
             provider,
             source_root_key,
-            source_key: canonical_source_key(source_root_key, &canonical_path),
+            source_key,
             filesystem_path: candidate.path,
             canonical_path,
             layout_hint,
@@ -747,6 +790,14 @@ fn collect_codex_jsonl_candidates(
     }
 
     collection
+}
+
+fn collect_pi_jsonl_candidates(
+    sessions_dir: &Path,
+    provider: IntegrationProvider,
+    diagnostic: &mut Option<String>,
+) -> TranscriptCandidateCollection {
+    collect_codex_jsonl_candidates(sessions_dir, provider, diagnostic)
 }
 
 /// Enumerate every Claude transcript under `projects_dir`, flagging sub-agent
@@ -941,6 +992,19 @@ fn record_root_failure(
         bounded.push('…');
         bounded
     });
+}
+
+fn retained_source_key(
+    provider: IntegrationProvider,
+    source_root_key: &str,
+    canonical_path: &Path,
+    pi_hostname: Option<&str>,
+) -> Option<String> {
+    if provider == IntegrationProvider::Pi {
+        let header = crate::pi_session::read_pi_session_header(canonical_path)?;
+        return crate::storage::pi_source_key(pi_hostname?, &header.id).ok();
+    }
+    Some(canonical_source_key(source_root_key, canonical_path))
 }
 
 fn canonical_source_key(source_root_key: &str, canonical_path: &Path) -> String {
@@ -1506,7 +1570,7 @@ impl SessionIndex {
         .candidates)
     }
 
-    /// Scan Claude and Codex session JSONL files and index new/modified files.
+    /// Scan retained Claude, Codex, and Pi JSONL files and index changes.
     /// Returns the number of newly indexed messages.
     pub fn startup_scan(
         &self,
@@ -3038,9 +3102,9 @@ pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<Skill
 ///
 /// Retained reconciliation reaches the identical Pi row shape through
 /// `transcript_analytics::parse_transcript_analytics_source`. Both paths use
-/// the same builder, so action identity and skill fan-out cannot drift. Pi has
-/// no sub-agent transcripts, so chain identity is flat: every row is the
-/// session's own.
+/// the same builder and canonical source key, so action identity and skill
+/// fan-out cannot drift. Pi chain identity is flat: every row is the session's
+/// own.
 // @lat: [[data-flow#Session Indexing Pipeline#Enrichment]]
 pub(crate) fn pi_transcript_tool_rows(
     session_id: &str,
@@ -3050,10 +3114,12 @@ pub(crate) fn pi_transcript_tool_rows(
     Vec<crate::transcript_analytics::OwnedToolAction>,
     Vec<crate::transcript_analytics::OwnedSkillUsage>,
 ) {
+    let source_key = crate::storage::pi_source_key(hostname, session_id)
+        .expect("validated Pi transcript identity");
     crate::transcript_analytics::owned_tool_rows(
         &crate::transcript_analytics::OwnedToolRowIdentity {
             provider: IntegrationProvider::Pi,
-            source_key: &crate::storage::pi_live_source_key(session_id),
+            source_key: &source_key,
             session_id,
             chain_id: session_id,
             parent_chain_id: None,
@@ -5251,19 +5317,114 @@ pub async fn sync_search_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
     use tempfile::TempDir;
 
     #[test]
     // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Transcript Root Coverage]]
-    fn retained_analytics_roots_exclude_notify_driven_pi() {
+    fn retained_analytics_roots_include_persisted_pi() {
         assert_eq!(
             retained_jsonl_source_root_identities(),
             vec![
                 (IntegrationProvider::Claude, CLAUDE_SOURCE_ROOT_KEY),
                 (IntegrationProvider::Codex, CODEX_SOURCE_ROOT_KEY),
+                (IntegrationProvider::Pi, PI_SOURCE_ROOT_KEY),
             ]
         );
+    }
+
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Startup Search Recovery]]
+    #[test]
+    #[serial]
+    fn startup_scan_indexes_persisted_pi_without_notify() {
+        let root = TempDir::new().expect("tempdir");
+        let claude = root.path().join("claude");
+        let codex = root.path().join("codex");
+        let pi = root.path().join("pi");
+        for directory in [&claude, &codex, &pi] {
+            fs::create_dir(directory).expect("create transcript root");
+        }
+        fs::write(
+            pi.join("session.jsonl"),
+            concat!(
+                r#"{"type":"session","version":3,"id":"pi-startup","timestamp":"2026-08-18T02:00:00Z","cwd":"/work/quill"}"#,
+                "\n",
+                r#"{"type":"message","id":"prompt","parentId":null,"timestamp":"2026-08-18T02:00:01Z","message":{"role":"user","content":"startup-pi-needle"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write Pi transcript");
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_DATA_DIR", root.path());
+            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", &claude);
+            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", &codex);
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
+        }
+
+        let inventory = enumerate_pi_retained_jsonl_source_root();
+        assert_eq!(
+            inventory.sources.len(),
+            1,
+            "Pi startup inventory failed: {:?}",
+            inventory.outcome
+        );
+        let notified = validate_retained_notify_source(
+            IntegrationProvider::Pi,
+            &inventory.sources[0].filesystem_path,
+        )
+        .expect("validate Pi notify source")
+        .expect("Pi retained source");
+        assert_eq!(
+            notified.source_key, inventory.sources[0].source_key,
+            "startup and notify must coalesce on one canonical owner"
+        );
+        assert_eq!(
+            inventory.sources[0].source_key,
+            crate::storage::pi_source_key(&SessionIndex::local_hostname(), "pi-startup")
+                .expect("canonical local Pi source")
+        );
+        assert_eq!(
+            extract_messages_from_jsonl(
+                IntegrationProvider::Pi,
+                &inventory.sources[0].filesystem_path,
+            )
+            .messages
+            .len(),
+            1
+        );
+        let index_dir = root.path().join("index");
+        let index = SessionIndex::open_or_create(&index_dir).expect("open index");
+        assert_eq!(
+            index
+                .startup_scan_without_emit(None)
+                .expect("scan persisted sources"),
+            1
+        );
+        index.reader.reload().expect("reload startup index");
+        let results = index
+            .search(
+                "startup-pi-needle",
+                &SearchFilters {
+                    provider: Some(IntegrationProvider::Pi),
+                    ..SearchFilters::default()
+                },
+                "relevance",
+                0,
+                10,
+            )
+            .expect("search startup Pi source");
+        assert_eq!(results.total_hits, 1);
+        assert_eq!(results.hits[0].session_id, "pi-startup");
+
+        unsafe {
+            std::env::remove_var("QUILL_DEMO_MODE");
+            std::env::remove_var("QUILL_DATA_DIR");
+            std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
+            std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
+            std::env::remove_var("QUILL_PI_SESSIONS_DIR");
+        }
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Shared Root Session Id]]

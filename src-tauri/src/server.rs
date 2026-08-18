@@ -166,7 +166,9 @@ pub async fn start_server(
         live_tracker,
         demo_mode: std::env::var("QUILL_DEMO_MODE").ok().as_deref() == Some("1"),
     });
-    spawn_pi_spool_drain(Arc::clone(&state));
+    if pi_spool_import_enabled(state.storage) {
+        spawn_pi_spool_drain(Arc::clone(&state));
+    }
 
     // The main router below is intentionally reachable on 0.0.0.0. Context
     // routes, especially execute, live on a separate loopback listener and
@@ -1178,6 +1180,10 @@ fn pi_spool_root() -> PathBuf {
         .join("pi-spool")
 }
 
+fn pi_spool_import_enabled(storage: &Storage) -> bool {
+    matches!(storage.get_setting("pi_spool_cleanup_pending"), Ok(None))
+}
+
 fn spawn_pi_spool_drain(state: Arc<ServerState>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(PI_SPOOL_DRAIN_INTERVAL);
@@ -1512,9 +1518,6 @@ fn enqueue_validated_retained_source(
     state: &ServerState,
     source: sessions::DiscoveredRetainedJsonlSource,
 ) {
-    if source.provider == IntegrationProvider::Pi {
-        return;
-    }
     if let Err(error) = crate::enqueue_retained_live_source(&state.app_handle, source) {
         log::error!("Failed to enqueue validated retained transcript: {error}");
     }
@@ -1546,9 +1549,9 @@ async fn drain_session_notify_queue(state: Arc<ServerState>, key: String) {
             }
         }
 
-        // A missing index no longer abandons the drain: Pi's tool and skill
-        // rows come only from this parse, and Session Search failing to open
-        // must not also cost Pi its analytics.
+        // A missing index no longer abandons the drain: Pi still lands its
+        // low-latency tool/skill replacement, while retained reconciliation
+        // remains authoritative independently of Session Search.
         let idx = state.session_index.clone();
 
         let app_handle = state.app_handle.clone();
@@ -1654,20 +1657,15 @@ fn index_session_notify_payload(
             extracted.session_id.clone()
         };
 
-    // Pi's tool and skill rows have no other producer: it never reaches
-    // retained transcript analytics, and the pushed live path deliberately
-    // carries no tool payloads, so this parse is the only place that evidence
-    // exists. Search indexing stays authoritative for the response — a
-    // persistence failure is logged rather than raised, because it must not
-    // cost the session its search documents.
+    // Notify keeps Pi tool and skill data low-latency. Retained reconciliation
+    // later replaces the same canonical owner with the complete source snapshot.
     if payload.provider == IntegrationProvider::Pi {
         let (tool_actions, skill_usages) =
             sessions::pi_transcript_tool_rows(&session_id, &host, &extracted.messages);
-        if let Err(error) = storage.replace_pi_transcript_tool_rows(
-            &crate::storage::pi_live_source_key(&session_id),
-            &tool_actions,
-            &skill_usages,
-        ) {
+        let source_key = crate::storage::pi_source_key(&host, &session_id)?;
+        if let Err(error) =
+            storage.replace_pi_transcript_tool_rows(&source_key, &tool_actions, &skill_usages)
+        {
             log::error!("Failed to persist Pi transcript tool rows: {error}");
         }
     }
@@ -2441,7 +2439,7 @@ async fn post_session_notify(
 
     let provider = payload.provider;
     let jsonl_path = PathBuf::from(&payload.jsonl_path);
-    let model_source = match tokio::task::spawn_blocking(move || {
+    let retained_source = match tokio::task::spawn_blocking(move || {
         sessions::validate_retained_notify_source(provider, &jsonl_path)
     })
     .await
@@ -2500,15 +2498,14 @@ async fn post_session_notify(
         }
     };
 
-    if let Some(source) = model_source {
+    if let Some(source) = retained_source {
         // Session Search availability cannot suppress either analytics domain.
         enqueue_validated_retained_source(&state, source);
     }
 
-    // Pi is the one provider whose `tool_actions` and `skill_usages` exist
-    // nowhere but this parse, so an unopenable index must not turn its notify
-    // away. Claude and Codex own those rows through retained analytics and
-    // have nothing left to do here without an index.
+    // Pi keeps its low-latency tool/skill replacement even without Search;
+    // the shared retained reconciliation was already queued above. Claude and
+    // Codex have nothing left to do here without an index.
     if state.session_index.is_none() && provider != IntegrationProvider::Pi {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3415,6 +3412,19 @@ mod observed_subagent_tests {
             .get_model_usage_overview(crate::models::ModelRange::SevenDays, Some("pi"))
             .expect("read pushed Pi usage");
         assert_eq!(overview.totals.total_tokens, 100);
+    }
+
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Retired Spool Isolation]]
+    #[test]
+    fn pi_spool_cleanup_marker_disables_runtime_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).expect("init storage");
+
+        assert!(!pi_spool_import_enabled(&storage));
+        storage
+            .delete_setting("pi_spool_cleanup_pending")
+            .expect("clear migration marker");
+        assert!(pi_spool_import_enabled(&storage));
     }
 
     fn spool_track_payload(session_id: &str) -> serde_json::Value {

@@ -330,6 +330,10 @@ impl RetainedLiveDomains {
         model: true,
         transcript: false,
     };
+    const TRANSCRIPT: Self = Self {
+        model: false,
+        transcript: true,
+    };
 }
 
 struct RetainedDomainWork {
@@ -434,7 +438,9 @@ impl RetainedSourceRunnerState {
     ) -> Result<(RetainedLiveQueueAdmission, RetainedDrainSchedule), String> {
         if !matches!(
             source.provider,
-            integrations::IntegrationProvider::Claude | integrations::IntegrationProvider::Codex
+            integrations::IntegrationProvider::Claude
+                | integrations::IntegrationProvider::Codex
+                | integrations::IntegrationProvider::Pi
         ) || source.source_root_key.is_empty()
             || source.source_key.is_empty()
             || !source.canonical_path.is_absolute()
@@ -669,7 +675,12 @@ pub(crate) fn enqueue_retained_live_source(
     app_handle: &tauri::AppHandle,
     source: sessions::DiscoveredRetainedJsonlSource,
 ) -> Result<RetainedLiveQueueAdmission, String> {
-    enqueue_retained_source_domains(app_handle, source, RetainedLiveDomains::BOTH)
+    let domains = if source.provider == integrations::IntegrationProvider::Pi {
+        RetainedLiveDomains::TRANSCRIPT
+    } else {
+        RetainedLiveDomains::BOTH
+    };
+    enqueue_retained_source_domains(app_handle, source, domains)
 }
 
 fn enqueue_retained_source_domains(
@@ -740,8 +751,8 @@ fn spawn_startup_model_source_reconciliation(app: tauri::AppHandle) {
     });
 }
 
-/// Periodically rescan both transcript roots and feed changed sources into the
-/// same live-reconcile queues the notify hook uses.
+/// Periodically rescan retained transcript roots and feed changed sources into
+/// the same live-reconcile queues the notify hook uses.
 ///
 /// Live coverage no longer depends solely on the per-session notify hook: a
 /// session created after startup whose hook never fires (e.g. a long-running
@@ -5785,9 +5796,9 @@ pub fn run() {
                     log::error!("Could not resume interrupted model history backfill: {error}");
                 }
             }
-            // Re-admit the current retained inventory even when migration 28's
-            // one-time backfill is already complete. This is separate from
-            // Session Search startup and runs off the setup thread.
+            // Re-admit Claude/Codex model sources even when migration 28's
+            // one-time backfill is complete. Pi startup replacement runs in the
+            // transcript pass above and must not duplicate model work here.
             spawn_startup_model_source_reconciliation(app.handle().clone());
 
             // Initialize session search index first (shared with HTTP server)
@@ -6394,6 +6405,59 @@ mod tests {
                 default_project: "quill".to_owned(),
             },
         }
+    }
+
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Shared Coordinator Admission]]
+    #[test]
+    fn pi_reuses_retained_source_coordinator_without_model_work() {
+        let state = RetainedSourceRunnerState::new();
+        let mut source = retained_test_source("pi-coordinator");
+        source.provider = integrations::IntegrationProvider::Pi;
+        source.source_root_key = "pi:sessions";
+        source.layout_hint = sessions::RetainedJsonlSourceLayoutHint::PiTranscript;
+
+        let (_, schedule) = state
+            .enqueue_live_source(source.clone(), RetainedLiveDomains::TRANSCRIPT)
+            .expect("enqueue Pi source");
+        assert!(!schedule.model);
+        assert!(schedule.transcript);
+        let (admission, repeated_schedule) = state
+            .enqueue_live_source(source, RetainedLiveDomains::TRANSCRIPT)
+            .expect("coalesce Pi notify");
+        assert_eq!(admission, RetainedLiveQueueAdmission::Coalesced);
+        assert!(!repeated_schedule.model && !repeated_schedule.transcript);
+        assert!(state.take_ready(RetainedLiveDomain::Model, 1).is_empty());
+        assert_eq!(state.take_ready(RetainedLiveDomain::Transcript, 2).len(), 1);
+    }
+
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Recovery]]
+    #[test]
+    fn periodic_rescan_admits_persisted_pi_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(&path, "{}\n").expect("write changed source");
+        let canonical_path = std::fs::canonicalize(&path).expect("canonical source");
+        let source = sessions::DiscoveredRetainedJsonlSource {
+            provider: integrations::IntegrationProvider::Pi,
+            source_root_key: "pi:sessions",
+            source_key: "pi-source".to_owned(),
+            filesystem_path: path,
+            canonical_path: canonical_path.clone(),
+            layout_hint: sessions::RetainedJsonlSourceLayoutHint::PiTranscript,
+        };
+        let roots = [sessions::ProviderSourceRoot {
+            provider: integrations::IntegrationProvider::Pi,
+            source_root_key: "pi:sessions",
+            resolved_root_path: temp.path().to_path_buf(),
+            canonical_root_path: Some(std::fs::canonicalize(temp.path()).expect("canonical root")),
+            outcome: sessions::ProviderRootEnumerationOutcome::Complete,
+            sources: vec![source.clone()],
+        }];
+
+        assert_eq!(
+            collect_rescan_changed_sources_from_roots(std::time::SystemTime::UNIX_EPOCH, &roots),
+            vec![source]
+        );
     }
 
     // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Live Source Coordinator Test Specs#Independent Domain Retry]]

@@ -130,11 +130,6 @@ pub(crate) fn pi_source_key(hostname: &str, session_id: &str) -> Result<String, 
     ))
 }
 
-// quill-oyie.14 replaces the remaining notify callers with `pi_source_key`.
-pub(crate) fn pi_live_source_key(session_id: &str) -> String {
-    format!("live:pi:{session_id}")
-}
-
 // @lat: [[backend#Backend#Database#tool_detail payload carve-out]]
 /// `tool_actions.category` value whose rows carry no readable payload. Every
 /// SQL reader of `full_input` / `full_output` is gated on
