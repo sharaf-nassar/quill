@@ -1522,7 +1522,7 @@ function persistLifecycle(config, state, info, type, fields) {
       fields.reason,
     ),
     event: type,
-    normalized_host: config.hostname.toLowerCase(),
+    normalized_host: config.hostname.split(".")[0].toLowerCase(),
     session_id: info.id,
     process_instance_id: state.process.id,
     sequence,

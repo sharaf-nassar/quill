@@ -250,7 +250,11 @@ test("protocol v2 builders share exact generation and omit absent options", () =
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Persisted lifecycle evidence]]
 test("persistent lifecycle appends the same protocol v2 event before live delivery", async () => {
   await withHome(
-    { url: "http://127.0.0.1:19876", secret: "secret", hostname: "PI-HOST" },
+    {
+      url: "http://127.0.0.1:19876",
+      secret: "secret",
+      hostname: "PI-HOST.EXAMPLE.COM",
+    },
     async () => {
       const order = [];
       const pi = fakePi({ onAppend: () => order.push("append") });
@@ -278,6 +282,7 @@ test("persistent lifecycle appends the same protocol v2 event before live delive
           call.url.endsWith("/api/v1/pi/track"),
         ).body;
         assert.equal(envelope.protocol, PI_PROTOCOL_V2);
+        assert.equal(envelope.events[0].normalized_host, "pi-host");
         assert.equal(entry.schema, 2);
         assert.equal(entry.event_uuid, envelope.events[0].event_uuid);
         assert.equal(entry.event, envelope.events[0].event);
