@@ -323,8 +323,115 @@ test("persistent lifecycle appends the same protocol v2 event before live delive
   );
 });
 
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Typed bounded delivery]]
+test("persistent live sessions reannounce every 30 seconds without overlapping", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const calls = [];
+      let finishReplay;
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        if (!String(url).endsWith("/api/v1/pi/track")) {
+          return httpResponse(202);
+        }
+        calls.push(JSON.parse(options.body));
+        if (calls.length === 2) {
+          return new Promise((resolve) => {
+            finishReplay = () => resolve(httpResponse(202));
+          });
+        }
+        return httpResponse(202);
+      };
+      const ctx = context("periodic-recovery");
+      try {
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "startup" },
+          ctx,
+        );
+        await flushRequests();
+        assert.equal(calls.length, 1);
+        assert.equal(pi.entries.length, 1);
+
+        t.mock.timers.tick(30_000);
+        await flushRequests();
+        assert.equal(calls.length, 2);
+        assert.deepEqual(calls[1], calls[0]);
+        assert.equal(pi.entries.length, 1);
+
+        t.mock.timers.tick(30_000);
+        await flushRequests();
+        assert.equal(calls.length, 2);
+
+        finishReplay();
+        await flushRequests();
+        t.mock.timers.tick(30_000);
+        await flushRequests();
+        assert.equal(calls.length, 3);
+        assert.deepEqual(calls[2], calls[0]);
+        assert.equal(pi.entries.length, 1);
+
+        await pi.handlers.get("session_shutdown")[0](
+          { type: "session_shutdown", reason: "quit" },
+          ctx,
+        );
+        assert.equal(calls.length, 4);
+        assert.equal(calls[3].events[0].event, "session_end");
+        t.mock.timers.tick(60_000);
+        await flushRequests();
+        assert.equal(calls.length, 4);
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Typed bounded delivery]]
+test("reporter replacement releases the prior live reannouncement", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      let requests = 0;
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async (url) => {
+        if (String(url).endsWith("/api/v1/pi/track")) requests += 1;
+        return httpResponse(202);
+      };
+      const ctx = context("released-recovery");
+      try {
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "startup" },
+          ctx,
+        );
+        await flushRequests();
+        assert.equal(requests, 1);
+
+        quill(pi.api);
+        t.mock.timers.tick(60_000);
+        await flushRequests();
+        assert.equal(requests, 1);
+
+        await pi.handlers.get("session_shutdown")[0](
+          { type: "session_shutdown", reason: "quit" },
+          ctx,
+        );
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#No-session tracking boundary]]
-test("no-session mode keeps root tools and router but writes and sends no tracking", async () => {
+test("no-session mode keeps root tools and router but writes and sends no tracking", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
   await withHome(
     { url: "http://127.0.0.1:19876", secret: "secret" },
     async () => {
@@ -351,6 +458,9 @@ test("no-session mode keeps root tools and router but writes and sends no tracki
           ctx,
         );
         pi.handlers.get("input")[0]({ type: "input", text: "private" }, ctx);
+        await flushRequests();
+        t.mock.timers.tick(60_000);
+        await flushRequests();
         await pi.handlers.get("session_shutdown")[0](
           { type: "session_shutdown", reason: "quit" },
           ctx,
@@ -413,7 +523,8 @@ test("transient tracking failures retry once and auth reloads once", async () =>
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Typed bounded delivery]]
-test("unknown session reannounces once and protocol mismatch makes live push inert", async () => {
+test("unknown session reannounces once and protocol mismatch makes live push inert", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
   await withHome(
     { url: "http://127.0.0.1:19876", secret: "secret" },
     async () => {
@@ -485,6 +596,9 @@ test("unknown session reannounces once and protocol mismatch makes live push ine
           ctx,
         );
         await flushRequests();
+        t.mock.timers.tick(60_000);
+        await flushRequests();
+        assert.equal(requests, 1);
         await pi.handlers.get("session_shutdown")[0](
           { type: "session_shutdown", reason: "quit" },
           ctx,

@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 
 // Keep equal to LOCAL_TIMEOUT_MS in ../codex-integration/scripts/lib.cjs.
 const LOCAL_TIMEOUT_MS = 1500;
+const LIVE_REANNOUNCE_MS = 30_000;
 const CONTEXT_PORT = "19877";
 const FEATURES = {
   context_preservation: true,
@@ -425,9 +426,14 @@ export function electReporterCandidate(candidates, contract) {
     )[0];
 }
 
+function releaseReporter(candidate) {
+  candidate?.release?.();
+}
+
 function resetReporterBroker(config, broker) {
   globalThis[REPORTER_BROKERS]?.delete(config.quillRoot);
   globalThis[REPORTER_CLAIMS]?.delete(config.quillRoot);
+  for (const candidate of broker.candidates.values()) releaseReporter(candidate);
   broker.candidates.clear();
 }
 
@@ -552,10 +558,11 @@ function registerReporterCandidate(pi, config, descriptor, setup) {
       candidate.tools.set(tool.name, tool);
     },
   };
-  setup(candidateApi, {
+  candidate.release = setup(candidateApi, {
     ...config,
     installChannel: descriptor.install_channel,
   });
+  releaseReporter(broker.candidates.get(candidate.extension_path));
   broker.candidates.set(candidate.extension_path, candidate);
   for (const event of candidate.handlers.keys()) {
     installBrokerEvent(broker, event, config);
@@ -677,8 +684,50 @@ async function postPayload(config, endpoint, payload) {
   }
 }
 
+function stopLiveReannounce(state) {
+  if (state.liveReannounceTimer === null) return;
+  clearInterval(state.liveReannounceTimer);
+  state.liveReannounceTimer = null;
+}
+
+function scheduleLiveReannounce(config, state) {
+  if (
+    state.liveReannounceTimer !== null ||
+    state.inert ||
+    state.released ||
+    state.shutdown
+  ) {
+    return;
+  }
+  state.liveReannounceTimer = setInterval(() => {
+    if (
+      !state.startEnvelope ||
+      state.liveReannounceInFlight ||
+      state.inert ||
+      state.released ||
+      state.shutdown
+    ) {
+      return;
+    }
+    const replay = sendTracked(
+      config,
+      state,
+      "/api/v1/pi/track",
+      state.startEnvelope,
+    );
+    state.liveReannounceInFlight = replay;
+    const clear = () => {
+      if (state.liveReannounceInFlight === replay) {
+        state.liveReannounceInFlight = null;
+      }
+    };
+    void replay.then(clear, clear);
+  }, LIVE_REANNOUNCE_MS);
+  state.liveReannounceTimer.unref?.();
+}
+
 async function sendTracked(config, state, endpoint, payload) {
-  if (state.inert) return false;
+  if (state.inert || state.released) return false;
   try {
     await postPayload(config, endpoint, payload);
     return true;
@@ -694,7 +743,10 @@ async function sendTracked(config, state, endpoint, payload) {
         error = recoveryError;
       }
     }
-    if (error instanceof ProtocolMismatchError) state.inert = true;
+    if (error instanceof ProtocolMismatchError) {
+      state.inert = true;
+      stopLiveReannounce(state);
+    }
     writeLog(
       config,
       error instanceof QuillExtensionError
@@ -1789,7 +1841,10 @@ function persistLifecycle(config, state, info, type, fields) {
     return Promise.resolve(false);
   }
   const envelope = buildProtocolV2Envelope([event]);
-  if (type === "session_start") state.startEnvelope = envelope;
+  if (type === "session_start") {
+    state.startEnvelope = envelope;
+    scheduleLiveReannounce(config, state);
+  }
   return sendTracked(config, state, "/api/v1/pi/track", envelope);
 }
 
@@ -1898,9 +1953,13 @@ function registerTracking(pi, config, trackingOnlyChild) {
   const state = {
     assistantTextMessages: new Set(),
     inert: false,
+    liveReannounceInFlight: null,
+    liveReannounceTimer: null,
     notify: null,
     pi,
     process: reporterProcess(config),
+    released: false,
+    shutdown: false,
     startEnvelope: null,
   };
   const activity = (event, ctx, name, hookEvent) => {
@@ -1922,7 +1981,8 @@ function registerTracking(pi, config, trackingOnlyChild) {
   registerHandler(pi, config, "session_start", (event, ctx) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
-      if (!info.file) return;
+      if (!info.file || state.released) return;
+      state.shutdown = false;
       const { lineage, previousSessionId } = resolveStart(event, info);
       state.notify = { info, lineage };
       postTelemetry(config, event, ctx, EVENT_MAP.session_start);
@@ -1939,8 +1999,11 @@ function registerTracking(pi, config, trackingOnlyChild) {
   });
   registerHandler(pi, config, "session_shutdown", async (event, ctx) => {
     try {
+      state.shutdown = true;
+      stopLiveReannounce(state);
+      await state.liveReannounceInFlight;
       const info = sessionInfo(ctx);
-      if (!info.file) return;
+      if (!info.file || state.released) return;
       postTelemetry(config, event, ctx, EVENT_MAP.session_shutdown);
       await trackEvent(config, state, info, "session_end", {
         reason: event.reason,
@@ -2150,9 +2213,15 @@ function registerTracking(pi, config, trackingOnlyChild) {
       return undefined;
     });
   });
+
+  return () => {
+    state.released = true;
+    stopLiveReannounce(state);
+  };
 }
 
 function configureReporter(pi, config) {
+  let release;
   const trackingOnlyChild = process.env.PI_SUBAGENT_CHILD === "1";
   if (FEATURES.context_preservation && !trackingOnlyChild) {
     for (const tool of TOOLS) {
@@ -2212,7 +2281,7 @@ function configureReporter(pi, config) {
   }
 
   if (FEATURES.activity_tracking) {
-    registerTracking(pi, config, trackingOnlyChild);
+    release = registerTracking(pi, config, trackingOnlyChild);
     if (!trackingOnlyChild) {
       for (const [eventName, hookEvent] of Object.entries(EVENT_MAP)) {
         if (TRACKING_EVENTS.has(eventName)) continue;
@@ -2230,6 +2299,7 @@ function configureReporter(pi, config) {
       }
     }
   }
+  return release;
 }
 
 // @lat: [[infrastructure#Infrastructure#Pi Integration Deployment#Extension Tools and Telemetry]]

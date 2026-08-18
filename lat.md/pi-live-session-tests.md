@@ -56,6 +56,8 @@ Durable open rows load as recovering after restart or tracking re-enable. Same-p
 
 Pi session-message hints consult durable lifecycle before analytics mutation, returning typed `409` for unknown or stale ownership.
 
+While a persistent Pi session remains live, its reporter replays the identical start envelope every 30 seconds without another persisted entry. Overlapping sends are skipped, and shutdown, reporter release, or protocol mismatch stops the replay so recovery cannot revive an ended or incompatible session.
+
 A live start without a reconciled file records `source_not_persisted`; validated notify or committed persisted-source reconciliation clears only that process's diagnostic.
 
 ## Protocol v2 decoder contract

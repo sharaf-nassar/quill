@@ -433,11 +433,13 @@ is a coordinated protocol/storage redesign rather than a small patch.
   order inside one transaction, and return `applied`, `duplicate`, `stale`, or
   `unknown_session` outcomes. Mutate `LiveTracker` only from committed applied
   outcomes.
-- **Recovery:** use a tracking-only heartbeat/reannouncement every 30 seconds,
-  immediate reannounce after `unknown_session`, one replay of the original
-  mutation, and a per-session cooldown. Durable open state rehydrates as
-  recovering/unresolved, never active, until same-instance proof arrives. Keep
-  the existing 15-minute crash backstop.
+- **Recovery:** while a persistent session is live, replay its exact cached
+  start envelope every 30 seconds without appending another Pi entry. Skip a
+  tick while its prior replay is in flight, and stop the timer at shutdown,
+  reporter release, or protocol mismatch. Keep immediate reannounce after
+  `unknown_session` and one replay of the original mutation. Durable open state
+  rehydrates as recovering/unresolved, never active, until same-instance proof
+  arrives. Keep the existing 15-minute crash backstop.
 - **Lineage graph:** persist direct parent, visible root, validated agent role,
   and process instance. Resolve with memoization, a visited set, and maximum
   depth 64. Cycle, missing ancestor, cross-host conflict, and depth overflow
@@ -629,9 +631,11 @@ authenticates and bounds raw bytes before examining open discriminator strings,
 then converts supported shapes into closed Rust domain types. The same event IDs
 appear in custom entries and live pushes, so live delivery and later source
 replacement cannot double-count. `unknown_session` triggers one immediate
-lifecycle reannounce; a 30-second non-persisted heartbeat repairs live state
-after Quill restart without adding heartbeat entries to the Pi file. Durable
-open state rehydrates as recovering, not live, until same-process proof arrives.
+lifecycle reannounce. While the persistent session stays live, the extension
+replays the same cached start envelope every 30 seconds without adding another
+entry to the Pi file; overlapping sends are skipped and shutdown, reporter
+release, or protocol mismatch clears the timer. Durable open state rehydrates as
+recovering, not live, until same-process proof arrives.
 
 Lineage persists direct parent identity, visible root identity, process
 instance, and bounded agent role. The live graph resolves ancestors with a
@@ -952,8 +956,10 @@ Typed responses:
 
 No authenticated permanent response creates a failed-request spool. The
 extension logs one bounded typed error and retries only timeout/429/503; 401
-reloads config once; 409 appends/reannounces lifecycle then retries once; 426
-stays inert until reload with an exact pair.
+reloads config once; 409 reannounces the cached start envelope without another
+append, then retries the original mutation once; 426 stays inert until reload
+with an exact pair. A live persistent reporter also replays the cached start
+every 30 seconds with at most one replay in flight.
 
 ### Persisted-source reconciliation
 
@@ -1330,8 +1336,9 @@ Acceptance:
 - Persistent custom entry is appended before same-ID live send and flushes with
   Pi's first assistant entry; missing/nonpersistent session writes and sends
   nothing and creates no health subject.
-- Timeout/429/503 retry, 401 reload-once, 409 reannounce-once, and 426 inert
-  behavior are bounded and tested; no Pi spool/log directory is created.
+- Timeout/429/503 retry, 401 reload-once, 409 reannounce-once, 30-second
+  live-only start replay, and 426 inert behavior are bounded and tested; replay
+  never appends another Pi entry, and no Pi spool/log directory is created.
 - Root persistent and no-session modes retain exactly eight tools/router cases;
   child mode exposes none; all tracking URLs are loopback and payload-free.
 
