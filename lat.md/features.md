@@ -392,7 +392,7 @@ The Settings section of the [[frontend#Manage Workspace]], opened by the titleba
 
 Rendered as the `settings` section of the Manage workspace ([[src/windows/ManageWindowView.tsx]]); the titlebar cog opens `manage` at that section (via a `manage:navigate` event when it is already open). The former standalone `?view=settings` window was retired.
 
-Settings is always reachable (the Manage workspace never gates it) so users can manage integrations and runtime preferences before any provider is enabled. The shell lives in [[src/windows/SettingsWindowView.tsx]]; its `.settings-tabs` flex container uses `nowrap` so the five top tabs never collapse onto a second row, and its own window chrome (titlebar/close) is suppressed via `manage.css` when embedded in the Manage content pane.
+Settings is always reachable (the Manage workspace never gates it) so users can manage integrations and runtime preferences before any provider is enabled. The shell lives in [[src/windows/SettingsWindowView.tsx]]; the active tab is owned by the Manage shell and passed in, so a `settings:<tab>` deep link retargets an already-open workspace instead of being ignored by a mounted component's own state; its `.settings-tabs` flex container uses `nowrap` so the five top tabs never collapse onto a second row, and its own window chrome (titlebar/close) is suppressed via `manage.css` when embedded in the Manage content pane.
 
 ### Tab Layout
 

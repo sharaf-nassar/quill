@@ -15,9 +15,19 @@ const server = await createServer({
 	appType: "custom",
 	server: { middlewareMode: true, hmr: false },
 	optimizeDeps: { noDiscovery: true },
+	plugins: [
+		{
+			name: "expose-parse-target",
+			transform(code, id) {
+				if (id.endsWith("/ManageWindowView.tsx")) {
+					return `${code}\nexport { parseTarget };`;
+				}
+			},
+		},
+	],
 });
 
-const { default: ManageWindowView } = await server.ssrLoadModule(
+const { default: ManageWindowView, parseTarget } = await server.ssrLoadModule(
 	"/src/windows/ManageWindowView.tsx",
 );
 
@@ -31,4 +41,18 @@ test("Manage offers Sessions, Learning, and Settings", () => {
 	);
 
 	assert.deepEqual(labels, ["Sessions", "Learning", "Settings", "Live"]);
+});
+
+// @lat: [[manage-section-tests#Manage Section Tests#Section Deep Links]]
+test("deep links carry an optional settings tab", () => {
+	assert.deepEqual(parseTarget("settings:integrations"), {
+		section: "settings",
+		tab: "integrations",
+	});
+	assert.deepEqual(parseTarget("settings"), { section: "settings", tab: null });
+	assert.deepEqual(parseTarget("bogus:integrations"), {
+		section: null,
+		tab: null,
+	});
+	assert.deepEqual(parseTarget(null), { section: null, tab: null });
 });

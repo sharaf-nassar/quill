@@ -17,6 +17,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { check } from "@tauri-apps/plugin-updater";
 import LimitsSection from "./components/widget/LimitsSection";
+import { openManageWindow } from "./lib/manageWindow";
 import ViewRegion from "./components/widget/ViewRegion";
 import WidgetTitleBar from "./components/widget/WidgetTitleBar";
 import type { UseIntegrationsResult } from "./hooks/useIntegrations";
@@ -269,18 +270,17 @@ function App({ integrations }: AppProps) {
       return {
         title: "Provider status unavailable",
         description:
-          "Quill could not load integration status. Restart the app, then enable Claude Code or Codex from Manage.",
+          "Quill could not load integration status. Restart the app, then enable a provider in Settings.",
       };
     }
     if (hasDetectedProvider) {
       return {
         title: "No provider is enabled",
-        description:
-          "Enable Claude Code or Codex from Manage to restore Quill features.",
+        description: "Enable a provider in Settings to restore Quill features.",
       };
     }
     return {
-      title: "Install Claude Code or Codex",
+      title: "No supported provider found",
       description:
         "Quill needs at least one supported provider installed and enabled before its features can run.",
     };
@@ -312,9 +312,9 @@ function App({ integrations }: AppProps) {
               <button
                 type="button"
                 className="wg-key wg-key-wide"
-                onClick={() => void refreshIntegrations()}
+                onClick={() => void openManageWindow("settings:integrations")}
               >
-                Rescan providers
+                Open Settings
               </button>
             </div>
           ) : (

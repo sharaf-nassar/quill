@@ -40,7 +40,7 @@ Bundle targets: macOS app bundle + DMG, Windows NSIS, Linux AppImage. The Linux 
 
 #### Development Identity
 
-A development run claims `com.quilltoolkit.app.dev` so it cannot mutate the installed app's state.
+A development run claims `com.quilltoolkit.app.dev` so it cannot mutate the installed app's data. It shares the installed app's listener and provider contract — see [[backend#Backend#Data Paths#Development runtime isolation]] — so the two cannot run at the same time.
 
 `src-tauri/tauri.dev.conf.json` overrides nothing but `identifier`, and `scripts/tauri.mjs` — the `npm run tauri` entry point — appends `--config src-tauri/tauri.dev.conf.json` when the subcommand is `dev` and the caller passed no `--config`/`-c` of their own. Injecting it there rather than behind a separate opt-in script is the point: `npm run tauri -- dev` is the command a maintainer reaches for, so isolation cannot be lost by omission. `build` and every other subcommand pass through untouched, so release output is byte-identical. The Tauri CLI hands the merged config to the build through `TAURI_CONFIG`, so `tauri::generate_context!()` embeds the dev identifier and the isolation survives `tauri dev --release` — `debug_assertions` deliberately plays no part.
 

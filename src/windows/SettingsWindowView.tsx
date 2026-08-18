@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { useIntegrations } from "../hooks/useIntegrations";
 import { useIntegrationFeatures } from "../hooks/useIntegrationFeatures";
 import { useRuntimeSettings } from "../hooks/useRuntimeSettings";
@@ -13,17 +12,25 @@ import LearningTab from "../components/settings/LearningTab";
 import PerformanceTab from "../components/settings/PerformanceTab";
 import "../styles/settings.css";
 
-function SettingsWindowView() {
+interface SettingsWindowViewProps {
+  // The tab lives in the Manage shell so a `settings:<tab>` deep link can
+  // retarget an already-open workspace.
+  tab: SettingsTabId;
+  onTabChange: (id: SettingsTabId) => void;
+}
+
+function SettingsWindowView({
+  tab: active,
+  onTabChange,
+}: SettingsWindowViewProps) {
   const integrations = useIntegrations();
   const features = useIntegrationFeatures();
   const runtime = useRuntimeSettings();
   const learning = useLearningSettings();
 
-  const [active, setActive] = useState<SettingsTabId>("general");
-
   return (
     <div className="settings-window">
-      <SettingsTabs active={active} onChange={setActive} />
+      <SettingsTabs active={active} onChange={onTabChange} />
       <div className="settings-content">
         {active === "general" && (
           <GeneralTab runtime={runtime} learning={learning} />

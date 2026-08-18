@@ -1895,6 +1895,46 @@ fn report_fatal_storage_failure(app: &tauri::AppHandle, error: &str) {
         });
 }
 
+/// Report a taken listener port and terminate.
+///
+/// Every Quill build — installed or `tauri dev` — answers on the published
+/// port and publishes the same provider contract, so two of them cannot
+/// coexist: whichever binds second would leave every provider pointed at the
+/// other one. A silent log line here reads as "the app started but nothing
+/// works", so the second launch names the conflict and quits.
+///
+/// The dialog is queued rather than shown synchronously, matching
+/// [`report_fatal_storage_failure`]. Both the callback and the watchdog exit
+/// with the same status, so whichever runs first is the whole answer.
+pub(crate) fn report_fatal_port_conflict(app: &tauri::AppHandle, port: u16) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+    log::error!("Fatal: port {port} is already in use by another Quill");
+
+    for (_, window) in app.webview_windows() {
+        if let Err(error) = window.hide() {
+            log::warn!("Failed to hide window after a port conflict: {error}");
+        }
+    }
+
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(FATAL_STORAGE_DIALOG_TIMEOUT).await;
+        log::error!("Port-conflict dialog did not respond; exiting without an answer");
+        std::process::exit(1);
+    });
+
+    app.dialog()
+        .message(format!(
+            "Another Quill is already running and owns port {port}.\n\nQuit that \
+             Quill first, then start this one. Only one Quill can serve the \
+             local integrations at a time."
+        ))
+        .title("Quill Cannot Start")
+        .kind(MessageDialogKind::Error)
+        .buttons(MessageDialogButtons::Ok)
+        .show(move |_| std::process::exit(1));
+}
+
 /// Publish the process-wide storage handle, or surface a fatal failure.
 ///
 /// Returns `None` once the failure dialog owns termination; the caller must

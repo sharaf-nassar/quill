@@ -3,10 +3,12 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+/// The secret half of the shared provider contract, so it lives with the
+/// contract at production's root rather than under this process's identity:
+/// a provider reads one `config.json` and cannot hold a second credential.
 fn secret_path() -> Result<PathBuf, String> {
-    let default = dirs::data_local_dir()
-        .ok_or_else(|| "cannot determine local data directory".to_string())?
-        .join(crate::data_paths::app_identifier());
+    let default = crate::data_paths::shared_app_data_dir()
+        .ok_or_else(|| "cannot determine local data directory".to_string())?;
     let data_dir = crate::data_paths::resolve_data_dir_with_default(default);
     Ok(data_dir.join("auth_secret"))
 }

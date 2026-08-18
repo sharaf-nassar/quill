@@ -3,32 +3,20 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+// Every identity answers on the published pair. Providers resolve one
+// contract from one fixed path and cannot tell which build wrote it, so a
+// second listener pair only produces a provider talking to the wrong Quill.
+// Two Quills therefore cannot run at once: the second fails its bind and
+// says so, which is the honest outcome.
 pub(crate) const DEFAULT_MAIN_PORT: u16 = 19876;
 pub(crate) const DEFAULT_CONTEXT_PORT: u16 = 19877;
-// A non-production identity defaults to its own loopback pair: sharing
-// production's would make whichever process starts second fail its bind, and
-// a provider pointed at the shared port would reach whichever won.
-pub(crate) const DEV_MAIN_PORT: u16 = 19878;
-pub(crate) const DEV_CONTEXT_PORT: u16 = 19879;
-
-/// The `(main, context)` listener defaults for an identity. Production keeps
-/// 19876/19877; anything else answers on its own pair.
-pub(crate) fn default_ports_for(identifier: &str) -> (u16, u16) {
-    if crate::data_paths::namespace_for(identifier).is_some() {
-        (DEV_MAIN_PORT, DEV_CONTEXT_PORT)
-    } else {
-        (DEFAULT_MAIN_PORT, DEFAULT_CONTEXT_PORT)
-    }
-}
 
 pub(crate) fn main_port() -> u16 {
-    let (main, _) = default_ports_for(crate::data_paths::app_identifier());
-    configured_port("QUILL_PORT", main)
+    configured_port("QUILL_PORT", DEFAULT_MAIN_PORT)
 }
 
 pub(crate) fn context_port() -> u16 {
-    let (_, context) = default_ports_for(crate::data_paths::app_identifier());
-    configured_port("QUILL_CONTEXT_PORT", context)
+    configured_port("QUILL_CONTEXT_PORT", DEFAULT_CONTEXT_PORT)
 }
 
 fn configured_port(name: &str, default: u16) -> u16 {
@@ -39,11 +27,11 @@ fn configured_port(name: &str, default: u16) -> u16 {
 }
 
 pub(crate) fn config_path() -> PathBuf {
-    crate::data_paths::quill_config_dir().join("config.json")
+    crate::data_paths::shared_config_dir().join("config.json")
 }
 
 pub(crate) fn auth_secret_path() -> PathBuf {
-    let default = crate::data_paths::default_app_data_dir()
+    let default = crate::data_paths::shared_app_data_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp").join(crate::data_paths::app_identifier()));
     crate::data_paths::resolve_data_dir_with_default(default).join("auth_secret")
 }
@@ -205,30 +193,20 @@ mod tests {
 
     // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
     #[test]
-    fn production_keeps_the_published_listener_pair() {
-        assert_eq!(default_ports_for(PRODUCTION_IDENTIFIER), (19876, 19877));
-    }
-
-    // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
-    #[test]
-    fn a_development_identity_defaults_to_its_own_listener_pair() {
-        let (main, context) = default_ports_for(&dev_identity());
-        let (prod_main, prod_context) = default_ports_for(PRODUCTION_IDENTIFIER);
-
-        assert_eq!((main, context), (19878, 19879));
-        assert_ne!(main, prod_main);
-        assert_ne!(context, prod_context);
-        assert_ne!(
-            main, prod_context,
-            "dev must not squat production's context"
+    #[serial]
+    fn every_identity_answers_on_the_published_listener_pair() {
+        clear_port_env();
+        assert_eq!(
+            (main_port(), context_port()),
+            (DEFAULT_MAIN_PORT, DEFAULT_CONTEXT_PORT)
         );
-        assert_ne!(context, prod_main);
+        assert_eq!((DEFAULT_MAIN_PORT, DEFAULT_CONTEXT_PORT), (19876, 19877));
     }
 
     // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
     #[test]
     #[serial]
-    fn explicit_port_overrides_beat_both_identity_defaults() {
+    fn explicit_port_overrides_beat_the_published_defaults() {
         clear_port_env();
         assert_eq!(main_port(), 19876);
         assert_eq!(context_port(), 19877);
@@ -245,16 +223,19 @@ mod tests {
 
     // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
     #[test]
-    fn the_shared_contract_relocates_with_the_identity() {
+    fn the_shared_contract_stays_on_the_path_providers_read() {
         let home = dirs::home_dir().expect("home dir");
-        assert_eq!(
-            config_path(),
-            home.join(".config/quill/config.json"),
-            "production contract path is unchanged"
+        assert_eq!(config_path(), home.join(".config/quill/config.json"));
+        assert!(
+            auth_secret_path().starts_with(
+                crate::data_paths::shared_app_data_dir().expect("shared app data dir")
+            ),
+            "the contract's credential must not relocate with the identity"
         );
         assert_eq!(
             crate::data_paths::quill_dir_name_for(&dev_identity()),
-            "quill-dev"
+            "quill-dev",
+            "Quill's own data still relocates"
         );
     }
 

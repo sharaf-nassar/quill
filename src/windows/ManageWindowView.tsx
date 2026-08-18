@@ -12,6 +12,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { listen } from "@tauri-apps/api/event";
 import { useIntegrations } from "../hooks/useIntegrations";
+import type { SettingsTabId } from "../components/settings/SettingsTabs";
 import { IS_MACOS } from "../lib/windowChrome";
 import CommandPalette, {
   type PaletteCommand,
@@ -115,11 +116,23 @@ const SECTION_IDS = SECTIONS.map((s) => s.id);
 const STORAGE_KEY = "quill-manage-section";
 const IS_MAC = IS_MACOS;
 
+// A deep link may name a settings tab as well: `settings:integrations`.
+function parseTarget(raw: string | null): {
+  section: ManageSection | null;
+  tab: SettingsTabId | null;
+} {
+  const [id, tab] = (raw ?? "").split(":");
+  return SECTION_IDS.includes(id as ManageSection)
+    ? { section: id as ManageSection, tab: (tab as SettingsTabId) || null }
+    : { section: null, tab: null };
+}
+
+const DEEP_LINK = parseTarget(
+  new URLSearchParams(window.location.search).get("section"),
+);
+
 function resolveInitialSection(): ManageSection {
-  const fromUrl = new URLSearchParams(window.location.search).get("section");
-  if (fromUrl && SECTION_IDS.includes(fromUrl as ManageSection)) {
-    return fromUrl as ManageSection;
-  }
+  if (DEEP_LINK.section) return DEEP_LINK.section;
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored && SECTION_IDS.includes(stored as ManageSection)) {
@@ -161,6 +174,9 @@ function ManageNoProvider({
 
 function ManageWindowView() {
   const [active, setActive] = useState<ManageSection>(resolveInitialSection);
+  const [settingsTab, setSettingsTab] = useState<SettingsTabId>(
+    DEEP_LINK.tab ?? "general",
+  );
   const [version, setVersion] = useState("");
   const integrations = useIntegrations();
   const railRefs = useRef<(HTMLButtonElement | null)[]>([]);
@@ -184,9 +200,10 @@ function ManageWindowView() {
   // it emits `manage:navigate` so we switch sections instead of being ignored.
   useEffect(() => {
     const un = listen<string>("manage:navigate", (e) => {
-      if (SECTION_IDS.includes(e.payload as ManageSection)) {
-        setActive(e.payload as ManageSection);
-      }
+      const { section, tab } = parseTarget(e.payload);
+      if (!section) return;
+      setActive(section);
+      if (tab) setSettingsTab(tab);
     });
     return () => {
       void un.then((fn) => fn());
@@ -358,7 +375,7 @@ function ManageWindowView() {
             ) : active === "learning" ? (
               <LearningSection />
             ) : (
-              <SettingsSection />
+              <SettingsSection tab={settingsTab} onTabChange={setSettingsTab} />
             )}
           </Suspense>
         </main>

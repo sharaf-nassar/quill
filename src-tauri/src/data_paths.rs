@@ -53,10 +53,11 @@ pub fn app_identifier() -> &'static str {
 /// The namespace a non-production identity gives its Quill-owned runtime
 /// state, or `None` for the installed app.
 ///
-/// This is the single environment discriminator: everything that would
-/// otherwise collide with a running production instance — the loopback
-/// listener ports, `~/.config/quill/`, and the provider-facing auth contract
-/// underneath it — keys off this and stays byte-identical in production.
+/// This is the single environment discriminator for Quill's own *data* —
+/// `~/.config/quill/`, the context store, learned rules, deployment staging.
+/// The machine-global handshake (listener ports, the shared provider
+/// contract, and the auth secret it publishes) deliberately does not key off
+/// it: only one Quill may own the local listener at a time.
 ///
 /// Tests use this directly because the process identity is a write-once global.
 pub fn namespace_for(identifier: &str) -> Option<&str> {
@@ -86,16 +87,29 @@ pub fn quill_dir_name_for(identifier: &str) -> String {
     }
 }
 
-/// `~/.config/quill/`, namespaced for a non-production identity.
-///
-/// Every Quill-owned file under this root — the shared provider contract,
-/// the context store, deployment staging, the Pi spool — relocates with the
-/// identity, so a dev run neither reads nor rewrites the installed app's.
-pub fn quill_config_dir() -> PathBuf {
+fn config_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".config")
-        .join(quill_dir_name())
+}
+
+/// `~/.config/quill/`, namespaced for a non-production identity.
+///
+/// Quill's own state under this root — the context store, deployment
+/// staging, the Pi spool — relocates with the identity, so a dev run neither
+/// reads nor rewrites the installed app's data.
+pub fn quill_config_dir() -> PathBuf {
+    config_root().join(quill_dir_name())
+}
+
+/// `~/.config/quill/` for every identity.
+///
+/// The provider-facing contract lives here because providers resolve it from
+/// one fixed path: the Pi extension, the Claude hooks, and the Codex wrapper
+/// all read `~/.config/quill/config.json` and cannot know which Quill build
+/// wrote it. A namespaced copy is a contract no provider ever reads.
+pub fn shared_config_dir() -> PathBuf {
+    config_root().join(quill_dir_name_for(PRODUCTION_IDENTIFIER))
 }
 
 /// Platform-aware app-data directory for an explicit identity.
@@ -116,6 +130,15 @@ fn app_data_dir_for(identifier: &str) -> Option<PathBuf> {
 /// Platform-aware app-data directory without demo-mode overrides.
 pub fn default_app_data_dir() -> Option<PathBuf> {
     app_data_dir_for(app_identifier())
+}
+
+/// Production's app-data directory whatever this process's identity is.
+///
+/// Only the auth secret lives here rather than under [`default_app_data_dir`]:
+/// it is the credential half of the shared contract, so both identities must
+/// publish and accept the same one.
+pub fn shared_app_data_dir() -> Option<PathBuf> {
+    app_data_dir_for(PRODUCTION_IDENTIFIER)
 }
 const CLAUDE_PROJECTS_DIR_ENV: &str = "QUILL_CLAUDE_PROJECTS_DIR";
 const CODEX_SESSIONS_DIR_ENV: &str = "QUILL_CODEX_SESSIONS_DIR";
@@ -460,9 +483,27 @@ mod tests {
             "production is unchanged"
         );
         assert!(dev.ends_with("com.quilltoolkit.app.dev"));
-        for leaf in ["usage.db", "auth_secret", "session-index"] {
+        for leaf in ["usage.db", "session-index"] {
             assert_ne!(prod.join(leaf), dev.join(leaf), "{leaf} must not be shared");
         }
+    }
+
+    // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
+    #[test]
+    fn the_provider_handshake_roots_ignore_the_identity() {
+        let home = dirs::home_dir().expect("home dir");
+
+        assert_eq!(shared_config_dir(), home.join(".config/quill"));
+        assert_eq!(
+            shared_app_data_dir(),
+            app_data_dir_for(PRODUCTION_IDENTIFIER),
+            "the auth secret is the contract's credential, not per-identity state"
+        );
+        assert_ne!(
+            shared_config_dir(),
+            config_root().join(quill_dir_name_for(&format!("{PRODUCTION_IDENTIFIER}.dev"))),
+            "Quill's own config root still relocates"
+        );
     }
 
     // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]

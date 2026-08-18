@@ -272,14 +272,19 @@ This loads `src-tauri/tauri.dev.conf.json`, so a dev run identifies as
 and single-instance lock separate from an installed Quill. Invoking the Tauri
 CLI directly (`cargo tauri dev`) skips that and writes to production state.
 
-That identity also moves the runtime endpoints, so a dev run can sit beside a
-running install: it listens on 19878/19879 instead of 19876/19877, keeps its
-config and context store under `~/.config/quill-dev/`, keeps app caches under
-its identity-specific data root, and skips startup provider repair that would
-otherwise re-point `~/.claude/`,
-`~/.codex/`, and `~/.pi/` at the dev build. `QUILL_PORT` and
-`QUILL_CONTEXT_PORT` still override the ports; `QUILL_DEV_INTEGRATIONS=1` opts
-a dev run back into provider installs.
+A dev run keeps its own database, context store, learned rules, and app caches
+(`~/.config/quill-dev/` and its identity-specific data root), and skips startup
+provider repair that would otherwise re-point `~/.claude/`, `~/.codex/`, and
+`~/.pi/` at the dev build. `QUILL_DEV_INTEGRATIONS=1` opts a dev run back into
+provider installs.
+
+What it does *not* move is the provider handshake: every build listens on
+19876/19877 and publishes the same `~/.config/quill/config.json` with the same
+auth secret, because a provider resolves one contract from one fixed path and
+cannot tell which Quill wrote it. Only one Quill can run at a time — the second
+one finds the port taken, says so in a dialog, and quits. Stop the installed app
+before `npm run tauri -- dev`. `QUILL_PORT` and `QUILL_CONTEXT_PORT` still
+override the ports when you really do want two.
 
 ## Controls
 

@@ -2,11 +2,13 @@
 // Live regression for development runtime isolation (Linux only).
 //
 // Builds a production-identity and a dev-identity Quill, then runs both at the
-// same time under one throwaway HOME, one Xvfb display, and one session bus.
-// It asserts the pair coexists (distinct default listeners, distinct auth
-// contracts, distinct context stores) and that starting the dev build leaves
-// every production-owned byte — the shared provider contract, the context
-// store, the cache root, and the real provider integration assets — untouched.
+// same time under one throwaway HOME, one Xvfb display, and one session bus,
+// each on explicitly overridden ports (the two identities share the published
+// pair, so only an override lets this fixture hold both up at once).
+// It asserts the pair keeps separate data — context store, cache root, app
+// data — while sharing the one provider handshake, and that starting the dev
+// build leaves every production-owned byte, including the shared contract and
+// the real provider integration assets, untouched.
 //
 // Heavyweight by nature, so it is not part of `npm test`. Run it directly:
 //
@@ -362,7 +364,7 @@ async function main() {
 	step("starting the dev build beside it");
 	const development = launch(binaries.dev, home, ports.dev, busAddress, "development");
 	await waitForHealth(development, ports.dev.main);
-	const devSecret = readSecret(home, DEV_ID);
+	const devSecret = readSecret(home, PROD_ID);
 	await waitForContext(development, ports.dev.context, devSecret);
 
 	// Both alive, each on the endpoints its explicit overrides named.
@@ -371,12 +373,16 @@ async function main() {
 	assert.ok((await fetch(`http://127.0.0.1:${ports.prod.main}/api/v1/health`)).ok);
 	assert.ok((await fetch(`http://127.0.0.1:${ports.dev.main}/api/v1/health`)).ok);
 
-	// Distinct auth contracts: neither secret opens the other's context store.
-	assert.notEqual(prodSecret, devSecret, "each identity owns its own auth secret");
+	// One shared credential: a provider holds a single contract, so both
+	// builds must accept the secret that contract publishes. Only the store
+	// behind each listener is private.
+	assert.equal(prodSecret, devSecret, "the contract's credential is machine-global");
+	assert.ok(
+		!existsSync(join(fixtureRoots(home).data, DEV_ID, "auth_secret")),
+		"a dev run must not mint a second credential",
+	);
 	assert.equal(await contextStatus(ports.prod.context, prodSecret), 200);
 	assert.equal(await contextStatus(ports.dev.context, devSecret), 200);
-	assert.equal(await contextStatus(ports.prod.context, devSecret), 401);
-	assert.equal(await contextStatus(ports.dev.context, prodSecret), 401);
 
 	// Distinct context and cache roots.
 	const devConfigRoot = join(fixtureRoots(home).config, "quill-dev");

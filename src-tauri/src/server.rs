@@ -157,6 +157,25 @@ pub async fn start_server(
 ) {
     let port = crate::integrations::config_contract::main_port();
 
+    // Bind before anything else starts. One machine has one Quill listener
+    // and one provider contract pointing at it, so a taken port means another
+    // Quill already owns both — the user has to stop it, and nothing below
+    // should run in the meantime.
+    //
+    // Bound to 0.0.0.0 intentionally — remote hosts need to reach this server.
+    let addr = format!("0.0.0.0:{port}");
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            crate::report_fatal_port_conflict(&app_handle, port);
+            return;
+        }
+        Err(error) => {
+            log::error!("Failed to bind token server on {addr}: {error}");
+            return;
+        }
+    };
+
     if let Ok(sessions) = storage.load_pi_recovering_sessions() {
         live_tracker.rehydrate_pi_sessions(sessions);
     }
@@ -249,16 +268,6 @@ pub async fn start_server(
         .route("/api/v1/sessions/facets", get(get_session_facets))
         .with_state(state)
         .merge(pi_track_router(pi_track_state));
-
-    // Bind to 0.0.0.0 intentionally — remote hosts need to reach this server
-    let addr = format!("0.0.0.0:{port}");
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            log::error!("Failed to bind token server on {addr}: {e}");
-            return;
-        }
-    };
 
     log::info!("Token server listening on {addr}");
 
