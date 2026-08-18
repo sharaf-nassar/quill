@@ -100,7 +100,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 45;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 46;
 
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
@@ -112,10 +112,27 @@ const MODEL_SOURCE_PATH_UNIX_PREFIX: &str = "\0quill-source-path-unix-v1:";
 const MODEL_SOURCE_PATH_WINDOWS_PREFIX: &str = "\0quill-source-path-windows-v1:";
 const MODEL_SOURCE_PATH_UNICODE_PREFIX: &str = "\0quill-source-path-unicode-v1:";
 const INDICATOR_PRIMARY_PROVIDER_KEY: &str = "indicator.primary_provider.v1";
-const PI_LIVE_SOURCE_ROOT_KEY: &str = "live:pi";
+const PI_LIVE_SOURCE_ROOT_KEY: &str = "pi:sessions";
+const PI_SOURCE_KEY_PREFIX: &str = "pi:session:v1";
 
+/// Canonical persisted/live Pi owner keyed by normalized host plus session.
+pub(crate) fn pi_source_key(hostname: &str, session_id: &str) -> Result<String, String> {
+    let hostname = crate::live_tracker::normalize_observed_hostname(hostname)
+        .ok_or_else(|| "Pi source hostname is invalid".to_string())?;
+    let session_id = session_id.trim();
+    if session_id.is_empty() || session_id.chars().any(char::is_control) {
+        return Err("Pi source session id is invalid".to_string());
+    }
+    Ok(format!(
+        "{PI_SOURCE_KEY_PREFIX}:{}:{}",
+        crate::hex_encode(hostname.as_bytes()),
+        crate::hex_encode(session_id.as_bytes())
+    ))
+}
+
+// quill-oyie.14 replaces the remaining notify callers with `pi_source_key`.
 pub(crate) fn pi_live_source_key(session_id: &str) -> String {
-    format!("{PI_LIVE_SOURCE_ROOT_KEY}:{session_id}")
+    format!("live:pi:{session_id}")
 }
 
 // @lat: [[backend#Backend#Database#tool_detail payload carve-out]]
@@ -761,6 +778,71 @@ fn evidence_weighted_score(
     let score = wilson_lower_bound(alpha * fresh, beta * fresh);
     let state = compute_state(score, alpha, beta, fresh);
     (score, state)
+}
+
+fn schema_45_backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".schema-45.backup");
+    PathBuf::from(backup)
+}
+
+fn verify_schema_45_backup(path: &Path) -> Result<(), String> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("Open schema-45 backup for verification: {error}"))?;
+    let quick_check = conn
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Verify schema-45 backup integrity: {error}"))?;
+    if quick_check != "ok" {
+        return Err(format!(
+            "Schema-45 backup quick_check failed: {quick_check}"
+        ));
+    }
+    let version = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |row| row.get::<_, i32>(0),
+        )
+        .map_err(|error| format!("Verify schema-45 backup version: {error}"))?;
+    if version != 45 {
+        return Err(format!("Schema-45 backup has schema version {version}"));
+    }
+    Ok(())
+}
+
+fn ensure_schema_45_backup(conn: &Connection, path: &Path) -> Result<PathBuf, String> {
+    let backup = schema_45_backup_path(path);
+    if backup.exists() {
+        if verify_schema_45_backup(&backup).is_ok() {
+            return Ok(backup);
+        }
+        std::fs::remove_file(&backup)
+            .map_err(|error| format!("Remove invalid schema-45 backup: {error}"))?;
+    }
+    let mut temporary = backup.as_os_str().to_os_string();
+    temporary.push(".building");
+    let temporary = PathBuf::from(temporary);
+    if temporary.exists() {
+        std::fs::remove_file(&temporary)
+            .map_err(|error| format!("Remove interrupted schema-45 backup: {error}"))?;
+    }
+
+    conn.execute("VACUUM INTO ?1", params![temporary.to_string_lossy()])
+        .map_err(|error| format!("Create schema-45 SQLite backup: {error}"))?;
+    verify_schema_45_backup(&temporary)?;
+    std::fs::File::open(&temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("Sync schema-45 backup: {error}"))?;
+    std::fs::rename(&temporary, &backup)
+        .map_err(|error| format!("Publish schema-45 backup: {error}"))?;
+    #[cfg(unix)]
+    if let Some(parent) = backup.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("Sync schema-45 backup directory: {error}"))?;
+    }
+    verify_schema_45_backup(&backup)?;
+    Ok(backup)
 }
 
 fn db_path() -> Result<PathBuf, String> {
@@ -5720,6 +5802,32 @@ impl Storage {
             .collect::<Vec<_>>();
         delete_runtime_rollups_for_sources_in_transaction(&tx, &rollup_sources)?;
         for key in &keys {
+            if proof.provider == IntegrationProvider::Pi {
+                tx.execute(
+                    "DELETE FROM token_snapshots
+                     WHERE provider = 'pi'
+                       AND (hostname, session_id) IN (
+                           SELECT normalized_hostname, session_id
+                           FROM pi_session_lifecycle
+                           WHERE provider = 'pi' AND source_key = ?1
+                       )",
+                    params![key],
+                )
+                .map_err(|e| format!("Delete Pi source token snapshots: {e}"))?;
+                for table in [
+                    "model_usage_observations",
+                    "model_usage_hourly",
+                    "model_observation_sources",
+                    "pi_event_receipts",
+                    "pi_session_lifecycle",
+                ] {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE provider='pi' AND source_key=?1"),
+                        params![key],
+                    )
+                    .map_err(|e| format!("Delete Pi {table} source rows: {e}"))?;
+                }
+            }
             for table in [
                 "session_events",
                 "response_times",
@@ -5846,7 +5954,18 @@ impl Storage {
             && snapshot
                 .hook_invocations
                 .iter()
-                .all(|r| r.provider == source.provider && r.source_key == source.source_key);
+                .all(|r| r.provider == source.provider && r.source_key == source.source_key)
+            && snapshot.pi_evidence.as_ref().is_none_or(|evidence| {
+                source.provider == IntegrationProvider::Pi
+                    && evidence.receipts.iter().all(|row| {
+                        row.source_key == source.source_key
+                            && row.session_id == source.analytics_session_id
+                    })
+                    && evidence.lifecycle.as_ref().is_none_or(|row| {
+                        row.source_key == source.source_key
+                            && row.session_id == source.analytics_session_id
+                    })
+            });
         if !owned_ok {
             return Err("Transcript analytics row ownership mismatch".into());
         }
@@ -5870,6 +5989,44 @@ impl Storage {
                 params![source.provider.as_str(), source.source_key],
             )
             .map_err(|e| format!("Delete {table} source rows: {e}"))?;
+        }
+        if snapshot.pi_evidence.is_some() {
+            tx.execute(
+                "DELETE FROM model_usage_observations
+                 WHERE provider = 'pi' AND source_key = ?1",
+                params![source.source_key],
+            )
+            .map_err(|e| format!("Delete Pi model observations: {e}"))?;
+            tx.execute(
+                "DELETE FROM model_usage_hourly
+                 WHERE provider = 'pi' AND source_key = ?1 AND raw_pruned = 0",
+                params![source.source_key],
+            )
+            .map_err(|e| format!("Delete Pi model rollups: {e}"))?;
+            tx.execute(
+                "DELETE FROM model_observation_sources
+                 WHERE provider = 'pi' AND source_key = ?1",
+                params![source.source_key],
+            )
+            .map_err(|e| format!("Delete Pi model source: {e}"))?;
+            tx.execute(
+                "DELETE FROM pi_event_receipts
+                 WHERE provider = 'pi' AND source_key = ?1",
+                params![source.source_key],
+            )
+            .map_err(|e| format!("Delete Pi event receipts: {e}"))?;
+            tx.execute(
+                "DELETE FROM pi_session_lifecycle
+                 WHERE provider = 'pi' AND source_key = ?1",
+                params![source.source_key],
+            )
+            .map_err(|e| format!("Delete Pi persisted lifecycle: {e}"))?;
+            tx.execute(
+                "DELETE FROM token_snapshots
+                 WHERE provider = 'pi' AND session_id = ?1 AND hostname = ?2",
+                params![source.analytics_session_id, source.hostname],
+            )
+            .map_err(|e| format!("Delete Pi token snapshots: {e}"))?;
         }
         // Retention's durability hinges on this one read. The replace above
         // has just deleted every owned row for the source, so an unfiltered
@@ -6017,11 +6174,314 @@ impl Storage {
                 watermark.as_deref(),
             )?;
         insert_owned_skill_usages_in_transaction(&tx, &snapshot.skill_usages)?;
+        if let Some(evidence) = &snapshot.pi_evidence {
+            let accepted_at_ms = Utc::now().timestamp_millis();
+            for receipt in &evidence.receipts {
+                tx.execute(
+                    "INSERT OR IGNORE INTO pi_event_receipts (
+                         provider, normalized_hostname, session_id, event_uuid,
+                         source_key, entry_id, process_instance_id, sequence,
+                         event_kind, occurred_at_ms, accepted_at_ms
+                     ) VALUES ('pi', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        receipt.normalized_hostname,
+                        receipt.session_id,
+                        receipt.event_uuid,
+                        receipt.source_key,
+                        receipt.entry_id,
+                        receipt.process_instance_id,
+                        receipt.sequence,
+                        receipt.event_kind,
+                        receipt.occurred_at_ms,
+                        accepted_at_ms,
+                    ],
+                )
+                .map_err(|e| format!("Insert Pi event receipt: {e}"))?;
+            }
+            if let Some(lifecycle) = &evidence.lifecycle {
+                tx.execute(
+                    "INSERT INTO pi_session_lifecycle (
+                         provider, normalized_hostname, session_id, source_key,
+                         origin_at_ms, process_instance_id, current_sequence,
+                         current_occurrence_id, occurred_at_ms, lifecycle_state,
+                         direct_parent_session_id, visible_root_session_id,
+                         lineage_state, lineage_reason, agent_role,
+                         reporter_protocol, reporter_version, updated_at_ms,
+                         closed_at_ms
+                     ) VALUES (
+                         'pi', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                         ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+                     )",
+                    params![
+                        lifecycle.normalized_hostname,
+                        lifecycle.session_id,
+                        lifecycle.source_key,
+                        lifecycle.origin_at_ms,
+                        lifecycle.process_instance_id,
+                        lifecycle.current_sequence,
+                        lifecycle.current_occurrence_id,
+                        lifecycle.occurred_at_ms,
+                        lifecycle.lifecycle_state,
+                        lifecycle.direct_parent_session_id,
+                        lifecycle.visible_root_session_id,
+                        lifecycle.lineage_state,
+                        lifecycle.lineage_reason,
+                        lifecycle.agent_role,
+                        lifecycle.reporter_protocol,
+                        lifecycle.reporter_version,
+                        accepted_at_ms,
+                        lifecycle.closed_at_ms,
+                    ],
+                )
+                .map_err(|e| format!("Insert Pi persisted lifecycle: {e}"))?;
+                tx.execute(
+                    "INSERT INTO live_analytics_sessions (
+                         provider, session_id, cwd, hostname, updated_at,
+                         ephemeral, lifecycle_at_ms, closed_at_ms
+                     ) VALUES ('pi', ?1, ?2, ?3, ?4, 0, ?5, ?6)
+                     ON CONFLICT(provider, session_id) DO UPDATE SET
+                         cwd = COALESCE(excluded.cwd, live_analytics_sessions.cwd),
+                         hostname = excluded.hostname,
+                         updated_at = excluded.updated_at,
+                         ephemeral = 0,
+                         lifecycle_at_ms = excluded.lifecycle_at_ms,
+                         closed_at_ms = excluded.closed_at_ms
+                     WHERE live_analytics_sessions.lifecycle_at_ms
+                           <= excluded.lifecycle_at_ms",
+                    params![
+                        lifecycle.session_id,
+                        source_cwd,
+                        lifecycle.normalized_hostname,
+                        Utc::now().to_rfc3339(),
+                        lifecycle.occurred_at_ms,
+                        lifecycle.closed_at_ms,
+                    ],
+                )
+                .map_err(|e| format!("Rehydrate Pi persisted lifecycle: {e}"))?;
+            }
+
+            let watermark_ms = watermark
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.timestamp_millis());
+            let retained_usage = evidence
+                .usage
+                .iter()
+                .filter(|row| watermark_ms.is_none_or(|cutoff| row.observed_at_ms >= cutoff))
+                .collect::<Vec<_>>();
+            for row in &retained_usage {
+                tx.execute(
+                    "INSERT OR IGNORE INTO model_usage_observations (
+                         provider, source_key, source_record_key, source_ordinal,
+                         observation_kind, source_session_id,
+                         analytics_session_id, chain_id, turn_id,
+                         raw_model_id, derived_model_id, cwd, hostname,
+                         is_sidechain, observed_at_ms, input_tokens,
+                         output_tokens, cache_creation_tokens,
+                         cache_read_tokens, model_evidence, token_evidence,
+                         event_uuid, input_cost, output_cost, cache_read_cost,
+                         cache_write_cost, total_cost
+                     ) VALUES (
+                         'pi', ?1, ?2, ?3, 'turn', ?4, ?4, ?4, ?5,
+                         ?6, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13,
+                         'explicit', 'direct', ?5, ?14, ?15, ?16, ?17, ?18
+                     )",
+                    params![
+                        source.source_key,
+                        row.source_record_key,
+                        row.source_ordinal,
+                        source.source_session_id,
+                        row.turn_id,
+                        row.model_id,
+                        source_cwd,
+                        source.hostname,
+                        row.observed_at_ms,
+                        row.input_tokens,
+                        row.output_tokens,
+                        row.cache_creation_tokens,
+                        row.cache_read_tokens,
+                        row.input_cost,
+                        row.output_cost,
+                        row.cache_read_cost,
+                        row.cache_write_cost,
+                        row.total_cost,
+                    ],
+                )
+                .map_err(|e| format!("Insert persisted Pi usage: {e}"))?;
+                tx.execute(
+                    "INSERT INTO token_snapshots (
+                         provider, session_id, hostname, timestamp,
+                         input_tokens, output_tokens,
+                         cache_creation_input_tokens,
+                         cache_read_input_tokens, cwd, is_sidechain,
+                         agent_id, parent_uuid
+                     ) VALUES ('pi', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, NULL)",
+                    params![
+                        source.analytics_session_id,
+                        source.hostname,
+                        row.timestamp,
+                        row.input_tokens,
+                        row.output_tokens,
+                        row.cache_creation_tokens,
+                        row.cache_read_tokens,
+                        source_cwd,
+                    ],
+                )
+                .map_err(|e| format!("Insert persisted Pi token snapshot: {e}"))?;
+                tx.execute(
+                    "INSERT INTO model_usage_hourly (
+                         hour_utc, provider, derived_model_id, source_key,
+                         analytics_session_id, obs_count, turn_count,
+                         token_count, sidechain_count, input_tokens,
+                         input_tokens_present, output_tokens,
+                         output_tokens_present, cache_creation_tokens,
+                         cache_creation_tokens_present, cache_read_tokens,
+                         cache_read_tokens_present, first_observed_at_ms,
+                         last_observed_at_ms, raw_pruned
+                     ) VALUES (
+                         (?1 / ?9) * ?9, 'pi', ?2, ?3, ?4, 1, 1, 0, 0,
+                         ?5, 1, ?6, 1, ?7, 1, ?8, 1, ?1, ?1, 0
+                     )
+                     ON CONFLICT(hour_utc, provider, derived_model_id, source_key)
+                     DO UPDATE SET
+                         obs_count = model_usage_hourly.obs_count + 1,
+                         turn_count = model_usage_hourly.turn_count + 1,
+                         input_tokens = model_usage_hourly.input_tokens + excluded.input_tokens,
+                         input_tokens_present = model_usage_hourly.input_tokens_present + 1,
+                         output_tokens = model_usage_hourly.output_tokens + excluded.output_tokens,
+                         output_tokens_present = model_usage_hourly.output_tokens_present + 1,
+                         cache_creation_tokens = model_usage_hourly.cache_creation_tokens
+                             + excluded.cache_creation_tokens,
+                         cache_creation_tokens_present =
+                             model_usage_hourly.cache_creation_tokens_present + 1,
+                         cache_read_tokens = model_usage_hourly.cache_read_tokens
+                             + excluded.cache_read_tokens,
+                         cache_read_tokens_present =
+                             model_usage_hourly.cache_read_tokens_present + 1,
+                         first_observed_at_ms = MIN(
+                             model_usage_hourly.first_observed_at_ms,
+                             excluded.first_observed_at_ms
+                         ),
+                         last_observed_at_ms = MAX(
+                             model_usage_hourly.last_observed_at_ms,
+                             excluded.last_observed_at_ms
+                         )
+                     WHERE model_usage_hourly.raw_pruned = 0",
+                    params![
+                        row.observed_at_ms,
+                        row.model_id,
+                        source.source_key,
+                        source.analytics_session_id,
+                        row.input_tokens,
+                        row.output_tokens,
+                        row.cache_creation_tokens,
+                        row.cache_read_tokens,
+                        MODEL_ROLLUP_HOUR_MS,
+                    ],
+                )
+                .map_err(|e| format!("Fold persisted Pi usage: {e}"))?;
+            }
+            let first_activity = retained_usage.iter().map(|row| row.observed_at_ms).min();
+            let last_activity = retained_usage.iter().map(|row| row.observed_at_ms).max();
+            tx.execute(
+                "INSERT INTO model_observation_sources (
+                     provider, source_key, source_root_key, source_path,
+                     source_session_id, analytics_session_id, chain_id,
+                     is_sidechain, cwd, hostname, first_activity_at_ms,
+                     last_activity_at_ms, mtime_ns, size_bytes,
+                     content_sha256, seen_generation, processing_status,
+                     observation_count, last_attempt_at_ms, last_success_at_ms
+                 ) VALUES (
+                     'pi', ?1, ?2, ?3, ?4, ?4, ?4, 0, ?5, ?6, ?7,
+                     ?8, ?9, ?10, ?11, ?12, 'ok', ?13, ?14, ?14
+                 )",
+                params![
+                    source.source_key,
+                    source.source_root_key,
+                    source.source_path.to_string_lossy(),
+                    source.source_session_id,
+                    source_cwd,
+                    source.hostname,
+                    first_activity,
+                    last_activity,
+                    source.mtime_ns,
+                    source.size_bytes,
+                    source.content_sha256,
+                    source.seen_generation,
+                    i64::try_from(retained_usage.len()).unwrap_or(i64::MAX),
+                    accepted_at_ms,
+                ],
+            )
+            .map_err(|e| format!("Register persisted Pi model source: {e}"))?;
+            if !retained_usage.is_empty() {
+                bump_rollup_generation_in_transaction(&tx)?;
+                bump_model_data_revision(&tx)?;
+            }
+        }
         if fold_runtime_rollup {
             refold_runtime_source(&tx, source)?;
         }
-        let registry_updated = tx.execute("INSERT INTO transcript_analytics_sources (provider,source_key,source_root_key,source_path,source_session_id,analytics_session_id,chain_id,parent_chain_id,agent_id,is_sidechain,project,cwd,hostname,mtime_ns,size_bytes,content_sha256,seen_generation,processing_status,last_attempt_at_ms,last_success_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,'ok',?18,?18) ON CONFLICT(provider,source_key) DO UPDATE SET source_root_key=excluded.source_root_key,source_path=excluded.source_path,source_session_id=excluded.source_session_id,analytics_session_id=excluded.analytics_session_id,chain_id=excluded.chain_id,parent_chain_id=excluded.parent_chain_id,agent_id=excluded.agent_id,is_sidechain=excluded.is_sidechain,project=excluded.project,cwd=excluded.cwd,hostname=excluded.hostname,mtime_ns=excluded.mtime_ns,size_bytes=excluded.size_bytes,content_sha256=excluded.content_sha256,seen_generation=excluded.seen_generation,processing_status='ok',last_attempt_at_ms=excluded.last_attempt_at_ms,last_success_at_ms=excluded.last_success_at_ms,suppressed_sha256=NULL,suppressed_at_ms=NULL,last_error=NULL WHERE transcript_analytics_sources.seen_generation <= excluded.seen_generation",
-             params![source.provider.as_str(),source.source_key,source.source_root_key,source.source_path.to_string_lossy(),source.source_session_id,source.analytics_session_id,source.chain_id,source.parent_chain_id,source.agent_id,i64::from(source.is_sidechain),source_project,source_cwd,source.hostname,source.mtime_ns,source.size_bytes,source.content_sha256,seen_generation,chrono::Utc::now().timestamp_millis()]).map_err(|e| format!("Upsert transcript source registry: {e}"))?;
+        let registry_updated = tx
+            .execute(
+                "INSERT INTO transcript_analytics_sources (
+                     provider, source_key, source_root_key, source_path,
+                     source_session_id, analytics_session_id, chain_id,
+                     parent_chain_id, agent_id, is_sidechain, project, cwd,
+                     hostname, mtime_ns, size_bytes, content_sha256,
+                     seen_generation, processing_status, last_attempt_at_ms,
+                     last_success_at_ms, source_kind
+                 ) VALUES (
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     ?12, ?13, ?14, ?15, ?16, ?17, 'ok', ?18, ?18,
+                     'transcript'
+                 )
+                 ON CONFLICT(provider, source_key) DO UPDATE SET
+                     source_root_key = excluded.source_root_key,
+                     source_path = excluded.source_path,
+                     source_session_id = excluded.source_session_id,
+                     analytics_session_id = excluded.analytics_session_id,
+                     chain_id = excluded.chain_id,
+                     parent_chain_id = excluded.parent_chain_id,
+                     agent_id = excluded.agent_id,
+                     is_sidechain = excluded.is_sidechain,
+                     project = excluded.project,
+                     cwd = excluded.cwd,
+                     hostname = excluded.hostname,
+                     mtime_ns = excluded.mtime_ns,
+                     size_bytes = excluded.size_bytes,
+                     content_sha256 = excluded.content_sha256,
+                     seen_generation = excluded.seen_generation,
+                     processing_status = 'ok',
+                     last_attempt_at_ms = excluded.last_attempt_at_ms,
+                     last_success_at_ms = excluded.last_success_at_ms,
+                     source_kind = 'transcript',
+                     suppressed_sha256 = NULL,
+                     suppressed_at_ms = NULL,
+                     last_error = NULL
+                 WHERE transcript_analytics_sources.seen_generation
+                       <= excluded.seen_generation",
+                params![
+                    source.provider.as_str(),
+                    source.source_key,
+                    source.source_root_key,
+                    source.source_path.to_string_lossy(),
+                    source.source_session_id,
+                    source.analytics_session_id,
+                    source.chain_id,
+                    source.parent_chain_id,
+                    source.agent_id,
+                    i64::from(source.is_sidechain),
+                    source_project,
+                    source_cwd,
+                    source.hostname,
+                    source.mtime_ns,
+                    source.size_bytes,
+                    source.content_sha256,
+                    seen_generation,
+                    chrono::Utc::now().timestamp_millis(),
+                ],
+            )
+            .map_err(|e| format!("Upsert transcript source registry: {e}"))?;
         if registry_updated != 1 {
             return Err("Transcript analytics generation advanced during replacement".into());
         }
@@ -6235,6 +6695,7 @@ impl Storage {
                 "SCHEMA_TOO_NEW: database schema version {current_version} was created by a newer version of Quill (this build supports up to {MAX_SUPPORTED_SCHEMA_VERSION}). Upgrade Quill to open it."
             ));
         }
+        let requires_schema_45_backup = (1..46).contains(&current_version);
 
         // Migration 1: add cwd column to token_snapshots
         if current_version < 1 {
@@ -8796,6 +9257,323 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 45: {e}"))?;
             tx.commit()
                 .map_err(|e| format!("Migration 45 commit: {e}"))?;
+        }
+
+        // Migration 46 moves Pi evidence to host-qualified source ownership
+        // and adds persisted lifecycle/receipt/health state. Databases that
+        // existed before this open are first advanced to schema 45, then
+        // backed up here so no migration-46 DDL can precede the verified copy.
+        if requires_schema_45_backup {
+            ensure_schema_45_backup(&conn, &path)?;
+        }
+        if current_version < 46 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 46 transaction: {e}"))?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pi_session_lifecycle (
+                     provider                 TEXT NOT NULL DEFAULT 'pi',
+                     normalized_hostname      TEXT NOT NULL,
+                     session_id               TEXT NOT NULL,
+                     source_key               TEXT NOT NULL,
+                     origin_at_ms             INTEGER NOT NULL,
+                     process_instance_id      TEXT NOT NULL,
+                     current_sequence         INTEGER NOT NULL,
+                     current_occurrence_id    TEXT NOT NULL,
+                     occurred_at_ms           INTEGER NOT NULL,
+                     lifecycle_state          TEXT NOT NULL,
+                     direct_parent_session_id TEXT,
+                     visible_root_session_id  TEXT,
+                     lineage_state            TEXT NOT NULL,
+                     lineage_reason           TEXT,
+                     agent_role               TEXT,
+                     reporter_protocol        INTEGER NOT NULL,
+                     reporter_version         TEXT NOT NULL,
+                     updated_at_ms             INTEGER NOT NULL,
+                     closed_at_ms              INTEGER,
+                     PRIMARY KEY(provider, normalized_hostname, session_id),
+                     UNIQUE(provider, source_key),
+                     CHECK(provider = 'pi'),
+                     CHECK(length(normalized_hostname) > 0),
+                     CHECK(length(session_id) > 0),
+                     CHECK(length(source_key) > 0),
+                     CHECK(origin_at_ms >= 0),
+                     CHECK(length(process_instance_id) > 0),
+                     CHECK(current_sequence >= 0),
+                     CHECK(length(current_occurrence_id) > 0),
+                     CHECK(occurred_at_ms >= 0),
+                     CHECK(lifecycle_state IN ('open', 'closed', 'recovering')),
+                     CHECK(lineage_state IN ('root', 'linked', 'agent', 'unresolved')),
+                     CHECK(reporter_protocol >= 0),
+                     CHECK(updated_at_ms >= 0),
+                     CHECK(closed_at_ms IS NULL OR closed_at_ms >= 0)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_pi_lifecycle_state
+                     ON pi_session_lifecycle(lifecycle_state, occurred_at_ms);
+                 CREATE INDEX IF NOT EXISTS idx_pi_lifecycle_parent
+                     ON pi_session_lifecycle(
+                         normalized_hostname, direct_parent_session_id
+                     );
+
+                 CREATE TABLE IF NOT EXISTS pi_event_receipts (
+                     provider            TEXT NOT NULL DEFAULT 'pi',
+                     normalized_hostname TEXT NOT NULL,
+                     session_id          TEXT NOT NULL,
+                     event_uuid          TEXT NOT NULL,
+                     source_key          TEXT NOT NULL,
+                     entry_id            TEXT NOT NULL,
+                     process_instance_id TEXT NOT NULL,
+                     sequence            INTEGER NOT NULL,
+                     event_kind          TEXT NOT NULL,
+                     occurred_at_ms       INTEGER NOT NULL,
+                     accepted_at_ms       INTEGER NOT NULL,
+                     PRIMARY KEY(
+                         provider, normalized_hostname, session_id, event_uuid
+                     ),
+                     CHECK(provider = 'pi'),
+                     CHECK(length(source_key) > 0),
+                     CHECK(length(entry_id) > 0),
+                     CHECK(length(process_instance_id) > 0),
+                     CHECK(sequence >= 0),
+                     CHECK(event_kind IN ('session_start', 'session_end', 'lineage')),
+                     CHECK(occurred_at_ms >= 0),
+                     CHECK(accepted_at_ms >= 0)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_pi_receipts_source
+                     ON pi_event_receipts(provider, source_key);
+
+                 CREATE TABLE IF NOT EXISTS pi_reporter_health (
+                     normalized_hostname TEXT NOT NULL,
+                     process_instance_id TEXT NOT NULL,
+                     install_channel     TEXT NOT NULL,
+                     reporter_protocol   INTEGER NOT NULL,
+                     reporter_version    TEXT NOT NULL,
+                     quill_build         TEXT NOT NULL,
+                     capability_digest   TEXT NOT NULL,
+                     last_handshake_ms   INTEGER,
+                     last_acceptance_ms  INTEGER,
+                     last_heartbeat_ms   INTEGER,
+                     connection_state    TEXT NOT NULL,
+                     compatibility_state TEXT NOT NULL,
+                     lifecycle_state     TEXT NOT NULL,
+                     child_ack_state     TEXT NOT NULL,
+                     source_state        TEXT NOT NULL,
+                     transport_state     TEXT NOT NULL,
+                     latest_code         TEXT,
+                     affected_sessions   INTEGER NOT NULL DEFAULT 0,
+                     recovered_at_ms     INTEGER,
+                     resolved_at_ms      INTEGER,
+                     PRIMARY KEY(
+                         normalized_hostname, process_instance_id,
+                         install_channel
+                     ),
+                     CHECK(reporter_protocol >= 0),
+                     CHECK(affected_sessions >= 0),
+                     CHECK(last_handshake_ms IS NULL OR last_handshake_ms >= 0),
+                     CHECK(last_acceptance_ms IS NULL OR last_acceptance_ms >= 0),
+                     CHECK(last_heartbeat_ms IS NULL OR last_heartbeat_ms >= 0),
+                     CHECK(recovered_at_ms IS NULL OR recovered_at_ms >= 0),
+                     CHECK(resolved_at_ms IS NULL OR resolved_at_ms >= 0)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_pi_reporter_health_active
+                     ON pi_reporter_health(normalized_hostname, last_heartbeat_ms);",
+            )
+            .map_err(|e| format!("Migration 46 (Pi ownership tables): {e}"))?;
+
+            let live_sessions = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT session_id, COALESCE(NULLIF(hostname, ''), 'unknown'),
+                                cwd, lifecycle_at_ms, closed_at_ms
+                         FROM live_analytics_sessions
+                         WHERE provider = 'pi'",
+                    )
+                    .map_err(|e| format!("Migration 46 (prepare Pi live sessions): {e}"))?;
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                        ))
+                    })
+                    .map_err(|e| format!("Migration 46 (query Pi live sessions): {e}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Migration 46 (read Pi live sessions): {e}"))?
+            };
+            let mut identities = BTreeMap::<String, String>::new();
+            for (session_id, hostname, _, _, _) in &live_sessions {
+                identities.insert(session_id.clone(), hostname.clone());
+            }
+            for table in ["transcript_analytics_sources", "model_observation_sources"] {
+                let mut statement = tx
+                    .prepare(&format!(
+                        "SELECT analytics_session_id,
+                                COALESCE(NULLIF(hostname, ''), 'unknown')
+                         FROM {table}
+                         WHERE provider = 'pi' AND analytics_session_id IS NOT NULL"
+                    ))
+                    .map_err(|e| format!("Migration 46 (prepare {table} identities): {e}"))?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| format!("Migration 46 (query {table} identities): {e}"))?;
+                for row in rows {
+                    let (session_id, hostname) =
+                        row.map_err(|e| format!("Migration 46 (read {table} identity): {e}"))?;
+                    identities.entry(session_id).or_insert(hostname);
+                }
+            }
+
+            for (session_id, hostname) in &identities {
+                let normalized_hostname =
+                    crate::live_tracker::normalize_observed_hostname(hostname)
+                        .unwrap_or_else(|| "unknown".to_string());
+                let source_key = pi_source_key(&normalized_hostname, session_id)?;
+                let legacy_key = format!("live:pi:{session_id}");
+                for table in [
+                    "session_events",
+                    "response_times",
+                    "tool_actions",
+                    "skill_usages",
+                    "hook_invocations",
+                    "retention_daily_aggregates",
+                    "runtime_hourly",
+                    "runtime_turn_state",
+                    "model_usage_observations",
+                    "model_usage_hourly",
+                ] {
+                    tx.execute(
+                        &format!(
+                            "UPDATE {table} SET source_key = ?1
+                             WHERE provider = 'pi' AND source_key = ?2"
+                        ),
+                        params![source_key, legacy_key],
+                    )
+                    .map_err(|e| format!("Migration 46 (move {table} Pi owner): {e}"))?;
+                }
+                tx.execute(
+                    "UPDATE transcript_analytics_sources
+                     SET source_key = ?1, source_root_key = ?2,
+                         processing_status = 'stale', hostname = ?3
+                     WHERE provider = 'pi' AND source_key = ?4",
+                    params![
+                        source_key,
+                        PI_LIVE_SOURCE_ROOT_KEY,
+                        normalized_hostname,
+                        legacy_key
+                    ],
+                )
+                .map_err(|e| format!("Migration 46 (move Pi runtime source): {e}"))?;
+                tx.execute(
+                    "UPDATE model_observation_sources
+                     SET source_key = ?1, source_root_key = ?2,
+                         processing_status = 'stale', hostname = ?3
+                     WHERE provider = 'pi' AND source_key = ?4",
+                    params![
+                        source_key,
+                        PI_LIVE_SOURCE_ROOT_KEY,
+                        normalized_hostname,
+                        legacy_key
+                    ],
+                )
+                .map_err(|e| format!("Migration 46 (move Pi model source): {e}"))?;
+                tx.execute(
+                    "UPDATE live_analytics_sessions SET hostname = ?2
+                     WHERE provider = 'pi' AND session_id = ?1",
+                    params![session_id, normalized_hostname],
+                )
+                .map_err(|e| format!("Migration 46 (normalize Pi live host): {e}"))?;
+                for table in [
+                    "model_usage_observations",
+                    "model_observation_sources",
+                    "token_snapshots",
+                    "skill_usages",
+                    "hook_invocations",
+                ] {
+                    let identity = if table == "model_usage_observations"
+                        || table == "model_observation_sources"
+                    {
+                        "analytics_session_id"
+                    } else {
+                        "session_id"
+                    };
+                    tx.execute(
+                        &format!(
+                            "UPDATE {table} SET hostname = ?2
+                             WHERE provider = 'pi' AND {identity} = ?1"
+                        ),
+                        params![session_id, normalized_hostname],
+                    )
+                    .map_err(|e| format!("Migration 46 (normalize {table} Pi host): {e}"))?;
+                }
+            }
+
+            tx.execute_batch(
+                "DROP INDEX IF EXISTS uidx_model_observations_pi_event_uuid;
+                 CREATE UNIQUE INDEX uidx_model_observations_pi_event_uuid
+                 ON model_usage_observations(
+                     hostname, analytics_session_id, event_uuid
+                 )
+                 WHERE provider = 'pi' AND event_uuid IS NOT NULL;",
+            )
+            .map_err(|e| format!("Migration 46 (host-qualify Pi usage identity): {e}"))?;
+
+            let migrated_at_ms = Utc::now().timestamp_millis();
+            for (session_id, hostname, _, lifecycle_at_ms, closed_at_ms) in live_sessions {
+                let normalized_hostname =
+                    crate::live_tracker::normalize_observed_hostname(&hostname)
+                        .unwrap_or_else(|| "unknown".to_string());
+                let source_key = pi_source_key(&normalized_hostname, &session_id)?;
+                let suffix = crate::hex_encode(session_id.as_bytes());
+                tx.execute(
+                    "INSERT OR IGNORE INTO pi_session_lifecycle (
+                         provider, normalized_hostname, session_id, source_key,
+                         origin_at_ms, process_instance_id, current_sequence,
+                         current_occurrence_id, occurred_at_ms, lifecycle_state,
+                         lineage_state, lineage_reason, reporter_protocol,
+                         reporter_version, updated_at_ms, closed_at_ms
+                     ) VALUES (
+                         'pi', ?1, ?2, ?3, ?4, ?5, 0, ?6, ?4, ?7,
+                         'unresolved', 'pre_schema_46', 1, 'legacy', ?8, ?9
+                     )",
+                    params![
+                        normalized_hostname,
+                        session_id,
+                        source_key,
+                        lifecycle_at_ms,
+                        format!("legacy-v45-{suffix}"),
+                        format!("legacy-v45-{suffix}"),
+                        if closed_at_ms.is_some() {
+                            "closed"
+                        } else {
+                            "recovering"
+                        },
+                        migrated_at_ms,
+                        closed_at_ms,
+                    ],
+                )
+                .map_err(|e| format!("Migration 46 (seed Pi lifecycle): {e}"))?;
+            }
+
+            for (key, value) in [
+                ("transcript_analytics_reingest_pending", "1"),
+                ("pi_persisted_source_reconciliation_pending", "1"),
+                ("pi_spool_cleanup_pending", "1"),
+            ] {
+                tx.execute(
+                    "INSERT OR REPLACE INTO settings(key, value) VALUES (?1, ?2)",
+                    params![key, value],
+                )
+                .map_err(|e| format!("Migration 46 (set {key}): {e}"))?;
+            }
+            tx.execute("INSERT INTO schema_version (version) VALUES (46)", [])
+                .map_err(|e| format!("Failed to record migration 46: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 46 commit: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -14792,8 +15570,19 @@ impl Storage {
         session_id: &str,
         closed_at_ms: i64,
     ) -> Result<(), String> {
-        let source_key = pi_live_source_key(session_id);
         let mut conn = self.conn.lock().unwrap();
+        let hostname = conn
+            .query_row(
+                "SELECT hostname FROM live_analytics_sessions
+                 WHERE provider = 'pi' AND session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Read Pi live source hostname: {error}"))?
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string());
+        let source_key = pi_source_key(&hostname, session_id)?;
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin Pi live source close: {error}"))?;
@@ -14906,7 +15695,7 @@ impl Storage {
             return Err("Invalid pushed Pi usage cost".to_string());
         }
 
-        let source_key = pi_live_source_key(&event.session_id);
+        let source_key = pi_source_key(hostname, &event.session_id)?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
@@ -14927,7 +15716,7 @@ impl Storage {
                  last_activity_at_ms, seen_generation, processing_status,
                  observation_count, last_attempt_at_ms, last_success_at_ms
              ) VALUES (
-                 'pi', ?1, 'live:pi', ?1, ?2, ?2, ?2, 0,
+                 'pi', ?1, 'pi:sessions', ?1, ?2, ?2, ?2, 0,
                  (SELECT cwd FROM live_analytics_sessions
                   WHERE provider = 'pi' AND session_id = ?2),
                  ?3, ?4, ?4, 0, 'ok', 0, ?4, ?4
@@ -15094,17 +15883,14 @@ impl Storage {
 
     /// Replace Pi's transcript-derived tool rows for one notified session.
     ///
-    /// Pi never enters retained transcript analytics, so the snapshot writer
-    /// that owns `tool_actions` and `skill_usages` for Claude and Codex never
-    /// runs for it, and the code-stats queries behind lines-changed saw no Pi
-    /// rows at all. The notify parse already builds both row sets through the
-    /// same extractor those providers use, and re-reads the whole transcript
-    /// each time, so replacing exactly this source's two tables is the
-    /// idempotent equivalent of one snapshot commit.
+    /// Notify uses this narrow replacement as a search-independent fast path;
+    /// persisted reconciliation later replaces the same rows through the full
+    /// source snapshot. Both paths share the canonical source key and builders,
+    /// so either order is idempotent.
     ///
-    /// `session_events` and `response_times` are deliberately untouched. They
-    /// share this `source_key` but are owned by the pushed live path, which
-    /// sees ephemeral sessions and in-flight turns no transcript restates.
+    /// Runtime, lifecycle, receipt, token, and model tables are deliberately
+    /// untouched here; the shared source coordinator owns their complete
+    /// persisted replacement.
     pub(crate) fn replace_pi_transcript_tool_rows(
         &self,
         source_key: &str,
@@ -18485,8 +19271,9 @@ impl Storage {
             return Err("Live hook invocation identity is incomplete".to_string());
         }
 
-        let source_key =
-            (provider == IntegrationProvider::Pi).then(|| pi_live_source_key(session_id));
+        let source_key = (provider == IntegrationProvider::Pi)
+            .then(|| pi_source_key(origin.hostname.unwrap_or("unknown"), session_id))
+            .transpose()?;
 
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
@@ -18529,7 +19316,7 @@ impl Storage {
                      processing_status, last_attempt_at_ms,
                      last_success_at_ms, source_kind
                  ) VALUES (
-                     'pi', ?1, 'live:pi', ?1, ?2, ?2, ?2, 0,
+                     'pi', ?1, 'pi:sessions', ?1, ?2, ?2, ?2, 0,
                      ?3, ?4, ?5, 0, 'ok', ?6, ?6, 'live'
                  )
                  ON CONFLICT(provider, source_key) DO UPDATE SET
@@ -20487,7 +21274,178 @@ mod tests {
             // a deleted temp directory.
             std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
             std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
+            std::env::remove_var("QUILL_PI_SESSIONS_DIR");
         }
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Canonical Source Identity]]
+    #[test]
+    fn pi_source_keys_are_host_qualified_and_unambiguous() {
+        assert_eq!(
+            pi_source_key("HOST", "session").expect("normalized Pi source"),
+            pi_source_key("host", "session").expect("canonical Pi source")
+        );
+        assert_ne!(
+            pi_source_key("host-a", "session").expect("first host source"),
+            pi_source_key("host-b", "session").expect("second host source")
+        );
+        assert_ne!(
+            pi_source_key("a:b", "c").expect("colon host source"),
+            pi_source_key("a", "b:c").expect("colon session source")
+        );
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Schema 45 Backup And Ownership Migration]]
+    #[test]
+    #[serial]
+    fn pi_schema_45_backup_precedes_migration_46() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let db = dir.path().join("usage.db");
+        let storage = Storage::init_at(db.clone(), false).expect("create current database");
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE pi_event_receipts;
+                 DROP TABLE pi_session_lifecycle;
+                 DROP TABLE pi_reporter_health;
+                 DROP INDEX uidx_model_observations_pi_event_uuid;
+                 CREATE UNIQUE INDEX uidx_model_observations_pi_event_uuid
+                 ON model_usage_observations(analytics_session_id, event_uuid)
+                 WHERE provider = 'pi' AND event_uuid IS NOT NULL;
+                 DELETE FROM schema_version WHERE version = 46;
+                 DELETE FROM settings WHERE key IN (
+                     'pi_persisted_source_reconciliation_pending',
+                     'pi_spool_cleanup_pending'
+                 );
+                 INSERT OR REPLACE INTO settings(key, value)
+                 VALUES ('pi_backup_main_probe', 'main');
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA wal_autocheckpoint=0;",
+            )
+            .expect("rewind fixture to schema 45");
+        }
+
+        // Pin a reader to the checkpointed schema-45 image, then commit another
+        // setting into WAL. VACUUM INTO must include both database and WAL state.
+        let reader = Connection::open(&db).expect("open schema-45 reader");
+        reader.execute_batch("BEGIN").expect("begin pinned reader");
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'pi_backup_main_probe'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("pin schema-45 reader"),
+            "main"
+        );
+        storage
+            .set_setting("pi_backup_wal_probe", "wal")
+            .expect("seed WAL backup probe");
+        let wal = PathBuf::from(format!("{}-wal", db.display()));
+        assert!(std::fs::metadata(&wal).expect("schema-45 WAL exists").len() > 0);
+        drop(storage);
+
+        let backup = schema_45_backup_path(&db);
+        let building = PathBuf::from(format!("{}.building", backup.display()));
+        std::fs::write(&building, b"interrupted backup").expect("seed interrupted backup");
+        let migrated = Storage::init_at(db.clone(), false).expect("migrate schema 45");
+        assert!(!building.exists());
+        assert_eq!(
+            migrated
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                    [],
+                    |row| row.get::<_, i32>(0),
+                )
+                .expect("read migrated schema"),
+            46
+        );
+        drop(migrated);
+        let reopened = Storage::init_at(db.clone(), false).expect("reopen migrated database");
+        assert_eq!(
+            reopened
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_version WHERE version = 46",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count migration 46 records"),
+            1,
+            "a second open must not re-enter migration 46"
+        );
+        drop(reopened);
+        reader
+            .execute_batch("ROLLBACK")
+            .expect("release pinned reader");
+        drop(reader);
+
+        let backup_conn = Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open schema-45 backup");
+        for (key, expected) in [
+            ("pi_backup_main_probe", "main"),
+            ("pi_backup_wal_probe", "wal"),
+        ] {
+            assert_eq!(
+                backup_conn
+                    .query_row(
+                        "SELECT value FROM settings WHERE key = ?1",
+                        params![key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .expect("read backup probe"),
+                expected
+            );
+        }
+        assert_eq!(
+            backup_conn
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                    [],
+                    |row| row.get::<_, i32>(0),
+                )
+                .expect("read backup schema"),
+            45
+        );
+        assert!(
+            backup_conn
+                .prepare("SELECT 1 FROM pi_session_lifecycle")
+                .is_err()
+        );
+        drop(backup_conn);
+
+        // Simulate the documented restore checkpoint: replacing the database
+        // with the published backup must rerun migration 46 successfully while
+        // preserving the already verified backup for another rollback.
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", db.display()));
+            if path.exists() {
+                std::fs::remove_file(path).expect("remove migrated database artifact");
+            }
+        }
+        std::fs::copy(&backup, &db).expect("restore schema-45 backup");
+        let resumed = Storage::init_at(db, false).expect("resume migration after restore");
+        assert_eq!(
+            resumed
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                    [],
+                    |row| row.get::<_, i32>(0),
+                )
+                .expect("read resumed schema"),
+            46
+        );
+        clear_env();
     }
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Ephemeral Persistence]]
@@ -25464,7 +26422,10 @@ mod tests {
                         open_turn_started_ms
                  FROM runtime_turn_state_v45;
                  DROP TABLE runtime_turn_state_v45;
-                 DELETE FROM schema_version WHERE version IN (43, 44, 45);",
+                 DROP TABLE pi_event_receipts;
+                 DROP TABLE pi_session_lifecycle;
+                 DROP TABLE pi_reporter_health;
+                 DELETE FROM schema_version WHERE version IN (43, 44, 45, 46);",
             )
             .expect("rewind database to schema 42");
         }
@@ -25479,7 +26440,7 @@ mod tests {
                 |row| row.get::<_, i32>(0),
             )
             .expect("read schema version"),
-            45
+            46
         );
         for column in [
             "event_uuid",
@@ -25608,7 +26569,10 @@ mod tests {
                      source_root_key = 'pi-push:legacy-live',
                      source_path = 'pi-push:legacy-live'
                  WHERE provider = 'pi' AND analytics_session_id = 'legacy-live';
-                 DELETE FROM schema_version WHERE version IN (44, 45);
+                 DELETE FROM schema_version WHERE version IN (44, 45, 46);
+                 DROP TABLE pi_event_receipts;
+                 DROP TABLE pi_session_lifecycle;
+                 DROP TABLE pi_reporter_health;
                  ALTER TABLE transcript_analytics_sources DROP COLUMN source_kind;
                  ALTER TABLE live_analytics_sessions DROP COLUMN closed_at_ms;
                  ALTER TABLE live_analytics_sessions DROP COLUMN lifecycle_at_ms;
@@ -25642,7 +26606,7 @@ mod tests {
                     |row| row.get::<_, i32>(0),
                 )
                 .expect("read migrated version"),
-                45
+                46
             );
             assert_eq!(
                 conn.query_row(
@@ -25664,7 +26628,8 @@ mod tests {
                 )
                 .expect("read migrated runtime identity"),
                 (
-                    "live:pi:legacy-live".to_string(),
+                    pi_source_key("legacy-host", "legacy-live")
+                        .expect("canonical legacy Pi source"),
                     "runtime-assistant:0".to_string(),
                     "legacy-live".to_string(),
                     stamps[1].to_string(),
@@ -25701,7 +26666,8 @@ mod tests {
                 )
                 .expect("read migrated usage identity"),
                 (
-                    "live:pi:legacy-live".to_string(),
+                    pi_source_key("legacy-host", "legacy-live")
+                        .expect("canonical legacy Pi source"),
                     "legacy-usage-event".to_string(),
                     0,
                     "legacy-usage-event".to_string(),
@@ -25739,9 +26705,11 @@ mod tests {
                 conn.query_row(
                     "SELECT open_turn_started_ms IS NULL
                      FROM runtime_turn_state
-                     WHERE provider = 'pi'
-                       AND source_key = 'live:pi:legacy-live'",
-                    [],
+                     WHERE provider = 'pi' AND source_key = ?1",
+                    params![
+                        pi_source_key("legacy-host", "legacy-live")
+                            .expect("canonical legacy Pi source")
+                    ],
                     |row| row.get::<_, bool>(0),
                 )
                 .expect("read migrated closed runtime state"),
@@ -25819,7 +26787,7 @@ mod tests {
             row,
             (
                 "event-1".into(),
-                "live:pi:session-1".into(),
+                pi_source_key("host", "session-1").expect("canonical Pi source"),
                 "anthropic/claude-sonnet-4-5".into(),
                 10,
                 20,
@@ -25994,6 +26962,23 @@ mod tests {
                         "{lifecycle} {table} must be pruned"
                     );
                 }
+                let source_key =
+                    pi_source_key("host", &session_id).expect("canonical retained Pi source key");
+                for owner in ["transcript_analytics_sources", "model_observation_sources"] {
+                    assert_eq!(
+                        conn.query_row(
+                            &format!(
+                                "SELECT COUNT(*) FROM {owner}
+                                 WHERE provider = 'pi' AND source_key = ?1"
+                            ),
+                            params![source_key],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .expect("count retained Pi owner"),
+                        1,
+                        "retention must preserve the canonical {owner} owner"
+                    );
+                }
             }
 
             store_pi_runtime_batch(&storage, &session_id, "old", &old_times);
@@ -26155,9 +27140,9 @@ mod tests {
                    ON state.provider = event.provider
                   AND state.source_key = event.source_key
                  WHERE event.provider = 'pi'
-                   AND event.source_key = 'live:pi:pi-sequential'
+                   AND event.source_key = ?1
                    AND event.rowid > state.finalized_through_rowid",
-                [],
+                params![pi_source_key("host", "pi-sequential").expect("canonical Pi source")],
                 |row| row.get::<_, i64>(0),
             )
             .expect("count active Pi residual rows");
@@ -26189,8 +27174,8 @@ mod tests {
                    ON rollup.provider = state.provider
                   AND rollup.source_key = state.source_key
                  WHERE state.provider = 'pi'
-                   AND state.source_key = 'live:pi:pi-out-of-order'",
-                [],
+                   AND state.source_key = ?1",
+                params![pi_source_key("host", "pi-out-of-order").expect("canonical Pi source")],
                 |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
             )
             .expect("read out-of-order runtime");
@@ -26205,9 +27190,8 @@ mod tests {
                 .unwrap()
                 .query_row(
                     "SELECT COUNT(*) FROM session_events
-                     WHERE provider = 'pi'
-                       AND source_key = 'live:pi:pi-out-of-order'",
-                    [],
+                     WHERE provider = 'pi' AND source_key = ?1",
+                    params![pi_source_key("host", "pi-out-of-order").expect("canonical Pi source")],
                     |row| row.get::<_, i64>(0),
                 )
                 .expect("count out-of-order replay"),
@@ -28943,7 +29927,7 @@ mod tests {
             .advance_retention_watermark(INSERT_FILTER_WATERMARK)
             .expect("advance watermark");
 
-        let source_key = pi_live_source_key("pi-session");
+        let source_key = pi_source_key("host", "pi-session").expect("canonical Pi source");
         let pruned = "2026-01-01T00:00:00.000Z";
         let kept = "2026-04-01T00:00:00.000Z";
         let tool_action =
@@ -33437,7 +34421,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .expect("read Pi live source"),
-                "live:pi:pi-live"
+                pi_source_key("remote-host", "pi-live").expect("canonical Pi source")
             );
             assert_eq!(
                 scalar_count(
@@ -33511,11 +34495,17 @@ mod tests {
         assert_eq!(sealed.session_count, before.session_count);
         assert_eq!(sealed.total_runtime_secs, before.total_runtime_secs);
         assert_eq!(
-            scalar_count(
-                &storage.conn.lock().unwrap(),
-                "SELECT COUNT(*) FROM runtime_hourly
-                 WHERE provider = 'pi' AND source_key = 'live:pi:pi-live'"
-            ),
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_hourly
+                     WHERE provider = 'pi' AND source_key = ?1",
+                    params![pi_source_key("remote-host", "pi-live").expect("canonical Pi source")],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count canonical Pi runtime rollups"),
             1
         );
 

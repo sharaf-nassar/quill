@@ -287,11 +287,9 @@ pub(crate) struct TranscriptAnalyticsSnapshot {
     pub(crate) tool_actions: Vec<OwnedToolAction>,
     pub(crate) skill_usages: Vec<OwnedSkillUsage>,
     pub(crate) hook_invocations: Vec<OwnedHookInvocation>,
-    #[allow(dead_code)] // Persisted replacement is a separate task.
     pub(crate) pi_evidence: Option<PiPersistedEvidence>,
 }
 
-#[allow(dead_code)] // Persisted replacement is a separate task.
 #[derive(Clone, Debug)]
 pub(crate) struct PiPersistedEvidence {
     pub(crate) lifecycle: Option<PiPersistedLifecycle>,
@@ -299,7 +297,6 @@ pub(crate) struct PiPersistedEvidence {
     pub(crate) usage: Vec<PiPersistedUsage>,
 }
 
-#[allow(dead_code)] // Persisted replacement is a separate task.
 #[derive(Clone, Debug)]
 pub(crate) struct PiPersistedLifecycle {
     pub(crate) normalized_hostname: String,
@@ -321,7 +318,6 @@ pub(crate) struct PiPersistedLifecycle {
     pub(crate) closed_at_ms: Option<i64>,
 }
 
-#[allow(dead_code)] // Persisted replacement is a separate task.
 #[derive(Clone, Debug)]
 pub(crate) struct PiPersistedReceipt {
     pub(crate) normalized_hostname: String,
@@ -335,7 +331,6 @@ pub(crate) struct PiPersistedReceipt {
     pub(crate) occurred_at_ms: i64,
 }
 
-#[allow(dead_code)] // Persisted replacement is a separate task.
 #[derive(Clone, Debug)]
 pub(crate) struct PiPersistedUsage {
     pub(crate) source_record_key: String,
@@ -1298,15 +1293,20 @@ pub(crate) fn run_transcript_analytics_reconciliation(
         }
     }
     summary.completed_all_roots = completed_roots == roots.len();
-    if summary.completed_all_roots
-        && force_full_reparse
-        && let Err(error) = storage.delete_setting(TRANSCRIPT_ANALYTICS_REINGEST_MARKER)
-    {
-        summary.completed_all_roots = false;
-        record_summary_failure(
-            &mut summary,
-            format!("retained transcript analytics marker clear failed: {error}"),
-        );
+    if summary.completed_all_roots && force_full_reparse {
+        for marker in [
+            TRANSCRIPT_ANALYTICS_REINGEST_MARKER,
+            "pi_persisted_source_reconciliation_pending",
+        ] {
+            if let Err(error) = storage.delete_setting(marker) {
+                summary.completed_all_roots = false;
+                record_summary_failure(
+                    &mut summary,
+                    format!("retained transcript analytics marker clear failed: {error}"),
+                );
+                break;
+            }
+        }
     }
     log::info!(
         "Retained transcript analytics reconciliation: replaced={} pruned={} failed_sources={} skipped_records={} roots_complete={}",
@@ -1702,7 +1702,11 @@ fn build_pi_persisted_evidence(
 ) -> Result<PiPersistedEvidence, TranscriptAnalyticsError> {
     let normalized_hostname = crate::live_tracker::normalize_observed_hostname(hostname)
         .ok_or(TranscriptAnalyticsError::PiSourceIdentity)?;
-    if source_key.trim().is_empty() {
+    if crate::storage::pi_source_key(&normalized_hostname, &session.header.id)
+        .ok()
+        .as_deref()
+        != Some(source_key)
+    {
         return Err(TranscriptAnalyticsError::PiSourceIdentity);
     }
 
@@ -2139,6 +2143,7 @@ pub(crate) fn stamp_analytics_root(
 mod tests {
     use super::*;
     use crate::sessions::ToolAction;
+    use rusqlite::OptionalExtension;
     use serde_json::json;
     use serial_test::serial;
     use std::fs::{File, FileTimes};
@@ -2259,7 +2264,12 @@ mod tests {
         Value::Object(record).to_string()
     }
 
-    fn pi_tracking_line(id: &str, timestamp: &str, event: Value) -> String {
+    fn pi_tracking_line(
+        id: &str,
+        parent_id: Option<&str>,
+        timestamp: &str,
+        event: Value,
+    ) -> String {
         let mut data = event.as_object().expect("tracking event object").clone();
         data.insert(
             "schema".to_owned(),
@@ -2277,7 +2287,7 @@ mod tests {
         json!({
             "type": "custom",
             "id": id,
-            "parentId": null,
+            "parentId": parent_id,
             "timestamp": timestamp,
             "customType": "quill-tracking",
             "data": Value::Object(data),
@@ -2544,12 +2554,17 @@ mod tests {
         );
     }
 
-    // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#Persisted Tracking Entries]]
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Persisted Source Atomic Replacement]]
     #[test]
-    fn persisted_pi_source_builds_owned_snapshot_and_search_evidence() {
-        let root = TempDir::new().expect("tempdir");
-        let path = root.path().join("session-root.jsonl");
-        let lines = vec![
+    #[serial]
+    fn persisted_pi_snapshot_replaces_all_owned_evidence_and_retains_last_good() {
+        clear_env();
+        let data_dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&data_dir);
+        let transcripts = TempDir::new().expect("tempdir");
+        let source_key = crate::storage::pi_source_key(TEST_HOSTNAME, "session-root")
+            .expect("canonical Pi source key");
+        let mut lines = vec![
             json!({
                 "type": "session",
                 "version": 3,
@@ -2559,45 +2574,71 @@ mod tests {
             })
             .to_string(),
             pi_tracking_line(
-                "tracking-start",
+                "track-old-start",
+                None,
                 "2026-08-18T02:00:01.000Z",
                 json!({
-                    "event_uuid": "event-start",
+                    "event_uuid": "event-old-start",
                     "event": "session_start",
                     "provider": "pi",
                     "normalized_host": TEST_HOSTNAME,
                     "session_id": "session-root",
-                    "process_instance_id": "process-a",
+                    "process_instance_id": "process-old",
                     "sequence": 1,
                     "origin_at": "2026-08-18T02:00:00.000Z",
                     "occurred_at": "2026-08-18T02:00:01.000Z",
-                    "delivery_source": "reconciliation",
+                    "delivery_source": "live",
                     "reason": "startup",
                     "lineage": {"kind": "root"}
                 }),
             ),
-            json!({
-                "type": "custom",
-                "id": "unknown-custom",
-                "parentId": "tracking-start",
-                "timestamp": "2026-08-18T02:00:02.000Z",
-                "customType": "other-extension",
-                "data": {"content": "must not become search content"}
-            })
-            .to_string(),
-            json!({
-                "type": "model_change",
-                "id": "model-change",
-                "parentId": "unknown-custom",
-                "timestamp": "2026-08-18T02:00:03.000Z",
-                "provider": "anthropic",
-                "modelId": "claude-sonnet-4-5"
-            })
-            .to_string(),
+            pi_tracking_line(
+                "track-new-start",
+                Some("track-old-start"),
+                "2026-08-18T02:00:02.000Z",
+                json!({
+                    "event_uuid": "event-new-start",
+                    "event": "session_start",
+                    "provider": "pi",
+                    "normalized_host": TEST_HOSTNAME,
+                    "session_id": "session-root",
+                    "process_instance_id": "process-new",
+                    "sequence": 1,
+                    "origin_at": "2026-08-18T02:00:02.000Z",
+                    "occurred_at": "2026-08-18T02:00:02.000Z",
+                    "delivery_source": "reconciliation",
+                    "reason": "resume",
+                    "lineage": {
+                        "kind": "agent",
+                        "parent_session_id": "session-parent"
+                    },
+                    "agent_role": "reviewer"
+                }),
+            ),
+            // A later stale end from the superseded process must not close the
+            // newer process selected by its own start occurrence.
+            pi_tracking_line(
+                "track-old-end",
+                Some("track-new-start"),
+                "2026-08-18T02:00:03.000Z",
+                json!({
+                    "event_uuid": "event-old-end",
+                    "event": "session_end",
+                    "provider": "pi",
+                    "normalized_host": TEST_HOSTNAME,
+                    "session_id": "session-root",
+                    "process_instance_id": "process-old",
+                    "sequence": 2,
+                    "origin_at": "2026-08-18T02:00:00.000Z",
+                    "occurred_at": "2026-08-18T02:00:03.000Z",
+                    "delivery_source": "reconciliation",
+                    "reason": "quit"
+                }),
+            ),
             json!({
                 "type": "message",
                 "id": "prompt",
-                "parentId": "model-change",
+                "parentId": "track-old-end",
                 "timestamp": "2026-08-18T02:00:04.000Z",
                 "message": {"role": "user", "content": "inspect the skill"}
             })
@@ -2652,71 +2693,399 @@ mod tests {
             })
             .to_string(),
         ];
-        std::fs::write(&path, jsonl_body(&lines)).expect("write Pi transcript");
+        let path = transcripts.path().join("session-root.jsonl");
+        std::fs::write(&path, jsonl_body(&lines)).expect("write persisted Pi source");
         set_mtime_ns(&path, FIXED_MTIME_NS);
         let source = DiscoveredRetainedJsonlSource {
             provider: IntegrationProvider::Pi,
             source_root_key: "pi:sessions",
-            source_key: "pi:test:session-root".to_owned(),
+            source_key: source_key.clone(),
             filesystem_path: path.clone(),
             canonical_path: path,
             layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
         };
-
-        let session = crate::pi_session::parse_pi_session_jsonl(&jsonl_body(&lines))
-            .expect("parse Pi session")
-            .expect("Pi session");
-        assert_eq!(session.tracking_entries.len(), 1);
-        assert_eq!(session.tracking_entries[0].source_ordinal, 1);
-        assert_eq!(session.model_changes.len(), 1);
-        assert_eq!(session.model_changes[0].source_ordinal, 3);
-        let search = crate::sessions::extract_pi_session(Path::new("session-root.jsonl"), session);
-        assert_eq!(search.messages.len(), 2);
-        assert_eq!(search.messages[0].content, "inspect the skill");
-        assert!(search.messages.iter().all(|message| {
-            !message.uuid.starts_with("tracking")
-                && !message.content.contains("must not become search content")
-        }));
-
-        let parsed = parse_transcript_analytics_source(&source, TEST_HOSTNAME)
-            .expect("parse persisted Pi source");
-        assert_eq!(parsed.native_identity.provider, IntegrationProvider::Pi);
-        assert_eq!(parsed.snapshot.session_events.len(), 4);
-        assert_eq!(parsed.snapshot.response_times.len(), 1);
-        assert_eq!(parsed.snapshot.tool_actions.len(), 1);
-        assert_eq!(parsed.snapshot.skill_usages.len(), 1);
-        let evidence = parsed.snapshot.pi_evidence.as_ref().expect("Pi evidence");
-        let lifecycle = evidence.lifecycle.as_ref().expect("Pi lifecycle");
-        assert_eq!(lifecycle.normalized_hostname, TEST_HOSTNAME);
-        assert_eq!(lifecycle.session_id, "session-root");
-        assert_eq!(lifecycle.source_key, source.source_key);
-        assert_eq!(lifecycle.process_instance_id, "process-a");
-        assert_eq!(lifecycle.current_sequence, 1);
-        assert_eq!(lifecycle.current_occurrence_id, "event-start");
-        assert_eq!(lifecycle.lifecycle_state, "recovering");
-        assert_eq!(lifecycle.lineage_state, "root");
+        let generation = storage
+            .begin_transcript_analytics_generation(IntegrationProvider::Pi, source.source_root_key)
+            .expect("begin Pi generation");
+        let snapshot = stamp_analytics_root(
+            parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+                .expect("parse persisted Pi source"),
+            "session-root",
+            generation,
+        )
+        .expect("stamp Pi snapshot");
+        assert_eq!(snapshot.session_events.len(), 4);
+        assert_eq!(snapshot.response_times.len(), 1);
+        assert_eq!(snapshot.tool_actions.len(), 1);
+        assert_eq!(snapshot.skill_usages.len(), 1);
         assert_eq!(
-            lifecycle.visible_root_session_id.as_deref(),
-            Some("session-root")
+            snapshot
+                .pi_evidence
+                .as_ref()
+                .expect("Pi evidence")
+                .usage
+                .len(),
+            1
         );
-        assert_eq!(lifecycle.reporter_protocol, 2);
-        assert!(lifecycle.closed_at_ms.is_none());
-        assert_eq!(evidence.receipts.len(), 1);
-        let receipt = &evidence.receipts[0];
-        assert_eq!(receipt.event_uuid, "event-start");
-        assert_eq!(receipt.entry_id, "tracking-start");
-        assert_eq!(receipt.event_kind, "session_start");
-        assert_eq!(receipt.sequence, 1);
-        assert_eq!(evidence.usage.len(), 1);
-        let usage = &evidence.usage[0];
-        assert_eq!(usage.source_ordinal, 5);
-        assert_eq!(usage.turn_id, "answer");
-        assert_eq!(usage.model_id, "anthropic/claude-sonnet-4-5");
-        assert_eq!(usage.input_tokens, 11);
-        assert_eq!(usage.output_tokens, 7);
-        assert_eq!(usage.cache_creation_tokens, 5);
-        assert_eq!(usage.cache_read_tokens, 3);
-        assert_eq!(usage.total_cost, Some(0.10));
+        let sibling_session = "session-sibling";
+        let sibling_key = crate::storage::pi_source_key(TEST_HOSTNAME, sibling_session)
+            .expect("canonical sibling Pi source key");
+        let mut sibling = snapshot.clone();
+        sibling.source.source_key.clone_from(&sibling_key);
+        sibling.source.source_path = transcripts.path().join("session-sibling.jsonl");
+        sibling.source.source_session_id = sibling_session.to_owned();
+        sibling.source.analytics_session_id = sibling_session.to_owned();
+        sibling.source.chain_id = sibling_session.to_owned();
+        for row in &mut sibling.session_events {
+            row.source_key.clone_from(&sibling_key);
+            row.session_id = sibling_session.to_owned();
+            row.chain_id = sibling_session.to_owned();
+        }
+        for row in &mut sibling.response_times {
+            row.source_key.clone_from(&sibling_key);
+            row.session_id = sibling_session.to_owned();
+            row.chain_id = sibling_session.to_owned();
+        }
+        for row in &mut sibling.tool_actions {
+            row.source_key.clone_from(&sibling_key);
+            row.session_id = sibling_session.to_owned();
+            row.chain_id = sibling_session.to_owned();
+        }
+        for row in &mut sibling.skill_usages {
+            row.source_key.clone_from(&sibling_key);
+            row.session_id = sibling_session.to_owned();
+            row.chain_id = sibling_session.to_owned();
+        }
+        if let Some(evidence) = &mut sibling.pi_evidence {
+            if let Some(lifecycle) = &mut evidence.lifecycle {
+                lifecycle.source_key.clone_from(&sibling_key);
+                lifecycle.session_id = sibling_session.to_owned();
+            }
+            for receipt in &mut evidence.receipts {
+                receipt.source_key.clone_from(&sibling_key);
+                receipt.session_id = sibling_session.to_owned();
+            }
+        }
+        storage
+            .replace_transcript_analytics_snapshot(&snapshot)
+            .expect("commit persisted Pi snapshot");
+        storage
+            .replace_transcript_analytics_snapshot(&sibling)
+            .expect("commit sibling Pi snapshot");
+
+        #[derive(Debug, PartialEq)]
+        struct LifecycleState {
+            process_instance_id: String,
+            sequence: i64,
+            state: String,
+            parent_session_id: Option<String>,
+            lineage_state: String,
+            agent_role: Option<String>,
+        }
+
+        #[derive(Debug, PartialEq)]
+        struct PiState {
+            evidence_counts: Vec<(&'static str, i64)>,
+            model_input_tokens: i64,
+            rollup_input_tokens: i64,
+            token_rows: (i64, i64),
+            lifecycle: Option<LifecycleState>,
+            transcript_owner: (i64, i64),
+            model_owner: (i64, i64),
+            live_owner: i64,
+        }
+
+        let persisted_state = |storage: &Storage, key: &str, session_id: &str| {
+            let conn = rusqlite::Connection::open(storage.database_path())
+                .expect("open persisted Pi test reader");
+            let count = |table: &'static str| {
+                (
+                    table,
+                    conn.query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM {table}
+                             WHERE provider = 'pi' AND source_key = ?1"
+                        ),
+                        rusqlite::params![key],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("count persisted Pi rows"),
+                )
+            };
+            let sum = |table: &str| {
+                conn.query_row(
+                    &format!(
+                        "SELECT COALESCE(SUM(input_tokens), 0) FROM {table}
+                         WHERE provider = 'pi' AND source_key = ?1"
+                    ),
+                    rusqlite::params![key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("sum persisted Pi input tokens")
+            };
+            PiState {
+                evidence_counts: [
+                    "session_events",
+                    "response_times",
+                    "tool_actions",
+                    "skill_usages",
+                    "hook_invocations",
+                    "runtime_hourly",
+                    "runtime_turn_state",
+                    "model_usage_observations",
+                    "model_usage_hourly",
+                    "pi_event_receipts",
+                    "pi_session_lifecycle",
+                ]
+                .map(count)
+                .to_vec(),
+                model_input_tokens: sum("model_usage_observations"),
+                rollup_input_tokens: sum("model_usage_hourly"),
+                token_rows: conn
+                    .query_row(
+                        "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0)
+                         FROM token_snapshots
+                         WHERE provider = 'pi' AND hostname = ?1 AND session_id = ?2",
+                        rusqlite::params![TEST_HOSTNAME, session_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .expect("read persisted Pi token rows"),
+                lifecycle: conn
+                    .query_row(
+                        "SELECT process_instance_id, current_sequence,
+                                lifecycle_state, direct_parent_session_id,
+                                lineage_state, agent_role
+                         FROM pi_session_lifecycle
+                         WHERE provider = 'pi' AND source_key = ?1",
+                        rusqlite::params![key],
+                        |row| {
+                            Ok(LifecycleState {
+                                process_instance_id: row.get(0)?,
+                                sequence: row.get(1)?,
+                                state: row.get(2)?,
+                                parent_session_id: row.get(3)?,
+                                lineage_state: row.get(4)?,
+                                agent_role: row.get(5)?,
+                            })
+                        },
+                    )
+                    .optional()
+                    .expect("read persisted Pi lifecycle"),
+                transcript_owner: conn
+                    .query_row(
+                        "SELECT COUNT(*), COALESCE(MAX(seen_generation), 0)
+                         FROM transcript_analytics_sources
+                         WHERE provider = 'pi' AND source_key = ?1",
+                        rusqlite::params![key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .expect("read transcript owner"),
+                model_owner: conn
+                    .query_row(
+                        "SELECT COUNT(*), COALESCE(MAX(observation_count), 0)
+                         FROM model_observation_sources
+                         WHERE provider = 'pi' AND source_key = ?1",
+                        rusqlite::params![key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .expect("read model owner"),
+                live_owner: conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM live_analytics_sessions
+                         WHERE provider = 'pi' AND hostname = ?1 AND session_id = ?2",
+                        rusqlite::params![TEST_HOSTNAME, session_id],
+                        |row| row.get(0),
+                    )
+                    .expect("read live owner"),
+            }
+        };
+        let count_of = |state: &PiState, table: &str| {
+            state
+                .evidence_counts
+                .iter()
+                .find_map(|(candidate, count)| (*candidate == table).then_some(*count))
+                .expect("tracked Pi evidence table")
+        };
+        let initial = persisted_state(&storage, &source_key, "session-root");
+        let sibling_initial = persisted_state(&storage, &sibling_key, sibling_session);
+        assert_eq!(count_of(&initial, "session_events"), 4);
+        assert_eq!(count_of(&initial, "response_times"), 1);
+        assert_eq!(count_of(&initial, "tool_actions"), 1);
+        assert_eq!(count_of(&initial, "skill_usages"), 1);
+        assert_eq!(count_of(&initial, "model_usage_observations"), 1);
+        assert_eq!(count_of(&initial, "pi_event_receipts"), 3);
+        assert_eq!(initial.token_rows, (1, 11));
+        assert_eq!(initial.transcript_owner, (1, generation));
+        assert_eq!(initial.model_owner, (1, 1));
+        assert_eq!(initial.live_owner, 1);
+        assert_eq!(
+            initial.lifecycle,
+            Some(LifecycleState {
+                process_instance_id: "process-new".to_owned(),
+                sequence: 1,
+                state: "recovering".to_owned(),
+                parent_session_id: Some("session-parent".to_owned()),
+                lineage_state: "agent".to_owned(),
+                agent_role: Some("reviewer".to_owned()),
+            })
+        );
+
+        // All deletes and replacement inserts execute before this final
+        // registry CHECK fails. Exact state, including the sibling, must roll
+        // back rather than exposing the deliberately emptied/changed evidence.
+        let mut broken = snapshot.clone();
+        broken.session_events.clear();
+        broken.response_times.clear();
+        broken.tool_actions.clear();
+        broken.skill_usages.clear();
+        if let Some(evidence) = &mut broken.pi_evidence {
+            evidence.receipts.clear();
+            evidence.usage[0].input_tokens = 999;
+            evidence
+                .lifecycle
+                .as_mut()
+                .expect("broken lifecycle")
+                .process_instance_id = "broken-process".to_owned();
+        }
+        broken.source.mtime_ns = broken.source.mtime_ns.saturating_add(1);
+        let trigger_conn = rusqlite::Connection::open(storage.database_path())
+            .expect("open Pi failure trigger connection");
+        trigger_conn
+            .execute_batch(
+                "CREATE TRIGGER fail_pi_transcript_registry
+                 BEFORE UPDATE ON transcript_analytics_sources
+                 WHEN NEW.provider = 'pi'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'late Pi registry failure');
+                 END;",
+            )
+            .expect("arm final Pi registry failure");
+        let error = storage
+            .replace_transcript_analytics_snapshot(&broken)
+            .expect_err("final registry trigger must fail");
+        trigger_conn
+            .execute_batch("DROP TRIGGER fail_pi_transcript_registry;")
+            .expect("disarm final Pi registry failure");
+        assert!(
+            error.contains("Upsert transcript source registry"),
+            "expected final registry failure, got {error}"
+        );
+        assert_eq!(
+            persisted_state(&storage, &source_key, "session-root"),
+            initial
+        );
+        assert_eq!(
+            persisted_state(&storage, &sibling_key, sibling_session),
+            sibling_initial
+        );
+
+        let drifted = lines[0].replace("session-root", "session-other");
+        std::fs::write(
+            &source.canonical_path,
+            jsonl_body(
+                &std::iter::once(drifted)
+                    .chain(lines.iter().skip(1).cloned())
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .expect("write drifted Pi source");
+        assert!(parse_transcript_analytics_source(&source, TEST_HOSTNAME).is_err());
+        assert_eq!(
+            persisted_state(&storage, &source_key, "session-root"),
+            initial
+        );
+
+        lines.push(pi_tracking_line(
+            "track-new-end",
+            Some("result"),
+            "2026-08-18T02:00:07.000Z",
+            json!({
+                "event_uuid": "event-new-end",
+                "event": "session_end",
+                "provider": "pi",
+                "normalized_host": TEST_HOSTNAME,
+                "session_id": "session-root",
+                "process_instance_id": "process-new",
+                "sequence": 2,
+                "origin_at": "2026-08-18T02:00:02.000Z",
+                "occurred_at": "2026-08-18T02:00:07.000Z",
+                "delivery_source": "reconciliation",
+                "reason": "quit"
+            }),
+        ));
+        std::fs::write(&source.canonical_path, jsonl_body(&lines))
+            .expect("write completed Pi source");
+        let next_generation = storage
+            .begin_transcript_analytics_generation(IntegrationProvider::Pi, source.source_root_key)
+            .expect("advance Pi generation");
+        let completed = stamp_analytics_root(
+            parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+                .expect("parse completed Pi source"),
+            "session-root",
+            next_generation,
+        )
+        .expect("stamp completed Pi snapshot");
+        storage
+            .replace_transcript_analytics_snapshot(&completed)
+            .expect("replace completed Pi snapshot");
+        let final_state = persisted_state(&storage, &source_key, "session-root");
+        assert_eq!(count_of(&final_state, "session_events"), 4);
+        assert_eq!(count_of(&final_state, "response_times"), 1);
+        assert_eq!(count_of(&final_state, "tool_actions"), 1);
+        assert_eq!(count_of(&final_state, "skill_usages"), 1);
+        assert_eq!(count_of(&final_state, "model_usage_observations"), 1);
+        assert_eq!(count_of(&final_state, "pi_event_receipts"), 4);
+        assert_eq!(
+            final_state
+                .lifecycle
+                .as_ref()
+                .map(|row| row.process_instance_id.as_str()),
+            Some("process-new")
+        );
+        assert_eq!(
+            final_state.lifecycle.as_ref().map(|row| row.sequence),
+            Some(2)
+        );
+        assert_eq!(
+            final_state.lifecycle.as_ref().map(|row| row.state.as_str()),
+            Some("closed")
+        );
+
+        let mut emptied = completed;
+        emptied.session_events.clear();
+        emptied.response_times.clear();
+        emptied.tool_actions.clear();
+        emptied.skill_usages.clear();
+        emptied.hook_invocations.clear();
+        emptied.pi_evidence = Some(PiPersistedEvidence {
+            lifecycle: None,
+            receipts: Vec::new(),
+            usage: Vec::new(),
+        });
+        storage
+            .replace_transcript_analytics_snapshot(&emptied)
+            .expect("clear persisted Pi source");
+        let empty_state = persisted_state(&storage, &source_key, "session-root");
+        assert!(
+            empty_state
+                .evidence_counts
+                .iter()
+                .all(|(_, count)| *count == 0),
+            "empty replacement must clear every source-owned evidence table: {empty_state:?}"
+        );
+        assert_eq!(empty_state.model_input_tokens, 0);
+        assert_eq!(empty_state.rollup_input_tokens, 0);
+        assert_eq!(empty_state.token_rows, (0, 0));
+        assert!(empty_state.lifecycle.is_none());
+        assert_eq!(empty_state.transcript_owner, (1, next_generation));
+        assert_eq!(empty_state.model_owner, (1, 0));
+        assert_eq!(empty_state.live_owner, 1);
+        assert_eq!(
+            persisted_state(&storage, &sibling_key, sibling_session),
+            sibling_initial,
+            "empty target replacement must not reach its sibling"
+        );
+        clear_env();
     }
 
     fn clear_env() {
@@ -3234,10 +3603,12 @@ mod tests {
             },
             &messages,
         );
+        let pi_source_key = crate::storage::pi_source_key(TEST_HOSTNAME, "pi-session")
+            .expect("canonical Pi source key");
         let (pi_actions, pi_skills) = owned_tool_rows(
             &OwnedToolRowIdentity {
                 provider: IntegrationProvider::Pi,
-                source_key: "live:pi:pi-session",
+                source_key: &pi_source_key,
                 session_id: "pi-session",
                 chain_id: "pi-session",
                 parent_chain_id: None,
@@ -3330,7 +3701,7 @@ mod tests {
             action_owner(&pi_actions[0]),
             (
                 IntegrationProvider::Pi,
-                "live:pi:pi-session".to_owned(),
+                pi_source_key.clone(),
                 "pi-session".to_owned(),
                 "pi-session".to_owned(),
                 None,
@@ -3353,7 +3724,7 @@ mod tests {
             skill_owner(&pi_skills[0]),
             (
                 IntegrationProvider::Pi,
-                "live:pi:pi-session".to_owned(),
+                pi_source_key,
                 "pi-session".to_owned(),
                 "pi-session".to_owned(),
                 None,

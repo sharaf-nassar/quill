@@ -1575,7 +1575,7 @@ fn drain_target(
                 &format!(
                     "DELETE FROM response_times AS response
                      WHERE response.provider = 'pi'
-                       AND response.source_key LIKE 'live:pi:%'
+                       AND response.source_key LIKE 'pi:session:v1:%'
                        AND length(response.timestamp) = 24
                        AND response.timestamp LIKE '%Z'
                        AND response.timestamp < ?2
