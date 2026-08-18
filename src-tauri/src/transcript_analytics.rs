@@ -22,6 +22,7 @@ use crate::transcript_identity::{
     IdentityError, JsonlRecord, ModelSourceFastFingerprint, NativeChainIdentity, SourceRootGraph,
     StableTranscriptReadError, model_source_content_sha256, model_source_fast_fingerprint,
     parse_jsonl_records, read_stable_transcript, resolve_codex_native_identity,
+    resolve_pi_native_identity,
 };
 use chrono::DateTime;
 use serde_json::Value;
@@ -286,6 +287,72 @@ pub(crate) struct TranscriptAnalyticsSnapshot {
     pub(crate) tool_actions: Vec<OwnedToolAction>,
     pub(crate) skill_usages: Vec<OwnedSkillUsage>,
     pub(crate) hook_invocations: Vec<OwnedHookInvocation>,
+    #[allow(dead_code)] // Persisted replacement is a separate task.
+    pub(crate) pi_evidence: Option<PiPersistedEvidence>,
+}
+
+#[allow(dead_code)] // Persisted replacement is a separate task.
+#[derive(Clone, Debug)]
+pub(crate) struct PiPersistedEvidence {
+    pub(crate) lifecycle: Option<PiPersistedLifecycle>,
+    pub(crate) receipts: Vec<PiPersistedReceipt>,
+    pub(crate) usage: Vec<PiPersistedUsage>,
+}
+
+#[allow(dead_code)] // Persisted replacement is a separate task.
+#[derive(Clone, Debug)]
+pub(crate) struct PiPersistedLifecycle {
+    pub(crate) normalized_hostname: String,
+    pub(crate) session_id: String,
+    pub(crate) source_key: String,
+    pub(crate) origin_at_ms: i64,
+    pub(crate) process_instance_id: String,
+    pub(crate) current_sequence: i64,
+    pub(crate) current_occurrence_id: String,
+    pub(crate) occurred_at_ms: i64,
+    pub(crate) lifecycle_state: &'static str,
+    pub(crate) direct_parent_session_id: Option<String>,
+    pub(crate) visible_root_session_id: Option<String>,
+    pub(crate) lineage_state: &'static str,
+    pub(crate) lineage_reason: Option<String>,
+    pub(crate) agent_role: Option<String>,
+    pub(crate) reporter_protocol: i64,
+    pub(crate) reporter_version: String,
+    pub(crate) closed_at_ms: Option<i64>,
+}
+
+#[allow(dead_code)] // Persisted replacement is a separate task.
+#[derive(Clone, Debug)]
+pub(crate) struct PiPersistedReceipt {
+    pub(crate) normalized_hostname: String,
+    pub(crate) session_id: String,
+    pub(crate) event_uuid: String,
+    pub(crate) source_key: String,
+    pub(crate) entry_id: String,
+    pub(crate) process_instance_id: String,
+    pub(crate) sequence: i64,
+    pub(crate) event_kind: &'static str,
+    pub(crate) occurred_at_ms: i64,
+}
+
+#[allow(dead_code)] // Persisted replacement is a separate task.
+#[derive(Clone, Debug)]
+pub(crate) struct PiPersistedUsage {
+    pub(crate) source_record_key: String,
+    pub(crate) source_ordinal: i64,
+    pub(crate) turn_id: String,
+    pub(crate) timestamp: String,
+    pub(crate) observed_at_ms: i64,
+    pub(crate) model_id: String,
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) cache_creation_tokens: i64,
+    pub(crate) cache_read_tokens: i64,
+    pub(crate) input_cost: Option<f64>,
+    pub(crate) output_cost: Option<f64>,
+    pub(crate) cache_read_cost: Option<f64>,
+    pub(crate) cache_write_cost: Option<f64>,
+    pub(crate) total_cost: Option<f64>,
 }
 
 /// Bounded per-source diagnostics for record anomalies that are skipped
@@ -1261,6 +1328,8 @@ pub(crate) enum TranscriptAnalyticsError {
     SourceTooLarge,
     UnstableSource,
     Identity(IdentityError),
+    PiSession(String),
+    PiSourceIdentity,
     SourceIdentityDrift,
     EmptyResolvedRoot,
     InconsistentSnapshot,
@@ -1282,6 +1351,11 @@ impl fmt::Display for TranscriptAnalyticsError {
             Self::Identity(error) => {
                 write!(formatter, "cannot resolve transcript identity: {error}")
             }
+            Self::PiSession(error) => {
+                write!(formatter, "cannot parse persisted Pi session: {error}")
+            }
+            Self::PiSourceIdentity => formatter
+                .write_str("persisted Pi source identity does not match its tracking entries"),
             Self::SourceIdentityDrift => formatter
                 .write_str("retained transcript identity changed between inventory and commit"),
             Self::EmptyResolvedRoot => formatter.write_str("resolved analytics root is empty"),
@@ -1409,7 +1483,20 @@ fn resolve_native_identity(
             resolve_codex_native_identity(records)?,
             TranscriptRecordDiagnostics::default(),
         ),
-        _ => unreachable!("retained analytics inventory only contains Claude and Codex"),
+        IntegrationProvider::Pi => {
+            let session = crate::pi_session::parse_pi_session_records(
+                records
+                    .iter()
+                    .map(|record| (record.ordinal, record.value.clone())),
+            )
+            .map_err(|error| TranscriptAnalyticsError::PiSession(error.to_string()))?
+            .ok_or_else(|| TranscriptAnalyticsError::PiSession("missing session header".into()))?;
+            (
+                resolve_pi_native_identity(&session)?,
+                TranscriptRecordDiagnostics::default(),
+            )
+        }
+        IntegrationProvider::MiniMax => unreachable!("MiniMax has no retained analytics"),
     };
     // A retained-layout disagreement is one anomalous fact about an otherwise
     // usable source, so it is counted rather than discarding every row.
@@ -1543,6 +1630,283 @@ fn push_response_time(
     });
 }
 
+fn pi_timestamp_ms(value: &str) -> Result<i64, TranscriptAnalyticsError> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.timestamp_millis())
+        .filter(|timestamp| *timestamp >= 0)
+        .ok_or(TranscriptAnalyticsError::PiSourceIdentity)
+}
+
+fn pi_usage_dimension(
+    usage: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<i64, TranscriptAnalyticsError> {
+    let value = usage.get(key).and_then(Value::as_i64).unwrap_or(0);
+    (0..=100_000_000)
+        .contains(&value)
+        .then_some(value)
+        .ok_or(TranscriptAnalyticsError::PiSourceIdentity)
+}
+
+fn pi_usage_cost(
+    usage: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<f64>, TranscriptAnalyticsError> {
+    let Some(cost) = usage
+        .get("cost")
+        .and_then(Value::as_object)
+        .and_then(|cost| cost.get(key))
+    else {
+        return Ok(None);
+    };
+    let value = cost
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or(TranscriptAnalyticsError::PiSourceIdentity)?;
+    Ok(Some(value))
+}
+
+fn pi_event_kind_name(kind: &crate::models::PiProtocolV2EventKind) -> &'static str {
+    match kind {
+        crate::models::PiProtocolV2EventKind::SessionStart { .. } => "session_start",
+        crate::models::PiProtocolV2EventKind::SessionEnd { .. } => "session_end",
+        crate::models::PiProtocolV2EventKind::Lineage { .. } => "lineage",
+    }
+}
+
+fn pi_lineage_fields(
+    lineage: &crate::models::PiProtocolV2Lineage,
+    session_id: &str,
+) -> (&'static str, Option<String>, Option<String>, Option<String>) {
+    match lineage {
+        crate::models::PiProtocolV2Lineage::Root => {
+            ("root", None, Some(session_id.to_owned()), None)
+        }
+        crate::models::PiProtocolV2Lineage::Linked { parent_session_id } => {
+            ("linked", Some(parent_session_id.clone()), None, None)
+        }
+        crate::models::PiProtocolV2Lineage::Agent { parent_session_id } => {
+            ("agent", Some(parent_session_id.clone()), None, None)
+        }
+        crate::models::PiProtocolV2Lineage::Unresolved { reason } => {
+            ("unresolved", None, None, Some(reason.clone()))
+        }
+    }
+}
+
+fn build_pi_persisted_evidence(
+    session: &crate::pi_session::PiSession,
+    source_key: &str,
+    hostname: &str,
+) -> Result<PiPersistedEvidence, TranscriptAnalyticsError> {
+    let normalized_hostname = crate::live_tracker::normalize_observed_hostname(hostname)
+        .ok_or(TranscriptAnalyticsError::PiSourceIdentity)?;
+    if source_key.trim().is_empty() {
+        return Err(TranscriptAnalyticsError::PiSourceIdentity);
+    }
+
+    let mut receipts = Vec::with_capacity(session.tracking_entries.len());
+    let mut tracking = Vec::with_capacity(session.tracking_entries.len());
+    for entry in &session.tracking_entries {
+        let event = &entry.tracking.data.event;
+        if event.session_id != session.header.id
+            || event.normalized_host != normalized_hostname
+            || event.provider != crate::models::PiProtocolV2Provider::Pi
+        {
+            return Err(TranscriptAnalyticsError::PiSourceIdentity);
+        }
+        let occurred_at_ms = pi_timestamp_ms(&event.occurred_at)?;
+        pi_timestamp_ms(&event.origin_at)?;
+        let sequence = i64::try_from(event.sequence)
+            .map_err(|_| TranscriptAnalyticsError::PiSourceIdentity)?;
+        receipts.push(PiPersistedReceipt {
+            normalized_hostname: normalized_hostname.clone(),
+            session_id: session.header.id.clone(),
+            event_uuid: event.event_uuid.clone(),
+            source_key: source_key.to_owned(),
+            entry_id: entry.base.id.clone(),
+            process_instance_id: event.process_instance_id.clone(),
+            sequence,
+            event_kind: pi_event_kind_name(&event.kind),
+            occurred_at_ms,
+        });
+        tracking.push((entry, occurred_at_ms, sequence));
+    }
+
+    let lifecycle = tracking
+        .iter()
+        .filter(|(entry, _, _)| {
+            matches!(
+                entry.tracking.data.event.kind,
+                crate::models::PiProtocolV2EventKind::SessionStart { .. }
+            )
+        })
+        .max_by_key(|(entry, occurred_at_ms, _)| (*occurred_at_ms, entry.source_ordinal))
+        .map(|(start, _, start_sequence)| {
+            (
+                start.tracking.data.event.process_instance_id.as_str(),
+                *start_sequence,
+            )
+        })
+        .map(|(current_process, start_sequence)| {
+            let current = tracking
+                .iter()
+                .filter(|(entry, _, sequence)| {
+                    entry.tracking.data.event.process_instance_id == current_process
+                        && *sequence >= start_sequence
+                })
+                .max_by_key(|(entry, occurred_at_ms, sequence)| {
+                    (*sequence, *occurred_at_ms, entry.source_ordinal)
+                })
+                .expect("selected process has a start event");
+            let lifecycle_event = tracking
+                .iter()
+                .filter(|(entry, _, sequence)| {
+                    entry.tracking.data.event.process_instance_id == current_process
+                        && *sequence >= start_sequence
+                        && matches!(
+                            entry.tracking.data.event.kind,
+                            crate::models::PiProtocolV2EventKind::SessionStart { .. }
+                                | crate::models::PiProtocolV2EventKind::SessionEnd { .. }
+                        )
+                })
+                .max_by_key(|(entry, occurred_at_ms, sequence)| {
+                    (*sequence, *occurred_at_ms, entry.source_ordinal)
+                });
+            let lineage_event = tracking
+                .iter()
+                .filter(|(entry, _, sequence)| {
+                    entry.tracking.data.event.process_instance_id == current_process
+                        && *sequence >= start_sequence
+                        && matches!(
+                            entry.tracking.data.event.kind,
+                            crate::models::PiProtocolV2EventKind::SessionStart { .. }
+                                | crate::models::PiProtocolV2EventKind::Lineage { .. }
+                        )
+                })
+                .max_by_key(|(entry, occurred_at_ms, sequence)| {
+                    (*sequence, *occurred_at_ms, entry.source_ordinal)
+                });
+
+            let (lineage_state, direct_parent_session_id, visible_root_session_id, lineage_reason) =
+                lineage_event
+                    .map(|(entry, _, _)| match &entry.tracking.data.event.kind {
+                        crate::models::PiProtocolV2EventKind::SessionStart { lineage, .. }
+                        | crate::models::PiProtocolV2EventKind::Lineage { lineage, .. } => {
+                            pi_lineage_fields(lineage, &session.header.id)
+                        }
+                        crate::models::PiProtocolV2EventKind::SessionEnd { .. } => unreachable!(),
+                    })
+                    .unwrap_or(("unresolved", None, None, Some("lineage_missing".into())));
+            let agent_role = tracking
+                .iter()
+                .filter(|(entry, _, sequence)| {
+                    entry.tracking.data.event.process_instance_id == current_process
+                        && *sequence >= start_sequence
+                })
+                .filter_map(|(entry, occurred_at_ms, sequence)| {
+                    let role = match &entry.tracking.data.event.kind {
+                        crate::models::PiProtocolV2EventKind::SessionStart {
+                            agent_role, ..
+                        }
+                        | crate::models::PiProtocolV2EventKind::Lineage { agent_role, .. } => {
+                            agent_role.as_ref()
+                        }
+                        crate::models::PiProtocolV2EventKind::SessionEnd { .. } => None,
+                    }?;
+                    Some((role, *sequence, *occurred_at_ms, entry.source_ordinal))
+                })
+                .max_by_key(|(_, sequence, occurred_at_ms, ordinal)| {
+                    (*sequence, *occurred_at_ms, *ordinal)
+                })
+                .map(|(role, _, _, _)| role.clone());
+            let current_event = &current.0.tracking.data.event;
+            let origin_at_ms = pi_timestamp_ms(&current_event.origin_at)?;
+            let lifecycle_state =
+                match lifecycle_event.map(|(entry, _, _)| &entry.tracking.data.event.kind) {
+                    Some(crate::models::PiProtocolV2EventKind::SessionEnd { .. }) => "closed",
+                    _ => "recovering",
+                };
+            let closed_at_ms = (lifecycle_state == "closed")
+                .then(|| lifecycle_event.map(|(_, occurred_at_ms, _)| *occurred_at_ms))
+                .flatten();
+            Ok::<PiPersistedLifecycle, TranscriptAnalyticsError>(PiPersistedLifecycle {
+                normalized_hostname: normalized_hostname.clone(),
+                session_id: session.header.id.clone(),
+                source_key: source_key.to_owned(),
+                origin_at_ms,
+                process_instance_id: current_event.process_instance_id.clone(),
+                current_sequence: current.2,
+                current_occurrence_id: current_event.event_uuid.clone(),
+                occurred_at_ms: current.1,
+                lifecycle_state,
+                direct_parent_session_id,
+                visible_root_session_id,
+                lineage_state,
+                lineage_reason,
+                agent_role,
+                reporter_protocol: i64::from(current.0.tracking.data.reporter.protocol),
+                reporter_version: current.0.tracking.data.reporter.version.clone(),
+                closed_at_ms,
+            })
+        })
+        .transpose()?;
+
+    let mut usage = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in &session.entries {
+        if entry.message.get("role").and_then(Value::as_str) != Some("assistant")
+            || !seen.insert(entry.base.id.as_str())
+        {
+            continue;
+        }
+        let Some(native_usage) = entry.message.get("usage").and_then(Value::as_object) else {
+            continue;
+        };
+        let provider = entry
+            .message
+            .get("provider")
+            .and_then(Value::as_str)
+            .ok_or(TranscriptAnalyticsError::PiSourceIdentity)?;
+        let model = entry
+            .message
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or(TranscriptAnalyticsError::PiSourceIdentity)?;
+        let model_id = crate::model_usage::validate_model_id(&format!("{provider}/{model}"))
+            .map_err(|_| TranscriptAnalyticsError::PiSourceIdentity)?;
+        usage.push(PiPersistedUsage {
+            source_record_key: format!(
+                "pi_native_v1:{}:{}",
+                session.header.id.len(),
+                entry.base.id
+            ),
+            source_ordinal: i64::try_from(entry.source_ordinal)
+                .map_err(|_| TranscriptAnalyticsError::PiSourceIdentity)?,
+            turn_id: entry.base.id.clone(),
+            timestamp: entry.base.timestamp.clone(),
+            observed_at_ms: pi_timestamp_ms(&entry.base.timestamp)?,
+            model_id,
+            input_tokens: pi_usage_dimension(native_usage, "input")?,
+            output_tokens: pi_usage_dimension(native_usage, "output")?,
+            cache_creation_tokens: pi_usage_dimension(native_usage, "cacheWrite")?,
+            cache_read_tokens: pi_usage_dimension(native_usage, "cacheRead")?,
+            input_cost: pi_usage_cost(native_usage, "input")?,
+            output_cost: pi_usage_cost(native_usage, "output")?,
+            cache_read_cost: pi_usage_cost(native_usage, "cacheRead")?,
+            cache_write_cost: pi_usage_cost(native_usage, "cacheWrite")?,
+            total_cost: pi_usage_cost(native_usage, "total")?,
+        });
+    }
+
+    Ok(PiPersistedEvidence {
+        lifecycle,
+        receipts,
+        usage,
+    })
+}
+
 /// Parse all transcript-derived analytics without mutating storage.
 // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots]]
 pub(crate) fn parse_transcript_analytics_source(
@@ -1566,11 +1930,32 @@ fn parse_transcript_analytics_source_bytes(
         std::str::from_utf8(&bytes).map_err(|_| TranscriptAnalyticsError::InvalidUtf8)?;
     let records = parse_jsonl_records(contents);
     drop(bytes);
-    let (native_identity, diagnostics) = resolve_native_identity(source, &records)?;
-
-    let extracted =
-        extract_messages_from_jsonl_records(source.provider, &source.canonical_path, &records);
     let source_key = source.source_key.clone();
+    let (native_identity, diagnostics, extracted, pi_evidence) = if source.provider
+        == IntegrationProvider::Pi
+    {
+        let session = crate::pi_session::parse_pi_session_records(
+            records
+                .iter()
+                .map(|record| (record.ordinal, record.value.clone())),
+        )
+        .map_err(|error| TranscriptAnalyticsError::PiSession(error.to_string()))?
+        .ok_or_else(|| TranscriptAnalyticsError::PiSession("missing session header".into()))?;
+        let native_identity = resolve_pi_native_identity(&session)?;
+        let pi_evidence = build_pi_persisted_evidence(&session, &source_key, hostname)?;
+        let extracted = crate::sessions::extract_pi_session(&source.canonical_path, session);
+        (
+            native_identity,
+            TranscriptRecordDiagnostics::default(),
+            extracted,
+            Some(pi_evidence),
+        )
+    } else {
+        let (native_identity, diagnostics) = resolve_native_identity(source, &records)?;
+        let extracted =
+            extract_messages_from_jsonl_records(source.provider, &source.canonical_path, &records);
+        (native_identity, diagnostics, extracted, None)
+    };
     let mut native_event_ordinals = HashMap::<String, usize>::new();
     let session_events = extracted
         .events
@@ -1679,6 +2064,7 @@ fn parse_transcript_analytics_source_bytes(
         tool_actions,
         skill_usages,
         hook_invocations,
+        pi_evidence,
     };
     Ok(ParsedTranscriptAnalyticsSource {
         native_identity,
@@ -1871,6 +2257,32 @@ mod tests {
             record.insert("cwd".to_owned(), json!(cwd));
         }
         Value::Object(record).to_string()
+    }
+
+    fn pi_tracking_line(id: &str, timestamp: &str, event: Value) -> String {
+        let mut data = event.as_object().expect("tracking event object").clone();
+        data.insert(
+            "schema".to_owned(),
+            json!(crate::pi_tracking::PI_PROTOCOL_V2_TRACKING_SCHEMA),
+        );
+        data.insert(
+            "reporter".to_owned(),
+            json!({
+                "protocol": crate::pi_tracking::PI_PROTOCOL_V2,
+                "version": crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION,
+                "quill_build": crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD,
+                "capability_digest": crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+            }),
+        );
+        json!({
+            "type": "custom",
+            "id": id,
+            "parentId": null,
+            "timestamp": timestamp,
+            "customType": "quill-tracking",
+            "data": Value::Object(data),
+        })
+        .to_string()
     }
 
     fn claude_sidechain_line(session_id: &str, agent_id: &str, uuid: &str) -> String {
@@ -2130,6 +2542,181 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#Persisted Tracking Entries]]
+    #[test]
+    fn persisted_pi_source_builds_owned_snapshot_and_search_evidence() {
+        let root = TempDir::new().expect("tempdir");
+        let path = root.path().join("session-root.jsonl");
+        let lines = vec![
+            json!({
+                "type": "session",
+                "version": 3,
+                "id": "session-root",
+                "timestamp": "2026-08-18T02:00:00.000Z",
+                "cwd": "/work/quill"
+            })
+            .to_string(),
+            pi_tracking_line(
+                "tracking-start",
+                "2026-08-18T02:00:01.000Z",
+                json!({
+                    "event_uuid": "event-start",
+                    "event": "session_start",
+                    "provider": "pi",
+                    "normalized_host": TEST_HOSTNAME,
+                    "session_id": "session-root",
+                    "process_instance_id": "process-a",
+                    "sequence": 1,
+                    "origin_at": "2026-08-18T02:00:00.000Z",
+                    "occurred_at": "2026-08-18T02:00:01.000Z",
+                    "delivery_source": "reconciliation",
+                    "reason": "startup",
+                    "lineage": {"kind": "root"}
+                }),
+            ),
+            json!({
+                "type": "custom",
+                "id": "unknown-custom",
+                "parentId": "tracking-start",
+                "timestamp": "2026-08-18T02:00:02.000Z",
+                "customType": "other-extension",
+                "data": {"content": "must not become search content"}
+            })
+            .to_string(),
+            json!({
+                "type": "model_change",
+                "id": "model-change",
+                "parentId": "unknown-custom",
+                "timestamp": "2026-08-18T02:00:03.000Z",
+                "provider": "anthropic",
+                "modelId": "claude-sonnet-4-5"
+            })
+            .to_string(),
+            json!({
+                "type": "message",
+                "id": "prompt",
+                "parentId": "model-change",
+                "timestamp": "2026-08-18T02:00:04.000Z",
+                "message": {"role": "user", "content": "inspect the skill"}
+            })
+            .to_string(),
+            json!({
+                "type": "message",
+                "id": "answer",
+                "parentId": "prompt",
+                "timestamp": "2026-08-18T02:00:05.000Z",
+                "message": {
+                    "role": "assistant",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-5",
+                    "content": [
+                        {"type": "text", "text": "reading"},
+                        {
+                            "type": "toolCall",
+                            "id": "read-skill",
+                            "name": "read",
+                            "arguments": {
+                                "path": "/home/test/.pi/agent/skills/demo/SKILL.md"
+                            }
+                        }
+                    ],
+                    "usage": {
+                        "input": 11,
+                        "output": 7,
+                        "cacheWrite": 5,
+                        "cacheRead": 3,
+                        "cost": {
+                            "input": 0.01,
+                            "output": 0.02,
+                            "cacheWrite": 0.03,
+                            "cacheRead": 0.04,
+                            "total": 0.10
+                        }
+                    }
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "message",
+                "id": "result",
+                "parentId": "answer",
+                "timestamp": "2026-08-18T02:00:06.000Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "read-skill",
+                    "toolName": "read",
+                    "content": [{"type": "text", "text": "skill body"}]
+                }
+            })
+            .to_string(),
+        ];
+        std::fs::write(&path, jsonl_body(&lines)).expect("write Pi transcript");
+        set_mtime_ns(&path, FIXED_MTIME_NS);
+        let source = DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: "pi:sessions",
+            source_key: "pi:test:session-root".to_owned(),
+            filesystem_path: path.clone(),
+            canonical_path: path,
+            layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
+        };
+
+        let session = crate::pi_session::parse_pi_session_jsonl(&jsonl_body(&lines))
+            .expect("parse Pi session")
+            .expect("Pi session");
+        assert_eq!(session.tracking_entries.len(), 1);
+        assert_eq!(session.tracking_entries[0].source_ordinal, 1);
+        assert_eq!(session.model_changes.len(), 1);
+        assert_eq!(session.model_changes[0].source_ordinal, 3);
+        let search = crate::sessions::extract_pi_session(Path::new("session-root.jsonl"), session);
+        assert_eq!(search.messages.len(), 2);
+        assert_eq!(search.messages[0].content, "inspect the skill");
+        assert!(search.messages.iter().all(|message| {
+            !message.uuid.starts_with("tracking")
+                && !message.content.contains("must not become search content")
+        }));
+
+        let parsed = parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+            .expect("parse persisted Pi source");
+        assert_eq!(parsed.native_identity.provider, IntegrationProvider::Pi);
+        assert_eq!(parsed.snapshot.session_events.len(), 4);
+        assert_eq!(parsed.snapshot.response_times.len(), 1);
+        assert_eq!(parsed.snapshot.tool_actions.len(), 1);
+        assert_eq!(parsed.snapshot.skill_usages.len(), 1);
+        let evidence = parsed.snapshot.pi_evidence.as_ref().expect("Pi evidence");
+        let lifecycle = evidence.lifecycle.as_ref().expect("Pi lifecycle");
+        assert_eq!(lifecycle.normalized_hostname, TEST_HOSTNAME);
+        assert_eq!(lifecycle.session_id, "session-root");
+        assert_eq!(lifecycle.source_key, source.source_key);
+        assert_eq!(lifecycle.process_instance_id, "process-a");
+        assert_eq!(lifecycle.current_sequence, 1);
+        assert_eq!(lifecycle.current_occurrence_id, "event-start");
+        assert_eq!(lifecycle.lifecycle_state, "recovering");
+        assert_eq!(lifecycle.lineage_state, "root");
+        assert_eq!(
+            lifecycle.visible_root_session_id.as_deref(),
+            Some("session-root")
+        );
+        assert_eq!(lifecycle.reporter_protocol, 2);
+        assert!(lifecycle.closed_at_ms.is_none());
+        assert_eq!(evidence.receipts.len(), 1);
+        let receipt = &evidence.receipts[0];
+        assert_eq!(receipt.event_uuid, "event-start");
+        assert_eq!(receipt.entry_id, "tracking-start");
+        assert_eq!(receipt.event_kind, "session_start");
+        assert_eq!(receipt.sequence, 1);
+        assert_eq!(evidence.usage.len(), 1);
+        let usage = &evidence.usage[0];
+        assert_eq!(usage.source_ordinal, 5);
+        assert_eq!(usage.turn_id, "answer");
+        assert_eq!(usage.model_id, "anthropic/claude-sonnet-4-5");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_creation_tokens, 5);
+        assert_eq!(usage.cache_read_tokens, 3);
+        assert_eq!(usage.total_cost, Some(0.10));
     }
 
     fn clear_env() {

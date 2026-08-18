@@ -1,7 +1,8 @@
-//! Narrow Pi transcript reads retained for notify-driven search indexing.
+//! Persisted Pi session parsing shared by search and source reconciliation.
 //!
-//! The full-file parser keeps v2/v3 message entries, while notify validation
-//! uses the bounded header probe before admitting a path to search indexing.
+//! Full-file parsing keeps native messages/model changes plus exact
+//! `quill-tracking` custom entries. Notify validation remains a bounded header
+//! probe before a path enters either pipeline.
 
 use std::fmt;
 use std::fs::File;
@@ -10,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
+
+use crate::models::{PiProtocolV2ErrorCode, PiProtocolV2TrackingEntry};
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -33,17 +36,44 @@ pub(crate) struct PiMessageEntry {
     #[serde(flatten)]
     pub(crate) base: PiSessionEntryBase,
     pub(crate) message: Value,
+    #[serde(skip)]
+    pub(crate) source_ordinal: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PiModelChangeEntry {
+    #[serde(flatten)]
+    pub(crate) base: PiSessionEntryBase,
+    pub(crate) provider: String,
+    pub(crate) model_id: String,
+    #[serde(skip)]
+    pub(crate) source_ordinal: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PiTrackingEntry {
+    pub(crate) base: PiSessionEntryBase,
+    pub(crate) source_ordinal: u64,
+    pub(crate) tracking: PiProtocolV2TrackingEntry,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PiSession {
     pub(crate) header: PiSessionHeader,
     pub(crate) entries: Vec<PiMessageEntry>,
+    pub(crate) model_changes: Vec<PiModelChangeEntry>,
+    pub(crate) tracking_entries: Vec<PiTrackingEntry>,
 }
 
 #[derive(Debug)]
 pub(crate) enum PiSessionParseError {
     UnsupportedVersion(u64),
+    InvalidTrackingEntry {
+        source_ordinal: u64,
+        code: PiProtocolV2ErrorCode,
+        message: String,
+    },
     Read {
         path: PathBuf,
         source: std::io::Error,
@@ -56,6 +86,14 @@ impl fmt::Display for PiSessionParseError {
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "pi session version {version} is unsupported")
             }
+            Self::InvalidTrackingEntry {
+                source_ordinal,
+                code,
+                message,
+            } => write!(
+                formatter,
+                "invalid quill-tracking entry at source ordinal {source_ordinal}: {code:?}: {message}"
+            ),
             Self::Read { path, source } => {
                 write!(formatter, "read pi session {}: {source}", path.display())
             }
@@ -67,7 +105,7 @@ impl std::error::Error for PiSessionParseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Read { source, .. } => Some(source),
-            Self::UnsupportedVersion(_) => None,
+            Self::UnsupportedVersion(_) | Self::InvalidTrackingEntry { .. } => None,
         }
     }
 }
@@ -108,18 +146,18 @@ pub(crate) fn read_pi_session_header(path: &Path) -> Option<PiSessionHeader> {
 pub(crate) fn parse_pi_session_jsonl(
     contents: &str,
 ) -> Result<Option<PiSession>, PiSessionParseError> {
-    parse_pi_session_values(
-        contents
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok()),
-    )
+    parse_pi_session_records(contents.lines().enumerate().filter_map(|(ordinal, line)| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .map(|value| (ordinal as u64, value))
+    }))
 }
 
-pub(crate) fn parse_pi_session_values(
-    values: impl IntoIterator<Item = Value>,
+pub(crate) fn parse_pi_session_records(
+    records: impl IntoIterator<Item = (u64, Value)>,
 ) -> Result<Option<PiSession>, PiSessionParseError> {
-    let mut values = values.into_iter();
-    let Some(header_value) = values.next() else {
+    let mut records = records.into_iter();
+    let Some((_header_ordinal, header_value)) = records.next() else {
         return Ok(None);
     };
     if header_value.get("type").and_then(Value::as_str) != Some("session") {
@@ -133,18 +171,68 @@ pub(crate) fn parse_pi_session_values(
         return Err(PiSessionParseError::UnsupportedVersion(version));
     }
 
-    let mut entries = values
-        .filter(|value| value.get("type").and_then(Value::as_str) == Some("message"))
-        .filter_map(|value| serde_json::from_value::<PiMessageEntry>(value).ok())
-        .collect::<Vec<_>>();
-    if version == 2 {
-        for entry in &mut entries {
-            if entry.message.get("role").and_then(Value::as_str) == Some("hookMessage") {
-                entry.message["role"] = Value::String("custom".into());
+    let mut entries = Vec::new();
+    let mut model_changes = Vec::new();
+    let mut tracking_entries = Vec::new();
+    for (source_ordinal, value) in records {
+        match value.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if let Ok(mut entry) = serde_json::from_value::<PiMessageEntry>(value) {
+                    entry.source_ordinal = source_ordinal;
+                    if version == 2
+                        && entry.message.get("role").and_then(Value::as_str) == Some("hookMessage")
+                    {
+                        entry.message["role"] = Value::String("custom".into());
+                    }
+                    entries.push(entry);
+                }
             }
+            Some("model_change") => {
+                if let Ok(mut entry) = serde_json::from_value::<PiModelChangeEntry>(value) {
+                    entry.source_ordinal = source_ordinal;
+                    model_changes.push(entry);
+                }
+            }
+            Some("custom")
+                if value.get("customType").and_then(Value::as_str) == Some("quill-tracking") =>
+            {
+                let base = serde_json::from_value::<PiSessionEntryBase>(value.clone()).map_err(
+                    |error| PiSessionParseError::InvalidTrackingEntry {
+                        source_ordinal,
+                        code: PiProtocolV2ErrorCode::InvalidEntry,
+                        message: error.to_string(),
+                    },
+                )?;
+                let mut wire = value;
+                let object = wire
+                    .as_object_mut()
+                    .expect("custom entry must be an object");
+                object.remove("id");
+                object.remove("parentId");
+                object.remove("timestamp");
+                let bytes =
+                    serde_json::to_vec(&wire).expect("JSON value serialization cannot fail");
+                let tracking = crate::pi_tracking::decode_protocol_v2_tracking_entry(&bytes)
+                    .map_err(|error| PiSessionParseError::InvalidTrackingEntry {
+                        source_ordinal,
+                        code: error.code,
+                        message: error.message,
+                    })?;
+                tracking_entries.push(PiTrackingEntry {
+                    base,
+                    source_ordinal,
+                    tracking,
+                });
+            }
+            _ => {}
         }
     }
-    Ok(Some(PiSession { header, entries }))
+    Ok(Some(PiSession {
+        header,
+        entries,
+        model_changes,
+        tracking_entries,
+    }))
 }
 
 #[cfg(test)]
@@ -179,6 +267,9 @@ mod tests {
             session.entries[2].base.timestamp,
             "2026-08-14T08:00:09.000Z"
         );
+        assert_eq!(session.model_changes.len(), 1);
+        assert_eq!(session.model_changes[0].provider, "anthropic");
+        assert_eq!(session.model_changes[0].model_id, "claude-sonnet-4-5");
     }
 
     // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#V2 Hook Messages]]
@@ -209,6 +300,41 @@ mod tests {
 
         assert_eq!(session.entries.len(), 1);
         assert_eq!(session.entries[0].base.id, "kept");
+    }
+
+    // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#Persisted Tracking Entries]]
+    #[test]
+    fn rejects_invalid_quill_tracking_entries_in_supported_sessions() {
+        let invalid = format!(
+            "{}\n{}\n",
+            V3.lines().next().expect("v3 header"),
+            serde_json::json!({
+                "type": "custom",
+                "id": "tracking",
+                "parentId": null,
+                "timestamp": "2026-08-14T08:00:01.000Z",
+                "customType": "quill-tracking",
+                "data": {
+                    "schema": 999,
+                    "reporter": {
+                        "protocol": crate::pi_tracking::PI_PROTOCOL_V2,
+                        "version": crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION,
+                        "quill_build": crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD,
+                        "capability_digest": crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST
+                    },
+                    "unexpected": true
+                }
+            })
+        );
+
+        assert!(matches!(
+            parse_pi_session_jsonl(&invalid),
+            Err(PiSessionParseError::InvalidTrackingEntry {
+                source_ordinal: 1,
+                code: crate::models::PiProtocolV2ErrorCode::TrackingSchemaMismatch,
+                ..
+            })
+        ));
     }
 
     // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#Ephemeral Sessions]]

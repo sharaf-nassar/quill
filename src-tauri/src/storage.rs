@@ -28356,6 +28356,7 @@ mod tests {
                         message_id: None,
                     })
                     .collect(),
+                pi_evidence: None,
             }
         }
     }
@@ -28449,6 +28450,7 @@ mod tests {
                     },
                 )
                 .collect(),
+            pi_evidence: base.pi_evidence,
         }
     }
 

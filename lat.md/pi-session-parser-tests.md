@@ -4,11 +4,11 @@ lat:
 ---
 # Pi Session Parser Test Specs
 
-These tests pin the narrow Pi parser kept for notified search indexing and bounded header probes.
+These tests pin the shared persisted Pi parser used by search indexing and source snapshots, plus bounded notify header probes.
 
 ## V3 Message Entries
 
-V3 headers and message entries retain the identity, cwd, timestamps, ids, parent links, and message values needed by indexing.
+V3 headers, message entries, model changes, and original source ordinals retain the identity, cwd, timestamps, ids, parent links, model values, and usage evidence needed by indexing and snapshots.
 
 ## V2 Hook Messages
 
@@ -20,11 +20,19 @@ V1 sessions return an explicit unsupported-version error because they lack stabl
 
 ## Malformed And Unknown Input
 
-Malformed lines, non-message entries, and invalid messages do not prevent later valid messages from parsing.
+Malformed lines, unknown custom entries, and invalid native messages do not prevent later valid evidence from parsing.
+
+Exact `quill-tracking` entries are different: malformed or unsupported tracking schemas fail the source rather than silently dropping durable lifecycle evidence.
+
+## Persisted Tracking Entries
+
+Supported `quill-tracking` entries decode through the exact protocol-v2 validator while preserving entry identity and source ordinal.
+
+Native message usage, model-change, tool, skill, lifecycle, receipt, and search evidence remain available from the same parse; tracking rows never become searchable content, and invalid tracking produces a typed parse failure.
 
 ## Ephemeral Sessions
 
-An absent session-file path or a missing file returns no session, covering Pi's non-persisted ephemeral mode without filesystem mutation.
+An absent session-file path or a missing file returns no session without filesystem mutation; persisted-source snapshots have no evidence to invent for that case.
 
 ## Bounded Header Probe
 

@@ -3036,12 +3036,11 @@ pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<Skill
 /// Build Pi's owned `tool_actions` and `skill_usages` rows from one notify
 /// parse.
 ///
-/// Claude and Codex reach the identical row shape through
-/// `transcript_analytics::parse_transcript_analytics_source`, which Pi never
-/// enters. Both go through the same builder, so the action key and the skill
-/// fan-out cannot drift apart and both paths dedupe against the same unique
-/// indexes. Pi has no sub-agent transcripts, so chain identity is flat: every
-/// row is the session's own.
+/// Retained reconciliation reaches the identical Pi row shape through
+/// `transcript_analytics::parse_transcript_analytics_source`. Both paths use
+/// the same builder, so action identity and skill fan-out cannot drift. Pi has
+/// no sub-agent transcripts, so chain identity is flat: every row is the
+/// session's own.
 // @lat: [[data-flow#Session Indexing Pipeline#Enrichment]]
 pub(crate) fn pi_transcript_tool_rows(
     session_id: &str,
@@ -3751,8 +3750,10 @@ pub(crate) fn extract_messages_from_jsonl_records(
         IntegrationProvider::Codex => extract_codex_messages_from_jsonl_records(records),
         IntegrationProvider::Pi => extract_pi_messages(
             path,
-            crate::pi_session::parse_pi_session_values(
-                records.iter().map(|record| record.value.clone()),
+            crate::pi_session::parse_pi_session_records(
+                records
+                    .iter()
+                    .map(|record| (record.ordinal, record.value.clone())),
             ),
         ),
         IntegrationProvider::MiniMax => unreachable!("MiniMax has no transcript source"),
@@ -3763,14 +3764,20 @@ fn extract_pi_messages(
     path: &Path,
     parsed: Result<Option<crate::pi_session::PiSession>, crate::pi_session::PiSessionParseError>,
 ) -> ExtractedSession {
-    let session = match parsed {
-        Ok(Some(session)) => session,
-        Ok(None) => return unsupported_extracted_session(path),
+    match parsed {
+        Ok(Some(session)) => extract_pi_session(path, session),
+        Ok(None) => unsupported_extracted_session(path),
         Err(error) => {
             log::warn!("Failed to parse Pi JSONL {}: {error}", path.display());
-            return unsupported_extracted_session(path);
+            unsupported_extracted_session(path)
         }
-    };
+    }
+}
+
+pub(crate) fn extract_pi_session(
+    _path: &Path,
+    session: crate::pi_session::PiSession,
+) -> ExtractedSession {
     let session_id = session.header.id;
     let cwd = session.header.cwd;
     let project_name = Path::new(&cwd)
@@ -3779,15 +3786,68 @@ fn extract_pi_messages(
         .map(str::to_owned);
     let mut seen = HashSet::new();
     let mut messages: Vec<ExtractedMessage> = Vec::new();
+    let mut events = Vec::new();
     let mut tool_use_map: HashMap<String, ToolUseEntry> = HashMap::new();
 
-    for (source_ordinal, entry) in session.entries.into_iter().enumerate() {
+    for entry in session.entries {
         if !seen.insert(entry.base.id.clone()) {
             continue;
         }
         let Some(role) = entry.message.get("role").and_then(|value| value.as_str()) else {
             continue;
         };
+
+        let event_kinds = match role {
+            "user" => vec![SessionEventKind::UserText],
+            "toolResult" => vec![SessionEventKind::UserToolResult],
+            "assistant" => {
+                let content = entry.message.get("content");
+                let has_text = content
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+                    || content
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|blocks| {
+                            blocks.iter().any(|block| {
+                                block.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("text")
+                                    && block
+                                        .get("text")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_some_and(|text| !text.trim().is_empty())
+                            })
+                        });
+                let has_tool =
+                    content
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|blocks| {
+                            blocks.iter().any(|block| {
+                                block.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("toolCall")
+                            })
+                        });
+                [
+                    has_text.then_some(SessionEventKind::AsstText),
+                    has_tool.then_some(SessionEventKind::AsstToolUse),
+                ]
+                .into_iter()
+                .flatten()
+                .collect()
+            }
+            _ => Vec::new(),
+        };
+        for (event_ordinal, kind) in event_kinds.into_iter().enumerate() {
+            events.push(ExtractedEvent {
+                source_ordinal: entry.source_ordinal,
+                event_ordinal,
+                timestamp: entry.base.timestamp.clone(),
+                kind,
+                is_sidechain: false,
+                agent_id: None,
+                uuid: Some(entry.base.id.clone()),
+                parent_uuid: entry.base.parent_id.clone(),
+            });
+        }
 
         if role == "toolResult" {
             let Some(tool_use_id) = entry
@@ -3884,7 +3944,7 @@ fn extract_pi_messages(
                 }
                 tool_actions.push(ToolAction {
                     tool_use_id: tool_use_id.clone(),
-                    source_ordinal: source_ordinal as u64,
+                    source_ordinal: entry.source_ordinal,
                     block_ordinal,
                     tool_name: tool_name.to_string(),
                     category: category.clone(),
@@ -3942,7 +4002,7 @@ fn extract_pi_messages(
         project_name,
         messages,
         extraction_succeeded: true,
-        events: Vec::new(),
+        events,
         hook_invocations: Vec::new(),
     }
 }
