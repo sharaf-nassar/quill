@@ -1,6 +1,6 @@
 // quill-managed:pi
-// quill-managed-pi-payload: 2
-// Quill-managed Pi integration, payload/stamp 2.
+// quill-managed-pi-payload: 3
+// Quill-managed Pi integration, payload/stamp 3.
 // Disable Pi in Quill to remove this file.
 // @ts-nocheck - untyped Node payload loaded by Pi, outside this repo's TS
 // program (tsconfig covers src/ only and there is no @types/node).
@@ -16,7 +16,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { hostname, homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Keep equal to LOCAL_TIMEOUT_MS in ../codex-integration/scripts/lib.cjs.
 const LOCAL_TIMEOUT_MS = 1500;
@@ -27,7 +28,7 @@ const FEATURES = {
   context_telemetry: true,
 };
 const PROTOCOL_VERSION = 1;
-export const EXTENSION_VERSION = "0.1.0";
+export const EXTENSION_VERSION = "0.2.0";
 const MIN_QUILL_VERSION = "0.9.0";
 
 export const PI_PROTOCOL_V2 = 2;
@@ -39,6 +40,7 @@ export const PI_PROTOCOL_V2_CAPABILITIES = Object.freeze([
   "lifecycle-occurrence",
   "persisted-session-entry",
   "typed-outcomes",
+  "candidate-broker",
 ]);
 export const PI_PROTOCOL_V2_CAPABILITY_DIGEST = createHash("sha256")
   .update(PI_PROTOCOL_V2_CAPABILITIES.join("\n"))
@@ -47,8 +49,16 @@ const TAINTED_MAX_PATHS = 256;
 // Keep equal to sessions::COMPACT_SEARCH_MAX_BYTES.
 const HISTORY_RESULT_MAX_BYTES = 32 * 1024;
 const REPORTER_CLAIMS = Symbol.for("quill.pi.reporter.claims");
+const REPORTER_BROKERS = Symbol.for("quill.pi.reporter.brokers.v1");
+const REPORTER_NOTICES = Symbol.for("quill.pi.reporter.notices.v1");
 const REPORTER_PROCESS = Symbol.for("quill.pi.reporter.process");
-let lastNoticeRoot;
+const REPORTER_CHANNEL_RANK = Object.freeze({
+  managed: 0,
+  npm: 1,
+  project: 2,
+  development: 3,
+});
+const EXTENSION_PATH = fileURLToPath(import.meta.url);
 const READER_COMMAND_PATTERN =
   /\b(cat|bat|head|tail|less|more|view|od|xxd|strings|hexdump|sed|awk|grep|rg|ack|jq|yq|xq|xmllint)\b/i;
 const BINARY_URL_EXT_RE =
@@ -316,6 +326,10 @@ function loadConfig() {
       (typeof config.hostname === "string" && config.hostname.trim()) ||
       hostname().split(".")[0] ||
       "local",
+    reporterContract:
+      config.pi_reporter && typeof config.pi_reporter === "object"
+        ? config.pi_reporter
+        : undefined,
   };
 }
 
@@ -326,16 +340,221 @@ function headers(config) {
   };
 }
 
-function claimReporter(config) {
-  const claims = globalThis[REPORTER_CLAIMS] || new Set();
-  globalThis[REPORTER_CLAIMS] = claims;
-  if (claims.has(config.quillRoot)) return false;
-  claims.add(config.quillRoot);
-  return true;
+function reporterNotice(root, code, message) {
+  const notices = globalThis[REPORTER_NOTICES] || new Set();
+  globalThis[REPORTER_NOTICES] = notices;
+  const key = `${root}\u0000${code}`;
+  if (notices.has(key)) return;
+  notices.add(key);
+  console.warn(`Quill Pi extension inactive: ${code}: ${message}`);
 }
 
-function releaseReporter(config) {
+function pathInside(path, root) {
+  const rel = relative(resolve(root), resolve(path));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+export function reporterCandidateForPath(extensionPath, options = {}) {
+  const home = options.home || process.env.HOME || homedir();
+  const agentDir = resolve(
+    options.agentDir || process.env.PI_CODING_AGENT_DIR || join(home, ".pi", "agent"),
+  );
+  const cwd = resolve(options.cwd || process.cwd());
+  const path = resolve(extensionPath);
+  const projectRoot = join(cwd, ".pi");
+  let installChannel;
+  if (path === join(agentDir, "extensions", "quill.ts")) {
+    installChannel = "managed";
+  } else if (
+    pathInside(path, join(projectRoot, "extensions")) ||
+    pathInside(path, join(projectRoot, "npm"))
+  ) {
+    installChannel = "project";
+  } else if (
+    path.endsWith(
+      join("node_modules", "@sharaf-nassar", "quill-pi", "quill.ts"),
+    )
+  ) {
+    installChannel = "npm";
+  } else {
+    installChannel = "development";
+  }
+  const selectedPath = options.selectedPath || process.env.QUILL_PI_REPORTER_PATH;
+  const official = installChannel === "managed" || installChannel === "npm";
+  return {
+    install_channel: installChannel,
+    extension_path: path,
+    eligible: official || (selectedPath !== undefined && resolve(selectedPath) === path),
+    protocol: PI_PROTOCOL_V2,
+    reporter_version: PI_PROTOCOL_V2_REPORTER_VERSION,
+    quill_build: PI_PROTOCOL_V2_QUILL_BUILD,
+    capability_digest: PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+    capabilities: PI_PROTOCOL_V2_CAPABILITIES,
+  };
+}
+
+function candidateMatchesContract(candidate, contract) {
+  return (
+    contract?.enabled === true &&
+    candidate.eligible &&
+    candidate.protocol === contract.protocol &&
+    candidate.reporter_version === contract.reporter_version &&
+    candidate.quill_build === contract.quill_build &&
+    candidate.capability_digest === contract.capability_digest
+  );
+}
+
+export function electReporterCandidate(candidates, contract) {
+  return candidates
+    .filter(
+      (candidate) =>
+        !candidate.failed && candidateMatchesContract(candidate, contract),
+    )
+    .sort(
+      (left, right) =>
+        REPORTER_CHANNEL_RANK[left.install_channel] -
+          REPORTER_CHANNEL_RANK[right.install_channel] ||
+        right.capabilities.length - left.capabilities.length ||
+        left.extension_path.localeCompare(right.extension_path),
+    )[0];
+}
+
+function resetReporterBroker(config, broker) {
+  globalThis[REPORTER_BROKERS]?.delete(config.quillRoot);
   globalThis[REPORTER_CLAIMS]?.delete(config.quillRoot);
+  broker.candidates.clear();
+}
+
+function installBrokerEvent(broker, event, config) {
+  if (broker.registeredEvents.has(event)) return;
+  broker.registeredEvents.add(event);
+  try {
+    broker.pi.on(event, (...args) => {
+      const active = electReporterCandidate(
+        [...broker.candidates.values()],
+        broker.contract,
+      );
+      const handlers = active?.handlers.get(event) || [];
+      const invoke = () => {
+        let result;
+        for (const handler of handlers) {
+          const current = handler(...args);
+          if (result === undefined && current !== undefined) result = current;
+        }
+        return result;
+      };
+      if (event !== "session_shutdown") return invoke();
+      try {
+        const result = invoke();
+        if (result && typeof result.finally === "function") {
+          return result.finally(() => resetReporterBroker(config, broker));
+        }
+        resetReporterBroker(config, broker);
+        return result;
+      } catch (error) {
+        resetReporterBroker(config, broker);
+        throw error;
+      }
+    });
+  } catch (error) {
+    writeLog(
+      config,
+      new RegistrationError(`Cannot register ${event}`, { cause: error }),
+    );
+  }
+}
+
+function installBrokerTool(broker, tool, config) {
+  if (broker.registeredTools.has(tool.name)) return;
+  broker.registeredTools.add(tool.name);
+  try {
+    broker.pi.registerTool({
+      ...tool,
+      async execute(...args) {
+        const active = electReporterCandidate(
+          [...broker.candidates.values()],
+          broker.contract,
+        );
+        const execute = active?.tools.get(tool.name)?.execute;
+        return execute ? execute(...args) : unavailable();
+      },
+    });
+  } catch (error) {
+    writeLog(
+      config,
+      new RegistrationError(`Cannot register ${tool.name}`, { cause: error }),
+    );
+  }
+}
+
+function registerReporterCandidate(pi, config, descriptor, setup) {
+  const contract = config.reporterContract;
+  if (contract?.enabled === false) return;
+  if (!candidateMatchesContract(descriptor, contract)) {
+    reporterNotice(
+      config.quillRoot,
+      descriptor.eligible
+        ? "ReporterPairMismatch"
+        : "ReporterOptInRequired",
+      descriptor.eligible
+        ? "install the exact Quill/reporter pair, then reload Pi"
+        : `select ${descriptor.extension_path} with QUILL_PI_REPORTER_PATH, then reload Pi`,
+    );
+    return;
+  }
+
+  const brokers = globalThis[REPORTER_BROKERS] || new Map();
+  const claims = globalThis[REPORTER_CLAIMS] || new Set();
+  globalThis[REPORTER_BROKERS] = brokers;
+  globalThis[REPORTER_CLAIMS] = claims;
+  let broker = brokers.get(config.quillRoot);
+  if (!broker && claims.has(config.quillRoot)) {
+    reporterNotice(
+      config.quillRoot,
+      "ReporterReloadRequired",
+      "a legacy pre-broker reporter is already loaded; remove it or reload Pi",
+    );
+    return;
+  }
+  if (!broker) {
+    broker = {
+      pi,
+      contract,
+      candidates: new Map(),
+      registeredEvents: new Set(),
+      registeredTools: new Set(),
+    };
+    brokers.set(config.quillRoot, broker);
+    claims.add(config.quillRoot);
+  }
+  broker.contract = contract;
+
+  const candidate = {
+    ...descriptor,
+    failed: false,
+    handlers: new Map(),
+    tools: new Map(),
+  };
+  const candidateApi = {
+    appendEntry: (...args) => pi.appendEntry(...args),
+    on(event, handler) {
+      const handlers = candidate.handlers.get(event) || [];
+      handlers.push(handler);
+      candidate.handlers.set(event, handlers);
+    },
+    registerTool(tool) {
+      candidate.tools.set(tool.name, tool);
+    },
+  };
+  setup(candidateApi, config);
+  broker.candidates.set(candidate.extension_path, candidate);
+  for (const event of candidate.handlers.keys()) {
+    installBrokerEvent(broker, event, config);
+  }
+  installBrokerEvent(broker, "session_shutdown", config);
+  for (const tool of candidate.tools.values()) {
+    installBrokerTool(broker, tool, config);
+  }
 }
 
 async function fetchJson(config, url, options) {
@@ -1706,8 +1925,6 @@ function registerTracking(pi, config) {
         config,
         new TransportError("Pi shutdown tracking failed", { cause: error }),
       );
-    } finally {
-      releaseReporter(config);
     }
   });
   registerHandler(pi, config, "agent_start", (event, ctx) =>
@@ -1890,23 +2107,7 @@ function registerTracking(pi, config) {
   });
 }
 
-// @lat: [[infrastructure#Infrastructure#Pi Integration Deployment#Extension Tools and Telemetry]]
-export default function quill(pi) {
-  let config;
-  try {
-    config = loadConfig();
-  } catch (error) {
-    const root = process.env.HOME || process.env.USERPROFILE || homedir();
-    if (lastNoticeRoot !== root) {
-      lastNoticeRoot = root;
-      console.warn(
-        "Quill Pi extension inactive: install or repair Quill config.",
-      );
-    }
-    return;
-  }
-  if (!claimReporter(config)) return;
-
+function configureReporter(pi, config) {
   const trackingOnlyChild = process.env.PI_SUBAGENT_CHILD === "1";
   if (FEATURES.context_preservation && !trackingOnlyChild) {
     for (const tool of TOOLS) {
@@ -1983,9 +2184,21 @@ export default function quill(pi) {
         });
       }
     }
-  } else {
-    registerHandler(pi, config, "session_shutdown", () =>
-      releaseReporter(config),
-    );
   }
+}
+
+// @lat: [[infrastructure#Infrastructure#Pi Integration Deployment#Extension Tools and Telemetry]]
+export default function quill(pi) {
+  let config;
+  try {
+    config = loadConfig();
+  } catch (error) {
+    const root = process.env.HOME || process.env.USERPROFILE || homedir();
+    reporterNotice(root, "ConfigError", "install or repair Quill config");
+    return;
+  }
+  const descriptor = reporterCandidateForPath(EXTENSION_PATH, {
+    home: config.home,
+  });
+  registerReporterCandidate(pi, config, descriptor, configureReporter);
 }

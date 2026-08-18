@@ -10,7 +10,7 @@ const manifest = JSON.parse(readFileSync(new URL("package.json", packageDir), "u
 // @lat: [[pi-package-tests#Pi Package Test Specs#Registry artifact]]
 test("Pi package has one dependency-free extension export", () => {
   assert.equal(manifest.name, "@sharaf-nassar/quill-pi");
-  assert.equal(manifest.version, "0.1.0");
+  assert.equal(manifest.version, "0.2.0");
   assert.equal(manifest.version, EXTENSION_VERSION);
   assert.equal(manifest.exports["."], "./quill.ts");
   assert.deepEqual(manifest.pi.extensions, ["./quill.ts"]);
@@ -29,4 +29,27 @@ test("Pi package has one dependency-free extension export", () => {
     packed.files.map(({ path }) => path).sort(),
     ["LICENSE", "README.md", "package.json", "quill.ts"],
   );
+});
+
+// @lat: [[pi-package-tests#Pi Package Test Specs#Desktop-first publication]]
+test("Pi package publication waits for the matching desktop release", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/publish-pi-extension.yml", import.meta.url),
+    "utf8",
+  );
+  const desktopGate = workflow.indexOf(
+    "Verify matching desktop release is available",
+  );
+  const buildStage = workflow.indexOf(
+    "Stage exact desktop build in reporter source",
+  );
+  const dryRun = workflow.indexOf("npm publish --dry-run --provenance");
+  const publish = workflow.indexOf("npm publish --provenance --access public");
+
+  assert.ok(desktopGate > 0);
+  assert.ok(buildStage > desktopGate);
+  assert.ok(dryRun > buildStage);
+  assert.ok(publish > dryRun);
+  assert.match(workflow, /gh release view "v\$\{PI_VERSION\}"/);
+  assert.match(workflow, /"0\.0\.0-injected-by-ci", process\.env\.PI_VERSION/);
 });

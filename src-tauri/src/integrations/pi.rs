@@ -14,15 +14,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::Manager;
 
-const INTEGRATION_STATE_VERSION: u8 = 1;
+const INTEGRATION_STATE_VERSION: u8 = 2;
 const MIN_PI_VERSION: (u64, u64, u64) = (0, 84, 0);
 const CONFIG_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
 const SESSION_DIR_ENV: &str = "PI_CODING_AGENT_SESSION_DIR";
 const EXTENSION_FILE: &str = "quill.ts";
 const AGENTS_TEMPLATE_FILE: &str = "agents-md-section.md";
 const QUILL_EXTENSION_MARKER: &str = "quill-managed:pi";
-const PAYLOAD_MARKER: &str = "quill-managed-pi-payload: 2";
+const PAYLOAD_MARKER: &str = "quill-managed-pi-payload: 3";
+const QUILL_BUILD_SENTINEL: &str = "0.0.0-injected-by-ci";
 const CONTEXT_HTTP_ENABLED_KEY: &str = "context_http.enabled";
+const PI_REPORTER_ENABLED_KEY: &str = "pi_reporter.enabled";
+const PI_REPORTER_RELOAD_REQUIRED_KEY: &str = "pi_reporter.reload_required";
+const PI_REPORTER_EXACT_SEEN_KEY: &str = "pi_reporter.exact_seen";
 const FEATURES_DECLARATION: &str = "const FEATURES";
 const AGENTS_BLOCK_START: &str = "<!-- quill-managed:pi:start -->";
 const AGENTS_BLOCK_END: &str = "<!-- quill-managed:pi:end -->";
@@ -207,7 +211,7 @@ fn install_from_bundle(
     }
 
     let snapshots = capture_snapshots(paths)?;
-    let prior_context_setting = storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?;
+    let prior_settings = capture_reporter_settings(storage)?;
     let setup = (|| {
         crate::integrations::config_contract::write_local_contract_at(
             &paths.quill_config,
@@ -216,6 +220,7 @@ fn install_from_bundle(
             crate::integrations::config_contract::main_port(),
             crate::integrations::config_contract::context_port(),
         )?;
+        write_reporter_contract(&paths.quill_config, true, &extension)?;
         fs::create_dir_all(paths.extensions_dir()).map_err(|error| {
             format!(
                 "Failed to create Pi extensions directory {}: {error}",
@@ -238,9 +243,14 @@ fn install_from_bundle(
                 extension.display()
             )
         })?;
+        storage.set_settings_atomically(&[
+            (CONTEXT_HTTP_ENABLED_KEY, "true"),
+            (PI_REPORTER_ENABLED_KEY, "true"),
+            (PI_REPORTER_RELOAD_REQUIRED_KEY, "true"),
+            (PI_REPORTER_EXACT_SEEN_KEY, ""),
+        ])?;
         update_agents_block(&paths.agents_path(), &bundle.join(AGENTS_TEMPLATE_FILE))?;
         write_integration_state(paths, version)?;
-        storage.set_setting(CONTEXT_HTTP_ENABLED_KEY, "true")?;
         verify_without_stamp(bundle, paths, features, storage)?;
         let stamp = current_stamp(bundle, version, features)?;
         write_deployment_stamp(&paths.provider_root, &stamp)?;
@@ -250,7 +260,7 @@ fn install_from_bundle(
     match setup {
         Ok(()) => snapshots.commit(),
         Err(error) => {
-            let error = restore_context_setting(storage, prior_context_setting, error);
+            let error = restore_reporter_settings(storage, &prior_settings, error);
             Err(snapshots.restore_with_error(error))
         }
     }
@@ -271,7 +281,7 @@ fn uninstall_with_paths(
 ) -> Result<(), String> {
     let snapshots = capture_snapshots(paths)?;
     let manifest = build_owned_manifest(paths);
-    let prior_context_setting = storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?;
+    let prior_settings = capture_reporter_settings(storage)?;
     let result = (|| {
         for extension in quill_extension_files(&paths.extensions_dir())? {
             remove_path(&extension).map_err(|error| {
@@ -286,12 +296,21 @@ fn uninstall_with_paths(
             remove_path(&path)
                 .map_err(|error| format!("Failed to remove {}: {error}", path.display()))?;
         }
-        // Pi is the only installed consumer of this listener today.
-        storage.delete_setting(CONTEXT_HTTP_ENABLED_KEY)?;
-        verify_uninstalled(paths, storage)?;
+        // Pi is the only installed consumer of this listener today. The
+        // explicit false also makes every managed/npm/project/dev reporter
+        // inert before Pi reloads, even when another provider keeps config.json.
+        storage.set_settings_atomically(&[
+            (CONTEXT_HTTP_ENABLED_KEY, "false"),
+            (PI_REPORTER_ENABLED_KEY, "false"),
+            (PI_REPORTER_RELOAD_REQUIRED_KEY, "true"),
+            (PI_REPORTER_EXACT_SEEN_KEY, ""),
+        ])?;
         if remove_shared_config {
             crate::integrations::config_contract::remove_at(&paths.quill_config)?;
+        } else {
+            write_reporter_contract(&paths.quill_config, false, &paths.extension_path())?;
         }
+        verify_uninstalled(paths, storage, remove_shared_config)?;
         remove_owned_artifacts(&manifest)?;
         verify_owned_artifacts_removed(&manifest)?;
         Ok(())
@@ -299,10 +318,75 @@ fn uninstall_with_paths(
     match result {
         Ok(()) => snapshots.commit(),
         Err(error) => {
-            let error = restore_context_setting(storage, prior_context_setting, error);
+            let error = restore_reporter_settings(storage, &prior_settings, error);
             Err(snapshots.restore_with_error(error))
         }
     }
+}
+
+fn local_reporter_config(value: &serde_json::Value) -> bool {
+    value
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|url| reqwest::Url::parse(url).ok())
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+}
+
+fn reporter_contract(enabled: bool, managed_path: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": enabled,
+        "protocol": crate::pi_tracking::PI_PROTOCOL_V2,
+        "reporter_version": crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION,
+        "quill_build": crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD,
+        "capability_digest": crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+        "managed_path": managed_path,
+    })
+}
+
+fn write_reporter_contract(
+    config_path: &Path,
+    enabled: bool,
+    managed_path: &Path,
+) -> Result<(), String> {
+    let bytes = fs::read(config_path)
+        .map_err(|error| format!("Failed to read {}: {error}", config_path.display()))?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Failed to parse {}: {error}", config_path.display()))?;
+    if !local_reporter_config(&value) {
+        return Ok(());
+    }
+    value
+        .as_object_mut()
+        .ok_or_else(|| format!("{} must contain a JSON object", config_path.display()))?
+        .insert(
+            "pi_reporter".to_string(),
+            reporter_contract(enabled, managed_path),
+        );
+    fs::write(
+        config_path,
+        serde_json::to_vec_pretty(&value)
+            .map_err(|error| format!("Failed to serialize Pi reporter contract: {error}"))?,
+    )
+    .map_err(|error| format!("Failed to write {}: {error}", config_path.display()))
+}
+
+fn verify_reporter_contract(
+    config_path: &Path,
+    enabled: bool,
+    managed_path: &Path,
+) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(config_path)
+            .map_err(|error| format!("Failed to read {}: {error}", config_path.display()))?,
+    )
+    .map_err(|error| format!("Failed to parse {}: {error}", config_path.display()))?;
+    if local_reporter_config(&value)
+        && value.get("pi_reporter") != Some(&reporter_contract(enabled, managed_path))
+    {
+        return Err("Pi reporter contract does not match this Quill build".to_string());
+    }
+    Ok(())
 }
 
 fn build_owned_manifest(paths: &PiInstallPaths) -> OwnedAssetManifest {
@@ -312,7 +396,7 @@ fn build_owned_manifest(paths: &PiInstallPaths) -> OwnedAssetManifest {
         .unwrap_or_else(|| Path::new("/tmp"));
     OwnedAssetManifest {
         files: vec![root.join("pi-extension.log").to_string_lossy().into_owned()],
-        directories: vec![root.join("pi-spool").to_string_lossy().into_owned()],
+        directories: Vec::new(),
     }
 }
 
@@ -389,6 +473,9 @@ fn verify_without_stamp(
     if storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?.as_deref() != Some("true") {
         return Err("Pi context HTTP listener setting is disabled".to_string());
     }
+    if storage.get_setting(PI_REPORTER_ENABLED_KEY)?.as_deref() != Some("true") {
+        return Err("Pi reporter ingestion is disabled".to_string());
+    }
     crate::integrations::config_contract::verify_local_contract_at(
         &paths.quill_config,
         &paths.auth_secret,
@@ -396,7 +483,7 @@ fn verify_without_stamp(
         crate::integrations::config_contract::main_port(),
         crate::integrations::config_contract::context_port(),
     )?;
-    Ok(())
+    verify_reporter_contract(&paths.quill_config, true, &paths.extension_path())
 }
 
 pub(crate) fn deployment_is_current(app: &tauri::AppHandle, features: IntegrationFeatures) -> bool {
@@ -425,21 +512,51 @@ fn recover_interrupted_install_with_paths(
     recover_staged_batch(&paths.transaction_targets())?;
     let installed = paths.extension_path().is_file()
         && is_quill_extension(&paths.extension_path()).unwrap_or(false);
-    if installed {
-        storage.set_setting(CONTEXT_HTTP_ENABLED_KEY, "true")
-    } else {
-        storage.delete_setting(CONTEXT_HTTP_ENABLED_KEY)
-    }
+    let enabled = if installed { "true" } else { "false" };
+    storage.set_settings_atomically(&[
+        (CONTEXT_HTTP_ENABLED_KEY, enabled),
+        (PI_REPORTER_ENABLED_KEY, enabled),
+        (PI_REPORTER_RELOAD_REQUIRED_KEY, "true"),
+        (PI_REPORTER_EXACT_SEEN_KEY, ""),
+    ])
 }
 
-fn restore_context_setting(storage: &Storage, prior: Option<String>, primary: String) -> String {
-    let restored = match prior {
-        Some(value) => storage.set_setting(CONTEXT_HTTP_ENABLED_KEY, &value),
-        None => storage.delete_setting(CONTEXT_HTTP_ENABLED_KEY),
-    };
-    match restored {
-        Ok(()) => primary,
-        Err(error) => format!("{primary}; context HTTP setting rollback failed: {error}"),
+const REPORTER_TRANSACTION_SETTINGS: [&str; 4] = [
+    CONTEXT_HTTP_ENABLED_KEY,
+    PI_REPORTER_ENABLED_KEY,
+    PI_REPORTER_RELOAD_REQUIRED_KEY,
+    PI_REPORTER_EXACT_SEEN_KEY,
+];
+
+fn capture_reporter_settings(storage: &Storage) -> Result<Vec<Option<String>>, String> {
+    REPORTER_TRANSACTION_SETTINGS
+        .iter()
+        .map(|key| storage.get_setting(key))
+        .collect()
+}
+
+fn restore_reporter_settings(
+    storage: &Storage,
+    prior: &[Option<String>],
+    primary: String,
+) -> String {
+    let mut errors = Vec::new();
+    for (key, value) in REPORTER_TRANSACTION_SETTINGS.iter().zip(prior) {
+        let restored = match value {
+            Some(value) => storage.set_setting(key, value),
+            None => storage.delete_setting(key),
+        };
+        if let Err(error) = restored {
+            errors.push(format!("{key}: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        primary
+    } else {
+        format!(
+            "{primary}; Pi reporter settings rollback failed: {}",
+            errors.join("; ")
+        )
     }
 }
 
@@ -504,6 +621,7 @@ fn render_extension(bundle: &Path, features: IntegrationFeatures) -> Result<Vec<
             features.context_telemetry,
         ),
     );
+    source = source.replace(QUILL_BUILD_SENTINEL, env!("CARGO_PKG_VERSION"));
     Ok(source.into_bytes())
 }
 
@@ -833,7 +951,11 @@ fn remove_agents_block(path: &Path) -> Result<(), String> {
     }
 }
 
-fn verify_uninstalled(paths: &PiInstallPaths, storage: &Storage) -> Result<(), String> {
+fn verify_uninstalled(
+    paths: &PiInstallPaths,
+    storage: &Storage,
+    shared_config_removed: bool,
+) -> Result<(), String> {
     if !quill_extension_files(&paths.extensions_dir())?.is_empty() {
         return Err("A Quill-owned Pi extension remains after uninstall".to_string());
     }
@@ -845,8 +967,14 @@ fn verify_uninstalled(paths: &PiInstallPaths, storage: &Storage) -> Result<(), S
     if paths.state_path().exists() || paths.stamp_path().exists() {
         return Err("Pi lifecycle metadata remains after uninstall".to_string());
     }
-    if storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?.is_some() {
-        return Err("Pi context HTTP listener setting remains after uninstall".to_string());
+    if storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?.as_deref() != Some("false") {
+        return Err("Pi context HTTP listener setting remains enabled after uninstall".to_string());
+    }
+    if storage.get_setting(PI_REPORTER_ENABLED_KEY)?.as_deref() != Some("false") {
+        return Err("Pi reporter ingestion remains enabled after uninstall".to_string());
+    }
+    if !shared_config_removed {
+        verify_reporter_contract(&paths.quill_config, false, &paths.extension_path())?;
     }
     Ok(())
 }
@@ -912,7 +1040,7 @@ pub(crate) fn resolve_session_dir_from(
 mod tests {
     use super::*;
 
-    const PAYLOAD: &str = "// quill-managed:pi\n// quill-managed-pi-payload: 2\nconst FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };\nexport default function quill() {}\n";
+    const PAYLOAD: &str = "// quill-managed:pi\n// quill-managed-pi-payload: 3\nconst FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };\nexport const PI_PROTOCOL_V2_QUILL_BUILD = \"0.0.0-injected-by-ci\";\nexport default function quill() {}\n";
     const AGENTS: &str = "<!-- quill-managed:pi:start -->\n## Quill Session History\n\nUse `quill_search_history`.\n<!-- quill-managed:pi:end -->\n";
 
     struct Harness {
@@ -975,6 +1103,15 @@ mod tests {
                 .as_str()
                 .is_some_and(|host| !host.is_empty())
         );
+        assert_eq!(installed["pi_reporter"]["enabled"], true);
+        assert_eq!(
+            installed["pi_reporter"]["reporter_version"],
+            crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION
+        );
+        assert_eq!(
+            installed["pi_reporter"]["managed_path"],
+            harness.paths.extension_path().to_string_lossy().as_ref()
+        );
 
         fs::write(
             &harness.paths.quill_config,
@@ -1025,6 +1162,9 @@ mod tests {
 
         uninstall_with_paths(&harness.paths, &harness.storage, false).unwrap();
         assert!(harness.paths.quill_config.exists());
+        let disabled: serde_json::Value =
+            serde_json::from_slice(&fs::read(&harness.paths.quill_config).unwrap()).unwrap();
+        assert_eq!(disabled["pi_reporter"]["enabled"], false);
 
         install_from_bundle(
             &harness.bundle,
@@ -1113,7 +1253,7 @@ mod tests {
         assert!(!harness.paths.extension_path().exists());
         assert!(!harness.paths.state_path().exists());
         assert!(!harness.paths.stamp_path().exists());
-        assert!(!spool.exists());
+        assert!(spool.exists());
         assert!(!log.exists());
     }
 
@@ -1153,6 +1293,62 @@ mod tests {
                 .as_deref(),
             Some("true")
         );
+    }
+
+    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Transactional repair rollback]]
+    #[test]
+    fn failed_repair_restores_config_extension_state_and_database_settings() {
+        let harness = Harness::new();
+        fs::create_dir_all(harness.paths.extensions_dir()).unwrap();
+        let old_extension = b"// quill-managed:pi\n// old reporter bytes\n";
+        let old_agents = b"user instructions\n";
+        let old_config = br#"{"url":"http://localhost:19000","secret":"old"}"#;
+        fs::write(harness.paths.extension_path(), old_extension).unwrap();
+        fs::write(harness.paths.agents_path(), old_agents).unwrap();
+        fs::write(&harness.paths.quill_config, old_config).unwrap();
+        harness
+            .storage
+            .set_settings_atomically(&[
+                (CONTEXT_HTTP_ENABLED_KEY, "false"),
+                (PI_REPORTER_ENABLED_KEY, "false"),
+                (PI_REPORTER_RELOAD_REQUIRED_KEY, "false"),
+                (PI_REPORTER_EXACT_SEEN_KEY, "old-generation"),
+            ])
+            .unwrap();
+        fs::write(
+            harness.bundle.join(AGENTS_TEMPLATE_FILE),
+            b"invalid template without ownership markers\n",
+        )
+        .unwrap();
+
+        let error = install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            IntegrationFeatures::default(),
+            &harness.storage,
+        )
+        .unwrap_err();
+        assert!(error.contains("lacks managed block markers"));
+        assert_eq!(
+            fs::read(harness.paths.extension_path()).unwrap(),
+            old_extension
+        );
+        assert_eq!(fs::read(harness.paths.agents_path()).unwrap(), old_agents);
+        assert_eq!(fs::read(&harness.paths.quill_config).unwrap(), old_config);
+        for (key, expected) in [
+            (CONTEXT_HTTP_ENABLED_KEY, "false"),
+            (PI_REPORTER_ENABLED_KEY, "false"),
+            (PI_REPORTER_RELOAD_REQUIRED_KEY, "false"),
+            (PI_REPORTER_EXACT_SEEN_KEY, "old-generation"),
+        ] {
+            assert_eq!(
+                harness.storage.get_setting(key).unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(!harness.paths.state_path().exists());
+        assert!(!harness.paths.stamp_path().exists());
     }
 
     // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Semantic Verification]]
@@ -1247,7 +1443,7 @@ mod tests {
 
         fs::write(
             harness.paths.extension_path(),
-            "// quill-managed:pi\n// quill-managed-pi-payload: 1\nexport default function oldQuill() {}\n",
+            "// quill-managed:pi\n// quill-managed-pi-payload: 2\nexport default function oldQuill() {}\n",
         )
         .unwrap();
         fs::write(harness.paths.stamp_path(), "old-build-stamp").unwrap();
@@ -1397,7 +1593,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(after_install.as_deref(), Some("true"));
-        assert_eq!(after_uninstall, None);
+        assert_eq!(after_uninstall.as_deref(), Some("false"));
+        assert_eq!(
+            harness
+                .storage
+                .get_setting(PI_REPORTER_ENABLED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
     }
 
     // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Feature-gated Payload]]
@@ -1421,6 +1625,7 @@ mod tests {
         assert!(installed.contains(
             "const FEATURES = { context_preservation: false, activity_tracking: true, context_telemetry: true };"
         ));
+        assert!(installed.contains(env!("CARGO_PKG_VERSION")));
         assert!(deployment_is_current_with_paths(
             &harness.bundle,
             &harness.paths,

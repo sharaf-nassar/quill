@@ -68,6 +68,8 @@ pub enum PiExtensionErrorKind {
     Config,
     Transport,
     ProtocolMismatch,
+    ReporterReloadRequired,
+    Disabled,
     Registration,
     Spool,
     Unknown,

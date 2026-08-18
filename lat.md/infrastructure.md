@@ -368,11 +368,11 @@ Pi must resolve through the shared login-shell, launcher, and symlink-aware PATH
 
 The selected `$PI_CODING_AGENT_DIR` and `$PI_CODING_AGENT_SESSION_DIR`, or their `~/.pi/agent` defaults, are captured in `~/.config/quill/pi/integration-state.json` with the detected Pi version. Later repair and removal use those persisted paths even if the environment changes.
 
-Installation copies the bundled `quill.ts` to `<Pi config>/extensions/quill.ts` and maintains one Quill block in `<Pi config>/AGENTS.md`. The extension payload marker and managed block markers define ownership. A user-owned `quill.ts` blocks installation; unrelated extension files and user instruction bytes remain untouched. Disabling removes marked Quill files, the managed block, state, stamp, Pi spool directory, and bounded extension log. It does not delete indexed Pi sessions or analytics.
+Installation copies the bundled `quill.ts` to `<Pi config>/extensions/quill.ts` and maintains one Quill block in `<Pi config>/AGENTS.md`. The extension payload marker and managed block markers define ownership. A user-owned `quill.ts` blocks installation; unrelated extension files and user instruction bytes remain untouched. Disabling removes marked Quill files, the managed block, state, stamp, and bounded extension log, then persists a disabled reporter contract so npm/project/development copies stay inert without changing their files. It does not delete indexed Pi sessions or analytics. Legacy spool cleanup is sequenced separately after reconciliation and exact reporter reload.
 
 Pi's npm package is user-owned. Quill never edits Pi package settings or npm storage, while `pi install`, `pi update`, `pi config`, and `pi remove` own that lifecycle. Managed uninstall cannot remove the package, and package removal cannot remove Quill's managed file or local data.
 
-Pi uses [[src-tauri/src/integrations/deploy.rs#FileSnapshots]] as a configuration-only transaction over individual files, including the shared provider contract. It never stages or renames the extensions directory, so sibling extensions cannot enter Quill's backup. The global mutation guard invokes Pi recovery before every provider mutation.
+Pi uses [[src-tauri/src/integrations/deploy.rs#FileSnapshots]] as a configuration-only transaction over individual files, including the shared provider contract. The same transaction snapshots and restores context-listener, reporter-enable, reload-required, and exact-generation settings, so config, database gates, deployed bytes, instruction/state files, and stamp roll back together. It never stages or renames the extensions directory, so sibling extensions cannot enter Quill's backup. The global mutation guard invokes Pi recovery before every provider mutation.
 
 Startup repair takes the same fast path as Codex: a deployment is current only when its bundled-source stamp matches and semantic verification passes. An old stamp therefore triggers the idempotent install path and replaces the owned extension with current bundled bytes without user action. Verification checks exact extension bytes, payload ownership, the current AGENTS block, four-field integration state, and local shared config. Tauri bundles `pi-integration/**/*`, and [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Packaged Assets]] pins that package input.
 
@@ -380,19 +380,20 @@ Startup repair takes the same fast path as Codex: a deployment is current only w
 
 `@sharaf-nassar/quill-pi` publishes the same dependency-free `quill.ts` source that Quill bundles, with independent SemVer and support for Pi `>=0.84.0 <1` on Node.js `>=22.19.0`.
 
-Pi's native order is project extensions, user extensions, then packages. A process-wide claim keyed by Quill's config root lets the first compatible copy register; later managed or npm copies stay inert. The shutdown handler releases the claim before Pi rebuilds extensions on `/reload` or session replacement.
+Pi's native order remains project extensions, user extensions, then packages, but load order no longer chooses Quill ownership. [[src-tauri/pi-integration/quill.ts#electReporterCandidate]] feeds exact candidates into one process-global broker whose single delegating tool/handler set elects managed, then npm, then explicitly selected project/development paths. Candidates declare channel, extension path, reporter/protocol/build generation, capability digest, and capabilities. Project/development copies require `QUILL_PI_REPORTER_PATH` to equal their resolved file exactly.
+
+The local `pi_reporter` config contract is the server's exact generation and enablement source. Disabled, unselected, older/newer, or capability-skewed candidates register nothing. Protocol drift during a process makes live delivery inert while Pi custom entries remain durable. A pre-broker claim is never replaced in-process: the new copy emits typed `ReporterReloadRequired` remediation, while a new broker also holds the legacy claim so later old copies cannot register.
 
 | Copies present | Reporter precedence | Lifecycle owner |
 | --- | --- | --- |
 | Managed and npm | Managed | Quill repairs only the marked file; Pi updates only the package. |
-| User `quill.ts` and npm | User file, then npm | Quill refuses to overwrite an unmarked global file. |
-| Project, managed, and npm | Project, managed, then npm | Project trust and Pi settings remain user-owned. |
+| User `quill.ts` and npm | Exact npm reporter | Quill refuses to overwrite the unmarked global file. |
+| Selected project, managed, and npm | Managed, then npm, then project | Project trust and Pi settings remain user-owned. |
+| Selected development only | Development | Exact path opt-in is required and never mutates production integration assets. |
 
-Only compatible Quill reporters participate in the claim. An unrelated user extension named `quill.ts` keeps its behavior; the npm copy remains the only Quill reporter. Copies older than package `0.1.0` must not coexist because they predate election.
+Reporter package `0.2.0` introduces broker participation and cannot silently cooperate with pre-broker copies. Exact npm versions provide rollback and downgrade pins; Pi excludes pins from bulk updates. Desktop rollback changes only the managed bundle. Every install-channel change takes effect after `/reload`, and neither channel deletes the other's files, settings, persisted session evidence, config, secrets, or indexed data.
 
-Exact npm versions provide rollback and downgrade pins; Pi excludes pins from bulk updates. Desktop rollback changes only the managed bundle. Every install-channel change takes effect after `/reload`, and neither channel deletes the other's files, settings, persisted session evidence, config, secrets, or indexed data.
-
-`.github/workflows/publish-pi-extension.yml` accepts only `pi-vX.Y.Z` tags matching both package and reporter versions. It tests the real npm tarball and extension before `npm publish --provenance --access public` from a GitHub-hosted OIDC runner.
+`.github/workflows/publish-pi-extension.yml` accepts only `pi-vX.Y.Z` tags matching package and reporter versions, requires published non-prerelease desktop `vX.Y.Z` assets first, injects that exact desktop build into the reporter source, and performs pack plus provenance publish dry runs before `npm publish --provenance --access public` from a GitHub-hosted OIDC runner.
 
 The npm trusted-publisher record must name `sharaf-nassar/quill` and that exact workflow filename. npm's Sigstore provenance and registry attestation are the package signature; CI stores no long-lived npm token. Package metadata fixes the public registry, repository directory, MIT license, export, Pi manifest, and supported host versions. [[pi-package-tests]] pins the shipped files.
 

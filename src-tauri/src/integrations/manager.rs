@@ -29,10 +29,14 @@ fn pi_extension_error(value: &str) -> Option<PiExtensionErrorKind> {
         "ProtocolMismatchError" | "protocol_mismatch" => {
             Some(PiExtensionErrorKind::ProtocolMismatch)
         }
+        "ReporterReloadRequired" => Some(PiExtensionErrorKind::ReporterReloadRequired),
+        "ReporterDisabled" => Some(PiExtensionErrorKind::Disabled),
         "RegistrationError" => Some(PiExtensionErrorKind::Registration),
-        "SpoolError" | "spool_corrupt" | "spool_corrupt_gap" | "spool_drop_gap" => {
-            Some(PiExtensionErrorKind::Spool)
-        }
+        "SpoolError"
+        | "spool_corrupt"
+        | "spool_corrupt_gap"
+        | "spool_drop_gap"
+        | "spool_retired_without_import" => Some(PiExtensionErrorKind::Spool),
         _ => Some(PiExtensionErrorKind::Unknown),
     }
 }
@@ -55,10 +59,20 @@ fn pi_extension_health_at(
                 PiExtensionHealthState::Stale
             }
         });
-    let last_error = storage
-        .get_setting("pi_extension.spool_gap")?
-        .filter(|value| !value.is_empty())
-        .or(storage.get_setting("pi_extension.last_error")?);
+    let last_error = if storage.get_setting("pi_reporter.enabled")?.as_deref() == Some("false") {
+        Some("ReporterDisabled".to_string())
+    } else if storage
+        .get_setting("pi_reporter.reload_required")?
+        .as_deref()
+        == Some("true")
+    {
+        Some("ReporterReloadRequired".to_string())
+    } else {
+        storage
+            .get_setting("pi_extension.spool_gap")?
+            .filter(|value| !value.is_empty())
+            .or(storage.get_setting("pi_extension.last_error")?)
+    };
     Ok(PiExtensionHealth {
         state,
         last_seen,
@@ -876,7 +890,7 @@ mod tests {
         assert_eq!(health.protocol.as_deref(), Some("2"));
     }
 
-    // @lat: [[pi-spool-tests#Pi Spool Drain Test Specs#Typed health gap]]
+    // @lat: [[pi-spool-tests#Pi Spool Retirement Test Specs#Typed retirement gap]]
     #[test]
     fn pi_extension_health_surfaces_spool_drop_and_corrupt_gaps() {
         assert_eq!(
@@ -885,6 +899,10 @@ mod tests {
         );
         assert_eq!(
             pi_extension_error("spool_corrupt_gap"),
+            Some(PiExtensionErrorKind::Spool)
+        );
+        assert_eq!(
+            pi_extension_error("spool_retired_without_import"),
             Some(PiExtensionErrorKind::Spool)
         );
 
@@ -901,6 +919,33 @@ mod tests {
                 .unwrap()
                 .last_error,
             Some(PiExtensionErrorKind::Spool)
+        );
+    }
+
+    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Reload and disable status]]
+    #[test]
+    fn pi_extension_health_types_reload_and_disable_remediation() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Storage::init_at(dir.path().join("quill.db"), false).unwrap();
+        storage
+            .set_settings_atomically(&[
+                ("pi_reporter.enabled", "true"),
+                ("pi_reporter.reload_required", "true"),
+            ])
+            .unwrap();
+        assert_eq!(
+            pi_extension_health_at(&storage, Utc::now())
+                .unwrap()
+                .last_error,
+            Some(PiExtensionErrorKind::ReporterReloadRequired)
+        );
+
+        storage.set_setting("pi_reporter.enabled", "false").unwrap();
+        assert_eq!(
+            pi_extension_health_at(&storage, Utc::now())
+                .unwrap()
+                .last_error,
+            Some(PiExtensionErrorKind::Disabled)
         );
     }
 

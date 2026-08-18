@@ -40,12 +40,6 @@ Session Search startup inventory scans persisted Pi files without requiring a pr
 
 Validated Pi sources enter the existing provider-plus-source coordinator with transcript work armed and model work unarmed. Pi does not create a second queue, permit, retry, or backoff implementation.
 
-## Retired Spool Isolation
-
-Migration 46's durable `pi_spool_cleanup_pending` marker prevents production startup from spawning the legacy spool drain.
-
-Persisted sessions remain the only reconciliation source; direct legacy drain tests stay available until deployment cutover owns artifact deletion.
-
 ## No Root Scan
 
 Provider-qualified session lookup returns no Pi transcript instead of walking every file to compare header ids.

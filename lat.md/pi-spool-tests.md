@@ -2,32 +2,22 @@
 lat:
   require-code-mention: true
 ---
-# Pi Spool Drain Test Specs
+# Pi Spool Retirement Test Specs
 
-These tests pin Quill's bounded replay of Pi tracking and runtime envelopes without racing live appenders or duplicating accepted events.
+These tests pin one-way retirement of Quill-owned legacy Pi spool artifacts without importing them.
 
-## Live overlap
+## Cutover sequencing
 
-A live-PID file remains appendable across drains; newly appended records land while repeated usage and runtime UUIDs remain deduplicated.
+Retirement waits for persisted-source reconciliation and an exact reporter generation accepted after reload.
 
-## Corrupt continuation and dead cleanup
+## Owned artifact cleanup
 
-A corrupt committed line records a typed gap without blocking later valid lines, and Quill deletes the dead writer's claimed file after the pass.
+Retirement claims and removes only dead or already-claimed Quill spool files, preserves live and foreign files, records the no-import gap, and completes only after every owned writer exits.
 
-## Cap drop gap
+## Typed retirement gap
 
-File, directory, and age caps record a typed drop gap; dead files can be claimed and removed while live-PID files remain untouched.
-
-## Ingest throttling
-
-Four 15-second passes consume at most half of each Pi ingest window, leaving 2,000 requests per minute for live tracking and runtime traffic.
-
-A throttled file retains its claimed remainder and the next pass resumes at the record the budget stopped on rather than replaying the records it already spent.
-
-## Typed health gap
-
-Provider health maps both corrupt-record and cap-drop gap codes to the typed spool error state exposed by integration status.
+Provider health maps legacy drop, corrupt-record, and retirement-without-import gap codes to the typed spool error state exposed by integration status.
 
 ## Symlink boundary
 
-The drain rejects a symlinked spool root and leaves every file in its external target untouched.
+Retirement rejects a symlinked spool root and leaves every file in its external target untouched.

@@ -40,15 +40,41 @@ jobs:
             echo "::error::Tag, package, and extension versions must match"
             exit 1
           fi
+          echo "PI_VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Verify matching desktop release is available
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DRAFT=$(gh release view "v${PI_VERSION}" --json isDraft --jq .isDraft)
+          PRERELEASE=$(gh release view "v${PI_VERSION}" --json isPrerelease --jq .isPrerelease)
+          ASSETS=$(gh release view "v${PI_VERSION}" --json assets --jq '.assets | length')
+          if [ "$DRAFT" != "false" ] || [ "$PRERELEASE" != "false" ] || [ "$ASSETS" -lt 1 ]; then
+            echo "::error::Published desktop release v${PI_VERSION} with managed assets is required first"
+            exit 1
+          fi
 
       - name: Test package and extension
         run: |
           node --test scripts/pi-package.test.mjs
           node --test src-tauri/pi-integration/quill.test.mjs
 
-      - name: Inspect package
+      - name: Stage exact desktop build in reporter source
+        shell: bash
+        run: |
+          node -e 'const fs=require("fs"); const path="src-tauri/pi-integration/quill.ts"; const source=fs.readFileSync(path,"utf8"); const next=source.replaceAll("0.0.0-injected-by-ci", process.env.PI_VERSION); if(next===source) process.exit(1); fs.writeFileSync(path,next)'
+          BUILD=$(node -e "import('./src-tauri/pi-integration/quill.ts').then(module => process.stdout.write(module.PI_PROTOCOL_V2_QUILL_BUILD))")
+          if [ "$BUILD" != "$PI_VERSION" ]; then
+            echo "::error::Reporter build does not match desktop v${PI_VERSION}"
+            exit 1
+          fi
+
+      - name: Inspect package and provenance publish
         working-directory: src-tauri/pi-integration
-        run: npm pack --dry-run --json
+        run: |
+          npm pack --dry-run --json
+          npm publish --dry-run --provenance --access public
 
       - name: Publish package
         working-directory: src-tauri/pi-integration

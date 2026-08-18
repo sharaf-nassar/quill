@@ -36,7 +36,11 @@ Pi 0.84.0 and newer pass detection, while older, unknown, and malformed versions
 
 ## Transactional Round Trip
 
-Install and uninstall preserve existing AGENTS.md bytes and unrelated Pi extensions while removing every Quill-owned lifecycle, spool, and extension-log artifact.
+Install and uninstall preserve existing AGENTS.md bytes and unrelated Pi extensions while removing every Quill-owned lifecycle and extension-log artifact. Spool files remain under retirement sequencing rather than provider uninstall.
+
+## Transactional repair rollback
+
+A repair failure after config, reporter bytes, and database gates change restores exact prior config, extension, instruction/state bytes, and reporter/listener settings through [[src-tauri/src/integrations/pi.rs#restore_reporter_settings]].
 
 ## Crash Recovery
 
@@ -72,7 +76,13 @@ Saved enablement cannot hide a fresh version, path, or writability error reporte
 
 ## Context HTTP Setting
 
-Install enables the setting-gated loopback context listener, uninstall clears it, and both changes share the recoverable deployment transaction.
+Install enables the setting-gated loopback context listener, uninstall persists it false, and both changes share the recoverable deployment transaction.
+
+## Reload and disable status
+
+Install and repair require a Pi reload until Quill observes the exact reporter generation.
+
+Disable immediately gates every reporter channel and exposes typed disabled remediation without removing npm, project, development, or foreign files.
 
 ## Feature-gated Payload
 

@@ -11,15 +11,18 @@ import {
 } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import quill, {
   PI_PROTOCOL_V2,
+  PI_PROTOCOL_V2_CAPABILITIES,
   PI_PROTOCOL_V2_CAPABILITY_DIGEST,
   PI_PROTOCOL_V2_QUILL_BUILD,
   PI_PROTOCOL_V2_REPORTER_VERSION,
   buildProtocolV2Envelope,
+  electReporterCandidate,
+  reporterCandidateForPath,
   buildProtocolV2Event,
   buildQuillTrackingEntry,
   protocolV2FixtureJsonl,
@@ -139,16 +142,31 @@ function httpResponse(status, body = {}) {
   };
 }
 
+const SOURCE_PATH = fileURLToPath(new URL("./quill.ts", import.meta.url));
+const REPORTER_CONTRACT = {
+  enabled: true,
+  protocol: PI_PROTOCOL_V2,
+  reporter_version: PI_PROTOCOL_V2_REPORTER_VERSION,
+  quill_build: PI_PROTOCOL_V2_QUILL_BUILD,
+  capability_digest: PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+};
+
 async function withHome(config, run) {
-  const root = configRoot(config);
+  const configured =
+    config && typeof config === "object"
+      ? { pi_reporter: REPORTER_CONTRACT, ...config }
+      : config;
+  const root = configRoot(configured);
   const oldHome = process.env.HOME;
   const oldChild = process.env.PI_SUBAGENT_CHILD;
   const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
+  const oldReporterPath = process.env.QUILL_PI_REPORTER_PATH;
   process.env.HOME = root;
+  process.env.QUILL_PI_REPORTER_PATH = SOURCE_PATH;
   delete process.env.PI_SUBAGENT_CHILD;
   delete process.env.PI_SUBAGENT_PARENT_SESSION;
   try {
-    return await run();
+    return await run(root);
   } finally {
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
@@ -156,6 +174,8 @@ async function withHome(config, run) {
     else process.env.PI_SUBAGENT_CHILD = oldChild;
     if (oldParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
     else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
+    if (oldReporterPath === undefined) delete process.env.QUILL_PI_REPORTER_PATH;
+    else process.env.QUILL_PI_REPORTER_PATH = oldReporterPath;
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -340,7 +360,7 @@ test("no-session mode keeps root tools and router but writes and sends no tracki
         assert.equal(pi.entries.length, 0);
         assert.equal(requests, 0);
         assert.deepEqual([...pi.tools.keys()], TOOL_NAMES);
-        assert.equal(pi.handlers.get("tool_call")?.length, 2);
+        assert.equal(pi.handlers.get("tool_call")?.length, 1);
       } finally {
         globalThis.fetch = oldFetch;
       }
@@ -561,13 +581,101 @@ test("registers every production tracking handler", async () => {
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Reporter coexistence]]
+test("reporter candidates classify channels and require exact unofficial opt-in", () => {
+  const home = "/home/test";
+  const agentDir = `${home}/.pi/agent`;
+  const cwd = `${home}/work/project`;
+  const paths = {
+    managed: `${agentDir}/extensions/quill.ts`,
+    npm: `${agentDir}/npm/node_modules/@sharaf-nassar/quill-pi/quill.ts`,
+    project: `${cwd}/.pi/extensions/quill.ts`,
+    development: `${home}/work/quill/src-tauri/pi-integration/quill.ts`,
+  };
+
+  for (const [installChannel, extensionPath] of Object.entries(paths)) {
+    const candidate = reporterCandidateForPath(extensionPath, {
+      home,
+      agentDir,
+      cwd,
+      selectedPath:
+        installChannel === "project" || installChannel === "development"
+          ? extensionPath
+          : undefined,
+    });
+    assert.equal(candidate.install_channel, installChannel);
+    assert.equal(candidate.extension_path, resolve(extensionPath));
+    assert.equal(candidate.eligible, true);
+  }
+
+  for (const installChannel of ["project", "development"]) {
+    assert.equal(
+      reporterCandidateForPath(paths[installChannel], {
+        home,
+        agentDir,
+        cwd,
+      }).eligible,
+      false,
+    );
+  }
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Reporter coexistence]]
+test("reporter election rejects both skew directions and follows channel precedence", () => {
+  const candidate = (install_channel, overrides = {}) => ({
+    install_channel,
+    extension_path: `/${install_channel}/quill.ts`,
+    eligible: true,
+    protocol: PI_PROTOCOL_V2,
+    reporter_version: PI_PROTOCOL_V2_REPORTER_VERSION,
+    quill_build: PI_PROTOCOL_V2_QUILL_BUILD,
+    capability_digest: PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+    capabilities: PI_PROTOCOL_V2_CAPABILITIES,
+    ...overrides,
+  });
+  const project = candidate("project");
+  const npm = candidate("npm");
+  const managed = candidate("managed");
+
+  assert.equal(
+    electReporterCandidate([project, npm, managed], REPORTER_CONTRACT),
+    managed,
+  );
+  assert.equal(electReporterCandidate([project, npm], REPORTER_CONTRACT), npm);
+  assert.equal(electReporterCandidate([project], REPORTER_CONTRACT), project);
+  assert.equal(
+    electReporterCandidate(
+      [candidate("managed", { protocol: PI_PROTOCOL_V2 - 1 })],
+      REPORTER_CONTRACT,
+    ),
+    undefined,
+  );
+  assert.equal(
+    electReporterCandidate(
+      [candidate("managed", { protocol: PI_PROTOCOL_V2 + 1 })],
+      REPORTER_CONTRACT,
+    ),
+    undefined,
+  );
+  assert.equal(
+    electReporterCandidate(
+      [candidate("managed", { eligible: false }), project],
+      REPORTER_CONTRACT,
+    ),
+    project,
+  );
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Reporter coexistence]]
 test("coexisting copies register and emit each stable event once", async () => {
   await withHome(
     { url: "http://127.0.0.1:19876", secret: "secret", hostname: "pi-host" },
     async () => {
       const pi = fakePi();
+      const laterCopy = fakePi();
       quill(pi.api);
-      quill(pi.api);
+      quill(laterCopy.api);
+      assert.equal(laterCopy.handlers.size, 0);
+      assert.equal(laterCopy.tools.size, 0);
 
       for (const event of [
         "session_start",
@@ -654,6 +762,54 @@ test("coexisting copies register and emit each stable event once", async () => {
         );
       } finally {
         globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Feature gates]]
+test("disabled and mismatched reporter contracts register nothing", async () => {
+  for (const pi_reporter of [
+    { ...REPORTER_CONTRACT, enabled: false },
+    { ...REPORTER_CONTRACT, reporter_version: "99.0.0" },
+    { ...REPORTER_CONTRACT, quill_build: "99.0.0" },
+  ]) {
+    await withHome(
+      { url: "http://127.0.0.1:19876", secret: "secret", pi_reporter },
+      () => {
+        const pi = fakePi();
+        quill(pi.api);
+        assert.equal(pi.tools.size, 0);
+        assert.equal(pi.handlers.size, 0);
+      },
+    );
+  }
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Reporter coexistence]]
+test("a pre-broker claim stays active and emits one reload remediation", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    (root) => {
+      const claimsKey = Symbol.for("quill.pi.reporter.claims");
+      const quillRoot = join(root, ".config", "quill");
+      const claims = globalThis[claimsKey] || new Set();
+      globalThis[claimsKey] = claims;
+      claims.add(quillRoot);
+      const warnings = [];
+      const oldWarn = console.warn;
+      console.warn = (...parts) => warnings.push(parts.join(" "));
+      try {
+        const pi = fakePi();
+        quill(pi.api);
+        quill(pi.api);
+        assert.equal(pi.handlers.size, 0);
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /ReporterReloadRequired/);
+        assert.match(warnings[0], /reload/i);
+      } finally {
+        console.warn = oldWarn;
+        claims.delete(quillRoot);
       }
     },
   );
@@ -837,7 +993,7 @@ test("tracking handlers emit versioned lifecycle, usage, and runtime envelopes",
         assert.equal(usageBatches.length, 2);
         assert.deepEqual(usageBatches[0].body, {
           protocol: 1,
-          extension_version: "0.1.0",
+          extension_version: "0.2.0",
           min_quill_version: "0.9.0",
           events: [
             {
@@ -1383,6 +1539,7 @@ test("rendered feature flags independently gate tools and telemetry", async () =
           );
           writeFileSync(path, renderFeatures(source, flags));
           const rendered = (await import(pathToFileURL(path).href)).default;
+          process.env.QUILL_PI_REPORTER_PATH = path;
           const pi = fakePi();
           rendered(pi.api);
           assert.equal(pi.tools.size, expectedTools);
@@ -1416,6 +1573,10 @@ test("registration and handler exceptions never escape", async () => {
       const rejecting = fakePi({ registerError: new Error("duplicate") });
       assert.doesNotThrow(() => quill(rejecting.api));
       assert.equal(rejecting.registrationAttempts(), TOOL_NAMES.length);
+      await rejecting.handlers.get("session_shutdown")[0](
+        { type: "session_shutdown", reason: "reload" },
+        context("registration-reset", { sessionFile: undefined }),
+      );
 
       const pi = fakePi();
       quill(pi.api);
@@ -2003,6 +2164,7 @@ test("context preservation off registers no router or routing telemetry", async 
         }),
       );
       const rendered = (await import(pathToFileURL(path).href)).default;
+      process.env.QUILL_PI_REPORTER_PATH = path;
       const pi = fakePi();
       let requests = 0;
       const oldFetch = globalThis.fetch;
@@ -2118,6 +2280,7 @@ test("context telemetry off preserves routing without posting", async () => {
         }),
       );
       const rendered = (await import(pathToFileURL(path).href)).default;
+      process.env.QUILL_PI_REPORTER_PATH = path;
       const pi = fakePi();
       let requests = 0;
       const oldFetch = globalThis.fetch;
@@ -2320,6 +2483,7 @@ test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", a
       context_url: baseUrl,
       secret: "real-pi-secret",
       hostname: "pi-test",
+      pi_reporter: REPORTER_CONTRACT,
     }),
   );
 
@@ -2355,6 +2519,7 @@ test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", a
         PI_CODING_AGENT_DIR: configDir,
         PI_CODING_AGENT_SESSION_DIR: sessionDir,
         PI_SUBAGENT_CHILD: "0",
+        QUILL_PI_REPORTER_PATH: SOURCE_PATH,
       },
     },
   );
