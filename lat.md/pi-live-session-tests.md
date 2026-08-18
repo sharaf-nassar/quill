@@ -66,6 +66,8 @@ It reads open generation metadata before closed lifecycle/lineage variants, reje
 
 The Pi tracking protocol accepts explicit agent lineage with a validated parent session id so the extension marker survives the HTTP boundary.
 
+A child enters this guarantee only when its launcher explicitly loads Quill. Generic runtime acknowledgement is useful evidence, but Quill does not auto-propagate the active reporter path; unconfigured ambient-disabled children remain unsupported.
+
 ## Tracking Rate Headroom
 
 The independent Pi tracking limiter charges contained events and accepts 4,000 events in one 60-second window, four times the specified stream even when envelopes batch 200 events.

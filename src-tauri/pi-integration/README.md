@@ -31,6 +31,8 @@ For persistent sessions, lifecycle and direct-lineage evidence is appended as co
 
 When `PI_SUBAGENT_CHILD=1`, the extension registers tracking only. Root processes, including `--no-session`, retain the eight `quill_` tools and context router; children expose neither.
 
+Child launchers such as pi-subagents may load Quill through their generic explicit `extensions` or `subagentOnlyExtensions` configuration and may report a generic runtime acknowledgement. Quill does not edit launcher settings, auto-inject the broker-selected reporter path, or pin a Quill-specific pi-subagents release. An ambient-disabled child without an explicitly configured Quill extension remains outside the supported tracking guarantee.
+
 ## Ownership and coexistence
 
 Pi 0.84 resolves project and user extensions before package extensions. The first compatible Quill copy claims the reporter for that load. Later copies register no tools or handlers. Session shutdown releases the claim so `/reload`, `/new`, `/resume`, and `/fork` can elect again.

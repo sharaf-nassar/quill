@@ -81,6 +81,8 @@ Failed live tracking leaves lifecycle evidence in Pi's buffered/persisted sessio
 
 Root persistent and no-session modes expose exactly eight `quill_` tools plus context routing. `PI_SUBAGENT_CHILD=1` registers tracking only, with no child tools or router.
 
+Generic launcher configuration may explicitly load the Quill extension and provide best-effort runtime acknowledgement. Quill does not auto-inject the broker-selected path or pin a Quill-specific launcher release; ambient-disabled children without explicit Quill configuration remain unsupported.
+
 ## Tool registration boundary
 
 Pi receives the eight `quill_`-prefixed tools with dependency-free plain JSON Schema parameter objects.

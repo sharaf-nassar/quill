@@ -268,9 +268,9 @@ Acceptance criteria:
 - A real router integration test covers authentication, compatible acceptance,
   unknown variants, exact-version/build failure, unknown-session recovery, and
   typed response bodies.
-- A real pi-subagents launch proves child reporter loading/acknowledgement,
-  direct and nested parent IDs, agent names, and behavior when ambient
-  extensions are disabled.
+- Configured child-mode fixtures prove tracking-only registration, direct and
+  nested parent IDs, agent names, and no child Quill tools/router. Ambient-
+  disabled children without an explicit Quill extension remain unsupported.
 - Deployment tests cover valid foreign overwrite, newer-extension/older-server,
   older-extension/newer-server, managed/npm/project coexistence, development
   identity opt-in, rollback, and mid-process drift.
@@ -374,13 +374,14 @@ is a coordinated protocol/storage redesign rather than a small patch.
    not become an analytics migration. Approve this rule? Flagged by:
    requirements, ambiguity, feasibility, scope, stakeholders.
 
-4. **Must supported `pi-subagents` children remain tracked when ambient
-   extensions are disabled?** Recommended: yes. Define a versioned,
-   tracking-only child reporter that `pi-subagents` explicitly injects and
-   acknowledges, with no context tools or routing handlers. Other launchers
-   remain unresolved unless they implement the same small contract. This
-   explicitly supersedes Feature 027's no-community-package-dependency boundary.
-   Approve? Flagged by: gaps, feasibility, scope, stakeholders.
+4. **When are `pi-subagents` children inside Quill's tracking guarantee?**
+   Recommended: when the active Quill extension is explicitly configured for
+   the child through generic extension loading. `PI_SUBAGENT_CHILD=1` keeps that
+   instance tracking-only, and generic runtime acknowledgement is best-effort.
+   Quill does not auto-inject the broker winner or require a Quill-specific
+   upstream release. Ambient-disabled children without explicit configuration
+   remain unsupported. Approve? Flagged by: gaps, feasibility, scope,
+   stakeholders.
 
 5. **What compatibility, trust, disable, and rollback policy should ship?**
    Recommended: support current and immediately previous protocol generations;
@@ -516,8 +517,8 @@ is a coordinated protocol/storage redesign rather than a small patch.
   lifecycle continuity, spool caps, health, and explicit-agent suppression need
   a precedence rewrite in this feature rather than additive contradictory text.
 - The likely critical path is 6-10 engineer-weeks after clarification, with
-  external scheduling risk for the `pi-subagents` contract and deterministic
-  multi-process crash/reconciliation tests.
+  deterministic multi-process crash/reconciliation tests as the main external
+  scheduling risk.
 
 ## Clarifications
 
@@ -542,14 +543,15 @@ runtime include descendants; agent count/runtime remain explicit; root turn
 count remains root-only; descendant token/turn evidence remains separately
 inspectable and is counted once in provider/project/global analytics.
 
-**Q4: Must supported `pi-subagents` children remain tracked when ambient
-extensions are disabled?**
+**Q4: When are `pi-subagents` children inside Quill's tracking guarantee?**
 
-A: **Option A.** Yes. Define a versioned tracking-only reporter that
-`pi-subagents` injects and acknowledges even under `--no-extensions`, without
-context tools or routing handlers. Other launchers remain unsupported/unresolved
-unless they implement the same explicit contract. This supersedes Feature 027's
-no-community-package-dependency boundary.
+A: **Explicit configuration only.** Existing generic `extensions` or
+`subagentOnlyExtensions` loading is sufficient when it names the Quill
+extension. `PI_SUBAGENT_CHILD=1` then registers tracking without context tools
+or routing, and generic runtime acknowledgement is best-effort. Quill does not
+auto-propagate the broker-selected path or pin a Quill-specific upstream
+release. Ambient-disabled children without explicit Quill configuration and
+arbitrary launchers remain unsupported.
 
 **Q5: What compatibility, trust, disable, and rollback policy ships?**
 
@@ -646,11 +648,13 @@ candidate registry with one delegating handler set. Candidates declare source,
 exact reporter/protocol version, capabilities, and extension path. Exact-match
 managed and npm candidates are accepted by default; project/development
 candidates require opt-in. Legacy pre-broker copies require removal/reload.
-The root reporter exposes its active extension path and tracking capability to
-`pi-subagents`; supported child launches explicitly inject that same file under
-`--no-extensions`. In a child process, `PI_SUBAGENT_CHILD=1` makes the extension
-register tracking only, with no tools or router, and acknowledge the contract
-through Pi's extension event bus.
+Child launchers may load the Quill extension through their generic explicit
+extension configuration. For `pi-subagents`, `extensions` or
+`subagentOnlyExtensions` is sufficient; Quill does not rewrite agent settings,
+auto-propagate the broker-selected path, or pin a Quill-specific upstream
+release. In a configured child process, `PI_SUBAGENT_CHILD=1` makes the
+extension register tracking only, with no tools or router. Generic runtime
+acknowledgement is useful evidence but not a Quill-controlled guarantee.
 
 The old Pi spool and ephemeral feature become retired compatibility state. The
 upgrade first reconciles every persisted Pi session, optionally imports usable
@@ -784,16 +788,16 @@ Constitution alignment:
     reconciliation gap, affected reporter count, remediation, and verified
     recovery without a new inspector/dashboard.
 
-### Child reporter integration and release evidence
+### Child reporter configuration boundary
 
-- `scripts/pi-subagents-tracking-contract.test.mjs` (new)
-  - Launch real direct/nested children with ambient extensions enabled and
-    disabled, verify explicit injection/acknowledgement, parent/root IDs, role,
-    process instance, exact reporter pair, and tracking-only tool surface.
-- External `pi-subagents` release dependency
-  - Consume the parent reporter descriptor and inject the active Quill extension
-    path as a child runtime extension. Quill completion requires a compatible
-    released version; arbitrary launchers remain out of scope.
+- Existing generic child extension configuration
+  - `extensions` or `subagentOnlyExtensions` may explicitly load the Quill
+    extension. Configured children use `PI_SUBAGENT_CHILD=1` for tracking-only
+    registration and may expose generic runtime acknowledgement.
+  - Quill does not mutate launcher settings, auto-inject the broker-selected
+    reporter, or pin a Quill-specific `pi-subagents` release. Ambient-disabled
+    children without explicit configuration and arbitrary launchers remain out
+    of scope.
 - `scripts/dev-runtime-isolation.mjs`
   - Add opted-in project/development reporter scenarios and prove they cannot
     overwrite or report to production without explicit selection.
@@ -1038,9 +1042,10 @@ updated `lat.md` specs.
   newer-reporter/older-server and older-reporter/newer-server rejection,
   mid-process server drift, feature flags, user-owned files, transactional
   repair/rollback, package tag, npm provenance, and matching Pi/Node support.
-- **Real `pi-subagents`:** direct, parallel, async, nested/fanout, resume, and
-  ambient-disabled launches inject/acknowledge tracking-only reporter and expose
-  no `quill_` tools/router in children.
+- **Configured child boundary:** child-mode extension fixtures prove
+  tracking-only registration and no `quill_` tools/router. Generic launcher
+  acknowledgement may be recorded when an explicit Quill extension path is
+  configured; ambient-disabled unconfigured children remain unsupported.
 - **Fleet qualification:** 64 concurrent persisted child launches; 1,000
   events/minute for ten minutes; zero lost lifecycle starts after
   reconciliation; sync handler maximum `<=10 ms`; 1,500 ms local timeout;
@@ -1058,9 +1063,9 @@ updated `lat.md` specs.
   duplicate telemetry mapping, and no stale Feature 027 `lat.md` contract.
 
 Full gates: focused Node/Rust/UI suites, real Pi 0.84 minimum and current
-supported runs, real `pi-subagents` contract, `cargo fmt --check`, Clippy with
-warnings denied, Rust checks/tests, npm test/lint/build/knip, package tarball,
-`git diff --check`, `lat check`, and exact-pair release dry run.
+supported runs, configured child-mode extension tests, `cargo fmt --check`,
+Clippy with warnings denied, Rust checks/tests, npm test/lint/build/knip,
+package tarball, `git diff --check`, `lat check`, and exact-pair release dry run.
 
 ## Risks
 
@@ -1088,10 +1093,10 @@ warnings denied, Rust checks/tests, npm test/lint/build/knip, package tarball,
 - **Legacy reporters cannot join the broker.** Mitigation: explicit reload or
   removal, server-side duplicate tolerance during upgrade, and no claim that
   hot replacement can unregister old handlers.
-- **`pi-subagents` is an external release dependency.** Mitigation: freeze a
-  small versioned contract, publish Quill's reporter descriptor first, gate
-  Quill completion on a compatible release, and keep arbitrary launchers out of
-  scope.
+- **Generic child extension configuration may drift upstream.** Mitigation:
+  document the explicit configuration boundary, keep child mode tracking-only,
+  and adapt Quill's extension when a future launcher change requires it. Quill
+  does not pin or gate on a Quill-specific `pi-subagents` release.
 - **Forward-only migration constrains rollback.** Mitigation: pre-upgrade DB
   backup evidence, exact release sequencing, additive/inert old columns, and
   forward-fix preference.
@@ -1440,34 +1445,28 @@ rollback fixture, and `lat check`.
 
 Blocks external child integration and telemetry/health.
 
-### Pin the tracking-only pi-subagents release contract — P1
+### Document the generic pi-subagents extension boundary — P1
 
-Depends on broker. Publish the reporter descriptor/ack contract, add real
-direct/nested/ambient-disabled fixtures, and obtain a compatible external
-`pi-subagents` release that injects the active extension path. Record exact npm
-package version, registry tarball integrity/SHA-256, upstream repository commit,
-release URL, minimum Pi version, acquisition command, and contract capability
-digest in the test fixture and spec. No unpinned local package satisfies this
-bead.
+Depends on broker. Document that current generic `extensions` or
+`subagentOnlyExtensions` configuration is sufficient when a launcher explicitly
+names the Quill extension. Quill does not require a Quill-specific upstream
+release, auto-inject the broker-selected reporter, or mutate launcher settings.
+If upstream behavior changes later, Quill may ship a matching extension update.
 
-Files: `src-tauri/pi-integration/quill.ts`,
-`scripts/pi-subagents-tracking-contract.test.mjs` (new),
-`src-tauri/pi-integration/README.md`,
-`src-tauri/pi-integration/package.json`,
+Files: `src-tauri/pi-integration/README.md`,
 `lat.md/pi-extension-tests.md`, `lat.md/pi-live-session-tests.md`,
 `specs/028-pi-agent-tracking-hardening.md`.
 
 Acceptance:
 
-- Pinned released artifact passes direct, parallel, async, nested/fanout,
-  resume, and ambient-disabled launch tests with tracking-only acknowledgement,
-  exact versions, parent/root IDs, role, process instance, and no child tools/
-  router.
-- Capability ceiling semantics remain intact and arbitrary launchers remain
-  explicitly unsupported.
+- Configured child mode remains tracking-only, with no child Quill tools/router,
+  and generic runtime acknowledgement remains best-effort evidence.
+- Ambient-disabled children without an explicitly configured Quill extension
+  and arbitrary launchers remain outside the supported tracking guarantee.
+- No runtime, package, external release pin, or launcher-setting mutation is
+  introduced.
 
-Focused command: `node --test scripts/pi-subagents-tracking-contract.test.mjs`
-against the pinned artifact.
+Focused commands: existing Pi extension child-mode tests and `lat check`.
 
 Blocks telemetry/health and final qualification.
 
@@ -1583,8 +1582,8 @@ reopening or superseding completed work.
   edges; all priorities remain inside the allowed P0-P3 range.
 - Serialized all repeated `quill.ts`, `storage.rs`, protocol, child-ack, health,
   and `lat.md` ownership; child integration now blocks telemetry/health.
-- Added a pinned external `pi-subagents` release receipt with exact package,
-  tarball integrity, commit, capability digest, and deterministic acquisition.
+- Documented the generic `pi-subagents` extension-loading boundary without a
+  Quill-specific upstream release pin or automatic broker-path guarantee.
 - Bounded reporter-health identity, expiry, row caps, saturation behavior, and
   summary cleanup.
 - Defined pre-assistant/no-file behavior as intentional absence rather than an
