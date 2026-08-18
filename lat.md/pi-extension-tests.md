@@ -2,9 +2,10 @@
 lat:
   require-code-mention: true
 ---
+
 # Pi Extension Test Specs
 
-These tests pin the managed Pi extension's tracking reporter, private failure spool, local-only tools, routing, and real-loader compatibility.
+These tests pin the managed Pi extension's persisted tracking reporter, local-only tools, routing, root/child capability boundary, and real-loader compatibility.
 
 ## Self disabling load
 
@@ -24,17 +25,29 @@ Compatible managed and npm copies elect one reporter, so every handler and stabl
 
 ## Tracking envelopes
 
-Handlers push versioned lifecycle, per-message usage, model, activity, and runtime envelopes without message bodies; Quill derives the stable live source from provider and session identity.
+Persistent-session handlers push protocol-v2 lifecycle/lineage envelopes plus content-free protocol-v1 model, usage, activity, and runtime acceleration. Quill derives stable live identity from provider and session identity.
 
 ## Protocol v2 fixture contract
 
 Deterministic TypeScript builders freeze the exact protocol-v2 generation and persisted-entry wire.
 
-The checked-in JSONL covers canonical identity, lifecycle occurrence fields, every start/end reason, delivery source, lineage state, optional field, exact-generation mismatch, and typed outcome. Valid `quill-tracking` entries contain no prompt, message, or tool output. Runtime emission remains protocol 1 until persisted-entry migration.
+The checked-in JSONL covers canonical identity, lifecycle occurrence fields, every start/end reason, delivery source, lineage state, optional field, exact-generation mismatch, and typed outcome. Valid `quill-tracking` entries contain no prompt, message, or tool output. Lifecycle live emission and persisted entries use protocol 2; native-derived model, usage, activity, and runtime acceleration remains protocol 1.
+
+## Persisted lifecycle evidence
+
+A persistent session appends `quill-tracking` lifecycle/direct-lineage data through Pi before sending the same event UUID in its protocol-v2 live envelope. Pi buffers pre-assistant entries and flushes them with the native session file.
+
+## No-session tracking boundary
+
+A session without a persistent Pi file appends and sends no tracking or health evidence while retaining the root process's eight tools and context router.
+
+## Typed bounded delivery
+
+Timeout, `429`, and `503` delivery retries once; `401` reloads config once; `409 unknown_session` reannounces the persisted start once before one mutation replay; `426` makes later live pushes inert while durable entries continue.
 
 ## Handshake and lineage
 
-Session start sends the handshake, resolves one stable parent header id, and notifies indexing only when a transcript path exists.
+Session start appends and sends protocol-v2 lifecycle evidence, resolves one stable parent header id, and notifies indexing only when a transcript path exists.
 
 ## Deferred transcript notify
 
@@ -56,17 +69,17 @@ A marked Pi subagent rejects malformed or self-referential parent ids read from 
 
 After Pi persists a turn, the extension repeats notify with the transcript identity and lineage captured at session start.
 
-## Stable teardown identity
+## Process lifecycle identity
 
-Reloading the extension for the same session header reproduces the same lifecycle event id so retries remain idempotent across teardown.
+Reloading the extension in one Pi process preserves its process-instance UUID and advances the per-instance lifecycle sequence; distinct occurrences keep distinct event UUIDs.
 
-## Spool durability
+## Persisted source durability
 
-Failed tracking sends lazily create a bounded 0700 spool with capped 0600 per-session files and a bounded private diagnostic log.
+Failed live tracking leaves lifecycle evidence in Pi's buffered/persisted session source and creates no failure spool or extension log.
 
-## Protocol degradation
+## Tracking capability boundary
 
-Protocol mismatch becomes a typed, logged, spooled failure without escaping into Pi or starting an unbounded retry loop.
+Root persistent and no-session modes expose exactly eight `quill_` tools plus context routing. `PI_SUBAGENT_CHILD=1` registers tracking only, with no child tools or router.
 
 ## Tool registration boundary
 
@@ -78,7 +91,7 @@ Rendered `context_preservation`, `activity_tracking`, and `context_telemetry` va
 
 ## Exception containment
 
-Typed registration, transport, protocol, config, and spool failures remain contained so Pi keeps running while Quill is unavailable or incompatible.
+Typed registration, persistence, transport, protocol, and config failures remain contained so Pi keeps running while Quill is unavailable or incompatible.
 
 ## HTTP tool contract
 
@@ -128,4 +141,4 @@ It reports aggregate statistics only, cleans every temporary artifact, and never
 
 ## Real Pi session
 
-Installed Pi 0.84.2 loads the extension, pushes tracking and runtime envelopes, and calls `quill_context_stats` in an isolated persisted session.
+Installed Pi 0.84.2 loads the extension, flushes a `quill-tracking` custom entry with the native JSONL, pushes matching tracking/runtime envelopes, and calls `quill_context_stats` in an isolated persisted session.

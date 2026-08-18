@@ -7,17 +7,12 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import {
-  appendFileSync,
-  chmodSync,
   closeSync,
   existsSync,
   mkdirSync,
   openSync,
   readFileSync,
   readSync,
-  readdirSync,
-  statSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { hostname, homedir } from "node:os";
@@ -35,8 +30,6 @@ const PROTOCOL_VERSION = 1;
 export const EXTENSION_VERSION = "0.1.0";
 const MIN_QUILL_VERSION = "0.9.0";
 
-// Protocol v2 is frozen here for fixture generation. Runtime emission remains
-// protocol v1 until the persisted-entry migration switches the live reporter.
 export const PI_PROTOCOL_V2 = 2;
 export const PI_PROTOCOL_V2_REPORTER_VERSION = EXTENSION_VERSION;
 export const PI_PROTOCOL_V2_QUILL_BUILD = "0.0.0-injected-by-ci";
@@ -50,14 +43,11 @@ export const PI_PROTOCOL_V2_CAPABILITIES = Object.freeze([
 export const PI_PROTOCOL_V2_CAPABILITY_DIGEST = createHash("sha256")
   .update(PI_PROTOCOL_V2_CAPABILITIES.join("\n"))
   .digest("hex");
-const SPOOL_FILE_MAX_BYTES = 1024 * 1024;
-const SPOOL_DIR_MAX_BYTES = 16 * SPOOL_FILE_MAX_BYTES;
-const SPOOL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-const LOG_MAX_BYTES = 256 * 1024;
 const TAINTED_MAX_PATHS = 256;
 // Keep equal to sessions::COMPACT_SEARCH_MAX_BYTES.
 const HISTORY_RESULT_MAX_BYTES = 32 * 1024;
 const REPORTER_CLAIMS = Symbol.for("quill.pi.reporter.claims");
+const REPORTER_PROCESS = Symbol.for("quill.pi.reporter.process");
 let lastNoticeRoot;
 const READER_COMMAND_PATTERN =
   /\b(cat|bat|head|tail|less|more|view|od|xxd|strings|hexdump|sed|awk|grep|rg|ack|jq|yq|xq|xmllint)\b/i;
@@ -260,8 +250,9 @@ export class QuillExtensionError extends Error {
 export class ConfigError extends QuillExtensionError {}
 export class TransportError extends QuillExtensionError {}
 export class ProtocolMismatchError extends QuillExtensionError {}
+export class UnknownSessionError extends QuillExtensionError {}
 export class RegistrationError extends QuillExtensionError {}
-export class SpoolError extends QuillExtensionError {}
+export class PersistenceError extends QuillExtensionError {}
 
 function errorMessage(error) {
   return error instanceof Error
@@ -320,8 +311,6 @@ function loadConfig() {
     secret: config.secret,
     home: root,
     quillRoot,
-    spoolRoot: join(quillRoot, "pi-spool"),
-    logPath: join(quillRoot, "pi-extension.log"),
     markerRoot: join(root, ".config", "quill", "context", "markers"),
     hostname:
       (typeof config.hostname === "string" && config.hostname.trim()) ||
@@ -360,12 +349,6 @@ async function fetchJson(config, url, options) {
   return response.json();
 }
 
-function safeSessionId(value) {
-  return String(value || "unknown")
-    .replace(/[^a-zA-Z0-9._-]+/g, "_")
-    .slice(0, 120);
-}
-
 function trackedName(value) {
   return (
     typeof value === "string" &&
@@ -376,157 +359,123 @@ function trackedName(value) {
   );
 }
 
-function writeLog(config, error) {
-  try {
-    const line = `${new Date().toISOString()} ${errorMessage(error)}\n`;
-    mkdirSync(config.quillRoot, { recursive: true, mode: 0o700 });
-    let size = 0;
-    try {
-      size = statSync(config.logPath).size;
-    } catch (statError) {
-      if (statError?.code !== "ENOENT") throw statError;
-    }
-    if (size + Buffer.byteLength(line) > LOG_MAX_BYTES) {
-      writeFileSync(config.logPath, line, { mode: 0o600 });
-    } else {
-      appendFileSync(config.logPath, line, { mode: 0o600 });
-    }
-    chmodSync(config.logPath, 0o600);
-  } catch (logError) {
-    console.error("Quill Pi extension log failure", errorMessage(logError));
-  }
+function writeLog(_config, error) {
+  console.error("Quill Pi extension", errorMessage(error));
 }
 
-function spoolFile(config, sessionId) {
-  return join(
-    config.spoolRoot,
-    `${safeSessionId(sessionId)}.${process.pid}.jsonl`,
-  );
-}
-
-function pruneSpool(config, incomingBytes, currentPath) {
-  const now = Date.now();
-  const files = readdirSync(config.spoolRoot)
-    .filter((name) => name.endsWith(".jsonl"))
-    .map((name) => {
-      const path = join(config.spoolRoot, name);
-      return { path, ...statSync(path) };
-    })
-    .sort((left, right) => left.mtimeMs - right.mtimeMs);
-  let total = files.reduce((sum, file) => sum + file.size, 0);
-  for (const file of files) {
-    if (
-      file.path !== currentPath &&
-      (now - file.mtimeMs > SPOOL_MAX_AGE_MS ||
-        total + incomingBytes > SPOOL_DIR_MAX_BYTES)
-    ) {
-      unlinkSync(file.path);
-      total -= file.size;
-    }
+function reporterProcess(config) {
+  const processes = globalThis[REPORTER_PROCESS] || new Map();
+  globalThis[REPORTER_PROCESS] = processes;
+  let state = processes.get(config.quillRoot);
+  if (!state) {
+    state = { id: randomUUID(), origins: new Map(), sequence: 0 };
+    processes.set(config.quillRoot, state);
   }
-  return total;
-}
-
-function appendSpool(config, endpoint, payload) {
-  const sessionId = payload.session_id || payload.events?.[0]?.session_id;
-  const line = `${JSON.stringify({ endpoint, payload })}\n`;
-  const bytes = Buffer.byteLength(line);
-  if (bytes > SPOOL_FILE_MAX_BYTES)
-    throw new SpoolError("Spool record exceeds file cap");
-  try {
-    mkdirSync(config.spoolRoot, { recursive: true, mode: 0o700 });
-    chmodSync(config.spoolRoot, 0o700);
-    const path = spoolFile(config, sessionId);
-    let fileBytes = 0;
-    try {
-      fileBytes = statSync(path).size;
-    } catch (statError) {
-      if (statError?.code !== "ENOENT") throw statError;
-    }
-    pruneSpool(config, bytes, path);
-    if (fileBytes + bytes > SPOOL_FILE_MAX_BYTES) {
-      throw new SpoolError("Spool file cap reached; newest event dropped");
-    }
-    appendFileSync(path, line, { mode: 0o600 });
-    chmodSync(path, 0o600);
-  } catch (error) {
-    if (error instanceof SpoolError) throw error;
-    throw new SpoolError("Failed to append Pi tracking spool", {
-      cause: error,
-    });
-  }
+  return state;
 }
 
 async function responseError(response) {
   let body;
   try {
     body = await response.json();
-  } catch (error) {
+  } catch {
     body = null;
   }
-  if (response.status === 400 && body?.error === "protocol_mismatch") {
-    return new ProtocolMismatchError(
-      body.message || "Pi tracking protocol mismatch",
-    );
+  const code = body?.code || body?.error;
+  const message = body?.message || `Quill returned ${response.status}`;
+  if (response.status === 409 && code === "unknown_session") {
+    return new UnknownSessionError(message);
   }
-  return new TransportError(
-    body?.message || `Quill returned ${response.status}`,
-  );
+  if (response.status === 426 || code === "protocol_mismatch") {
+    return new ProtocolMismatchError(message);
+  }
+  const error = new TransportError(message);
+  error.status = response.status;
+  error.retryAfterMs = Number.isFinite(body?.retry_after_ms)
+    ? Math.max(0, Math.min(LOCAL_TIMEOUT_MS, body.retry_after_ms))
+    : 0;
+  return error;
 }
 
-async function postPayload(config, endpoint, payload, retryAuth = true) {
-  let response;
-  try {
-    response = await fetch(`${config.main}${endpoint}`, {
-      method: "POST",
-      headers: headers(config),
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(LOCAL_TIMEOUT_MS),
-    });
-  } catch (error) {
-    throw new TransportError("Quill request failed", { cause: error });
+function retryDelay(milliseconds) {
+  return milliseconds > 0
+    ? new Promise((resolve) => setTimeout(resolve, milliseconds))
+    : Promise.resolve();
+}
+
+async function postPayload(config, endpoint, payload) {
+  let authReloaded = false;
+  let transientRetried = false;
+  for (;;) {
+    let response;
+    try {
+      response = await fetch(`${config.main}${endpoint}`, {
+        method: "POST",
+        headers: headers(config),
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(LOCAL_TIMEOUT_MS),
+      });
+    } catch (error) {
+      if (!transientRetried) {
+        transientRetried = true;
+        continue;
+      }
+      throw new TransportError("Quill request failed", { cause: error });
+    }
+    if (response.status === 401 && !authReloaded) {
+      authReloaded = true;
+      Object.assign(config, loadConfig());
+      continue;
+    }
+    if ([429, 503].includes(response.status) && !transientRetried) {
+      transientRetried = true;
+      const error = await responseError(response);
+      await retryDelay(error.retryAfterMs);
+      continue;
+    }
+    if (!response.ok) throw await responseError(response);
+    try {
+      await response.body?.cancel();
+    } catch (error) {
+      writeLog(
+        config,
+        new TransportError("Failed to release Quill response", {
+          cause: error,
+        }),
+      );
+    }
+    return;
   }
-  if (response.status === 401 && retryAuth) {
-    Object.assign(config, loadConfig());
-    return postPayload(config, endpoint, payload, false);
-  }
-  if (!response.ok) throw await responseError(response);
+}
+
+async function sendTracked(config, state, endpoint, payload) {
+  if (state.inert) return false;
   try {
-    await response.body?.cancel();
+    await postPayload(config, endpoint, payload);
+    return true;
   } catch (error) {
+    if (error instanceof UnknownSessionError && state.startEnvelope) {
+      try {
+        await postPayload(config, "/api/v1/pi/track", state.startEnvelope);
+        if (payload !== state.startEnvelope) {
+          await postPayload(config, endpoint, payload);
+        }
+        return true;
+      } catch (recoveryError) {
+        error = recoveryError;
+      }
+    }
+    if (error instanceof ProtocolMismatchError) state.inert = true;
     writeLog(
       config,
-      new TransportError("Failed to release Quill response", { cause: error }),
+      error instanceof QuillExtensionError
+        ? error
+        : new TransportError("Unexpected Pi tracking failure", {
+            cause: error,
+          }),
     );
+    return false;
   }
-}
-
-function sendTracked(config, state, endpoint, payload) {
-  let request;
-  try {
-    request = postPayload(config, endpoint, payload);
-  } catch (error) {
-    request = Promise.reject(error);
-  }
-  return request.then(
-    () => true,
-    (error) => {
-      const failure =
-        error instanceof QuillExtensionError
-          ? error
-          : new TransportError("Unexpected Pi tracking failure", {
-              cause: error,
-            });
-      state.lastError = failure.name;
-      writeLog(config, failure);
-      try {
-        appendSpool(config, endpoint, payload);
-      } catch (spoolError) {
-        writeLog(config, spoolError);
-      }
-      return false;
-    },
-  );
 }
 
 function boundedText(value, maxBytes) {
@@ -1082,6 +1031,17 @@ function stableId(prefix, ...parts) {
   return `${prefix}_${createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 32)}`;
 }
 
+function stableUuid(...parts) {
+  const hex = createHash("sha256")
+    .update(JSON.stringify(parts))
+    .digest("hex")
+    .slice(0, 32)
+    .split("");
+  hex[12] = "4";
+  hex[16] = ["8", "9", "a", "b"][Number.parseInt(hex[16], 16) % 4];
+  return `${hex.slice(0, 8).join("")}-${hex.slice(8, 12).join("")}-${hex.slice(12, 16).join("")}-${hex.slice(16, 20).join("")}-${hex.slice(20).join("")}`;
+}
+
 function sessionInfo(ctx) {
   const manager = ctx.sessionManager;
   const header = manager.getHeader?.();
@@ -1221,8 +1181,7 @@ export function buildQuillTrackingEntry(event, generation = {}) {
       ...event,
       reporter: {
         protocol: generation.protocol ?? PI_PROTOCOL_V2,
-        version:
-          generation.reporter_version ?? PI_PROTOCOL_V2_REPORTER_VERSION,
+        version: generation.reporter_version ?? PI_PROTOCOL_V2_REPORTER_VERSION,
         quill_build: generation.quill_build ?? PI_PROTOCOL_V2_QUILL_BUILD,
         capability_digest:
           generation.capability_digest ?? PI_PROTOCOL_V2_CAPABILITY_DIGEST,
@@ -1538,14 +1497,57 @@ export function protocolV2FixtureJsonl() {
   return `${cases.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
 }
 
-function trackEnvelope(state, events) {
+function trackEnvelope(events) {
   return {
     protocol: PROTOCOL_VERSION,
     extension_version: EXTENSION_VERSION,
     min_quill_version: MIN_QUILL_VERSION,
-    ...(state.lastError ? { last_error: state.lastError } : {}),
     events,
   };
+}
+
+function persistLifecycle(config, state, info, type, fields) {
+  const sequence = ++state.process.sequence;
+  let originAt = state.process.origins.get(info.id);
+  if (!originAt) {
+    originAt = isoTimestamp(info.header?.timestamp);
+    state.process.origins.set(info.id, originAt);
+  }
+  const event = buildProtocolV2Event({
+    event_uuid: stableUuid(
+      state.process.id,
+      info.id,
+      sequence,
+      type,
+      fields.reason,
+    ),
+    event: type,
+    normalized_host: config.hostname.toLowerCase(),
+    session_id: info.id,
+    process_instance_id: state.process.id,
+    sequence,
+    origin_at: originAt,
+    occurred_at: fields.occurred_at || isoTimestamp(),
+    delivery_source: "live",
+    reason: fields.reason,
+    ...(fields.previous_session_id
+      ? { previous_session_id: fields.previous_session_id }
+      : {}),
+    ...(fields.lineage ? { lineage: fields.lineage } : {}),
+  });
+  const entry = buildQuillTrackingEntry(event);
+  try {
+    state.pi.appendEntry(entry.customType, entry.data);
+  } catch (error) {
+    writeLog(
+      config,
+      new PersistenceError("Cannot append Pi tracking entry", { cause: error }),
+    );
+    return Promise.resolve(false);
+  }
+  const envelope = buildProtocolV2Envelope([event]);
+  if (type === "session_start") state.startEnvelope = envelope;
+  return sendTracked(config, state, "/api/v1/pi/track", envelope);
 }
 
 function trackEvent(
@@ -1556,6 +1558,10 @@ function trackEvent(
   fields = {},
   identity = randomUUID(),
 ) {
+  if (!info.file) return Promise.resolve(true);
+  if (type === "session_start" || type === "session_end") {
+    return persistLifecycle(config, state, info, type, fields);
+  }
   const timestamp = fields.timestamp || isoTimestamp();
   const event = {
     type,
@@ -1565,24 +1571,16 @@ function trackEvent(
     timestamp,
     ...fields,
   };
-  return sendTracked(
-    config,
-    state,
-    "/api/v1/pi/track",
-    trackEnvelope(state, [event]),
-  );
+  return sendTracked(config, state, "/api/v1/pi/track", trackEnvelope([event]));
 }
 
 function trackEvents(config, state, info, events) {
-  return sendTracked(
-    config,
-    state,
-    "/api/v1/pi/track",
-    trackEnvelope(state, events),
-  );
+  if (!info.file) return Promise.resolve(true);
+  return sendTracked(config, state, "/api/v1/pi/track", trackEnvelope(events));
 }
 
 function runtimeMessage(config, state, info, message) {
+  if (!info.file) return Promise.resolve(true);
   const payload = {
     provider: "pi",
     host: config.hostname,
@@ -1623,7 +1621,6 @@ function notifySession(config, state, info, lineage) {
   return postPayload(config, "/api/v1/sessions/notify", payload).then(
     () => true,
     (error) => {
-      state.lastError = error.name;
       writeLog(config, error);
       return false;
     },
@@ -1655,10 +1652,17 @@ function registerHandler(pi, config, event, handler) {
 }
 
 function registerTracking(pi, config) {
-  const state = { lastError: null, notify: null };
+  const state = {
+    inert: false,
+    notify: null,
+    pi,
+    process: reporterProcess(config),
+    startEnvelope: null,
+  };
   const activity = (event, ctx, name) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
+      if (!info.file) return;
       postTelemetry(config, event, ctx, EVENT_MAP[name]);
       return trackEvent(
         config,
@@ -1674,27 +1678,17 @@ function registerTracking(pi, config) {
   registerHandler(pi, config, "session_start", (event, ctx) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
+      if (!info.file) return;
       const { lineage, previousSessionId } = resolveStart(event, info);
       state.notify = { info, lineage };
-      const timestamp = isoTimestamp(info.header?.timestamp);
       postTelemetry(config, event, ctx, EVENT_MAP.session_start);
-      const handshake = trackEvent(
-        config,
-        state,
-        info,
-        "session_start",
-        {
-          timestamp,
-          cwd: info.cwd,
-          ephemeral: !info.file,
-          reason: event.reason,
-          ...(previousSessionId
-            ? { previous_session_id: previousSessionId }
-            : {}),
-          lineage,
-        },
-        `${event.reason}:${timestamp}`,
-      );
+      const handshake = trackEvent(config, state, info, "session_start", {
+        reason: event.reason,
+        ...(previousSessionId
+          ? { previous_session_id: previousSessionId }
+          : {}),
+        lineage,
+      });
       void notifySession(config, state, info, lineage);
       return handshake;
     });
@@ -1702,15 +1696,11 @@ function registerTracking(pi, config) {
   registerHandler(pi, config, "session_shutdown", async (event, ctx) => {
     try {
       const info = sessionInfo(ctx);
+      if (!info.file) return;
       postTelemetry(config, event, ctx, EVENT_MAP.session_shutdown);
-      await trackEvent(
-        config,
-        state,
-        info,
-        "session_end",
-        { reason: event.reason },
-        `${event.reason}:${event.targetSessionFile || ""}`,
-      );
+      await trackEvent(config, state, info, "session_end", {
+        reason: event.reason,
+      });
     } catch (error) {
       writeLog(
         config,
@@ -1732,6 +1722,7 @@ function registerTracking(pi, config) {
   registerHandler(pi, config, "input", (event, ctx) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
+      if (!info.file) return;
       const timestamp = isoTimestamp();
       postTelemetry(config, event, ctx, EVENT_MAP.input);
       void trackEvent(
@@ -1754,6 +1745,7 @@ function registerTracking(pi, config) {
   registerHandler(pi, config, "tool_execution_start", (event, ctx) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
+      if (!info.file) return;
       const timestamp = isoTimestamp();
       postTelemetry(config, event, ctx, EVENT_MAP.tool_execution_start);
       void trackEvent(
@@ -1777,6 +1769,7 @@ function registerTracking(pi, config) {
   registerHandler(pi, config, "tool_execution_end", (event, ctx) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
+      if (!info.file) return;
       const timestamp = isoTimestamp();
       postTelemetry(config, event, ctx, EVENT_MAP.tool_execution_end);
       void trackEvent(
@@ -1799,6 +1792,7 @@ function registerTracking(pi, config) {
   registerHandler(pi, config, "model_select", (event, ctx) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
+      if (!info.file) return;
       return trackEvent(
         config,
         state,
@@ -1816,6 +1810,7 @@ function registerTracking(pi, config) {
     if (event.message?.role !== "assistant" || !event.message.usage) return;
     defer(config, () => {
       const info = sessionInfo(ctx);
+      if (!info.file) return;
       const message = event.message;
       const timestamp = isoTimestamp(message.timestamp);
       const cost = message.usage.cost || {};
@@ -1865,6 +1860,7 @@ function registerTracking(pi, config) {
   registerHandler(pi, config, "turn_end", (event, ctx) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
+      if (!info.file) return;
       const timestamp = isoTimestamp(event.message?.timestamp);
       postTelemetry(config, event, ctx, EVENT_MAP.turn_end);
       void trackEvent(
@@ -1911,7 +1907,8 @@ export default function quill(pi) {
   }
   if (!claimReporter(config)) return;
 
-  if (FEATURES.context_preservation) {
+  const trackingOnlyChild = process.env.PI_SUBAGENT_CHILD === "1";
+  if (FEATURES.context_preservation && !trackingOnlyChild) {
     for (const tool of TOOLS) {
       try {
         pi.registerTool({
@@ -1970,18 +1967,21 @@ export default function quill(pi) {
 
   if (FEATURES.activity_tracking) {
     registerTracking(pi, config);
-    for (const [eventName, hookEvent] of Object.entries(EVENT_MAP)) {
-      if (TRACKING_EVENTS.has(eventName)) continue;
-      registerHandler(pi, config, eventName, (event, ctx) => {
-        try {
-          postTelemetry(config, event, ctx, hookEvent);
-        } catch (error) {
-          writeLog(
-            config,
-            new TransportError("Hook telemetry failed", { cause: error }),
-          );
-        }
-      });
+    if (!trackingOnlyChild) {
+      for (const [eventName, hookEvent] of Object.entries(EVENT_MAP)) {
+        if (TRACKING_EVENTS.has(eventName)) continue;
+        registerHandler(pi, config, eventName, (event, ctx) => {
+          try {
+            if (!sessionInfo(ctx).file) return;
+            postTelemetry(config, event, ctx, hookEvent);
+          } catch (error) {
+            writeLog(
+              config,
+              new TransportError("Hook telemetry failed", { cause: error }),
+            );
+          }
+        });
+      }
     }
   } else {
     registerHandler(pi, config, "session_shutdown", () =>
