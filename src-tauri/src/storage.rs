@@ -22448,6 +22448,7 @@ mod tests {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
+        let now = Utc::now().timestamp_millis();
         let first = pi_v2_event(
             "event-first",
             "session",
@@ -22529,13 +22530,13 @@ mod tests {
         assert_eq!(recovered[0].process_instance_id, "process-new");
         assert_eq!(
             storage
-                .pi_live_hint_disposition("host", "session", Some("process-old"), 20)
+                .pi_live_hint_disposition("host", "session", Some("process-old"), now + 20)
                 .unwrap(),
             PiProtocolV2Outcome::Stale
         );
         assert_eq!(
             storage
-                .pi_live_hint_disposition("host", "session", Some("process-new"), 21)
+                .pi_live_hint_disposition("host", "session", Some("process-new"), now + 21)
                 .unwrap(),
             PiProtocolV2Outcome::Applied
         );
