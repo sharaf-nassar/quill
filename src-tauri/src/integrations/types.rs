@@ -68,6 +68,12 @@ pub enum PiExtensionErrorKind {
     Config,
     Transport,
     ProtocolMismatch,
+    UnknownSession,
+    ChildReporterMissing,
+    SourceRecovering,
+    ReconciliationFailed,
+    TelemetryRejected,
+    Saturated,
     ReporterReloadRequired,
     Disabled,
     Registration,
@@ -84,6 +90,20 @@ pub struct PiExtensionHealth {
     pub extension_version: Option<String>,
     pub min_quill_version: Option<String>,
     pub last_error: Option<PiExtensionErrorKind>,
+    #[serde(default)]
+    pub affected_reporters: usize,
+    #[serde(default)]
+    pub affected_sessions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_recovered_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_extension_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_quill_version: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

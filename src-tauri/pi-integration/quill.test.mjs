@@ -1063,6 +1063,67 @@ test("tracking handlers emit versioned lifecycle, usage, and runtime envelopes",
   );
 });
 
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Tracking envelopes]]
+test("assistant text runtime follows text messages, not turn completion", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const messages = [];
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        if (String(url).endsWith("/api/v1/sessions/messages")) {
+          messages.push(...JSON.parse(options.body).messages);
+        }
+        return httpResponse(202);
+      };
+      try {
+        const ctx = context("text-semantics");
+        pi.handlers.get("turn_end")[0]({ type: "turn_end", turnIndex: 0 }, ctx);
+        pi.handlers.get("message_end")[0](
+          {
+            type: "message_end",
+            message: {
+              role: "assistant",
+              provider: "openai",
+              model: "gpt-5",
+              responseId: "tool-only",
+              timestamp: 1_765_699_202_000,
+              content: [{ type: "toolCall", name: "read" }],
+              usage: { input: 1, output: 1 },
+            },
+          },
+          ctx,
+        );
+        pi.handlers.get("message_end")[0](
+          {
+            type: "message_end",
+            message: {
+              role: "assistant",
+              provider: "openai",
+              model: "gpt-5",
+              responseId: "with-text",
+              timestamp: 1_765_699_203_000,
+              content: [{ type: "text", text: "done" }],
+              usage: { input: 1, output: 1 },
+            },
+          },
+          ctx,
+        );
+        await flushRequests();
+        assert.equal(
+          messages.filter((message) => message.event_kinds.includes("asst_text"))
+            .length,
+          1,
+        );
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Handshake and lineage]]
 test("session start resolves lineage once and notifies only persisted sessions", async () => {
   await withHome(
@@ -1767,7 +1828,7 @@ test("tool and telemetry handlers return from synchronous work in single-digit m
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Telemetry mapping and timeout]]
-test("telemetry maps Pi events and uses the shared local timeout", async () => {
+test("telemetry has one canonical tool pair and settled Stop semantics", async () => {
   await withHome(
     {
       url: "http://localhost:19876",
@@ -1778,12 +1839,14 @@ test("telemetry maps Pi events and uses the shared local timeout", async () => {
       const pi = fakePi();
       quill(pi.api);
       const payloads = [];
+      const headers = [];
       const timeouts = [];
       const oldFetch = globalThis.fetch;
       const oldTimeout = AbortSignal.timeout;
       globalThis.fetch = async (url, options) => {
         if (String(url).endsWith("/api/v1/hooks/observed")) {
           payloads.push(JSON.parse(options.body));
+          headers.push(options.headers);
         }
         return { ok: true, status: 202, body: { cancel: async () => {} } };
       };
@@ -1792,29 +1855,49 @@ test("telemetry maps Pi events and uses the shared local timeout", async () => {
         return oldTimeout(milliseconds);
       };
       try {
-        const mapping = {
-          session_start: "SessionStart",
-          input: "UserPromptSubmit",
-          tool_call: "PreToolUse",
-          tool_result: "PostToolUse",
-          turn_end: "Stop",
-          session_shutdown: "SessionEnd",
-          session_before_compact: "PreCompact",
-          session_compact: "PostCompact",
-        };
-        for (const event of Object.keys(mapping)) {
-          pi.handlers.get(event).at(-1)({ toolName: "read" }, context());
+        const ctx = context();
+        for (const [event, payload] of [
+          ["session_start", { reason: "startup" }],
+          ["input", { text: "prompt" }],
+          ["tool_call", { toolName: "read", input: { path: "/tmp/a" } }],
+          ["tool_execution_start", { toolName: "read", toolCallId: "call" }],
+          ["tool_execution_end", { toolName: "read", toolCallId: "call" }],
+          ["turn_start", { turnIndex: 0 }],
+          ["turn_end", { turnIndex: 0 }],
+          ["agent_start", {}],
+          ["agent_settled", {}],
+          ["session_before_compact", {}],
+          ["session_compact", {}],
+        ]) {
+          pi.handlers.get(event).at(-1)({ type: event, ...payload }, ctx);
         }
-        await new Promise((resolve) => setImmediate(resolve));
+        await flushRequests();
         assert.deepEqual(
           payloads.map((payload) => payload.hook_event).sort(),
-          Object.values(mapping).sort(),
+          [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "PreCompact",
+            "PostCompact",
+          ].sort(),
         );
+        assert.equal(
+          payloads.filter(({ hook_event }) => hook_event === "PreToolUse").length,
+          1,
+        );
+        assert.equal(
+          payloads.filter(({ hook_event }) => hook_event === "PostToolUse").length,
+          1,
+        );
+        assert.ok(payloads.every((payload) => payload.hook_event));
         assert.ok(payloads.every((payload) => payload.provider === "pi"));
-        assert.ok(
-          payloads.every((payload) => payload.session_id === "pi-session"),
-        );
+        assert.ok(payloads.every((payload) => payload.session_id === "pi-session"));
         assert.ok(payloads.every((payload) => payload.hostname === "pi-host"));
+        assert.ok(headers.every((value) => value["X-Quill-Pi-Process"]));
+        assert.ok(headers.every((value) => value["X-Quill-Pi-Channel"]));
 
         const lib = readFileSync(
           join(
@@ -1829,11 +1912,82 @@ test("telemetry maps Pi events and uses the shared local timeout", async () => {
         const sharedTimeout = Number(
           lib.match(/const LOCAL_TIMEOUT_MS = (\d+);/)[1],
         );
-        assert.ok(timeouts.length >= Object.keys(mapping).length);
+        assert.ok(timeouts.length >= payloads.length);
         assert.ok(timeouts.every((timeout) => timeout === sharedTimeout));
       } finally {
         globalThis.fetch = oldFetch;
         AbortSignal.timeout = oldTimeout;
+      }
+    },
+  );
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Telemetry mapping and timeout]]
+test("configured child lineage exclusively owns subagent hook semantics", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      process.env.PI_SUBAGENT_CHILD = "1";
+      process.env.PI_SUBAGENT_PARENT_SESSION = "parent-session";
+      const pi = fakePi();
+      quill(pi.api);
+      const hooks = [];
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        if (String(url).endsWith("/api/v1/hooks/observed")) {
+          hooks.push(JSON.parse(options.body).hook_event);
+        }
+        return httpResponse(202);
+      };
+      try {
+        const ctx = context("child-session");
+        pi.handlers.get("agent_start")[0]({ type: "agent_start" }, ctx);
+        pi.handlers.get("agent_settled")[0]({ type: "agent_settled" }, ctx);
+        await flushRequests();
+        assert.deepEqual(hooks, ["SubagentStart", "SubagentStop"]);
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Typed bounded delivery]]
+test("hook and routing telemetry surface typed non-2xx responses", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const errors = [];
+      const oldFetch = globalThis.fetch;
+      const oldError = console.error;
+      globalThis.fetch = async (url) =>
+        String(url).endsWith("/api/v1/hooks/observed")
+          ? httpResponse(429, { code: "rate_limited", message: "slow down" })
+          : httpResponse(503, { error: "unavailable" });
+      console.error = (...parts) => errors.push(parts.join(" "));
+      try {
+        pi.handlers.get("tool_execution_start")[0](
+          { type: "tool_execution_start", toolName: "read", toolCallId: "call" },
+          context(),
+        );
+        const denied = await routingHandler(pi)(
+          {
+            type: "tool_call",
+            toolName: "bash",
+            toolCallId: "route",
+            input: { command: "curl https://example.com" },
+          },
+          context(),
+        );
+        assert.equal(denied.block, true);
+        await flushRequests();
+        assert.ok(errors.some((error) => /rate_limited|slow down/.test(error)));
+        assert.ok(errors.some((error) => /unavailable/.test(error)));
+      } finally {
+        globalThis.fetch = oldFetch;
+        console.error = oldError;
       }
     },
   );

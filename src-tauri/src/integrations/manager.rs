@@ -26,9 +26,22 @@ fn pi_extension_error(value: &str) -> Option<PiExtensionErrorKind> {
         "" => None,
         "ConfigError" => Some(PiExtensionErrorKind::Config),
         "TransportError" => Some(PiExtensionErrorKind::Transport),
-        "ProtocolMismatchError" | "protocol_mismatch" => {
-            Some(PiExtensionErrorKind::ProtocolMismatch)
+        "ProtocolMismatchError"
+        | "protocol_mismatch"
+        | "reporter_version_mismatch"
+        | "quill_build_mismatch"
+        | "capability_mismatch"
+        | "tracking_schema_mismatch" => Some(PiExtensionErrorKind::ProtocolMismatch),
+        "unknown_session" | "reannounce_required" => Some(PiExtensionErrorKind::UnknownSession),
+        "child_reporter_missing" => Some(PiExtensionErrorKind::ChildReporterMissing),
+        "source_not_persisted" | "source_recovering" => {
+            Some(PiExtensionErrorKind::SourceRecovering)
         }
+        "reconciliation_failed" => Some(PiExtensionErrorKind::ReconciliationFailed),
+        "telemetry_rejected" | "rate_limited" | "unavailable" => {
+            Some(PiExtensionErrorKind::TelemetryRejected)
+        }
+        "saturated" => Some(PiExtensionErrorKind::Saturated),
         "ReporterReloadRequired" => Some(PiExtensionErrorKind::ReporterReloadRequired),
         "ReporterDisabled" => Some(PiExtensionErrorKind::Disabled),
         "RegistrationError" => Some(PiExtensionErrorKind::Registration),
@@ -41,17 +54,72 @@ fn pi_extension_error(value: &str) -> Option<PiExtensionErrorKind> {
     }
 }
 
+fn pi_health_remediation(error: PiExtensionErrorKind) -> &'static str {
+    match error {
+        PiExtensionErrorKind::ProtocolMismatch => {
+            "Install the exact Quill and reporter versions, then reload Pi."
+        }
+        PiExtensionErrorKind::UnknownSession => {
+            "Keep Pi running while the reporter reannounces the session and retries once."
+        }
+        PiExtensionErrorKind::ChildReporterMissing => {
+            "Load the Quill extension in the configured child launcher, then restart that child."
+        }
+        PiExtensionErrorKind::SourceRecovering => {
+            "Wait for persisted-source reconciliation to verify live state."
+        }
+        PiExtensionErrorKind::ReconciliationFailed => {
+            "Repair the persisted Pi session source, then retry reconciliation."
+        }
+        PiExtensionErrorKind::TelemetryRejected => {
+            "Check Quill ingestion status and logs, then retry the Pi operation."
+        }
+        PiExtensionErrorKind::Saturated => {
+            "Close stale Pi processes; health admission resumes below the per-host cap."
+        }
+        PiExtensionErrorKind::ReporterReloadRequired => {
+            "Remove the legacy reporter or reload Pi to activate the elected reporter."
+        }
+        PiExtensionErrorKind::Disabled => "Enable the Pi integration to resume reporting.",
+        PiExtensionErrorKind::Config => "Repair the Quill Pi configuration and reload Pi.",
+        PiExtensionErrorKind::Transport => "Check the local Quill server and retry.",
+        PiExtensionErrorKind::Registration => "Reload Pi after repairing the extension install.",
+        PiExtensionErrorKind::Spool => {
+            "Review the recorded retirement gap; no replay is available."
+        }
+        PiExtensionErrorKind::Unknown => "Check Quill logs for the typed reporter failure.",
+    }
+}
+
 fn pi_extension_health_at(
     storage: &Storage,
     now: DateTime<Utc>,
 ) -> Result<PiExtensionHealth, String> {
-    let last_seen = storage.get_setting("pi_extension.last_seen")?;
-    let state = last_seen
-        .as_deref()
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|seen| now.signed_duration_since(seen.with_timezone(&Utc)))
+    let reporter = storage.pi_reporter_health_summary_at(now.timestamp_millis())?;
+    let legacy_last_seen = storage.get_setting("pi_extension.last_seen")?;
+    let reporter_last_seen = reporter
+        .as_ref()
+        .and_then(|summary| summary.last_heartbeat_ms)
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map(|value| value.to_rfc3339());
+    let last_seen = reporter_last_seen.or(legacy_last_seen);
+    let known_acceptance = reporter
+        .as_ref()
+        .and_then(|summary| summary.last_acceptance_ms)
+        .and_then(DateTime::<Utc>::from_timestamp_millis);
+    let reporter_health_present = reporter.is_some();
+    let state = known_acceptance
+        .or_else(|| {
+            last_seen
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+        })
+        .map(|seen| now.signed_duration_since(seen))
         .map_or(PiExtensionHealthState::NeverConnected, |age| {
-            if age <= PI_EXTENSION_ALIVE_AFTER {
+            if reporter_health_present && known_acceptance.is_none() {
+                PiExtensionHealthState::NeverConnected
+            } else if age <= PI_EXTENSION_ALIVE_AFTER {
                 PiExtensionHealthState::Alive
             } else if age <= PI_EXTENSION_STALE_AFTER {
                 PiExtensionHealthState::Idle
@@ -59,27 +127,72 @@ fn pi_extension_health_at(
                 PiExtensionHealthState::Stale
             }
         });
-    let last_error = if storage.get_setting("pi_reporter.enabled")?.as_deref() == Some("false") {
-        Some("ReporterDisabled".to_string())
-    } else if storage
-        .get_setting("pi_reporter.reload_required")?
+    let configured_error =
+        if storage.get_setting("pi_reporter.enabled")?.as_deref() == Some("false") {
+            Some("ReporterDisabled".to_string())
+        } else if storage
+            .get_setting("pi_reporter.reload_required")?
+            .as_deref()
+            == Some("true")
+        {
+            Some("ReporterReloadRequired".to_string())
+        } else {
+            storage
+                .get_setting("pi_extension.spool_gap")?
+                .filter(|value| !value.is_empty())
+        };
+    let reporter_error = reporter
+        .as_ref()
+        .and_then(|summary| summary.worst_code)
+        .and_then(|code| pi_extension_error(code.as_str()));
+    let legacy_error = storage
+        .get_setting("pi_extension.last_error")?
+        .filter(|value| !value.is_empty())
         .as_deref()
-        == Some("true")
-    {
-        Some("ReporterReloadRequired".to_string())
-    } else {
-        storage
-            .get_setting("pi_extension.spool_gap")?
-            .filter(|value| !value.is_empty())
-            .or(storage.get_setting("pi_extension.last_error")?)
-    };
+        .and_then(pi_extension_error);
+    let last_error = configured_error
+        .as_deref()
+        .and_then(pi_extension_error)
+        .or(reporter_error)
+        .or(legacy_error);
+    let worst_subject = reporter
+        .as_ref()
+        .and_then(|summary| summary.worst_subject.as_ref());
+    let protocol = worst_subject
+        .map(|subject| subject.protocol.to_string())
+        .or(storage.get_setting("pi_extension.protocol")?);
+    let extension_version = worst_subject
+        .map(|subject| subject.reporter_version.clone())
+        .or(storage.get_setting("pi_extension.extension_version")?);
+    let affected_reporters = reporter
+        .as_ref()
+        .map_or(usize::from(last_error.is_some()), |summary| {
+            summary.affected_reporters
+        });
+    let affected_sessions = reporter
+        .as_ref()
+        .map_or(0, |summary| summary.affected_sessions);
+    let mismatch = last_error == Some(PiExtensionErrorKind::ProtocolMismatch);
     Ok(PiExtensionHealth {
         state,
         last_seen,
-        protocol: storage.get_setting("pi_extension.protocol")?,
-        extension_version: storage.get_setting("pi_extension.extension_version")?,
+        protocol,
+        extension_version,
         min_quill_version: storage.get_setting("pi_extension.min_quill_version")?,
-        last_error: last_error.as_deref().and_then(pi_extension_error),
+        last_error,
+        affected_reporters,
+        affected_sessions,
+        remediation: last_error.map(pi_health_remediation).map(str::to_owned),
+        last_recovered_at: reporter
+            .as_ref()
+            .and_then(|summary| summary.recovered_at_ms)
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+            .map(|value| value.to_rfc3339()),
+        required_protocol: mismatch.then(|| crate::pi_tracking::PI_PROTOCOL_V2.to_string()),
+        required_extension_version: mismatch
+            .then(|| crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION.to_owned()),
+        required_quill_version: mismatch
+            .then(|| crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD.to_owned()),
     })
 }
 
@@ -888,6 +1001,75 @@ mod tests {
             Some(PiExtensionErrorKind::ProtocolMismatch)
         );
         assert_eq!(health.protocol.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn pi_extension_health_aggregates_worst_reporter_and_recovery_detail() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Storage::init_at(dir.path().join("quill.db"), false).unwrap();
+        let now = Utc::now();
+        let mismatch = crate::pi_tracking::PiReporterHealthSubject::new(
+            "host",
+            "mismatch",
+            "managed",
+            1,
+            "0.1.0",
+            "old-build",
+            "old-capability",
+        )
+        .unwrap();
+        let unknown = crate::pi_tracking::PiReporterHealthSubject::new(
+            "host",
+            "unknown",
+            "npm",
+            2,
+            crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION,
+            crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD,
+            crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+        )
+        .unwrap();
+        storage
+            .record_pi_reporter_failure(
+                &mismatch,
+                crate::pi_tracking::PiReporterHealthCode::ProtocolMismatch,
+                2,
+                now.timestamp_millis(),
+            )
+            .unwrap();
+        storage
+            .record_pi_reporter_failure(
+                &unknown,
+                crate::pi_tracking::PiReporterHealthCode::UnknownSession,
+                1,
+                now.timestamp_millis() + 1,
+            )
+            .unwrap();
+
+        let health = pi_extension_health_at(&storage, now + TimeDelta::seconds(1)).unwrap();
+        assert_eq!(
+            health.last_error,
+            Some(PiExtensionErrorKind::ProtocolMismatch)
+        );
+        assert_eq!(health.affected_reporters, 2);
+        assert_eq!(health.affected_sessions, 3);
+        assert_eq!(health.protocol.as_deref(), Some("1"));
+        assert_eq!(health.required_protocol.as_deref(), Some("2"));
+        assert!(health.remediation.as_deref().unwrap().contains("exact"));
+
+        storage
+            .record_pi_reporter_recovery(
+                &mismatch,
+                crate::pi_tracking::PiReporterHealthDimension::Compatibility,
+                now.timestamp_millis() + 2,
+            )
+            .unwrap();
+        let recovered = pi_extension_health_at(&storage, now + TimeDelta::seconds(1)).unwrap();
+        assert_eq!(
+            recovered.last_error,
+            Some(PiExtensionErrorKind::UnknownSession)
+        );
+        assert_eq!(recovered.affected_reporters, 1);
+        assert!(recovered.last_recovered_at.is_some());
     }
 
     // @lat: [[pi-spool-tests#Pi Spool Retirement Test Specs#Typed retirement gap]]

@@ -1002,6 +1002,120 @@ fn pi_track_router(state: Arc<PiTrackRouteState>) -> Router {
         .with_state(state)
 }
 
+fn pi_reporter_health_subject(
+    headers: &HeaderMap,
+) -> Result<Option<crate::pi_tracking::PiReporterHealthSubject>, String> {
+    let values = [
+        crate::pi_tracking::PI_REPORTER_HOST_HEADER,
+        crate::pi_tracking::PI_REPORTER_PROCESS_HEADER,
+        crate::pi_tracking::PI_REPORTER_CHANNEL_HEADER,
+        crate::pi_tracking::PI_REPORTER_PROTOCOL_HEADER,
+        crate::pi_tracking::PI_REPORTER_VERSION_HEADER,
+        crate::pi_tracking::PI_REPORTER_BUILD_HEADER,
+        crate::pi_tracking::PI_REPORTER_CAPABILITY_HEADER,
+    ]
+    .map(|name| {
+        headers
+            .get(name)
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()
+            .map_err(|_| format!("Invalid {name} header"))
+    });
+    let [
+        host,
+        process,
+        channel,
+        protocol,
+        reporter,
+        build,
+        capability,
+    ] = values;
+    let [
+        host,
+        process,
+        channel,
+        protocol,
+        reporter,
+        build,
+        capability,
+    ] = [
+        host?,
+        process?,
+        channel?,
+        protocol?,
+        reporter?,
+        build?,
+        capability?,
+    ];
+    if [
+        host.is_some(),
+        process.is_some(),
+        channel.is_some(),
+        protocol.is_some(),
+        reporter.is_some(),
+        build.is_some(),
+        capability.is_some(),
+    ]
+    .into_iter()
+    .all(|present| !present)
+    {
+        return Ok(None);
+    }
+    let protocol = protocol
+        .ok_or_else(|| "Missing Pi reporter protocol header".to_owned())?
+        .parse::<u32>()
+        .map_err(|_| "Invalid Pi reporter protocol header".to_owned())?;
+    crate::pi_tracking::PiReporterHealthSubject::new(
+        host.as_deref()
+            .ok_or_else(|| "Missing Pi reporter host header".to_owned())?,
+        process
+            .as_deref()
+            .ok_or_else(|| "Missing Pi reporter process header".to_owned())?,
+        channel
+            .as_deref()
+            .ok_or_else(|| "Missing Pi reporter channel header".to_owned())?,
+        protocol,
+        reporter
+            .as_deref()
+            .ok_or_else(|| "Missing Pi reporter version header".to_owned())?,
+        build
+            .as_deref()
+            .ok_or_else(|| "Missing Pi reporter build header".to_owned())?,
+        capability
+            .as_deref()
+            .ok_or_else(|| "Missing Pi reporter capability header".to_owned())?,
+    )
+    .map(Some)
+}
+
+fn record_pi_telemetry_status(
+    storage: &Storage,
+    subject: Option<&crate::pi_tracking::PiReporterHealthSubject>,
+    status: StatusCode,
+) {
+    let Some(subject) = subject else {
+        return;
+    };
+    let now_ms = Utc::now().timestamp_millis();
+    let result = if status.is_success() {
+        storage.record_pi_reporter_recovery(
+            subject,
+            crate::pi_tracking::PiReporterHealthDimension::Transport,
+            now_ms,
+        )
+    } else {
+        storage.record_pi_reporter_failure(
+            subject,
+            crate::pi_tracking::PiReporterHealthCode::TelemetryRejected,
+            1,
+            now_ms,
+        )
+    };
+    if let Err(error) = result {
+        log::warn!("Could not persist Pi telemetry health: {error}");
+    }
+}
+
 fn pi_required_generation() -> PiProtocolV2Generation {
     PiProtocolV2Generation {
         protocol: crate::pi_tracking::PI_PROTOCOL_V2,
@@ -1061,6 +1175,17 @@ async fn post_pi_track(
             None,
         );
     }
+    let reporter_subject = match pi_reporter_health_subject(&headers) {
+        Ok(subject) => subject,
+        Err(error) => {
+            return pi_v2_error(
+                StatusCode::BAD_REQUEST,
+                PiProtocolV2ErrorCode::InvalidEnvelope,
+                error,
+                None,
+            );
+        }
+    };
     if state
         .storage
         .get_setting(PI_REPORTER_ENABLED_KEY)
@@ -1090,6 +1215,21 @@ async fn post_pi_track(
     let payload = match crate::pi_tracking::decode_protocol_v2_envelope(&bytes) {
         Ok(payload) => payload,
         Err(error) => {
+            if let Some(code) = crate::pi_tracking::PiReporterHealthCode::from_str(
+                &serde_json::to_value(error.code)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            ) && let Some(subject) = reporter_subject.as_ref()
+                && let Err(health_error) = state.storage.record_pi_reporter_failure(
+                    subject,
+                    code,
+                    1,
+                    Utc::now().timestamp_millis(),
+                )
+            {
+                log::warn!("Could not persist Pi compatibility health: {health_error}");
+            }
             return pi_v2_error(
                 pi_decode_status(error.code),
                 error.code,
@@ -1098,7 +1238,36 @@ async fn post_pi_track(
             );
         }
     };
+    if let Some(subject) = reporter_subject.as_ref() {
+        let envelope_subject = match crate::pi_tracking::PiReporterHealthSubject::from_envelope(
+            &payload,
+            &subject.install_channel,
+        ) {
+            Ok(subject) => subject,
+            Err(error) => {
+                return pi_v2_error(
+                    StatusCode::BAD_REQUEST,
+                    PiProtocolV2ErrorCode::InvalidEnvelope,
+                    error,
+                    None,
+                );
+            }
+        };
+        if envelope_subject != *subject {
+            return pi_v2_error(
+                StatusCode::BAD_REQUEST,
+                PiProtocolV2ErrorCode::InvalidEnvelope,
+                "Pi reporter headers do not match envelope identity",
+                None,
+            );
+        }
+    }
     if state.demo_mode || crate::ingest_is_quiesced() {
+        record_pi_telemetry_status(
+            state.storage,
+            reporter_subject.as_ref(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
         return pi_v2_error(
             StatusCode::SERVICE_UNAVAILABLE,
             PiProtocolV2ErrorCode::Unavailable,
@@ -1111,6 +1280,11 @@ async fn post_pi_track(
         MAX_PI_TRACK_REQUESTS,
         payload.events.len(),
     ) {
+        record_pi_telemetry_status(
+            state.storage,
+            reporter_subject.as_ref(),
+            StatusCode::TOO_MANY_REQUESTS,
+        );
         return pi_v2_error(
             StatusCode::TOO_MANY_REQUESTS,
             PiProtocolV2ErrorCode::RateLimited,
@@ -1121,9 +1295,10 @@ async fn post_pi_track(
 
     let storage = state.storage;
     let committed_payload = payload.clone();
+    let committed_subject = reporter_subject.clone();
     let outcomes = match tokio::task::spawn_blocking(move || {
         crate::with_ingest_write_permit(|| {
-            storage.apply_pi_protocol_v2_envelope(&committed_payload)
+            storage.apply_pi_protocol_v2_envelope(&committed_payload, committed_subject.as_ref())
         })
     })
     .await
@@ -1131,6 +1306,11 @@ async fn post_pi_track(
         Ok(Ok(outcomes)) => outcomes,
         Ok(Err(error)) => {
             log::error!("Pi protocol-v2 lifecycle transaction failed: {error}");
+            record_pi_telemetry_status(
+                storage,
+                reporter_subject.as_ref(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
             return pi_v2_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 PiProtocolV2ErrorCode::Unavailable,
@@ -1140,6 +1320,11 @@ async fn post_pi_track(
         }
         Err(error) => {
             log::error!("Pi protocol-v2 worker failed: {error}");
+            record_pi_telemetry_status(
+                storage,
+                reporter_subject.as_ref(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
             return pi_v2_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 PiProtocolV2ErrorCode::Unavailable,
@@ -1173,6 +1358,19 @@ async fn post_pi_track(
         let _ = app_handle.emit(crate::SESSIONS_LIVE_UPDATED_EVENT, ());
     }
     if outcomes.contains(&PiProtocolV2Outcome::UnknownSession) {
+        if let Some(subject) = reporter_subject.as_ref()
+            && let Err(error) = storage.record_pi_reporter_failure(
+                subject,
+                crate::pi_tracking::PiReporterHealthCode::UnknownSession,
+                outcomes
+                    .iter()
+                    .filter(|outcome| **outcome == PiProtocolV2Outcome::UnknownSession)
+                    .count(),
+                Utc::now().timestamp_millis(),
+            )
+        {
+            log::warn!("Could not persist Pi unknown-session health: {error}");
+        }
         return pi_v2_error(
             StatusCode::CONFLICT,
             PiProtocolV2ErrorCode::UnknownSession,
@@ -1910,20 +2108,28 @@ async fn post_hook_observed(
     if !check_auth(&headers, &state.secret) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
     }
+    let reporter_subject = match pi_reporter_health_subject(&headers) {
+        Ok(subject) => subject,
+        Err(error) => return (StatusCode::BAD_REQUEST, error),
+    };
+    let respond = |status, message: String| {
+        record_pi_telemetry_status(state.storage, reporter_subject.as_ref(), status);
+        (status, message)
+    };
     if !check_rate_limit_with_max(&state.obs_rate_limiter, MAX_OBS_REQUESTS) {
-        return (
+        return respond(
             StatusCode::TOO_MANY_REQUESTS,
             "Rate limit exceeded".to_string(),
         );
     }
     if payload.session_id.is_empty() || payload.session_id.len() > MAX_SESSION_ID_LEN {
-        return (StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
+        return respond(StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
     }
     if !is_supported_observed_hook_provider(payload.provider) {
-        return (StatusCode::BAD_REQUEST, "Invalid provider".to_string());
+        return respond(StatusCode::BAD_REQUEST, "Invalid provider".to_string());
     }
     if !is_supported_observed_hook_event(payload.provider, &payload.hook_event) {
-        return (
+        return respond(
             StatusCode::BAD_REQUEST,
             format!("Unknown hook_event: {}", payload.hook_event),
         );
@@ -1934,44 +2140,44 @@ async fn post_hook_observed(
         .as_ref()
         .is_some_and(|t| t.len() > MAX_STRING_LEN)
     {
-        return (StatusCode::BAD_REQUEST, "tool_name too long".to_string());
+        return respond(StatusCode::BAD_REQUEST, "tool_name too long".to_string());
     }
     if payload.cwd.as_ref().is_some_and(|c| c.len() > MAX_CWD_LEN) {
-        return (StatusCode::BAD_REQUEST, "cwd too long".to_string());
+        return respond(StatusCode::BAD_REQUEST, "cwd too long".to_string());
     }
     if payload
         .hostname
         .as_ref()
         .is_some_and(|hostname| hostname.len() > MAX_STRING_LEN)
     {
-        return (StatusCode::BAD_REQUEST, "hostname too long".to_string());
+        return respond(StatusCode::BAD_REQUEST, "hostname too long".to_string());
     }
     if payload
         .hook_matcher
         .as_ref()
         .is_some_and(|m| m.len() > MAX_STRING_LEN)
     {
-        return (StatusCode::BAD_REQUEST, "hook_matcher too long".to_string());
+        return respond(StatusCode::BAD_REQUEST, "hook_matcher too long".to_string());
     }
     if payload
         .agent_id
         .as_ref()
         .is_some_and(|a| a.len() > MAX_STRING_LEN)
     {
-        return (StatusCode::BAD_REQUEST, "agent_id too long".to_string());
+        return respond(StatusCode::BAD_REQUEST, "agent_id too long".to_string());
     }
     if payload.ts.is_empty() || payload.ts.len() > 64 {
-        return (StatusCode::BAD_REQUEST, "Invalid ts".to_string());
+        return respond(StatusCode::BAD_REQUEST, "Invalid ts".to_string());
     }
     if chrono::DateTime::parse_from_rfc3339(&payload.ts).is_err() {
-        return (
+        return respond(
             StatusCode::BAD_REQUEST,
             "ts must be ISO-8601 with offset".to_string(),
         );
     }
 
     store_hook_in_background(state.storage, state.app_handle.clone(), payload);
-    (StatusCode::ACCEPTED, "queued".to_string())
+    respond(StatusCode::ACCEPTED, "queued".to_string())
 }
 
 fn is_supported_observed_hook_provider(provider: IntegrationProvider) -> bool {
@@ -2294,16 +2500,35 @@ async fn post_context_savings_events(
             Json(serde_json::json!({"error": "Unauthorized"})),
         );
     }
+    let reporter_subject = match pi_reporter_health_subject(&headers) {
+        Ok(subject) => subject,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            );
+        }
+    };
     if !check_rate_limit_with_max(
         &state.context_savings_rate_limiter,
         MAX_CONTEXT_SAVINGS_REQUESTS,
     ) {
+        record_pi_telemetry_status(
+            state.storage,
+            reporter_subject.as_ref(),
+            StatusCode::TOO_MANY_REQUESTS,
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error": "Rate limit exceeded"})),
         );
     }
     if let Err(error) = validate_context_savings_batch(&payload) {
+        record_pi_telemetry_status(
+            state.storage,
+            reporter_subject.as_ref(),
+            StatusCode::BAD_REQUEST,
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": error})),
@@ -2312,11 +2537,17 @@ async fn post_context_savings_events(
 
     match state.storage.store_context_savings_events(&payload.events) {
         Ok(result) => {
+            record_pi_telemetry_status(state.storage, reporter_subject.as_ref(), StatusCode::OK);
             let _ = state.app_handle.emit("context-savings-updated", ());
             (StatusCode::OK, Json(serde_json::json!(result)))
         }
         Err(error) => {
             log::error!("Failed to store context savings events: {error}");
+            record_pi_telemetry_status(
+                state.storage,
+                reporter_subject.as_ref(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal server error"})),
@@ -3007,6 +3238,44 @@ mod observed_subagent_tests {
         })
     }
 
+    fn pi_reporter_request(
+        client: &reqwest::Client,
+        url: impl reqwest::IntoUrl,
+        wire: String,
+    ) -> reqwest::RequestBuilder {
+        let envelope = serde_json::from_str::<serde_json::Value>(&wire).expect("reporter wire");
+        let event = &envelope["events"][0];
+        client
+            .post(url)
+            .bearer_auth("route-secret")
+            .header(
+                crate::pi_tracking::PI_REPORTER_HOST_HEADER,
+                event["normalized_host"].as_str().unwrap(),
+            )
+            .header(
+                crate::pi_tracking::PI_REPORTER_PROCESS_HEADER,
+                event["process_instance_id"].as_str().unwrap(),
+            )
+            .header(crate::pi_tracking::PI_REPORTER_CHANNEL_HEADER, "managed")
+            .header(
+                crate::pi_tracking::PI_REPORTER_PROTOCOL_HEADER,
+                envelope["protocol"].as_u64().unwrap(),
+            )
+            .header(
+                crate::pi_tracking::PI_REPORTER_VERSION_HEADER,
+                envelope["reporter_version"].as_str().unwrap(),
+            )
+            .header(
+                crate::pi_tracking::PI_REPORTER_BUILD_HEADER,
+                envelope["quill_build"].as_str().unwrap(),
+            )
+            .header(
+                crate::pi_tracking::PI_REPORTER_CAPABILITY_HEADER,
+                envelope["capability_digest"].as_str().unwrap(),
+            )
+            .body(wire)
+    }
+
     async fn spawn_pi_route(state: Arc<PiTrackRouteState>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3059,13 +3328,14 @@ mod observed_subagent_tests {
             }
         ));
 
-        let response = client
-            .post(&url)
-            .bearer_auth("route-secret")
-            .body(protocol_v2_fixture("envelope.protocol_newer"))
-            .send()
-            .await
-            .expect("mismatch request");
+        let response = pi_reporter_request(
+            &client,
+            &url,
+            protocol_v2_fixture("envelope.protocol_newer"),
+        )
+        .send()
+        .await
+        .expect("mismatch request");
         assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
         assert!(matches!(
             response.json::<PiProtocolV2Response>().await.unwrap(),
@@ -3075,11 +3345,17 @@ mod observed_subagent_tests {
                 ..
             }
         ));
+        assert_eq!(
+            state
+                .storage
+                .pi_reporter_health_summary_at(Utc::now().timestamp_millis())
+                .unwrap()
+                .unwrap()
+                .worst_code,
+            Some(crate::pi_tracking::PiReporterHealthCode::ProtocolMismatch),
+        );
 
-        let response = client
-            .post(&url)
-            .bearer_auth("route-secret")
-            .body(start.clone())
+        let response = pi_reporter_request(&client, &url, start.clone())
             .send()
             .await
             .expect("accepted request");
@@ -3109,10 +3385,7 @@ mod observed_subagent_tests {
             Some(pi_generation_key().as_str())
         );
 
-        let response = client
-            .post(&url)
-            .bearer_auth("route-secret")
-            .body(start)
+        let response = pi_reporter_request(&client, &url, start)
             .send()
             .await
             .expect("duplicate request");
@@ -3142,14 +3415,16 @@ mod observed_subagent_tests {
             }
         ));
 
-        let unknown_url = spawn_pi_route(pi_route_state(false)).await;
-        let response = client
-            .post(unknown_url)
-            .bearer_auth("route-secret")
-            .body(protocol_v2_fixture("envelope.end.quit"))
-            .send()
-            .await
-            .expect("unknown-session request");
+        let unknown_state = pi_route_state(false);
+        let unknown_url = spawn_pi_route(Arc::clone(&unknown_state)).await;
+        let response = pi_reporter_request(
+            &client,
+            unknown_url,
+            protocol_v2_fixture("envelope.end.quit"),
+        )
+        .send()
+        .await
+        .expect("unknown-session request");
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert!(matches!(
             response.json::<PiProtocolV2Response>().await.unwrap(),
@@ -3158,6 +3433,15 @@ mod observed_subagent_tests {
                 ..
             }
         ));
+        assert_eq!(
+            unknown_state
+                .storage
+                .pi_reporter_health_summary_at(Utc::now().timestamp_millis())
+                .unwrap()
+                .unwrap()
+                .worst_code,
+            Some(crate::pi_tracking::PiReporterHealthCode::UnknownSession),
+        );
 
         let limited = pi_route_state(false);
         limited

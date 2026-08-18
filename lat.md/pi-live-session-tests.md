@@ -38,9 +38,11 @@ The Pi tracking boundary rejects bad bearer authentication with typed `401`, mal
 
 ## Authenticated Protocol v2 Router
 
-The real `/api/v1/pi/track` router authenticates before reading a bounded 1 MiB body, feeds exact fixture bytes through the open protocol-v2 decoder, and returns typed `400`, `401`, `409`, `426`, `429`, and `503` responses.
+The real `/api/v1/pi/track` router authenticates and validates canonical reporter identity before lifecycle mutation.
 
-Accepted responses include exact Quill build, protocol, reporter version, capability digest, and ordered dispositions.
+It bounds the body at 1 MiB, matches identity/generation headers to the envelope, feeds exact fixture bytes through the open protocol-v2 decoder, and returns typed `400`, `401`, `409`, `426`, `429`, and `503` responses.
+
+Accepted responses include exact Quill build, protocol, reporter version, capability digest, and ordered dispositions. Authenticated mismatch, unknown-session, rate, and availability outcomes write typed reporter health; successful evidence recovers only the matching subject and dimension.
 
 ## Transactional Lifecycle Disposition
 

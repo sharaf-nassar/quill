@@ -97,6 +97,25 @@ export function formatObservedSessionAgents(
 	).map(({ rank: _, ...agent }) => agent);
 }
 
+export function formatPiLineageStatus(reason: string): { label: string; detail: string } {
+	if (reason === "recovering") {
+		return {
+			label: "recovering",
+			detail: "Persisted Pi source is recovering; live state is not yet verified",
+		};
+	}
+	if (reason === "subagent_parent_unavailable") {
+		return {
+			label: "child gap",
+			detail: "Configured Pi child reporter could not verify its parent session",
+		};
+	}
+	return {
+		label: "unlinked",
+		detail: `Unlinked Pi session: ${reason.split("_").join(" ")}`,
+	};
+}
+
 export function resolveSessionMetrics(
 	tokens: string,
 	turns: string,

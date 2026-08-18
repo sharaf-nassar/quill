@@ -18,11 +18,15 @@ Pi extension reports transition from never connected to alive, idle, and stale u
 
 ## Typed extension error detail
 
-Protocol mismatch remains a typed Pi extension error with its reported protocol available for integration detail.
+Integration detail names every typed reporter-health failure.
+
+It covers exact mismatch, unknown session, configured-child gap, recovering source, reconciliation failure, rejected telemetry, and saturation while keeping affected counts, remediation, required generation, and verified recovery compact.
 
 ## Extension health presentation
 
-The enabled Pi row renders health, versions, last report, and typed error detail while degraded states remain slate or amber, never red.
+The enabled Pi row renders compact health detail without red severity.
+
+It includes versions, last report, typed failure, and intentional no-session absence. Sessions reuse their existing lineage datum to distinguish persisted-source recovery and configured-child gaps instead of adding a row.
 
 ## Missing health fallback
 

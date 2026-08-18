@@ -25,7 +25,9 @@ Compatible managed and npm copies elect one reporter, so every handler and stabl
 
 ## Tracking envelopes
 
-Persistent-session handlers push protocol-v2 lifecycle/lineage envelopes plus content-free protocol-v1 model, usage, activity, and runtime acceleration. Quill derives stable live identity from provider and session identity.
+Persistent-session handlers push protocol-v2 lifecycle and content-free protocol-v1 analytics acceleration.
+
+Assistant runtime closes on the first text-bearing assistant message rather than turn completion, so tool-only assistant messages do not invent `asst_text`. Quill derives stable live identity from provider and session identity.
 
 ## Protocol v2 fixture contract
 
@@ -43,7 +45,9 @@ A session without a persistent Pi file appends and sends no tracking or health e
 
 ## Typed bounded delivery
 
-Timeout, `429`, and `503` delivery retries once; `401` reloads config once; `409 unknown_session` reannounces the persisted start once before one mutation replay; `426` makes later live pushes inert while durable entries continue.
+Lifecycle delivery has bounded retry, reload, reannouncement, and inert-mismatch behavior.
+
+Timeout, `429`, and `503` retry once; `401` reloads config once; `409 unknown_session` reannounces the persisted start once before one mutation replay; `426` makes later live pushes inert while durable entries continue. Hook and routing telemetry inspect non-2xx bodies and surface typed server codes without changing routing decisions or escaping handlers.
 
 ## Handshake and lineage
 
@@ -109,7 +113,11 @@ Tool and telemetry handlers start their bounded HTTP work and return from synchr
 
 ## Telemetry mapping and timeout
 
-Pi lifecycle events map to the existing hook vocabulary with provider `pi`, and every request uses Codex's exact local timeout value.
+Pi telemetry has one canonical tool pair and settled root/child stop semantics.
+
+`tool_execution_start` maps to `PreToolUse` and `tool_execution_end` maps to `PostToolUse`; `tool_call` and `tool_result` never duplicate it. Root `agent_settled` emits `Stop`, while configured child `agent_start`/`agent_settled` exclusively emit `SubagentStart`/`SubagentStop`; turn completion emits neither.
+
+Every authenticated telemetry request carries the elected reporter's normalized host, process instance, install channel, and exact generation headers and uses Codex's exact local timeout value.
 
 ## Context router parity
 

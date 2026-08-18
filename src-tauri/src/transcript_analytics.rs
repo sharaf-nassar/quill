@@ -723,7 +723,21 @@ fn record_source_failure(
                 "cannot persist transcript analytics failure for source {}: {storage_error}",
                 source.source_key
             ))
-        })
+        })?;
+    if source.provider == IntegrationProvider::Pi {
+        storage
+            .record_pi_source_reconciliation_failure(
+                &source.source_key,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(|storage_error| {
+                RootReconciliationFault::Database(format!(
+                    "cannot persist Pi reconciliation health for source {}: {storage_error}",
+                    source.source_key
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 /// Best-effort diagnostic used by the live path, which reports its own error.
@@ -2143,6 +2157,7 @@ pub(crate) fn stamp_analytics_root(
 mod tests {
     use super::*;
     use crate::sessions::ToolAction;
+    use chrono::Utc;
     use rusqlite::OptionalExtension;
     use serde_json::json;
     use serial_test::serial;
@@ -2772,6 +2787,23 @@ mod tests {
         storage
             .replace_transcript_analytics_snapshot(&sibling)
             .expect("commit sibling Pi snapshot");
+        let reporter = crate::pi_tracking::PiReporterHealthSubject::new(
+            TEST_HOSTNAME,
+            "process-new",
+            "managed",
+            crate::pi_tracking::PI_PROTOCOL_V2,
+            crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION,
+            crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD,
+            crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+        )
+        .expect("Pi reporter health subject");
+        storage
+            .record_pi_reporter_recovery(
+                &reporter,
+                crate::pi_tracking::PiReporterHealthDimension::Source,
+                Utc::now().timestamp_millis(),
+            )
+            .expect("seed Pi reporter source health");
 
         #[derive(Debug, PartialEq)]
         struct LifecycleState {
@@ -2989,7 +3021,21 @@ mod tests {
             ),
         )
         .expect("write drifted Pi source");
-        assert!(parse_transcript_analytics_source(&source, TEST_HOSTNAME).is_err());
+        let drift_error = parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+            .err()
+            .expect("drifted Pi source must fail");
+        assert!(
+            record_source_failure(&storage, &source, generation, &drift_error.to_string()).is_ok(),
+            "record Pi source failure",
+        );
+        assert_eq!(
+            storage
+                .pi_reporter_health_summary_at(Utc::now().timestamp_millis())
+                .expect("read failed Pi reporter health")
+                .expect("Pi reporter health summary")
+                .worst_code,
+            Some(crate::pi_tracking::PiReporterHealthCode::ReconciliationFailed),
+        );
         assert_eq!(
             persisted_state(&storage, &source_key, "session-root"),
             initial
@@ -3028,6 +3074,12 @@ mod tests {
         storage
             .replace_transcript_analytics_snapshot(&completed)
             .expect("replace completed Pi snapshot");
+        let recovered_health = storage
+            .pi_reporter_health_summary_at(Utc::now().timestamp_millis())
+            .expect("read recovered Pi reporter health")
+            .expect("Pi reporter health summary");
+        assert_eq!(recovered_health.worst_code, None);
+        assert!(recovered_health.recovered_at_ms.is_some());
         let final_state = persisted_state(&storage, &source_key, "session-root");
         assert_eq!(count_of(&final_state, "session_events"), 4);
         assert_eq!(count_of(&final_state, "response_times"), 1);

@@ -42,6 +42,7 @@ import {
   formatExtrapolatedRuntime,
   formatNumber,
   formatObservedSessionAgents,
+  formatPiLineageStatus,
   formatRecency,
   isSessionLive,
   resolveSessionMetrics,
@@ -305,7 +306,7 @@ interface RowModel {
   nameLabel?: string;
   chipLabel?: string;
   parentSessionId?: string;
-  lineageUnresolvedReason?: string;
+  lineageStatus?: ReturnType<typeof formatPiLineageStatus>;
   agentSummary?: {
     count: string;
     countLabel: string;
@@ -492,13 +493,13 @@ function SessionIdentity({ row }: { row: RowModel }) {
           ↳ {row.parentSessionId.slice(0, 8)}
         </span>
       )}
-      {row.lineageUnresolvedReason && (
+      {row.lineageStatus && (
         <span
           className="wg-row-session-parent wg-row-datum"
-          data-tooltip="Unlinked Pi session"
-          aria-label={`Unlinked Pi session: ${row.lineageUnresolvedReason.split("_").join(" ")}`}
+          data-tooltip={row.lineageStatus.detail}
+          aria-label={row.lineageStatus.detail}
         >
-          unlinked
+          {row.lineageStatus.label}
         </span>
       )}
       {linkedCount > 0 && (
@@ -612,9 +613,9 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
     chip: { text: providerTag(row.provider), tone: row.provider },
     chipLabel: `Provider ${providerTag(row.provider)}`,
     parentSessionId: row.provider === "pi" ? row.parent_session_id ?? undefined : undefined,
-    lineageUnresolvedReason:
+    lineageStatus:
       row.provider === "pi" && row.pi_lineage?.kind === "unresolved"
-        ? row.pi_lineage.reason
+        ? formatPiLineageStatus(row.pi_lineage.reason)
         : undefined,
     agentSummary:
       hasAgentTotals || agents.length > 0

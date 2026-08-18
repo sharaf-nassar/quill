@@ -330,6 +330,14 @@ export type PiExtensionErrorKind =
   | "config"
   | "transport"
   | "protocol_mismatch"
+  | "unknown_session"
+  | "child_reporter_missing"
+  | "source_recovering"
+  | "reconciliation_failed"
+  | "telemetry_rejected"
+  | "saturated"
+  | "reporter_reload_required"
+  | "disabled"
   | "registration"
   | "spool"
   | "unknown";
@@ -341,6 +349,13 @@ export interface PiExtensionHealth {
   extensionVersion: string | null;
   minQuillVersion: string | null;
   lastError: PiExtensionErrorKind | null;
+  affectedReporters: number;
+  affectedSessions: number;
+  remediation?: string | null;
+  lastRecoveredAt?: string | null;
+  requiredProtocol?: string | null;
+  requiredExtensionVersion?: string | null;
+  requiredQuillVersion?: string | null;
 }
 
 export type PiLineage =
