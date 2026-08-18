@@ -104,6 +104,7 @@ test("formats every open agent with ordered model and runtime identity", () => {
 });
 
 // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Pi Agent Model Families]]
+// @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Agent Role Identity]]
 test("Pi agent rails reuse native model family labels", () => {
 	assert.deepEqual(
 		formatObservedSessionAgents("pi", [
@@ -113,6 +114,18 @@ test("Pi agent rails reuse native model family labels", () => {
 		[
 			{ model: "Opus", ariaLabel: "claude-opus-5, agent opus, 1s active runtime" },
 			{ model: "Sol", ariaLabel: "gpt-5.6-sol, agent sol, 1s active runtime" },
+		],
+	);
+	// A validated launcher role arrives as the agent type: the chip keeps the
+	// model family ordering while the label names both role and raw model.
+	assert.deepEqual(
+		formatObservedSessionAgents("pi", [
+			{ agent_id: "researcher", model_id: "gpt-5.6-sol", agent_type: "researcher", runtime_secs: 1, runtime_active: false },
+			{ agent_id: "reviewer", model_id: "claude-opus-5", agent_type: "reviewer", runtime_secs: 1, runtime_active: false },
+		], 1_000, 3_000).map(({ model, ariaLabel }) => ({ model, ariaLabel })),
+		[
+			{ model: "Opus", ariaLabel: "reviewer · claude-opus-5, agent reviewer, 1s active runtime" },
+			{ model: "Sol", ariaLabel: "researcher · gpt-5.6-sol, agent researcher, 1s active runtime" },
 		],
 	);
 });
@@ -149,9 +162,9 @@ test("Sessions fixtures expose lifetime and current-turn runtime evidence", () =
 	assert.ok(rows.every((row) => !("observed_subagent_count" in row) && !("observed_subagent_models" in row)));
 	assert.deepEqual(
 		rows.map((row) => row.observed_agents?.length ?? row.observed_agents),
-		[3, 0, null, 0, 2],
+		[3, 2, 0, null, 0, 2],
 	);
-	assert.deepEqual(rows.map((row) => row.agent_count), [5, 3, null, 0, null]);
+	assert.deepEqual(rows.map((row) => row.agent_count), [5, 2, 3, null, 0, null]);
 	const now = Date.now();
 	for (const row of rows) {
 		const liveRoot = row.current_turn_runtime_active ? 1 : 0;

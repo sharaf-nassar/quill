@@ -42,9 +42,11 @@ Expected output is `ok` and `45`; restarting Quill reapplies migration 46 and re
 
 ## Persisted Source Atomic Replacement
 
-One persisted Pi snapshot replaces every source-owned runtime, tool, lifecycle, receipt, token, usage, rollup, and registry row in one SQLite transaction.
+One persisted Pi snapshot replaces every source-owned runtime, tool, receipt, token, usage, rollup, and registry row in one SQLite transaction.
 
-A final registry failure rolls every table back, identity drift retains last-good, and an empty replacement clears only its source while preserving both registries and a sibling source. A superseded process cannot close the newer process; a persisted open process rehydrates as `recovering` until its own end appears.
+Lifecycle evidence participates only when present and ordered after the committed lifecycle already stored for that session.
+
+A final registry failure rolls every table back, identity drift retains last-good, and an empty replacement clears only its source-owned analytics evidence while preserving both registries, a sibling source, and any newer committed lifecycle when lifecycle evidence is absent. A superseded process cannot close the newer process; a persisted open process rehydrates as `recovering` until its own end appears.
 
 ## Replay And Cost Storage
 

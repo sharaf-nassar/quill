@@ -3070,13 +3070,17 @@ mod tests {
             empty_state
                 .evidence_counts
                 .iter()
-                .all(|(_, count)| *count == 0),
-            "empty replacement must clear every source-owned evidence table: {empty_state:?}"
+                .all(|(table, count)| *table == "pi_session_lifecycle" || *count == 0),
+            "empty replacement must clear source-owned analytics evidence: {empty_state:?}"
         );
+        assert_eq!(count_of(&empty_state, "pi_session_lifecycle"), 1);
         assert_eq!(empty_state.model_input_tokens, 0);
         assert_eq!(empty_state.rollup_input_tokens, 0);
         assert_eq!(empty_state.token_rows, (0, 0));
-        assert!(empty_state.lifecycle.is_none());
+        assert_eq!(
+            empty_state.lifecycle, final_state.lifecycle,
+            "missing reconciliation lifecycle cannot delete newer committed state"
+        );
         assert_eq!(empty_state.transcript_owner, (1, next_generation));
         assert_eq!(empty_state.model_owner, (1, 0));
         assert_eq!(empty_state.live_owner, 1);

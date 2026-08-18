@@ -29,3 +29,9 @@ One live Pi child uses the singular label `live linked session`.
 ## Unresolved Lineage Reason
 
 An unresolved Pi parent renders as explicitly unlinked with its pushed reason and never renders root or parent-navigation copy.
+
+Recovering durable rows use the same truthful unlinked treatment but do not claim live activity until same-process proof arrives.
+
+## Agent Role Identity
+
+A validated Pi launcher role is carried as the observed agent type. The compact rail retains model-family ordering while its instant tooltip and accessible label name both role and raw model when both exist.

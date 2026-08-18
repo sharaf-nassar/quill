@@ -22,21 +22,9 @@ Activity, model, lineage, and cumulative-token pushes update an existing Pi sess
 
 A pushed Pi session with no shutdown ages out through the shared 15-minute idle sweep, and a shutdown arriving after eviction stays an idempotent no-op.
 
-## Ephemeral Persistence
+## Persisted Source Presentation
 
-Migration 42 and the lifecycle upsert preserve the ephemeral flag with Pi's cwd and normalized hostname. Migration 44 orders replayed close/start events so stale starts stay closed and newer resumes reopen.
-
-## Ephemeral Live Overlay
-
-A pushed ephemeral start marks its live Sessions row immediately, before any usage or transcript evidence exists.
-
-## Ephemeral Breakdown Persistence
-
-An ephemeral lifecycle origin remains a Sessions row after shutdown and combines pushed usage with session-owned turn activity without creating ordinary lifecycle-only rows.
-
-## Ephemeral Badge
-
-The Sessions identity renders a neutral, accessible EPHEMERAL badge only for rows whose additive breakdown flag is true.
+Persisted Pi work never renders the retired EPHEMERAL badge. The additive database field remains inert for schema compatibility, while no-file sessions intentionally produce no row.
 
 ## Extension Health Persistence
 
@@ -46,7 +34,27 @@ An unchanged handshake repeated inside the refresh window writes nothing, while 
 
 ## Tracking Request Validation
 
-The Pi tracking boundary rejects bad bearer authentication with `401`, protocol mismatch with a typed `400`, and control characters in hostname identity before mutation.
+The Pi tracking boundary rejects bad bearer authentication with typed `401`, malformed or invalid authenticated bodies with typed `400`, and exact-generation mismatch with typed `426` before lifecycle mutation.
+
+## Authenticated Protocol v2 Router
+
+The real `/api/v1/pi/track` router authenticates before reading a bounded 1 MiB body, feeds exact fixture bytes through the open protocol-v2 decoder, and returns typed `400`, `401`, `409`, `426`, `429`, and `503` responses.
+
+Accepted responses include exact Quill build, protocol, reporter version, capability digest, and ordered dispositions.
+
+## Transactional Lifecycle Disposition
+
+One SQLite transaction returns `applied`, `duplicate`, `stale`, or `unknown_session` for each validated event.
+
+Only committed `applied` events mutate `LiveTracker`; newer process starts supersede older instances, while stale process ends and reconciliation cannot reopen or remove the replacement.
+
+Durable open rows load as recovering after restart or tracking re-enable. Same-process lifecycle or live-hint evidence can prove them live; a mismatched process is stale and an absent or closed lifecycle returns `unknown_session`.
+
+## Live Hint Recovery And Source Diagnostic
+
+Pi session-message hints consult durable lifecycle before analytics mutation, returning typed `409` for unknown or stale ownership.
+
+A live start without a reconciled file records `source_not_persisted`; validated notify or committed persisted-source reconciliation clears only that process's diagnostic.
 
 ## Protocol v2 decoder contract
 
@@ -98,7 +106,17 @@ One parent with two live children linked by pushed proof exposes exactly two lin
 
 ## Explicit Pi Agent Lineage
 
-An explicitly marked Pi subagent becomes a live agent on its parent with model, count, runtime, and activity while its child session row is omitted; generic Pi links remain separate.
+An explicitly marked Pi subagent becomes a live agent on its resolved root with model, validated launcher role, count, runtime, and activity while its child session row is omitted; generic Pi links remain separate.
+
+## Depth-Bounded Agent Projection
+
+Nested explicit agents preserve direct lineage internally but flatten into one visible root rail.
+
+Missing parents remain independent unresolved live rows, late proof attaches the same identity, and completion removes the child projection. Family activity and runtime include descendants; agent count/runtime remain explicit; root tokens and turns stay root-only.
+
+## Depth 64 Cycle And Cross-Host Rejection
+
+The memoized lineage resolver supports 64 direct edges. A 65th edge, cycle, missing ancestor, or parent found only on another host stays an unresolved independent live row rather than disappearing or attaching across identity boundaries.
 
 ## Pi Agent Retained Parent Overlay
 

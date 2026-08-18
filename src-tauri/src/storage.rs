@@ -87,12 +87,14 @@ use crate::models::{
     ModelOverviewDelegation, ModelOverviewDelegationTop, ModelOverviewPair,
     ModelOverviewProjectCell, ModelOverviewProjectRow, ModelOverviewRow, ModelOverviewTotals,
     ModelRange, ModelRunningNow, ModelSessionRow, ModelSessionsResponse, ModelTokenScope,
-    ModelUsageOverviewResponse, ObservationPayload, ObservationSummary, ProjectBreakdown,
-    ProjectTokens, ProviderTokenSeries, ProviderTokenSeriesResponse, RunInferenceCall,
-    RunInferenceConfinement, RunInferenceSummary, SessionBreakdown, SessionCodeStats,
-    SessionModelChain, SessionModelChainKind, SessionModelHistoryResponse, SessionModelSegment,
-    SessionRef, SessionStats, SkillBreakdown, SkillProjectBreakdown, TokenDataPoint,
-    TokenReportPayload, TokenStats, ToolCount, UsageBucket, UsageSource,
+    ModelUsageOverviewResponse, ObservationPayload, ObservationSummary, PiLineage,
+    PiProtocolV2DeliverySource, PiProtocolV2Envelope, PiProtocolV2EventKind, PiProtocolV2Lineage,
+    PiProtocolV2Outcome, PiRecoveringSession, ProjectBreakdown, ProjectTokens, ProviderTokenSeries,
+    ProviderTokenSeriesResponse, RunInferenceCall, RunInferenceConfinement, RunInferenceSummary,
+    SessionBreakdown, SessionCodeStats, SessionModelChain, SessionModelChainKind,
+    SessionModelHistoryResponse, SessionModelSegment, SessionRef, SessionStats, SkillBreakdown,
+    SkillProjectBreakdown, TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, UsageBucket,
+    UsageSource,
 };
 
 /// Highest migration this build knows how to apply. Every migration gate is a
@@ -128,6 +130,48 @@ pub(crate) fn pi_source_key(hostname: &str, session_id: &str) -> Result<String, 
         crate::hex_encode(hostname.as_bytes()),
         crate::hex_encode(session_id.as_bytes())
     ))
+}
+
+#[derive(Clone, Debug)]
+struct CurrentPiLifecycle {
+    origin_at_ms: i64,
+    process_instance_id: String,
+    sequence: i64,
+    occurred_at_ms: i64,
+}
+
+fn pi_lineage_columns(lineage: &PiProtocolV2Lineage) -> (&'static str, Option<&str>, Option<&str>) {
+    match lineage {
+        PiProtocolV2Lineage::Root => ("root", None, None),
+        PiProtocolV2Lineage::Linked { parent_session_id } => {
+            ("linked", Some(parent_session_id), None)
+        }
+        PiProtocolV2Lineage::Agent { parent_session_id } => {
+            ("agent", Some(parent_session_id), None)
+        }
+        PiProtocolV2Lineage::Unresolved { reason } => ("unresolved", None, Some(reason)),
+    }
+}
+
+fn stored_pi_lineage(state: &str, parent: Option<String>, reason: Option<String>) -> PiLineage {
+    match state {
+        "root" => PiLineage::Root,
+        "linked" => parent.map_or_else(
+            || PiLineage::Unresolved {
+                reason: "missing_parent".to_owned(),
+            },
+            |parent_session_id| PiLineage::Linked { parent_session_id },
+        ),
+        "agent" => parent.map_or_else(
+            || PiLineage::Unresolved {
+                reason: "missing_parent".to_owned(),
+            },
+            |parent_session_id| PiLineage::Agent { parent_session_id },
+        ),
+        _ => PiLineage::Unresolved {
+            reason: reason.unwrap_or_else(|| "unresolved".to_owned()),
+        },
+    }
 }
 
 // @lat: [[backend#Backend#Database#tool_detail payload carve-out]]
@@ -5503,6 +5547,502 @@ fn transcript_analytics_generation_key(provider: IntegrationProvider, root: &str
 }
 
 impl Storage {
+    /// Commit protocol-v2 lifecycle ordering before any in-memory projection.
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Transactional Lifecycle Disposition]]
+    pub(crate) fn apply_pi_protocol_v2_envelope(
+        &self,
+        envelope: &PiProtocolV2Envelope,
+    ) -> Result<Vec<PiProtocolV2Outcome>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin Pi lifecycle disposition: {error}"))?;
+        let accepted_at_ms = Utc::now().timestamp_millis();
+        let mut outcomes = Vec::with_capacity(envelope.events.len());
+
+        for event in &envelope.events {
+            let sequence = i64::try_from(event.sequence)
+                .map_err(|_| "Pi lifecycle sequence exceeds SQLite range".to_owned())?;
+            let origin_at_ms = DateTime::parse_from_rfc3339(&event.origin_at)
+                .map_err(|error| format!("Parse Pi origin timestamp: {error}"))?
+                .timestamp_millis();
+            let occurred_at_ms = DateTime::parse_from_rfc3339(&event.occurred_at)
+                .map_err(|error| format!("Parse Pi lifecycle timestamp: {error}"))?
+                .timestamp_millis();
+            let source_key = pi_source_key(&event.normalized_host, &event.session_id)?;
+            let already_received = tx
+                .query_row(
+                    "SELECT 1 FROM pi_event_receipts
+                     WHERE provider='pi' AND normalized_hostname=?1
+                       AND session_id=?2 AND event_uuid=?3",
+                    params![event.normalized_host, event.session_id, event.event_uuid],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| format!("Read Pi event receipt: {error}"))?
+                .is_some();
+            if already_received {
+                outcomes.push(PiProtocolV2Outcome::Duplicate);
+                continue;
+            }
+
+            let current = tx
+                .query_row(
+                    "SELECT origin_at_ms, process_instance_id, current_sequence,
+                            occurred_at_ms
+                     FROM pi_session_lifecycle
+                     WHERE provider='pi' AND normalized_hostname=?1 AND session_id=?2",
+                    params![event.normalized_host, event.session_id],
+                    |row| {
+                        Ok(CurrentPiLifecycle {
+                            origin_at_ms: row.get(0)?,
+                            process_instance_id: row.get(1)?,
+                            sequence: row.get(2)?,
+                            occurred_at_ms: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|error| format!("Read current Pi lifecycle: {error}"))?;
+
+            let outcome = match (&event.kind, current.as_ref()) {
+                (PiProtocolV2EventKind::SessionStart { .. }, None) => PiProtocolV2Outcome::Applied,
+                (PiProtocolV2EventKind::SessionStart { .. }, Some(current))
+                    if current.process_instance_id == event.process_instance_id =>
+                {
+                    if sequence > current.sequence {
+                        PiProtocolV2Outcome::Applied
+                    } else if sequence == current.sequence {
+                        PiProtocolV2Outcome::Duplicate
+                    } else {
+                        PiProtocolV2Outcome::Stale
+                    }
+                }
+                (PiProtocolV2EventKind::SessionStart { .. }, Some(current)) => {
+                    if occurred_at_ms > current.occurred_at_ms {
+                        PiProtocolV2Outcome::Applied
+                    } else {
+                        PiProtocolV2Outcome::Stale
+                    }
+                }
+                (_, None) => PiProtocolV2Outcome::UnknownSession,
+                (_, Some(current)) if current.process_instance_id != event.process_instance_id => {
+                    PiProtocolV2Outcome::Stale
+                }
+                (_, Some(current)) if sequence > current.sequence => PiProtocolV2Outcome::Applied,
+                (_, Some(current)) if sequence == current.sequence => {
+                    PiProtocolV2Outcome::Duplicate
+                }
+                _ => PiProtocolV2Outcome::Stale,
+            };
+
+            if outcome == PiProtocolV2Outcome::Applied {
+                match &event.kind {
+                    PiProtocolV2EventKind::SessionStart {
+                        previous_session_id,
+                        lineage,
+                        agent_role,
+                        ..
+                    } => {
+                        let (lineage_state, parent, lineage_reason) = pi_lineage_columns(lineage);
+                        let lifecycle_state = match event.delivery_source {
+                            PiProtocolV2DeliverySource::Live => "open",
+                            PiProtocolV2DeliverySource::Reconciliation => "recovering",
+                        };
+                        let durable_origin_at_ms = current
+                            .as_ref()
+                            .map_or(origin_at_ms, |current| current.origin_at_ms);
+                        tx.execute(
+                            "INSERT INTO pi_session_lifecycle (
+                                 provider, normalized_hostname, session_id, source_key,
+                                 origin_at_ms, process_instance_id, current_sequence,
+                                 current_occurrence_id, occurred_at_ms, lifecycle_state,
+                                 direct_parent_session_id, visible_root_session_id,
+                                 lineage_state, lineage_reason, agent_role,
+                                 reporter_protocol, reporter_version, updated_at_ms,
+                                 closed_at_ms
+                             ) VALUES (
+                                 'pi', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                                 ?10, NULL, ?11, ?12, ?13, ?14, ?15, ?16, NULL
+                             )
+                             ON CONFLICT(provider, normalized_hostname, session_id)
+                             DO UPDATE SET
+                                 source_key=excluded.source_key,
+                                 origin_at_ms=excluded.origin_at_ms,
+                                 process_instance_id=excluded.process_instance_id,
+                                 current_sequence=excluded.current_sequence,
+                                 current_occurrence_id=excluded.current_occurrence_id,
+                                 occurred_at_ms=excluded.occurred_at_ms,
+                                 lifecycle_state=excluded.lifecycle_state,
+                                 direct_parent_session_id=excluded.direct_parent_session_id,
+                                 visible_root_session_id=NULL,
+                                 lineage_state=excluded.lineage_state,
+                                 lineage_reason=excluded.lineage_reason,
+                                 agent_role=excluded.agent_role,
+                                 reporter_protocol=excluded.reporter_protocol,
+                                 reporter_version=excluded.reporter_version,
+                                 updated_at_ms=excluded.updated_at_ms,
+                                 closed_at_ms=NULL",
+                            params![
+                                event.normalized_host,
+                                event.session_id,
+                                source_key,
+                                durable_origin_at_ms,
+                                event.process_instance_id,
+                                sequence,
+                                event.event_uuid,
+                                occurred_at_ms,
+                                lifecycle_state,
+                                parent,
+                                lineage_state,
+                                lineage_reason,
+                                agent_role,
+                                envelope.protocol,
+                                envelope.reporter_version,
+                                accepted_at_ms,
+                            ],
+                        )
+                        .map_err(|error| format!("Upsert Pi lifecycle start: {error}"))?;
+                        tx.execute(
+                            "INSERT INTO live_analytics_sessions (
+                                 provider, session_id, cwd, hostname, updated_at,
+                                 ephemeral, lifecycle_at_ms, closed_at_ms
+                             ) VALUES ('pi', ?1, NULL, ?2, ?3, 0, ?4, NULL)
+                             ON CONFLICT(provider, session_id) DO UPDATE SET
+                                 hostname=excluded.hostname,
+                                 updated_at=excluded.updated_at,
+                                 ephemeral=0,
+                                 lifecycle_at_ms=excluded.lifecycle_at_ms,
+                                 closed_at_ms=NULL",
+                            params![
+                                event.session_id,
+                                event.normalized_host,
+                                event.occurred_at,
+                                occurred_at_ms,
+                            ],
+                        )
+                        .map_err(|error| format!("Upsert Pi live lifecycle start: {error}"))?;
+                        if let Some(previous_session_id) = previous_session_id {
+                            tx.execute(
+                                "UPDATE pi_session_lifecycle
+                                 SET lifecycle_state='closed', closed_at_ms=?3,
+                                     updated_at_ms=?4
+                                 WHERE provider='pi' AND normalized_hostname=?1
+                                   AND session_id=?2 AND occurred_at_ms <= ?3",
+                                params![
+                                    event.normalized_host,
+                                    previous_session_id,
+                                    occurred_at_ms,
+                                    accepted_at_ms,
+                                ],
+                            )
+                            .map_err(|error| format!("Close replaced Pi lifecycle: {error}"))?;
+                            tx.execute(
+                                "UPDATE live_analytics_sessions
+                                 SET closed_at_ms=?2, lifecycle_at_ms=?2, updated_at=?3
+                                 WHERE provider='pi' AND session_id=?1",
+                                params![previous_session_id, occurred_at_ms, event.occurred_at],
+                            )
+                            .map_err(|error| format!("Close replaced Pi live row: {error}"))?;
+                        }
+
+                        if event.delivery_source == PiProtocolV2DeliverySource::Live {
+                            let source_persisted = tx
+                                .query_row(
+                                    "SELECT processing_status='ok'
+                                     FROM transcript_analytics_sources
+                                     WHERE provider='pi' AND source_key=?1",
+                                    params![source_key],
+                                    |row| row.get::<_, bool>(0),
+                                )
+                                .optional()
+                                .map_err(|error| format!("Read Pi source state: {error}"))?
+                                .unwrap_or(false);
+                            tx.execute(
+                                "INSERT INTO pi_reporter_health (
+                                     normalized_hostname, process_instance_id,
+                                     install_channel, reporter_protocol,
+                                     reporter_version, quill_build, capability_digest,
+                                     last_handshake_ms, last_acceptance_ms,
+                                     last_heartbeat_ms, connection_state,
+                                     compatibility_state, lifecycle_state,
+                                     child_ack_state, source_state, transport_state,
+                                     latest_code, affected_sessions
+                                 ) VALUES (
+                                     ?1, ?2, 'live', ?3, ?4, ?5, ?6, ?7, ?7, ?7,
+                                     'connected', 'compatible', 'created', 'unknown',
+                                     ?8, 'healthy', ?9, ?10
+                                 )
+                                 ON CONFLICT(
+                                     normalized_hostname, process_instance_id,
+                                     install_channel
+                                 ) DO UPDATE SET
+                                     reporter_protocol=excluded.reporter_protocol,
+                                     reporter_version=excluded.reporter_version,
+                                     quill_build=excluded.quill_build,
+                                     capability_digest=excluded.capability_digest,
+                                     last_handshake_ms=excluded.last_handshake_ms,
+                                     last_acceptance_ms=excluded.last_acceptance_ms,
+                                     last_heartbeat_ms=excluded.last_heartbeat_ms,
+                                     connection_state='connected',
+                                     compatibility_state='compatible',
+                                     lifecycle_state='created',
+                                     source_state=excluded.source_state,
+                                     transport_state='healthy',
+                                     latest_code=excluded.latest_code,
+                                     affected_sessions=excluded.affected_sessions",
+                                params![
+                                    event.normalized_host,
+                                    event.process_instance_id,
+                                    envelope.protocol,
+                                    envelope.reporter_version,
+                                    envelope.quill_build,
+                                    envelope.capability_digest,
+                                    accepted_at_ms,
+                                    if source_persisted {
+                                        "healthy"
+                                    } else {
+                                        "source_not_persisted"
+                                    },
+                                    if source_persisted {
+                                        None::<&str>
+                                    } else {
+                                        Some("source_not_persisted")
+                                    },
+                                    i64::from(!source_persisted),
+                                ],
+                            )
+                            .map_err(|error| format!("Record Pi reporter lifecycle: {error}"))?;
+                        }
+                    }
+                    PiProtocolV2EventKind::SessionEnd { .. } => {
+                        tx.execute(
+                            "UPDATE pi_session_lifecycle
+                             SET current_sequence=?4, current_occurrence_id=?5,
+                                 occurred_at_ms=?6, lifecycle_state='closed',
+                                 updated_at_ms=?7, closed_at_ms=?6
+                             WHERE provider='pi' AND normalized_hostname=?1
+                               AND session_id=?2 AND process_instance_id=?3",
+                            params![
+                                event.normalized_host,
+                                event.session_id,
+                                event.process_instance_id,
+                                sequence,
+                                event.event_uuid,
+                                occurred_at_ms,
+                                accepted_at_ms,
+                            ],
+                        )
+                        .map_err(|error| format!("Close Pi lifecycle: {error}"))?;
+                        tx.execute(
+                            "UPDATE live_analytics_sessions
+                             SET closed_at_ms=?2, lifecycle_at_ms=?2, updated_at=?3
+                             WHERE provider='pi' AND session_id=?1",
+                            params![event.session_id, occurred_at_ms, event.occurred_at],
+                        )
+                        .map_err(|error| format!("Close Pi live row: {error}"))?;
+                    }
+                    PiProtocolV2EventKind::Lineage {
+                        lineage,
+                        agent_role,
+                    } => {
+                        let (lineage_state, parent, reason) = pi_lineage_columns(lineage);
+                        tx.execute(
+                            "UPDATE pi_session_lifecycle
+                             SET current_sequence=?4, current_occurrence_id=?5,
+                                 occurred_at_ms=?6, direct_parent_session_id=?7,
+                                 visible_root_session_id=NULL, lineage_state=?8,
+                                 lineage_reason=?9,
+                                 agent_role=COALESCE(?10, agent_role),
+                                 updated_at_ms=?11
+                             WHERE provider='pi' AND normalized_hostname=?1
+                               AND session_id=?2 AND process_instance_id=?3",
+                            params![
+                                event.normalized_host,
+                                event.session_id,
+                                event.process_instance_id,
+                                sequence,
+                                event.event_uuid,
+                                occurred_at_ms,
+                                parent,
+                                lineage_state,
+                                reason,
+                                agent_role,
+                                accepted_at_ms,
+                            ],
+                        )
+                        .map_err(|error| format!("Update Pi lineage: {error}"))?;
+                    }
+                }
+            }
+
+            if outcome != PiProtocolV2Outcome::UnknownSession {
+                let event_kind = match event.kind {
+                    PiProtocolV2EventKind::SessionStart { .. } => "session_start",
+                    PiProtocolV2EventKind::SessionEnd { .. } => "session_end",
+                    PiProtocolV2EventKind::Lineage { .. } => "lineage",
+                };
+                tx.execute(
+                    "INSERT INTO pi_event_receipts (
+                         provider, normalized_hostname, session_id, event_uuid,
+                         source_key, entry_id, process_instance_id, sequence,
+                         event_kind, occurred_at_ms, accepted_at_ms
+                     ) VALUES ('pi', ?1, ?2, ?3, ?4, ?3, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        event.normalized_host,
+                        event.session_id,
+                        event.event_uuid,
+                        source_key,
+                        event.process_instance_id,
+                        sequence,
+                        event_kind,
+                        occurred_at_ms,
+                        accepted_at_ms,
+                    ],
+                )
+                .map_err(|error| format!("Insert Pi event receipt: {error}"))?;
+            }
+            outcomes.push(outcome);
+        }
+
+        tx.commit()
+            .map_err(|error| format!("Commit Pi lifecycle disposition: {error}"))?;
+        Ok(outcomes)
+    }
+
+    /// Resolve a live hint against the current durable process without letting
+    /// an older process revive or mutate its replacement.
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Live Hint Recovery And Source Diagnostic]]
+    pub(crate) fn pi_live_hint_disposition(
+        &self,
+        normalized_host: &str,
+        session_id: &str,
+        process_instance_id: Option<&str>,
+        observed_at_ms: i64,
+    ) -> Result<PiProtocolV2Outcome, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin Pi live-hint disposition: {error}"))?;
+        let current = tx
+            .query_row(
+                "SELECT process_instance_id, lifecycle_state
+                 FROM pi_session_lifecycle
+                 WHERE provider='pi' AND normalized_hostname=?1 AND session_id=?2",
+                params![normalized_host, session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Read Pi live-hint lifecycle: {error}"))?;
+        let outcome = match current {
+            None => PiProtocolV2Outcome::UnknownSession,
+            Some((_, ref state)) if state == "closed" => PiProtocolV2Outcome::UnknownSession,
+            Some((ref current_process, _))
+                if process_instance_id.is_some_and(|process| process != current_process) =>
+            {
+                PiProtocolV2Outcome::Stale
+            }
+            Some((ref current_process, _))
+                if process_instance_id == Some(current_process.as_str()) =>
+            {
+                tx.execute(
+                    "UPDATE pi_session_lifecycle
+                     SET lifecycle_state='open', updated_at_ms=?3
+                     WHERE provider='pi' AND normalized_hostname=?1 AND session_id=?2",
+                    params![normalized_host, session_id, observed_at_ms],
+                )
+                .map_err(|error| format!("Prove Pi lifecycle live: {error}"))?;
+                PiProtocolV2Outcome::Applied
+            }
+            Some(_) => PiProtocolV2Outcome::Applied,
+        };
+        tx.commit()
+            .map_err(|error| format!("Commit Pi live-hint disposition: {error}"))?;
+        Ok(outcome)
+    }
+
+    /// Mark every durable open Pi row as recovering before repopulating live
+    /// memory after restart or a tracking re-enable.
+    pub(crate) fn load_pi_recovering_sessions(&self) -> Result<Vec<PiRecoveringSession>, String> {
+        let now = Utc::now().timestamp_millis();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin Pi recovery load: {error}"))?;
+        tx.execute(
+            "UPDATE pi_session_lifecycle
+             SET lifecycle_state='recovering', updated_at_ms=?1
+             WHERE provider='pi' AND lifecycle_state='open'",
+            params![now],
+        )
+        .map_err(|error| format!("Mark Pi sessions recovering: {error}"))?;
+        let rows = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT lifecycle.normalized_hostname, lifecycle.session_id,
+                            lifecycle.process_instance_id, lifecycle.origin_at_ms,
+                            lifecycle.occurred_at_ms, live.cwd,
+                            lifecycle.lineage_state,
+                            lifecycle.direct_parent_session_id,
+                            lifecycle.lineage_reason, lifecycle.agent_role
+                     FROM pi_session_lifecycle AS lifecycle
+                     LEFT JOIN live_analytics_sessions AS live
+                       ON live.provider='pi'
+                      AND live.session_id=lifecycle.session_id
+                      AND live.hostname=lifecycle.normalized_hostname
+                     WHERE lifecycle.provider='pi'
+                       AND lifecycle.lifecycle_state='recovering'",
+                )
+                .map_err(|error| format!("Prepare Pi recovery load: {error}"))?;
+            statement
+                .query_map([], |row| {
+                    let lineage_state = row.get::<_, String>(6)?;
+                    let parent = row.get::<_, Option<String>>(7)?;
+                    let reason = row.get::<_, Option<String>>(8)?;
+                    Ok(PiRecoveringSession {
+                        normalized_host: row.get(0)?,
+                        session_id: row.get(1)?,
+                        process_instance_id: row.get(2)?,
+                        origin_at_ms: row.get(3)?,
+                        occurred_at_ms: row.get(4)?,
+                        cwd: row.get(5)?,
+                        lineage: stored_pi_lineage(&lineage_state, parent, reason),
+                        agent_role: row.get(9)?,
+                    })
+                })
+                .map_err(|error| format!("Query Pi recovery load: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Read Pi recovery row: {error}"))?
+        };
+        tx.commit()
+            .map_err(|error| format!("Commit Pi recovery load: {error}"))?;
+        Ok(rows)
+    }
+
+    pub(crate) fn clear_pi_source_not_persisted(
+        &self,
+        normalized_host: &str,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE pi_reporter_health
+                 SET source_state='healthy', latest_code=NULL,
+                     affected_sessions=0, recovered_at_ms=?3
+                 WHERE normalized_hostname=?1
+                   AND process_instance_id=(
+                       SELECT process_instance_id FROM pi_session_lifecycle
+                       WHERE provider='pi' AND normalized_hostname=?1
+                         AND session_id=?2
+                   )
+                   AND source_state='source_not_persisted'",
+                params![normalized_host, session_id, Utc::now().timestamp_millis()],
+            )
+            .map_err(|error| format!("Clear Pi source diagnostic: {error}"))?;
+        Ok(updated > 0)
+    }
+
     /// Enumerate last-good transcript analytics identities for one exact root.
     ///
     /// Live reconciliation uses this indexed registry read to resolve a changed
@@ -5985,6 +6525,39 @@ impl Storage {
             )
             .map_err(|e| format!("Delete {table} source rows: {e}"))?;
         }
+        let replace_pi_lifecycle = snapshot
+            .pi_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.lifecycle.as_ref())
+            .map(|incoming| {
+                tx.query_row(
+                    "SELECT process_instance_id, current_sequence, occurred_at_ms
+                     FROM pi_session_lifecycle
+                     WHERE provider='pi' AND normalized_hostname=?1 AND session_id=?2",
+                    params![incoming.normalized_hostname, incoming.session_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map(|current| match current {
+                    None => true,
+                    Some((process, sequence, _)) if process == incoming.process_instance_id => {
+                        incoming.current_sequence >= sequence
+                    }
+                    Some((_, _, occurred_at_ms)) => {
+                        incoming.lifecycle_state != "closed"
+                            && incoming.occurred_at_ms > occurred_at_ms
+                    }
+                })
+            })
+            .transpose()
+            .map_err(|error| format!("Read Pi lifecycle replacement order: {error}"))?
+            .unwrap_or(false);
         if snapshot.pi_evidence.is_some() {
             tx.execute(
                 "DELETE FROM model_usage_observations
@@ -6010,12 +6583,14 @@ impl Storage {
                 params![source.source_key],
             )
             .map_err(|e| format!("Delete Pi event receipts: {e}"))?;
-            tx.execute(
-                "DELETE FROM pi_session_lifecycle
-                 WHERE provider = 'pi' AND source_key = ?1",
-                params![source.source_key],
-            )
-            .map_err(|e| format!("Delete Pi persisted lifecycle: {e}"))?;
+            if replace_pi_lifecycle {
+                tx.execute(
+                    "DELETE FROM pi_session_lifecycle
+                     WHERE provider = 'pi' AND source_key = ?1",
+                    params![source.source_key],
+                )
+                .map_err(|e| format!("Delete Pi persisted lifecycle: {e}"))?;
+            }
             tx.execute(
                 "DELETE FROM token_snapshots
                  WHERE provider = 'pi' AND session_id = ?1 AND hostname = ?2",
@@ -6193,7 +6768,9 @@ impl Storage {
                 )
                 .map_err(|e| format!("Insert Pi event receipt: {e}"))?;
             }
-            if let Some(lifecycle) = &evidence.lifecycle {
+            if let Some(lifecycle) = &evidence.lifecycle
+                && replace_pi_lifecycle
+            {
                 tx.execute(
                     "INSERT INTO pi_session_lifecycle (
                          provider, normalized_hostname, session_id, source_key,
@@ -6253,6 +6830,20 @@ impl Storage {
                     ],
                 )
                 .map_err(|e| format!("Rehydrate Pi persisted lifecycle: {e}"))?;
+                tx.execute(
+                    "UPDATE pi_reporter_health
+                     SET source_state='healthy', latest_code=NULL,
+                         affected_sessions=0, recovered_at_ms=?3
+                     WHERE normalized_hostname=?1
+                       AND process_instance_id=?2
+                       AND source_state='source_not_persisted'",
+                    params![
+                        lifecycle.normalized_hostname,
+                        lifecycle.process_instance_id,
+                        accepted_at_ms,
+                    ],
+                )
+                .map_err(|e| format!("Clear reconciled Pi source diagnostic: {e}"))?;
             }
 
             let watermark_ms = watermark
@@ -14862,6 +15453,19 @@ impl Storage {
         sql.push_str(&format!(
             " ), session_evidence AS MATERIALIZED (
                  SELECT * FROM tok
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM pi_session_lifecycle AS lifecycle
+                     WHERE tok.provider='pi'
+                       AND lifecycle.provider='pi'
+                       AND lifecycle.normalized_hostname=tok.hostname
+                       AND lifecycle.session_id=tok.session_id
+                       AND lifecycle.lifecycle_state='closed'
+                       AND (
+                           lifecycle.lineage_state='agent'
+                           OR (lifecycle.lineage_state='unresolved'
+                               AND lifecycle.agent_role IS NOT NULL)
+                       )
+                 )
                  UNION ALL
                  SELECT ephemeral.* FROM ephemeral
                  WHERE NOT EXISTS (
@@ -14969,7 +15573,31 @@ impl Storage {
                           AND live.session_id = candidates.session_id
                           AND live.hostname = candidates.hostname),
                      0
-                 ) AS ephemeral
+                 ) AS ephemeral,
+                 (SELECT lifecycle.lifecycle_state
+                    FROM pi_session_lifecycle AS lifecycle
+                   WHERE lifecycle.provider='pi'
+                     AND candidates.provider='pi'
+                     AND lifecycle.normalized_hostname=candidates.hostname
+                     AND lifecycle.session_id=candidates.session_id) AS pi_lifecycle_state,
+                 (SELECT lifecycle.lineage_state
+                    FROM pi_session_lifecycle AS lifecycle
+                   WHERE lifecycle.provider='pi'
+                     AND candidates.provider='pi'
+                     AND lifecycle.normalized_hostname=candidates.hostname
+                     AND lifecycle.session_id=candidates.session_id) AS pi_lineage_state,
+                 (SELECT lifecycle.direct_parent_session_id
+                    FROM pi_session_lifecycle AS lifecycle
+                   WHERE lifecycle.provider='pi'
+                     AND candidates.provider='pi'
+                     AND lifecycle.normalized_hostname=candidates.hostname
+                     AND lifecycle.session_id=candidates.session_id) AS pi_parent_session_id,
+                 (SELECT lifecycle.lineage_reason
+                    FROM pi_session_lifecycle AS lifecycle
+                   WHERE lifecycle.provider='pi'
+                     AND candidates.provider='pi'
+                     AND lifecycle.normalized_hostname=candidates.hostname
+                     AND lifecycle.session_id=candidates.session_id) AS pi_lineage_reason
              FROM candidates
              ORDER BY candidates.last_active DESC, candidates.provider ASC,
                       candidates.hostname ASC, candidates.session_id ASC"
@@ -14997,12 +15625,17 @@ impl Storage {
         observed_keys: &[(String, String, String)],
     ) -> Result<Vec<SessionBreakdown>, String> {
         let limit = limit.unwrap_or(10).clamp(1, 500);
+        // Attached agent rows can occupy the SQL frontier before the live fold
+        // suppresses them. Overfetch by every observed identity so final
+        // truncation can still backfill the requested visible page.
+        let candidate_limit =
+            limit.saturating_add(i32::try_from(observed_keys.len()).unwrap_or(i32::MAX - limit));
         let conn = self.open_view_reader()?;
         let (sql, params_vec) = Self::session_breakdown_query(
             range_from_timestamp(range),
             hostname,
             provider,
-            limit,
+            candidate_limit,
             observed_keys,
         );
 
@@ -15015,11 +15648,31 @@ impl Storage {
 
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
+                let lifecycle_state = row.get::<_, Option<String>>(9)?;
+                let lineage_state = row.get::<_, Option<String>>(10)?;
+                let parent = row.get::<_, Option<String>>(11)?;
+                let lineage_reason = row.get::<_, Option<String>>(12)?;
+                let pi_lineage = lifecycle_state.as_deref().and_then(|lifecycle| {
+                    if lifecycle == "recovering" {
+                        return Some(PiLineage::Unresolved {
+                            reason: "recovering".to_owned(),
+                        });
+                    }
+                    lineage_state.as_deref().map(|state| {
+                        stored_pi_lineage(state, parent.clone(), lineage_reason.clone())
+                    })
+                });
+                let parent_session_id = match &pi_lineage {
+                    Some(PiLineage::Linked { parent_session_id }) => {
+                        Some(parent_session_id.clone())
+                    }
+                    _ => None,
+                };
                 Ok(SessionBreakdown {
                     provider: row.get(0)?,
                     session_id: row.get(1)?,
-                    parent_session_id: None,
-                    pi_lineage: None,
+                    parent_session_id,
+                    pi_lineage,
                     ephemeral: row.get(8)?,
                     hostname: row.get(2)?,
                     total_tokens: row.get(3)?,
@@ -21239,6 +21892,7 @@ fn downsample(points: Vec<DataPoint>, max: usize) -> Vec<DataPoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::PiProtocolV2Event;
     use serial_test::serial;
     use std::sync::{
         Arc,
@@ -21288,6 +21942,185 @@ mod tests {
             pi_source_key("a:b", "c").expect("colon host source"),
             pi_source_key("a", "b:c").expect("colon session source")
         );
+    }
+
+    fn pi_v2_envelope(event: PiProtocolV2Event) -> PiProtocolV2Envelope {
+        PiProtocolV2Envelope {
+            protocol: crate::models::PI_PROTOCOL_V2,
+            reporter_version: crate::models::PI_PROTOCOL_V2_REPORTER_VERSION.to_owned(),
+            quill_build: crate::models::PI_PROTOCOL_V2_QUILL_BUILD.to_owned(),
+            capability_digest: crate::models::PI_PROTOCOL_V2_CAPABILITY_DIGEST.to_owned(),
+            events: vec![event],
+        }
+    }
+
+    fn pi_v2_event(
+        event_uuid: &str,
+        session_id: &str,
+        process_instance_id: &str,
+        sequence: u64,
+        occurred_second: u32,
+        delivery_source: PiProtocolV2DeliverySource,
+        kind: PiProtocolV2EventKind,
+    ) -> PiProtocolV2Event {
+        PiProtocolV2Event {
+            event_uuid: event_uuid.to_owned(),
+            provider: crate::models::PiProtocolV2Provider::Pi,
+            normalized_host: "host".to_owned(),
+            session_id: session_id.to_owned(),
+            process_instance_id: process_instance_id.to_owned(),
+            sequence,
+            origin_at: "2026-08-18T02:00:00Z".to_owned(),
+            occurred_at: format!("2026-08-18T02:00:{occurred_second:02}Z"),
+            delivery_source,
+            kind,
+        }
+    }
+
+    fn pi_start(lineage: PiProtocolV2Lineage, role: Option<&str>) -> PiProtocolV2EventKind {
+        PiProtocolV2EventKind::SessionStart {
+            reason: crate::models::PiProtocolV2StartReason::Startup,
+            previous_session_id: None,
+            lineage,
+            agent_role: role.map(str::to_owned),
+        }
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Transactional Lifecycle Disposition]]
+    #[test]
+    #[serial]
+    fn pi_lifecycle_disposition_orders_processes_and_recovers_source_health() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let first = pi_v2_event(
+            "event-first",
+            "session",
+            "process-old",
+            1,
+            1,
+            PiProtocolV2DeliverySource::Live,
+            pi_start(PiProtocolV2Lineage::Root, None),
+        );
+        assert_eq!(
+            storage
+                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(first.clone()))
+                .unwrap(),
+            vec![PiProtocolV2Outcome::Applied]
+        );
+        assert_eq!(
+            storage
+                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(first))
+                .unwrap(),
+            vec![PiProtocolV2Outcome::Duplicate]
+        );
+        let unknown = pi_v2_event(
+            "event-unknown",
+            "missing",
+            "process-old",
+            2,
+            2,
+            PiProtocolV2DeliverySource::Live,
+            PiProtocolV2EventKind::SessionEnd {
+                reason: crate::models::PiProtocolV2EndReason::Quit,
+            },
+        );
+        assert_eq!(
+            storage
+                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(unknown))
+                .unwrap(),
+            vec![PiProtocolV2Outcome::UnknownSession]
+        );
+        assert_eq!(
+            storage
+                .pi_live_hint_disposition("host", "missing", None, 3)
+                .unwrap(),
+            PiProtocolV2Outcome::UnknownSession
+        );
+
+        let newer = pi_v2_event(
+            "event-newer",
+            "session",
+            "process-new",
+            1,
+            10,
+            PiProtocolV2DeliverySource::Live,
+            pi_start(PiProtocolV2Lineage::Root, None),
+        );
+        assert_eq!(
+            storage
+                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(newer))
+                .unwrap(),
+            vec![PiProtocolV2Outcome::Applied]
+        );
+        let stale_reconciliation = pi_v2_event(
+            "event-stale-reconcile",
+            "session",
+            "process-old",
+            99,
+            9,
+            PiProtocolV2DeliverySource::Reconciliation,
+            pi_start(PiProtocolV2Lineage::Root, None),
+        );
+        assert_eq!(
+            storage
+                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(stale_reconciliation))
+                .unwrap(),
+            vec![PiProtocolV2Outcome::Stale]
+        );
+
+        let recovered = storage.load_pi_recovering_sessions().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].process_instance_id, "process-new");
+        assert_eq!(
+            storage
+                .pi_live_hint_disposition("host", "session", Some("process-old"), 20)
+                .unwrap(),
+            PiProtocolV2Outcome::Stale
+        );
+        assert_eq!(
+            storage
+                .pi_live_hint_disposition("host", "session", Some("process-new"), 21)
+                .unwrap(),
+            PiProtocolV2Outcome::Applied
+        );
+        assert!(
+            storage
+                .clear_pi_source_not_persisted("host", "session")
+                .unwrap()
+        );
+
+        let conn = storage.conn.lock().unwrap();
+        let lifecycle = conn
+            .query_row(
+                "SELECT process_instance_id, lifecycle_state
+                 FROM pi_session_lifecycle
+                 WHERE provider='pi' AND normalized_hostname='host'
+                   AND session_id='session'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, ("process-new".to_owned(), "open".to_owned()));
+        let source_state = conn
+            .query_row(
+                "SELECT source_state, latest_code, affected_sessions
+                 FROM pi_reporter_health
+                 WHERE normalized_hostname='host'
+                   AND process_instance_id='process-new'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(source_state, ("healthy".to_owned(), None, 0));
+        drop(conn);
+        clear_env();
     }
 
     // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Schema 45 Backup And Ownership Migration]]
@@ -21443,7 +22276,7 @@ mod tests {
         clear_env();
     }
 
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Ephemeral Persistence]]
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Persisted Source Presentation]]
     #[test]
     #[serial]
     fn pi_lifecycle_upsert_persists_ephemeral_origin() {
@@ -21526,7 +22359,7 @@ mod tests {
         clear_env();
     }
 
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Ephemeral Breakdown Persistence]]
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Persisted Source Presentation]]
     #[test]
     #[serial]
     fn ephemeral_pi_breakdown_persists_pushed_usage_and_activity() {

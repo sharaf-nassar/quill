@@ -36,6 +36,22 @@ pub fn decode_protocol_v2_envelope(
 ) -> Result<PiProtocolV2Envelope, PiProtocolV2DecodeError> {
     let value = parse_json(bytes)?;
     let object = object(&value, PiProtocolV2ErrorCode::InvalidEnvelope, "envelope")?;
+    let protocol = object
+        .get("protocol")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            PiProtocolV2DecodeError::new(
+                PiProtocolV2ErrorCode::InvalidEnvelope,
+                "Envelope protocol must be an integer",
+            )
+        })?;
+    if protocol != PI_PROTOCOL_V2 {
+        return Err(PiProtocolV2DecodeError::new(
+            PiProtocolV2ErrorCode::ProtocolMismatch,
+            format!("Unsupported protocol {protocol}; expected {PI_PROTOCOL_V2}"),
+        ));
+    }
     exact_keys(
         object,
         &[
@@ -76,8 +92,15 @@ pub fn decode_protocol_v2_envelope(
             format!("Invalid protocol-v2 event: {error}"),
         )
     })?;
+    let mut event_ids = HashSet::with_capacity(envelope.events.len());
     for event in &envelope.events {
         validate_event(event)?;
+        if !event_ids.insert(event.event_uuid.as_str()) {
+            return Err(PiProtocolV2DecodeError::new(
+                PiProtocolV2ErrorCode::InvalidEvent,
+                "Duplicate event_uuid",
+            ));
+        }
     }
     Ok(envelope)
 }
@@ -392,15 +415,15 @@ fn validate_event(event: &PiProtocolV2Event) -> Result<(), PiProtocolV2DecodeErr
     validate_host(&event.normalized_host)?;
     validate_name(&event.session_id, "session_id")?;
     validate_name(&event.process_instance_id, "process_instance_id")?;
-    if event.sequence == 0 {
+    if event.sequence == 0 || i64::try_from(event.sequence).is_err() {
         return Err(PiProtocolV2DecodeError::new(
             PiProtocolV2ErrorCode::InvalidEvent,
-            "sequence must be positive",
+            "sequence must fit a positive signed integer",
         ));
     }
     let origin = parse_timestamp(&event.origin_at, "origin_at")?;
     let occurred = parse_timestamp(&event.occurred_at, "occurred_at")?;
-    if occurred < origin {
+    if origin.timestamp_millis() < 0 || occurred < origin {
         return Err(PiProtocolV2DecodeError::new(
             PiProtocolV2ErrorCode::InvalidEvent,
             "occurred_at cannot precede origin_at",

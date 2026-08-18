@@ -304,7 +304,6 @@ interface RowModel {
   };
   nameLabel?: string;
   chipLabel?: string;
-  ephemeral?: boolean;
   parentSessionId?: string;
   lineageUnresolvedReason?: string;
   agentSummary?: {
@@ -484,11 +483,6 @@ function SessionIdentity({ row }: { row: RowModel }) {
           {row.chip.text}
         </span>
       )}
-      {row.ephemeral && (
-        <span className="wg-row-session-ephemeral" aria-label="Ephemeral session">
-          EPHEMERAL
-        </span>
-      )}
       {row.parentSessionId && (
         <span
           className="wg-row-session-parent wg-row-datum"
@@ -522,7 +516,11 @@ function SessionIdentity({ row }: { row: RowModel }) {
 
 function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
   const name = projectName(row.project) ?? row.session_id.slice(0, 8);
-  const live = isSessionLive(row.last_active, row.ended_at, nowMs);
+  const recovering =
+    row.provider === "pi" &&
+    row.pi_lineage?.kind === "unresolved" &&
+    row.pi_lineage.reason === "recovering";
+  const live = !recovering && isSessionLive(row.last_active, row.ended_at, nowMs);
   const liveActivity = live && row.current_turn_runtime_active;
   const metrics = resolveSessionMetrics(
     formatTokenCount(row.total_tokens),
@@ -613,7 +611,6 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
     },
     chip: { text: providerTag(row.provider), tone: row.provider },
     chipLabel: `Provider ${providerTag(row.provider)}`,
-    ephemeral: row.ephemeral,
     parentSessionId: row.provider === "pi" ? row.parent_session_id ?? undefined : undefined,
     lineageUnresolvedReason:
       row.provider === "pi" && row.pi_lineage?.kind === "unresolved"

@@ -252,6 +252,16 @@ The route from `candidate` to `awaiting_review` is evidence-grounded (feature 00
 
 Promotion preconditions `lifecycle='awaiting_review'` and an inactive tombstone (else `Err`); the former eval-based regression gate was removed with the counterfactual harness, so promotion no longer consults evaluation results. It runs all DB mutations in ONE transaction — sets `file_path` and `lifecycle='active'`, appends an immutable `rule_versions` row (`change_kind='promote'`), records provenance (`origin_run_id/origin_model/origin_at`) plus a retention-proof `rule_evidence_citations` snapshot — and commits FIRST; only after the commit does it materialize the redacted + injection-sanitized `.md` in the scope dir (path-traversal-guarded) via a temp-file + atomic `rename`, so a crash never leaves a torn or provenance-less orphan file (a post-commit write failure returns `Err` and the dangling DB-active row is self-healed by reconcile step 3b). Re-derivation of a queued rule UPSERTs content (α/β merged in place, never a 2nd row, never overwriting an active `.md`) and the pending `current_version` is bumped only after the new version's `rule_evidence_citations` are persisted, atomically (feature 006 Follow-up B), so a queued rule is never silently stranded with a citation-less `current_version`. A one-time sentinel-guarded legacy archive-then-wipe in the [[src-tauri/src/storage.rs#Storage#init]] chain copies any pre-existing on-disk rules to a read-only manifested archive, deletes the live files, and tombstones their rows before the watcher starts.
 
+## Transactional Pi Lifecycle
+
+[[src-tauri/src/server.rs#post_pi_track]] authenticates and bounds raw `/api/v1/pi/track` bytes before [[src-tauri/src/pi_tracking.rs#decode_protocol_v2_envelope]] inspects open exact-generation metadata and closed lifecycle variants.
+
+The route returns typed compatibility, validation, rate, recovery, and availability responses; accepted handshakes name the exact build, protocol, reporter, capability digest, and ordered lifecycle dispositions.
+
+[[src-tauri/src/storage.rs#Storage#apply_pi_protocol_v2_envelope]] commits receipt dedupe, process/sequence ordering, durable lifecycle, replacement close, and source diagnostics in one transaction. [[src-tauri/src/live_tracker.rs#LiveTracker#apply_pi_protocol_v2_event]] receives only committed `applied` events. Restart and tracking re-enable load durable open rows as recovering, while same-process reannouncement or live hints prove them live. Missing source evidence stays `source_not_persisted` until validated notify or persisted-source reconciliation clears that process's diagnostic.
+
+The Sessions projection resolves explicit Pi agents through direct lineage with memoized roots, a visited set, and depth 64. Nested descendants flatten into the visible root; missing, cyclic, over-depth, and cross-host parents remain independent unresolved live rows; completion removes them. Descendants contribute family activity/runtime plus explicit agent count/runtime, while root tokens and turns stay root-only. Storage overfetches observed identities so child suppression cannot shorten a requested page.
+
 ## Session Search
 
 Full-text search across Claude Code, Codex, and Pi session transcripts, powered by Tantivy in [[src-tauri/src/sessions.rs]].

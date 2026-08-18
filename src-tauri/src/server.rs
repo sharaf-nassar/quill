@@ -7,11 +7,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use axum::{
     Json, Router,
-    extract::State,
+    body::to_bytes,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use subtle::ConstantTimeEq;
@@ -22,9 +24,10 @@ use tauri::Emitter;
 use crate::integrations::IntegrationProvider;
 use crate::models::{
     ContextSavingsEventPayload, ContextSavingsEventsBatchPayload, LearnedRulePayload,
-    LearningRunPayload, ObservationPayload, ObservedHookObservation, PiLineage, PiTrackEnvelope,
-    PiTrackEventKind, SessionMessagePayload, SessionMessagesPayload, SessionNotifyPayload,
-    TokenReportPayload,
+    LearningRunPayload, ObservationPayload, ObservedHookObservation, PiLineage,
+    PiProtocolV2ErrorCode, PiProtocolV2Generation, PiProtocolV2Outcome, PiProtocolV2Response,
+    PiTrackEnvelope, PiTrackEventKind, SessionMessagePayload, SessionMessagesPayload,
+    SessionNotifyPayload, TokenReportPayload,
 };
 use crate::sessions;
 use crate::storage::Storage;
@@ -57,6 +60,7 @@ const MAX_SESSION_MSG_REQUESTS: usize = 100;
 const MAX_PI_SESSION_MSG_REQUESTS: usize = 4_000;
 const MAX_PI_TRACK_REQUESTS: usize = 4_000;
 const MAX_PI_TRACK_EVENTS_PER_REQUEST: usize = 200;
+const MAX_PI_TRACK_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PI_LAST_ERROR_LEN: usize = 2_048;
 const PI_TRACK_PROTOCOL: u32 = 1;
 const MAX_PATH_LEN: usize = 4096;
@@ -117,13 +121,22 @@ struct ServerState {
     context_savings_rate_limiter: Mutex<VecDeque<Instant>>,
     session_rate_limiter: Mutex<VecDeque<Instant>>,
     pi_session_rate_limiter: Mutex<VecDeque<Instant>>,
-    pi_track_rate_limiter: Mutex<VecDeque<Instant>>,
+    pi_track_rate_limiter: Arc<Mutex<VecDeque<Instant>>>,
     pi_spool_offsets: Mutex<PiSpoolOffsets>,
     pending_session_notifies: Mutex<HashMap<String, PendingSessionNotify>>,
     pending_validation_retries: Mutex<HashMap<String, PendingValidationRetry>>,
     app_handle: tauri::AppHandle,
     session_index: Option<Arc<sessions::SessionIndex>>,
     live_tracker: Arc<crate::live_tracker::LiveTracker>,
+    demo_mode: bool,
+}
+
+struct PiTrackRouteState {
+    storage: &'static Storage,
+    secret: String,
+    rate_limiter: Arc<Mutex<VecDeque<Instant>>>,
+    live_tracker: Arc<crate::live_tracker::LiveTracker>,
+    app_handle: Option<tauri::AppHandle>,
     demo_mode: bool,
 }
 
@@ -149,6 +162,18 @@ pub async fn start_server(
 ) {
     let port = crate::integrations::config_contract::main_port();
 
+    if let Ok(sessions) = storage.load_pi_recovering_sessions() {
+        live_tracker.rehydrate_pi_sessions(sessions);
+    }
+    let pi_track_rate_limiter = Arc::new(Mutex::new(VecDeque::new()));
+    let pi_track_state = Arc::new(PiTrackRouteState {
+        storage,
+        secret: secret.clone(),
+        rate_limiter: Arc::clone(&pi_track_rate_limiter),
+        live_tracker: Arc::clone(&live_tracker),
+        app_handle: Some(app_handle.clone()),
+        demo_mode: std::env::var("QUILL_DEMO_MODE").ok().as_deref() == Some("1"),
+    });
     let state = Arc::new(ServerState {
         storage,
         secret: secret.clone(),
@@ -157,7 +182,7 @@ pub async fn start_server(
         context_savings_rate_limiter: Mutex::new(VecDeque::new()),
         session_rate_limiter: Mutex::new(VecDeque::new()),
         pi_session_rate_limiter: Mutex::new(VecDeque::new()),
-        pi_track_rate_limiter: Mutex::new(VecDeque::new()),
+        pi_track_rate_limiter,
         pi_spool_offsets: Mutex::new(PiSpoolOffsets::new()),
         pending_session_notifies: Mutex::new(HashMap::new()),
         pending_validation_retries: Mutex::new(HashMap::new()),
@@ -228,11 +253,11 @@ pub async fn start_server(
         )
         .route("/api/v1/sessions/notify", post(post_session_notify))
         .route("/api/v1/sessions/messages", post(post_session_messages))
-        .route("/api/v1/pi/track", post(post_pi_track))
         .route("/api/v1/sessions/search", get(get_session_search))
         .route("/api/v1/sessions/context", get(get_session_context_api))
         .route("/api/v1/sessions/facets", get(get_session_facets))
-        .with_state(state);
+        .with_state(state)
+        .merge(pi_track_router(pi_track_state));
 
     // Bind to 0.0.0.0 intentionally — remote hosts need to reach this server
     let addr = format!("0.0.0.0:{port}");
@@ -391,18 +416,9 @@ impl PiTrackError {
             message: message.into(),
         }
     }
-
-    fn response(self) -> (StatusCode, Json<serde_json::Value>) {
-        (
-            self.status,
-            Json(serde_json::json!({
-                "error": self.code,
-                "message": self.message,
-            })),
-        )
-    }
 }
 
+#[cfg(test)]
 fn validate_pi_track_auth(headers: &HeaderMap, secret: &str) -> StatusCode {
     if check_auth(headers, secret) {
         StatusCode::OK
@@ -1222,63 +1238,171 @@ fn spawn_pi_spool_drain(state: Arc<ServerState>) {
     });
 }
 
-async fn post_pi_track(
-    State(state): State<Arc<ServerState>>,
-    headers: HeaderMap,
-    Json(payload): Json<PiTrackEnvelope>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    if validate_pi_track_auth(&headers, &state.secret) != StatusCode::OK {
-        return PiTrackError {
-            status: StatusCode::UNAUTHORIZED,
-            code: "unauthorized",
-            message: "Unauthorized".to_owned(),
-        }
-        .response();
+fn pi_track_router(state: Arc<PiTrackRouteState>) -> Router {
+    Router::new()
+        .route("/api/v1/pi/track", post(post_pi_track))
+        .with_state(state)
+}
+
+fn pi_required_generation() -> PiProtocolV2Generation {
+    PiProtocolV2Generation {
+        protocol: crate::pi_tracking::PI_PROTOCOL_V2,
+        reporter_version: crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION.to_owned(),
+        quill_build: crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD.to_owned(),
+        capability_digest: crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST.to_owned(),
     }
-    if crate::ingest_is_quiesced() {
-        return PiTrackError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "quiesced",
-            message: "Database maintenance in progress; retry shortly".to_owned(),
+}
+
+fn pi_v2_error(
+    status: StatusCode,
+    code: PiProtocolV2ErrorCode,
+    message: impl Into<String>,
+    retry_after_ms: Option<u64>,
+) -> (StatusCode, Json<PiProtocolV2Response>) {
+    let required = matches!(
+        code,
+        PiProtocolV2ErrorCode::ProtocolMismatch
+            | PiProtocolV2ErrorCode::ReporterVersionMismatch
+            | PiProtocolV2ErrorCode::QuillBuildMismatch
+            | PiProtocolV2ErrorCode::CapabilityMismatch
+    )
+    .then(pi_required_generation);
+    (
+        status,
+        Json(PiProtocolV2Response::Error {
+            code,
+            message: message.into(),
+            required,
+            retry_after_ms,
+        }),
+    )
+}
+
+fn pi_decode_status(code: PiProtocolV2ErrorCode) -> StatusCode {
+    match code {
+        PiProtocolV2ErrorCode::ProtocolMismatch
+        | PiProtocolV2ErrorCode::ReporterVersionMismatch
+        | PiProtocolV2ErrorCode::QuillBuildMismatch
+        | PiProtocolV2ErrorCode::CapabilityMismatch
+        | PiProtocolV2ErrorCode::TrackingSchemaMismatch => StatusCode::UPGRADE_REQUIRED,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+// @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Authenticated Protocol v2 Router]]
+async fn post_pi_track(
+    State(state): State<Arc<PiTrackRouteState>>,
+    headers: HeaderMap,
+    request: Request,
+) -> (StatusCode, Json<PiProtocolV2Response>) {
+    if !check_auth(&headers, &state.secret) {
+        return pi_v2_error(
+            StatusCode::UNAUTHORIZED,
+            PiProtocolV2ErrorCode::Unauthorized,
+            "Unauthorized",
+            None,
+        );
+    }
+    let bytes = match to_bytes(request.into_body(), MAX_PI_TRACK_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return pi_v2_error(
+                StatusCode::BAD_REQUEST,
+                PiProtocolV2ErrorCode::InvalidEnvelope,
+                "Pi tracking body exceeds 1 MiB",
+                None,
+            );
         }
-        .response();
+    };
+    let payload = match crate::pi_tracking::decode_protocol_v2_envelope(&bytes) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return pi_v2_error(
+                pi_decode_status(error.code),
+                error.code,
+                error.message,
+                None,
+            );
+        }
+    };
+    if state.demo_mode || crate::ingest_is_quiesced() {
+        return pi_v2_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            PiProtocolV2ErrorCode::Unavailable,
+            "Pi tracking is temporarily unavailable",
+            Some(1500),
+        );
     }
     if !check_rate_limit_with_cost(
-        &state.pi_track_rate_limiter,
+        &state.rate_limiter,
         MAX_PI_TRACK_REQUESTS,
-        payload.events.len().max(1),
+        payload.events.len(),
     ) {
-        return PiTrackError {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            code: "rate_limited",
-            message: "Rate limit exceeded".to_owned(),
-        }
-        .response();
+        return pi_v2_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            PiProtocolV2ErrorCode::RateLimited,
+            "Rate limit exceeded",
+            Some(1500),
+        );
     }
 
     let storage = state.storage;
-    let tracker = Arc::clone(&state.live_tracker);
-    let demo_mode = state.demo_mode;
-    match tokio::task::spawn_blocking(move || {
-        crate::with_ingest_write_permit(|| ingest_pi_track(storage, &tracker, &payload, demo_mode))
+    let committed_payload = payload.clone();
+    let outcomes = match tokio::task::spawn_blocking(move || {
+        crate::with_ingest_write_permit(|| {
+            storage.apply_pi_protocol_v2_envelope(&committed_payload)
+        })
     })
     .await
     {
-        Ok(Ok(())) => {
-            let _ = state
-                .app_handle
-                .emit(crate::SESSIONS_LIVE_UPDATED_EVENT, ());
-            (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({"status": "accepted"})),
-            )
+        Ok(Ok(outcomes)) => outcomes,
+        Ok(Err(error)) => {
+            log::error!("Pi protocol-v2 lifecycle transaction failed: {error}");
+            return pi_v2_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                PiProtocolV2ErrorCode::Unavailable,
+                "Pi lifecycle transaction failed",
+                Some(1500),
+            );
         }
-        Ok(Err(error)) => error.response(),
         Err(error) => {
-            log::error!("Pi tracking worker failed: {error}");
-            PiTrackError::internal("Pi tracking worker failed").response()
+            log::error!("Pi protocol-v2 worker failed: {error}");
+            return pi_v2_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                PiProtocolV2ErrorCode::Unavailable,
+                "Pi lifecycle worker failed",
+                Some(1500),
+            );
+        }
+    };
+
+    let mut changed = false;
+    for (event, outcome) in payload.events.iter().zip(&outcomes) {
+        if *outcome == PiProtocolV2Outcome::Applied {
+            changed |= state.live_tracker.apply_pi_protocol_v2_event(event);
         }
     }
+    if changed && let Some(app_handle) = &state.app_handle {
+        let _ = app_handle.emit(crate::SESSIONS_LIVE_UPDATED_EVENT, ());
+    }
+    if outcomes.contains(&PiProtocolV2Outcome::UnknownSession) {
+        return pi_v2_error(
+            StatusCode::CONFLICT,
+            PiProtocolV2ErrorCode::UnknownSession,
+            "Session lifecycle must be reannounced",
+            None,
+        );
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(PiProtocolV2Response::Accepted {
+            quill_build: crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD.to_owned(),
+            protocol: crate::pi_tracking::PI_PROTOCOL_V2,
+            reporter_version: crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION.to_owned(),
+            capability_digest: crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST.to_owned(),
+            outcomes,
+        }),
+    )
 }
 
 fn store_observation_in_background(storage: &'static Storage, payload: ObservationPayload) {
@@ -2433,6 +2557,17 @@ async fn post_session_notify(
     if payload.session_id.is_empty() || payload.session_id.len() > MAX_STRING_LEN {
         return (StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
     }
+    if payload.process_instance_id.as_ref().is_some_and(|process| {
+        process.trim().is_empty()
+            || process.trim() != process
+            || process.len() > MAX_STRING_LEN
+            || process.chars().any(char::is_control)
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid process_instance_id".to_string(),
+        );
+    }
     if payload.jsonl_path.is_empty() || payload.jsonl_path.len() > MAX_PATH_LEN {
         return (StatusCode::BAD_REQUEST, "Invalid jsonl_path".to_string());
     }
@@ -2499,6 +2634,18 @@ async fn post_session_notify(
     };
 
     if let Some(source) = retained_source {
+        // A validated persisted source is the recovery path for an unknown
+        // live session, so notify never returns a false accepted no-op.
+        if provider == IntegrationProvider::Pi
+            && let Some(host) = payload
+                .host
+                .as_deref()
+                .and_then(crate::live_tracker::normalize_observed_hostname)
+        {
+            let _ = state
+                .storage
+                .clear_pi_source_not_persisted(&host, &payload.session_id);
+        }
         // Session Search availability cannot suppress either analytics domain.
         enqueue_validated_retained_source(&state, source);
     }
@@ -2524,6 +2671,14 @@ fn validate_session_messages_payload(payload: &mut SessionMessagesPayload) -> Re
     }
     if payload.session_id.trim().is_empty() || payload.session_id.len() > MAX_STRING_LEN {
         return Err("Invalid session_id".to_string());
+    }
+    if payload.process_instance_id.as_ref().is_some_and(|process| {
+        process.trim().is_empty()
+            || process.trim() != process
+            || process.len() > MAX_STRING_LEN
+            || process.chars().any(char::is_control)
+    }) {
+        return Err("Invalid process_instance_id".to_string());
     }
     if payload.host.trim().is_empty() || payload.host.len() > MAX_STRING_LEN {
         return Err("Invalid host".to_string());
@@ -2590,14 +2745,14 @@ async fn post_session_messages(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     Json(mut payload): Json<SessionMessagesPayload>,
-) -> impl IntoResponse {
+) -> Response {
     if !check_auth(&headers, &state.secret) {
-        return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
+        return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()).into_response();
     }
     // Validate the complete batch before constructing search documents or
     // scheduling any background mutation.
     if let Err(error) = validate_session_messages_payload(&mut payload) {
-        return (StatusCode::BAD_REQUEST, error);
+        return (StatusCode::BAD_REQUEST, error).into_response();
     }
     let (rate_limiter, max_requests) = session_messages_rate_limit(
         payload.provider,
@@ -2613,7 +2768,64 @@ async fn post_session_messages(
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "Rate limit exceeded".to_string(),
-        );
+        )
+            .into_response();
+    }
+
+    if payload.provider == IntegrationProvider::Pi {
+        let observed_at = payload
+            .messages
+            .iter()
+            .filter_map(|message| DateTime::parse_from_rfc3339(&message.timestamp).ok())
+            .map(|timestamp| timestamp.timestamp_millis())
+            .max()
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        let disposition = match state.storage.pi_live_hint_disposition(
+            &payload.host,
+            &payload.session_id,
+            payload.process_instance_id.as_deref(),
+            observed_at,
+        ) {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                log::error!("Pi message lifecycle disposition failed: {error}");
+                return pi_v2_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    PiProtocolV2ErrorCode::Unavailable,
+                    "Pi lifecycle lookup failed",
+                    Some(1500),
+                )
+                .into_response();
+            }
+        };
+        if disposition == PiProtocolV2Outcome::UnknownSession {
+            return pi_v2_error(
+                StatusCode::CONFLICT,
+                PiProtocolV2ErrorCode::UnknownSession,
+                "Session lifecycle must be reannounced",
+                None,
+            )
+            .into_response();
+        }
+        if disposition == PiProtocolV2Outcome::Stale {
+            return pi_v2_error(
+                StatusCode::CONFLICT,
+                PiProtocolV2ErrorCode::ReannounceRequired,
+                "A newer Pi process owns this session",
+                None,
+            )
+            .into_response();
+        }
+        if let Some(process_instance_id) = payload.process_instance_id.as_deref()
+            && let Some(at) = DateTime::<Utc>::from_timestamp_millis(observed_at)
+        {
+            state.live_tracker.prove_pi_session(
+                &payload.session_id,
+                &payload.host,
+                process_instance_id,
+                at,
+            );
+        }
     }
 
     let analytics_payload = payload.clone();
@@ -2633,14 +2845,16 @@ async fn post_session_messages(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to persist session analytics".to_string(),
-            );
+            )
+                .into_response();
         }
         Err(error) => {
             log::error!("Remote session analytics worker failed: {error}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to persist session analytics".to_string(),
-            );
+            )
+                .into_response();
         }
     }
 
@@ -2684,7 +2898,7 @@ async fn post_session_messages(
     } else {
         log::warn!("Session index unavailable after committed remote analytics write");
     }
-    (StatusCode::ACCEPTED, "persisted".to_string())
+    (StatusCode::ACCEPTED, "persisted".to_string()).into_response()
 }
 
 // --- Session search/context/facets GET endpoints ---
@@ -2973,6 +3187,192 @@ mod observed_subagent_tests {
         .expect("deserialize Pi tracking envelope")
     }
 
+    fn protocol_v2_fixture(name: &str) -> String {
+        include_str!("../pi-integration/fixtures/protocol-v2.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("fixture record"))
+            .find(|record| record["name"] == name)
+            .and_then(|record| record["wire"].as_str().map(str::to_owned))
+            .expect("named protocol-v2 fixture")
+    }
+
+    fn pi_route_state(demo_mode: bool) -> Arc<PiTrackRouteState> {
+        let storage = Box::leak(Box::new(
+            Storage::init_at(
+                tempfile::tempdir()
+                    .expect("tempdir")
+                    .keep()
+                    .join("usage.db"),
+                false,
+            )
+            .expect("storage"),
+        ));
+        Arc::new(PiTrackRouteState {
+            storage,
+            secret: "route-secret".to_owned(),
+            rate_limiter: Arc::new(Mutex::new(VecDeque::new())),
+            live_tracker: Arc::new(crate::live_tracker::LiveTracker::new(None)),
+            app_handle: None,
+            demo_mode,
+        })
+    }
+
+    async fn spawn_pi_route(state: Arc<PiTrackRouteState>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test route");
+        let address = listener.local_addr().expect("test route address");
+        tokio::spawn(async move {
+            axum::serve(listener, pi_track_router(state))
+                .await
+                .expect("serve test route");
+        });
+        format!("http://{address}/api/v1/pi/track")
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Authenticated Protocol v2 Router]]
+    #[tokio::test]
+    async fn real_pi_router_returns_typed_protocol_v2_statuses_and_handshake() {
+        let client = reqwest::Client::new();
+        let state = pi_route_state(false);
+        let url = spawn_pi_route(Arc::clone(&state)).await;
+        let start = protocol_v2_fixture("envelope.start.startup");
+
+        let response = client
+            .post(&url)
+            .body(r#"{"event":"future"}"#)
+            .send()
+            .await
+            .expect("unauthenticated request");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(matches!(
+            response.json::<PiProtocolV2Response>().await.unwrap(),
+            PiProtocolV2Response::Error {
+                code: PiProtocolV2ErrorCode::Unauthorized,
+                ..
+            }
+        ));
+
+        let response = client
+            .post(&url)
+            .bearer_auth("route-secret")
+            .body("{")
+            .send()
+            .await
+            .expect("malformed request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(matches!(
+            response.json::<PiProtocolV2Response>().await.unwrap(),
+            PiProtocolV2Response::Error {
+                code: PiProtocolV2ErrorCode::MalformedJson,
+                ..
+            }
+        ));
+
+        let response = client
+            .post(&url)
+            .bearer_auth("route-secret")
+            .body(protocol_v2_fixture("envelope.protocol_newer"))
+            .send()
+            .await
+            .expect("mismatch request");
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert!(matches!(
+            response.json::<PiProtocolV2Response>().await.unwrap(),
+            PiProtocolV2Response::Error {
+                code: PiProtocolV2ErrorCode::ProtocolMismatch,
+                required: Some(_),
+                ..
+            }
+        ));
+
+        let response = client
+            .post(&url)
+            .bearer_auth("route-secret")
+            .body(start.clone())
+            .send()
+            .await
+            .expect("accepted request");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            response.json::<PiProtocolV2Response>().await.unwrap(),
+            PiProtocolV2Response::Accepted {
+                protocol: 2,
+                outcomes,
+                ..
+            } if outcomes == vec![PiProtocolV2Outcome::Applied]
+        ));
+
+        let response = client
+            .post(&url)
+            .bearer_auth("route-secret")
+            .body(start)
+            .send()
+            .await
+            .expect("duplicate request");
+        assert!(matches!(
+            response.json::<PiProtocolV2Response>().await.unwrap(),
+            PiProtocolV2Response::Accepted { outcomes, .. }
+                if outcomes == vec![PiProtocolV2Outcome::Duplicate]
+        ));
+
+        let unknown_url = spawn_pi_route(pi_route_state(false)).await;
+        let response = client
+            .post(unknown_url)
+            .bearer_auth("route-secret")
+            .body(protocol_v2_fixture("envelope.end.quit"))
+            .send()
+            .await
+            .expect("unknown-session request");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(matches!(
+            response.json::<PiProtocolV2Response>().await.unwrap(),
+            PiProtocolV2Response::Error {
+                code: PiProtocolV2ErrorCode::UnknownSession,
+                ..
+            }
+        ));
+
+        let limited = pi_route_state(false);
+        limited
+            .rate_limiter
+            .lock()
+            .unwrap()
+            .extend(std::iter::repeat_n(Instant::now(), MAX_PI_TRACK_REQUESTS));
+        let response = client
+            .post(spawn_pi_route(limited).await)
+            .bearer_auth("route-secret")
+            .body(protocol_v2_fixture("envelope.start.startup"))
+            .send()
+            .await
+            .expect("limited request");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(matches!(
+            response.json::<PiProtocolV2Response>().await.unwrap(),
+            PiProtocolV2Response::Error {
+                code: PiProtocolV2ErrorCode::RateLimited,
+                retry_after_ms: Some(1500),
+                ..
+            }
+        ));
+
+        let response = client
+            .post(spawn_pi_route(pi_route_state(true)).await)
+            .bearer_auth("route-secret")
+            .body(protocol_v2_fixture("envelope.start.startup"))
+            .send()
+            .await
+            .expect("unavailable request");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(matches!(
+            response.json::<PiProtocolV2Response>().await.unwrap(),
+            PiProtocolV2Response::Error {
+                code: PiProtocolV2ErrorCode::Unavailable,
+                ..
+            }
+        ));
+    }
+
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Agent Lineage Protocol]]
     #[test]
     fn pi_tracking_protocol_accepts_agent_lineage() {
@@ -3071,6 +3471,7 @@ mod observed_subagent_tests {
             session_id: "pushed-id".into(),
             jsonl_path: transcript.to_string_lossy().into_owned(),
             host: Some("host".into()),
+            process_instance_id: None,
             cwd: Some("/work/quill".into()),
             project: Some("quill".into()),
             git_branch: None,
@@ -3131,6 +3532,7 @@ mod observed_subagent_tests {
             session_id: "pushed-id".into(),
             jsonl_path: transcript.to_string_lossy().into_owned(),
             host: Some("host".into()),
+            process_instance_id: None,
             cwd: Some("/work/quill".into()),
             project: Some("quill".into()),
             git_branch: None,

@@ -23,7 +23,11 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::integrations::IntegrationProvider;
-use crate::models::{ObservedLinkedSession, ObservedSessionAgent, PiLineage, SessionBreakdown};
+use crate::models::{
+    ObservedLinkedSession, ObservedSessionAgent, PiLineage, PiProtocolV2DeliverySource,
+    PiProtocolV2Event, PiProtocolV2EventKind, PiProtocolV2Lineage, PiRecoveringSession,
+    SessionBreakdown,
+};
 use crate::server::{MAX_CWD_LEN, MAX_STRING_LEN};
 
 /// Silence past this cutoff means the producing process is gone rather than
@@ -58,6 +62,13 @@ struct LiveSession {
     cwd: Option<String>,
     /// Whether Pi intentionally omitted a transcript for this session.
     ephemeral: bool,
+    /// Durable state loaded after restart is visible but not live until the
+    /// same process proves itself through protocol-v2 evidence.
+    recovering: bool,
+    /// Current Pi process identity, absent for legacy push records.
+    process_instance_id: Option<String>,
+    /// Validated launcher role/name carried onto the active-agent rail.
+    agent_role: Option<String>,
     /// Upstream provider and model from Pi's newest assistant message.
     model_provider: Option<String>,
     model: Option<String>,
@@ -171,6 +182,79 @@ fn advance(slot: &mut DateTime<Utc>, timestamp: DateTime<Utc>) -> bool {
         *slot = timestamp;
     }
     newer
+}
+
+const MAX_PI_LINEAGE_DEPTH: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PiRootResolution {
+    Root(SessionKey, usize),
+    Unresolved(&'static str),
+}
+
+fn resolve_pi_root(
+    key: &SessionKey,
+    lineages: &HashMap<SessionKey, PiLineage>,
+    keys: &HashSet<SessionKey>,
+    memo: &mut HashMap<SessionKey, PiRootResolution>,
+    visiting: &mut HashSet<SessionKey>,
+) -> PiRootResolution {
+    if let Some(resolution) = memo.get(key) {
+        return resolution.clone();
+    }
+    if !visiting.insert(key.clone()) {
+        return PiRootResolution::Unresolved("lineage_cycle");
+    }
+    let resolution = match lineages.get(key) {
+        Some(PiLineage::Root) => PiRootResolution::Root(key.clone(), 0),
+        Some(PiLineage::Agent { parent_session_id })
+        | Some(PiLineage::Linked { parent_session_id }) => {
+            let parent = SessionKey {
+                provider: key.provider.clone(),
+                host: key.host.clone(),
+                session_id: parent_session_id.clone(),
+            };
+            if keys.contains(&parent) {
+                match resolve_pi_root(&parent, lineages, keys, memo, visiting) {
+                    PiRootResolution::Root(root, distance) if distance < MAX_PI_LINEAGE_DEPTH => {
+                        PiRootResolution::Root(root, distance + 1)
+                    }
+                    PiRootResolution::Root(_, _) => {
+                        PiRootResolution::Unresolved("lineage_depth_exceeded")
+                    }
+                    unresolved => unresolved,
+                }
+            } else if keys.iter().any(|candidate| {
+                candidate.provider == key.provider
+                    && candidate.session_id == *parent_session_id
+                    && candidate.host != key.host
+            }) {
+                PiRootResolution::Unresolved("cross_host_parent")
+            } else {
+                PiRootResolution::Unresolved("missing_parent")
+            }
+        }
+        Some(PiLineage::Unresolved { .. }) => PiRootResolution::Unresolved("unresolved_parent"),
+        None => PiRootResolution::Unresolved("missing_lineage"),
+    };
+    visiting.remove(key);
+    memo.insert(key.clone(), resolution.clone());
+    resolution
+}
+
+fn protocol_lineage(lineage: &PiProtocolV2Lineage) -> PiLineage {
+    match lineage {
+        PiProtocolV2Lineage::Root => PiLineage::Root,
+        PiProtocolV2Lineage::Linked { parent_session_id } => PiLineage::Linked {
+            parent_session_id: parent_session_id.clone(),
+        },
+        PiProtocolV2Lineage::Agent { parent_session_id } => PiLineage::Agent {
+            parent_session_id: parent_session_id.clone(),
+        },
+        PiProtocolV2Lineage::Unresolved { reason } => PiLineage::Unresolved {
+            reason: reason.clone(),
+        },
+    }
 }
 
 /// The instant an RFC 3339 string names, in UTC.
@@ -515,22 +599,38 @@ impl TrackerState {
         let Self {
             sessions, files, ..
         } = self;
-        let active_agent_parents = sessions
+        let mut active_agent_ancestors = HashSet::new();
+        for (child_key, _child) in sessions
             .iter()
             .filter(|(_, child)| now.signed_duration_since(child.last_activity) <= IDLE_AFTER)
-            .filter_map(|(child_key, child)| match &child.lineage {
-                Some(PiLineage::Agent { parent_session_id }) => Some(SessionKey {
-                    provider: child_key.provider.clone(),
-                    host: child_key.host.clone(),
+            .filter(|(_, child)| matches!(child.lineage, Some(PiLineage::Agent { .. })))
+        {
+            let mut current_key = child_key.clone();
+            for _ in 0..MAX_PI_LINEAGE_DEPTH {
+                let Some(
+                    PiLineage::Agent { parent_session_id }
+                    | PiLineage::Linked { parent_session_id },
+                ) = sessions
+                    .get(&current_key)
+                    .and_then(|session| session.lineage.as_ref())
+                else {
+                    break;
+                };
+                let parent_key = SessionKey {
+                    provider: current_key.provider.clone(),
+                    host: current_key.host.clone(),
                     session_id: parent_session_id.clone(),
-                }),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
+                };
+                if !active_agent_ancestors.insert(parent_key.clone()) {
+                    break;
+                }
+                current_key = parent_key;
+            }
+        }
         let before = sessions.len();
         sessions.retain(|key, session| {
             now.signed_duration_since(session.last_activity) <= IDLE_AFTER
-                || active_agent_parents.contains(key)
+                || active_agent_ancestors.contains(key)
         });
         if sessions.len() == before {
             return false;
@@ -546,6 +646,163 @@ impl LiveTracker {
             state: Mutex::new(TrackerState::default()),
             app,
         }
+    }
+
+    /// Rehydrate durable Pi rows as recovering without claiming their process
+    /// is still live after restart or tracking re-enable.
+    pub(crate) fn rehydrate_pi_sessions(
+        &self,
+        sessions: impl IntoIterator<Item = PiRecoveringSession>,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !state.accepts(IntegrationProvider::Pi.as_str()) {
+            return false;
+        }
+        let mut changed = false;
+        for recovered in sessions {
+            let Some(origin_at) = DateTime::<Utc>::from_timestamp_millis(recovered.origin_at_ms)
+            else {
+                continue;
+            };
+            let Some(occurred_at) =
+                DateTime::<Utc>::from_timestamp_millis(recovered.occurred_at_ms)
+            else {
+                continue;
+            };
+            let key = SessionKey {
+                provider: IntegrationProvider::Pi.as_str().to_owned(),
+                host: recovered.normalized_host,
+                session_id: recovered.session_id,
+            };
+            let session = state.sessions.entry(key).or_default();
+            changed |= session.process_instance_id.as_deref()
+                != Some(recovered.process_instance_id.as_str())
+                || !session.recovering;
+            session.last_activity = occurred_at;
+            session.started_at = Some(origin_at);
+            session.cwd = observed_root_cwd(recovered.cwd.as_deref());
+            session.ephemeral = false;
+            session.recovering = true;
+            session.process_instance_id = Some(recovered.process_instance_id);
+            session.lineage = Some(recovered.lineage);
+            session.agent_role = recovered.agent_role;
+        }
+        drop(state);
+        if changed {
+            self.notify();
+        }
+        changed
+    }
+
+    /// Apply only a lifecycle event whose durable transaction returned
+    /// `applied`; duplicate, stale, and unknown events never reach this method.
+    pub(crate) fn apply_pi_protocol_v2_event(&self, event: &PiProtocolV2Event) -> bool {
+        let Some(origin_at) = utc(&event.origin_at) else {
+            return false;
+        };
+        let Some(occurred_at) = utc(&event.occurred_at) else {
+            return false;
+        };
+        let key = SessionKey {
+            provider: IntegrationProvider::Pi.as_str().to_owned(),
+            host: event.normalized_host.clone(),
+            session_id: event.session_id.clone(),
+        };
+        let mut state = self.state.lock().unwrap();
+        if !state.accepts(IntegrationProvider::Pi.as_str()) {
+            return false;
+        }
+        let changed = match &event.kind {
+            PiProtocolV2EventKind::SessionStart {
+                previous_session_id,
+                lineage,
+                agent_role,
+                ..
+            } => {
+                let mut changed = previous_session_id.as_ref().is_some_and(|previous| {
+                    state
+                        .sessions
+                        .remove(&SessionKey {
+                            provider: key.provider.clone(),
+                            host: key.host.clone(),
+                            session_id: previous.clone(),
+                        })
+                        .is_some()
+                });
+                if state.sessions.get(&key).is_some_and(|session| {
+                    session.process_instance_id.as_deref()
+                        != Some(event.process_instance_id.as_str())
+                }) {
+                    state.sessions.remove(&key);
+                    changed = true;
+                }
+                let session = state.sessions.entry(key).or_default();
+                let recovering =
+                    event.delivery_source == PiProtocolV2DeliverySource::Reconciliation;
+                changed |= session.started_at != Some(origin_at)
+                    || session.last_activity != occurred_at
+                    || session.recovering != recovering
+                    || session.process_instance_id.as_deref()
+                        != Some(event.process_instance_id.as_str())
+                    || session.lineage.as_ref() != Some(&protocol_lineage(lineage))
+                    || session.agent_role != *agent_role;
+                session.started_at = Some(origin_at);
+                session.last_activity = occurred_at;
+                session.ephemeral = false;
+                session.recovering = recovering;
+                session.process_instance_id = Some(event.process_instance_id.clone());
+                session.lineage = Some(protocol_lineage(lineage));
+                session.agent_role = agent_role.clone();
+                changed
+            }
+            PiProtocolV2EventKind::SessionEnd { .. } => {
+                state.sessions.get(&key).is_some_and(|session| {
+                    session.process_instance_id.as_deref()
+                        == Some(event.process_instance_id.as_str())
+                }) && state.sessions.remove(&key).is_some()
+            }
+            PiProtocolV2EventKind::Lineage {
+                lineage,
+                agent_role,
+            } => state.sessions.get_mut(&key).is_some_and(|session| {
+                if session.process_instance_id.as_deref()
+                    != Some(event.process_instance_id.as_str())
+                {
+                    return false;
+                }
+                let lineage = protocol_lineage(lineage);
+                let changed = advance(&mut session.last_activity, occurred_at)
+                    || session.lineage.as_ref() != Some(&lineage)
+                    || (agent_role.is_some() && session.agent_role != *agent_role);
+                session.lineage = Some(lineage);
+                if agent_role.is_some() {
+                    session.agent_role = agent_role.clone();
+                }
+                changed
+            }),
+        };
+        drop(state);
+        if changed {
+            self.notify();
+        }
+        changed
+    }
+
+    pub(crate) fn prove_pi_session(
+        &self,
+        session_id: &str,
+        host: &str,
+        process_instance_id: &str,
+        at: DateTime<Utc>,
+    ) -> bool {
+        self.mutate_pi_session(session_id, host, |session| {
+            if session.process_instance_id.as_deref() != Some(process_instance_id) {
+                return false;
+            }
+            let changed = session.recovering;
+            session.recovering = false;
+            advance(&mut session.last_activity, at) || changed
+        })
     }
 
     /// Open or continue one pushed Pi session, optionally replacing its prior
@@ -595,6 +852,7 @@ impl LiveTracker {
                     started_at: Some(at),
                     cwd: observed_root_cwd(cwd),
                     ephemeral,
+                    recovering: false,
                     ..LiveSession::default()
                 }
             });
@@ -610,6 +868,10 @@ impl LiveTracker {
         }
         if session.ephemeral != ephemeral {
             session.ephemeral = ephemeral;
+            changed = true;
+        }
+        if session.recovering {
+            session.recovering = false;
             changed = true;
         }
         drop(state);
@@ -864,18 +1126,35 @@ impl LiveTracker {
     /// Folded identities that must survive storage's provisional limit so
     /// their live activity can participate in final ranking.
     pub(crate) fn session_ranking_keys(&self) -> Vec<(String, String, String)> {
-        self.state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        let keys = state.sessions.keys().cloned().collect::<HashSet<_>>();
+        let lineages = state
             .sessions
             .iter()
-            .filter(|(_, session)| !matches!(session.lineage, Some(PiLineage::Agent { .. })))
-            .map(|(key, _)| {
-                (
-                    key.provider.clone(),
-                    key.session_id.clone(),
-                    key.host.clone(),
-                )
+            .filter(|(_, session)| !session.recovering)
+            .filter_map(|(key, session)| {
+                session
+                    .lineage
+                    .clone()
+                    .map(|lineage| (key.clone(), lineage))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut memo = HashMap::new();
+        state
+            .sessions
+            .iter()
+            .map(|(key, session)| {
+                let visible = if !session.recovering
+                    && matches!(session.lineage, Some(PiLineage::Agent { .. }))
+                {
+                    match resolve_pi_root(key, &lineages, &keys, &mut memo, &mut HashSet::new()) {
+                        PiRootResolution::Root(root, _) if root != *key => root,
+                        _ => key.clone(),
+                    }
+                } else {
+                    key.clone()
+                };
+                (visible.provider, visible.session_id, visible.host)
             })
             .collect()
     }
@@ -902,54 +1181,122 @@ impl LiveTracker {
         let mut agents_by_parent = HashMap::<SessionKey, Vec<ObservedSessionAgent>>::new();
         let mut agent_activity_by_parent = HashMap::<SessionKey, DateTime<Utc>>::new();
         let mut agent_child_keys = HashSet::new();
+        let keys = state.sessions.keys().cloned().collect::<HashSet<_>>();
+        let lineages = state
+            .sessions
+            .iter()
+            .filter(|(key, session)| {
+                key.provider == IntegrationProvider::Pi.as_str() && !session.recovering
+            })
+            .filter_map(|(key, session)| {
+                session
+                    .lineage
+                    .clone()
+                    .map(|lineage| (key.clone(), lineage))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut root_memo = HashMap::new();
+        let mut projected_lineage = HashMap::<SessionKey, PiLineage>::new();
+
         for (child_key, child) in &state.sessions {
-            let (parent_session_id, agent) = match child.lineage.as_ref() {
-                Some(PiLineage::Linked { parent_session_id }) => (parent_session_id, false),
-                Some(PiLineage::Agent { parent_session_id }) => (parent_session_id, true),
-                _ => continue,
-            };
-            let parent_key = SessionKey {
-                provider: IntegrationProvider::Pi.as_str().to_owned(),
-                host: child_key.host.clone(),
-                session_id: parent_session_id.clone(),
-            };
-            if agent {
-                agent_child_keys.insert(child_key.clone());
+            if child_key.provider != IntegrationProvider::Pi.as_str() {
+                continue;
             }
-            if state.sessions.contains_key(&parent_key) {
-                if agent {
-                    agent_activity_by_parent
-                        .entry(parent_key.clone())
-                        .and_modify(|activity| {
-                            if child.last_activity > *activity {
-                                *activity = child.last_activity;
-                            }
-                        })
-                        .or_insert(child.last_activity);
-                    agents_by_parent
-                        .entry(parent_key)
-                        .or_default()
-                        .push(ObservedSessionAgent {
-                            agent_id: child_key.session_id.clone(),
-                            model_id: child.model.clone(),
-                            agent_type: None,
-                            runtime_secs: child.started_at.map(|started_at| {
-                                now.signed_duration_since(started_at)
-                                    .num_milliseconds()
-                                    .max(0) as f64
-                                    / 1_000.0
-                            }),
-                            runtime_active: true,
-                        });
-                } else {
-                    linked_by_parent
-                        .entry(parent_key)
-                        .or_default()
-                        .push(ObservedLinkedSession {
-                            session_id: child_key.session_id.clone(),
-                            model_id: child.model.clone(),
-                        });
+            if child.recovering {
+                projected_lineage.insert(
+                    child_key.clone(),
+                    PiLineage::Unresolved {
+                        reason: "recovering".to_owned(),
+                    },
+                );
+                continue;
+            }
+            match child.lineage.as_ref() {
+                Some(PiLineage::Agent { .. }) => {
+                    let resolution = resolve_pi_root(
+                        child_key,
+                        &lineages,
+                        &keys,
+                        &mut root_memo,
+                        &mut HashSet::new(),
+                    );
+                    match resolution {
+                        PiRootResolution::Root(root_key, _)
+                            if root_key != *child_key
+                                && state
+                                    .sessions
+                                    .get(&root_key)
+                                    .is_some_and(|root| !root.recovering) =>
+                        {
+                            agent_child_keys.insert(child_key.clone());
+                            agent_activity_by_parent
+                                .entry(root_key.clone())
+                                .and_modify(|activity| {
+                                    if child.last_activity > *activity {
+                                        *activity = child.last_activity;
+                                    }
+                                })
+                                .or_insert(child.last_activity);
+                            agents_by_parent.entry(root_key).or_default().push(
+                                ObservedSessionAgent {
+                                    agent_id: child_key.session_id.clone(),
+                                    model_id: child.model.clone(),
+                                    agent_type: child.agent_role.clone(),
+                                    runtime_secs: child.started_at.map(|started_at| {
+                                        now.signed_duration_since(started_at)
+                                            .num_milliseconds()
+                                            .max(0) as f64
+                                            / 1_000.0
+                                    }),
+                                    runtime_active: true,
+                                },
+                            );
+                        }
+                        PiRootResolution::Unresolved(reason) => {
+                            projected_lineage.insert(
+                                child_key.clone(),
+                                PiLineage::Unresolved {
+                                    reason: reason.to_owned(),
+                                },
+                            );
+                        }
+                        _ => {
+                            projected_lineage.insert(
+                                child_key.clone(),
+                                PiLineage::Unresolved {
+                                    reason: "invalid_root".to_owned(),
+                                },
+                            );
+                        }
+                    }
                 }
+                Some(PiLineage::Linked { parent_session_id }) => {
+                    let parent_key = SessionKey {
+                        provider: child_key.provider.clone(),
+                        host: child_key.host.clone(),
+                        session_id: parent_session_id.clone(),
+                    };
+                    if state
+                        .sessions
+                        .get(&parent_key)
+                        .is_some_and(|parent| !parent.recovering)
+                    {
+                        linked_by_parent.entry(parent_key).or_default().push(
+                            ObservedLinkedSession {
+                                session_id: child_key.session_id.clone(),
+                                model_id: child.model.clone(),
+                            },
+                        );
+                    }
+                    projected_lineage.insert(
+                        child_key.clone(),
+                        child.lineage.clone().expect("matched linked lineage"),
+                    );
+                }
+                Some(lineage) => {
+                    projected_lineage.insert(child_key.clone(), lineage.clone());
+                }
+                None => {}
             }
         }
         for linked in linked_by_parent.values_mut() {
@@ -984,8 +1331,11 @@ impl LiveTracker {
                 row.runtime_as_of_ms = Some(now.timestamp_millis());
             }
             row.observed_agents = Some(observed_agents);
-            row.pi_lineage = session.lineage.clone();
-            row.parent_session_id = match &session.lineage {
+            row.pi_lineage = projected_lineage
+                .get(&key)
+                .cloned()
+                .or_else(|| session.lineage.clone());
+            row.parent_session_id = match &row.pi_lineage {
                 Some(PiLineage::Linked { parent_session_id }) => Some(parent_session_id.clone()),
                 _ => None,
             };
@@ -1037,13 +1387,17 @@ impl LiveTracker {
                 rows.push(SessionBreakdown {
                     provider: key.provider.clone(),
                     session_id: key.session_id.clone(),
-                    parent_session_id: match &session.lineage {
+                    parent_session_id: match projected_lineage.get(key).or(session.lineage.as_ref())
+                    {
                         Some(PiLineage::Linked { parent_session_id }) => {
                             Some(parent_session_id.clone())
                         }
                         _ => None,
                     },
-                    pi_lineage: session.lineage.clone(),
+                    pi_lineage: projected_lineage
+                        .get(key)
+                        .cloned()
+                        .or_else(|| session.lineage.clone()),
                     ephemeral: session.ephemeral,
                     hostname: key.host.clone(),
                     total_tokens: session.live_tokens.unwrap_or(0),
@@ -1143,24 +1497,43 @@ impl LiveTracker {
     /// Disabling or re-enabling tracking clears every folded session: coverage
     /// stays unknown until the next sweep rebuilds it from the transcripts.
     pub(crate) fn set_activity_tracking_enabled(&self, enabled: bool) {
-        let mut state = self.state.lock().unwrap();
-        state.activity_tracking_enabled = enabled;
-        state.sessions.clear();
-        state.files.clear();
+        {
+            let mut state = self.state.lock().unwrap();
+            state.activity_tracking_enabled = enabled;
+            state.sessions.clear();
+            state.files.clear();
+        }
+        if enabled
+            && let Ok(storage) = crate::get_storage()
+            && let Ok(sessions) = storage.load_pi_recovering_sessions()
+        {
+            self.rehydrate_pi_sessions(sessions);
+        }
     }
 
     pub(crate) fn set_provider_enabled(&self, provider: IntegrationProvider, enabled: bool) {
-        let provider = provider.as_str();
-        let mut state = self.state.lock().unwrap();
-        if enabled {
-            state.disabled_providers.remove(provider);
-        } else {
-            state.disabled_providers.insert(provider.to_owned());
+        let provider_name = provider.as_str();
+        {
+            let mut state = self.state.lock().unwrap();
+            if enabled {
+                state.disabled_providers.remove(provider_name);
+            } else {
+                state.disabled_providers.insert(provider_name.to_owned());
+            }
+            state
+                .sessions
+                .retain(|key, _| key.provider != provider_name);
+            state
+                .files
+                .retain(|_, tail| tail.session.provider != provider_name);
         }
-        state.sessions.retain(|key, _| key.provider != provider);
-        state
-            .files
-            .retain(|_, tail| tail.session.provider != provider);
+        if enabled
+            && provider == IntegrationProvider::Pi
+            && let Ok(storage) = crate::get_storage()
+            && let Ok(sessions) = storage.load_pi_recovering_sessions()
+        {
+            self.rehydrate_pi_sessions(sessions);
+        }
     }
 
     /// Emit `sessions-live-updated`.
@@ -2172,7 +2545,7 @@ mod tests {
         );
     }
 
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Ephemeral Live Overlay]]
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Persisted Source Presentation]]
     #[test]
     fn pi_ephemeral_start_marks_the_observed_session_row() {
         let tracker = LiveTracker::new(None);
@@ -2341,6 +2714,263 @@ mod tests {
                 .is_some_and(|runtime| (8.0..9.0).contains(&runtime))
         );
         assert!(agent.runtime_active);
+    }
+
+    fn protocol_start(
+        session_id: &str,
+        process: &str,
+        sequence: u64,
+        at: DateTime<Utc>,
+        lineage: PiProtocolV2Lineage,
+        role: Option<&str>,
+    ) -> PiProtocolV2Event {
+        PiProtocolV2Event {
+            event_uuid: format!("{session_id}-{sequence}"),
+            provider: crate::models::PiProtocolV2Provider::Pi,
+            normalized_host: "host".to_owned(),
+            session_id: session_id.to_owned(),
+            process_instance_id: process.to_owned(),
+            sequence,
+            origin_at: at.to_rfc3339(),
+            occurred_at: at.to_rfc3339(),
+            delivery_source: PiProtocolV2DeliverySource::Live,
+            kind: PiProtocolV2EventKind::SessionStart {
+                reason: crate::models::PiProtocolV2StartReason::Startup,
+                previous_session_id: None,
+                lineage,
+                agent_role: role.map(str::to_owned),
+            },
+        }
+    }
+
+    fn start_protocol_session(
+        tracker: &LiveTracker,
+        session_id: &str,
+        process: &str,
+        at: DateTime<Utc>,
+        lineage: PiProtocolV2Lineage,
+        role: Option<&str>,
+    ) {
+        assert!(tracker.apply_pi_protocol_v2_event(&protocol_start(
+            session_id, process, 1, at, lineage, role,
+        )));
+        tracker.start_pi_session(session_id, "host", Some("/work/quill"), false, at, None);
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Depth-Bounded Agent Projection]]
+    #[test]
+    fn pi_nested_agents_flatten_with_roles_and_unresolved_edges_stay_visible() {
+        let now = Utc::now();
+        let tracker = LiveTracker::new(None);
+        start_protocol_session(
+            &tracker,
+            "root",
+            "root-process",
+            now - TimeDelta::minutes(2),
+            PiProtocolV2Lineage::Root,
+            None,
+        );
+        start_protocol_session(
+            &tracker,
+            "agent-a",
+            "process-a",
+            now - TimeDelta::seconds(20),
+            PiProtocolV2Lineage::Agent {
+                parent_session_id: "root".to_owned(),
+            },
+            Some("reviewer"),
+        );
+        start_protocol_session(
+            &tracker,
+            "agent-b",
+            "process-b",
+            now - TimeDelta::seconds(10),
+            PiProtocolV2Lineage::Agent {
+                parent_session_id: "agent-a".to_owned(),
+            },
+            Some("researcher"),
+        );
+        tracker.set_pi_model("agent-a", "host", "anthropic", "claude-opus-5");
+        tracker.set_pi_model("agent-b", "host", "openai", "gpt-5.6-sol");
+
+        let (_, rows) = read_path(&tracker, Vec::new(), now);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
+        );
+        let root = &rows[0];
+        assert_eq!(root.agent_count, Some(2));
+        assert_eq!(root.active_runtime_rate, 2.0);
+        assert_eq!(root.turn_count, 0, "descendant turns never enter the root");
+        assert_eq!(root.total_tokens, 0, "descendant tokens remain separate");
+        assert_eq!(
+            root.observed_agents
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|agent| agent.agent_type.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("reviewer"), Some("researcher")]
+        );
+
+        start_protocol_session(
+            &tracker,
+            "late",
+            "process-late",
+            now,
+            PiProtocolV2Lineage::Agent {
+                parent_session_id: "missing".to_owned(),
+            },
+            Some("planner"),
+        );
+        let (_, rows) = read_path(&tracker, Vec::new(), now);
+        let late = rows.iter().find(|row| row.session_id == "late").unwrap();
+        assert_eq!(
+            late.pi_lineage,
+            Some(PiLineage::Unresolved {
+                reason: "missing_parent".to_owned(),
+            })
+        );
+
+        let lineage = PiProtocolV2Event {
+            event_uuid: "late-lineage".to_owned(),
+            provider: crate::models::PiProtocolV2Provider::Pi,
+            normalized_host: "host".to_owned(),
+            session_id: "late".to_owned(),
+            process_instance_id: "process-late".to_owned(),
+            sequence: 2,
+            origin_at: now.to_rfc3339(),
+            occurred_at: (now + TimeDelta::seconds(1)).to_rfc3339(),
+            delivery_source: PiProtocolV2DeliverySource::Live,
+            kind: PiProtocolV2EventKind::Lineage {
+                lineage: PiProtocolV2Lineage::Agent {
+                    parent_session_id: "root".to_owned(),
+                },
+                agent_role: Some("planner".to_owned()),
+            },
+        };
+        assert!(tracker.apply_pi_protocol_v2_event(&lineage));
+        let (_, rows) = read_path(&tracker, Vec::new(), now + TimeDelta::seconds(1));
+        assert!(rows.iter().all(|row| row.session_id != "late"));
+        assert_eq!(rows[0].agent_count, Some(3));
+
+        let end = PiProtocolV2Event {
+            event_uuid: "agent-b-end".to_owned(),
+            provider: crate::models::PiProtocolV2Provider::Pi,
+            normalized_host: "host".to_owned(),
+            session_id: "agent-b".to_owned(),
+            process_instance_id: "process-b".to_owned(),
+            sequence: 2,
+            origin_at: (now - TimeDelta::seconds(10)).to_rfc3339(),
+            occurred_at: (now + TimeDelta::seconds(2)).to_rfc3339(),
+            delivery_source: PiProtocolV2DeliverySource::Live,
+            kind: PiProtocolV2EventKind::SessionEnd {
+                reason: crate::models::PiProtocolV2EndReason::Quit,
+            },
+        };
+        assert!(tracker.apply_pi_protocol_v2_event(&end));
+        let (_, rows) = read_path(&tracker, Vec::new(), now + TimeDelta::seconds(2));
+        assert_eq!(rows[0].agent_count, Some(2));
+        assert!(rows.iter().all(|row| row.session_id != "agent-b"));
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Depth 64 Cycle And Cross-Host Rejection]]
+    #[test]
+    fn pi_agent_roots_bound_depth_and_reject_cycles_and_cross_host_parents() {
+        let now = Utc::now();
+        let tracker = LiveTracker::new(None);
+        start_protocol_session(
+            &tracker,
+            "depth-root",
+            "depth-root-process",
+            now,
+            PiProtocolV2Lineage::Root,
+            None,
+        );
+        for depth in 1..=65 {
+            start_protocol_session(
+                &tracker,
+                &format!("depth-{depth}"),
+                &format!("depth-process-{depth}"),
+                now,
+                PiProtocolV2Lineage::Agent {
+                    parent_session_id: if depth == 1 {
+                        "depth-root".to_owned()
+                    } else {
+                        format!("depth-{}", depth - 1)
+                    },
+                },
+                Some("worker"),
+            );
+        }
+        let (_, rows) = read_path(&tracker, Vec::new(), now);
+        let root = rows
+            .iter()
+            .find(|row| row.session_id == "depth-root")
+            .unwrap();
+        assert_eq!(root.agent_count, Some(64));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == "depth-65")
+                .unwrap()
+                .pi_lineage,
+            Some(PiLineage::Unresolved {
+                reason: "lineage_depth_exceeded".to_owned(),
+            })
+        );
+
+        let cycle = LiveTracker::new(None);
+        for (session, parent) in [("cycle-a", "cycle-b"), ("cycle-b", "cycle-a")] {
+            start_protocol_session(
+                &cycle,
+                session,
+                session,
+                now,
+                PiProtocolV2Lineage::Agent {
+                    parent_session_id: parent.to_owned(),
+                },
+                None,
+            );
+        }
+        let (_, rows) = read_path(&cycle, Vec::new(), now);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| matches!(
+            row.pi_lineage,
+            Some(PiLineage::Unresolved { ref reason }) if reason == "lineage_cycle"
+        )));
+
+        let cross_host = LiveTracker::new(None);
+        start_protocol_session(
+            &cross_host,
+            "child",
+            "child-process",
+            now,
+            PiProtocolV2Lineage::Agent {
+                parent_session_id: "parent".to_owned(),
+            },
+            None,
+        );
+        cross_host.start_pi_session(
+            "parent",
+            "other-host",
+            Some("/work/quill"),
+            false,
+            now,
+            None,
+        );
+        cross_host.set_pi_lineage("parent", "other-host", PiLineage::Root);
+        let (_, rows) = read_path(&cross_host, Vec::new(), now);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == "child")
+                .unwrap()
+                .pi_lineage,
+            Some(PiLineage::Unresolved {
+                reason: "cross_host_parent".to_owned(),
+            })
+        );
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Tail Mechanics]]

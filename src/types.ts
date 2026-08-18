@@ -172,7 +172,7 @@ export interface SessionBreakdown {
   /** Extension-proven Pi parent header id; null for root or unresolved. */
   parent_session_id: string | null;
   pi_lineage?: PiLineage | null;
-  /** Pi deliberately created no transcript; analytics remain local-only. */
+  /** Inert schema-compatibility field; persisted Pi rows never badge it. */
   ephemeral?: boolean;
   hostname: string;
   total_tokens: number;

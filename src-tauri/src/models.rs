@@ -303,6 +303,7 @@ pub enum PiProtocolV2ErrorCode {
     UnknownSession,
     ReannounceRequired,
     RateLimited,
+    SourceNotPersisted,
     Unavailable,
 }
 
@@ -333,6 +334,19 @@ pub enum PiProtocolV2Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
     },
+}
+
+/// Durable Pi process evidence reloaded without claiming current liveness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PiRecoveringSession {
+    pub normalized_host: String,
+    pub session_id: String,
+    pub process_instance_id: String,
+    pub origin_at_ms: i64,
+    pub occurred_at_ms: i64,
+    pub cwd: Option<String>,
+    pub lineage: PiLineage,
+    pub agent_role: Option<String>,
 }
 
 // Time-series point for token charts
@@ -1206,6 +1220,8 @@ pub struct SessionNotifyPayload {
     pub session_id: String,
     pub jsonl_path: String,
     pub host: Option<String>,
+    #[serde(default)]
+    pub process_instance_id: Option<String>,
     pub cwd: Option<String>,
     pub project: Option<String>,
     pub git_branch: Option<String>,
@@ -1253,6 +1269,8 @@ pub struct SessionMessagesPayload {
     pub provider: IntegrationProvider,
     pub host: String,
     pub session_id: String,
+    #[serde(default)]
+    pub process_instance_id: Option<String>,
     pub project: String,
     #[serde(default)]
     pub cwd: Option<String>,
