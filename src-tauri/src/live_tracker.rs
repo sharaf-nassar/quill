@@ -922,8 +922,8 @@ impl LiveTracker {
         })
     }
 
-    /// Open or continue one pushed Pi session, optionally replacing its prior
-    /// identity for new/resume/fork transitions.
+    /// Test-only setup for legacy in-memory Pi projections.
+    #[cfg(test)]
     pub(crate) fn start_pi_session(
         &self,
         session_id: &str,
@@ -998,8 +998,7 @@ impl LiveTracker {
         changed
     }
 
-    /// Close a pushed Pi session only when the shutdown is not older than the
-    /// newest event already observed for that identity.
+    #[cfg(test)]
     pub(crate) fn end_pi_session(&self, session_id: &str, host: &str, at: DateTime<Utc>) -> bool {
         let Some(host) = normalize_observed_hostname(host) else {
             return false;
@@ -1022,98 +1021,13 @@ impl LiveTracker {
         removed
     }
 
-    pub(crate) fn record_pi_activity(
-        &self,
-        session_id: &str,
-        host: &str,
-        at: DateTime<Utc>,
-    ) -> bool {
-        self.mutate_pi_session(session_id, host, |session| {
-            advance(&mut session.last_activity, at)
-        })
-    }
-
-    pub(crate) fn set_pi_model(
-        &self,
-        session_id: &str,
-        host: &str,
-        model_provider: &str,
-        model: &str,
-    ) -> bool {
-        self.mutate_pi_session(session_id, host, |session| {
-            if session.model_provider.as_deref() == Some(model_provider)
-                && session.model.as_deref() == Some(model)
-            {
-                return false;
-            }
-            session.model_provider = Some(model_provider.to_owned());
-            session.model = Some(model.to_owned());
-            true
-        })
-    }
-
+    #[cfg(test)]
     pub(crate) fn set_pi_lineage(&self, session_id: &str, host: &str, lineage: PiLineage) -> bool {
         self.mutate_pi_session(session_id, host, |session| {
             if session.lineage.as_ref() == Some(&lineage) {
                 return false;
             }
             session.lineage = Some(lineage);
-            true
-        })
-    }
-
-    pub(crate) fn set_pi_live_tokens(
-        &self,
-        session_id: &str,
-        host: &str,
-        input: i64,
-        output: i64,
-        cache_read: i64,
-        cache_write: i64,
-    ) -> bool {
-        let Some(total) = input
-            .checked_add(output)
-            .and_then(|total| total.checked_add(cache_read))
-            .and_then(|total| total.checked_add(cache_write))
-        else {
-            return false;
-        };
-        self.mutate_pi_session(session_id, host, |session| {
-            if session.live_tokens == Some(total) {
-                return false;
-            }
-            session.live_tokens = Some(total);
-            true
-        })
-    }
-
-    pub(crate) fn add_pi_live_tokens(
-        &self,
-        session_id: &str,
-        host: &str,
-        input: i64,
-        output: i64,
-        cache_read: i64,
-        cache_write: i64,
-    ) -> bool {
-        let Some(delta) = input
-            .checked_add(output)
-            .and_then(|total| total.checked_add(cache_read))
-            .and_then(|total| total.checked_add(cache_write))
-        else {
-            return false;
-        };
-        self.mutate_pi_session(session_id, host, |session| {
-            // The push and the fold read the same assistant messages, so once
-            // the session's own file has answered for this session the push
-            // may only accelerate it, never add to the total again.
-            if session.folded_tokens.is_some() {
-                return false;
-            }
-            let Some(total) = session.live_tokens.unwrap_or(0).checked_add(delta) else {
-                return false;
-            };
-            session.live_tokens = Some(total);
             true
         })
     }
@@ -2858,43 +2772,6 @@ mod tests {
         assert_eq!(session.cwd.as_deref(), Some("/new"));
     }
 
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Push Mutations]]
-    #[test]
-    fn pi_push_activity_model_lineage_and_tokens_update_existing_session_only() {
-        let tracker = LiveTracker::new(None);
-        let started = parse("2026-08-14T08:00:00Z");
-        tracker.start_pi_session("live", "host", Some("/work"), false, started, None);
-
-        assert!(tracker.record_pi_activity("live", "host", started + TimeDelta::seconds(1),));
-        assert!(tracker.set_pi_model("live", "host", "anthropic", "claude-sonnet-4-5"));
-        assert!(tracker.set_pi_lineage(
-            "live",
-            "host",
-            crate::models::PiLineage::Linked {
-                parent_session_id: "parent".into(),
-            },
-        ));
-        assert!(tracker.set_pi_live_tokens("live", "host", 10, 20, 30, 40));
-        assert!(!tracker.record_pi_activity("ended", "host", started));
-
-        let state = tracker.state.lock().unwrap();
-        let session = state.sessions.values().next().unwrap();
-        assert_eq!(session.last_activity, started + TimeDelta::seconds(1));
-        assert_eq!(session.model_provider.as_deref(), Some("anthropic"));
-        assert_eq!(session.model.as_deref(), Some("claude-sonnet-4-5"));
-        assert_eq!(
-            session.lineage,
-            Some(crate::models::PiLineage::Linked {
-                parent_session_id: "parent".into(),
-            })
-        );
-        assert_eq!(session.live_tokens, Some(100));
-        drop(state);
-
-        let (_, rows) = read_path(&tracker, Vec::new(), started + TimeDelta::seconds(2));
-        assert_eq!(rows[0].total_tokens, 100);
-    }
-
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Pushed Lineage Proof]]
     #[test]
     fn pi_push_lineage_keeps_root_linked_and_unresolved_distinct() {
@@ -2960,59 +2837,6 @@ mod tests {
         assert!(tracker.session_ranking_keys().is_empty());
     }
 
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Proven Live Lineage]]
-    #[test]
-    fn pi_pushed_parent_exposes_exactly_two_linked_children_and_keeps_sibling_independent() {
-        let now = parse("2026-08-14T08:00:10Z");
-        let tracker = LiveTracker::new(None);
-        let host = "host";
-        for session_id in ["parent", "child-a", "child-b", "sibling"] {
-            tracker.start_pi_session(session_id, host, Some("/work/quill"), false, now, None);
-            tracker.set_pi_model(session_id, host, "anthropic", "claude-sonnet-4-5");
-        }
-        tracker.set_pi_lineage("parent", host, PiLineage::Root);
-        for child in ["child-a", "child-b"] {
-            tracker.set_pi_lineage(
-                child,
-                host,
-                PiLineage::Linked {
-                    parent_session_id: "parent".into(),
-                },
-            );
-        }
-        tracker.set_pi_lineage("sibling", host, PiLineage::Root);
-        let (_, rows) = read_path(&tracker, Vec::new(), now);
-        assert_eq!(rows.len(), 4);
-        let parent_row = rows.iter().find(|row| row.session_id == "parent").unwrap();
-        assert_eq!(
-            parent_row
-                .live_linked_sessions
-                .as_ref()
-                .unwrap()
-                .iter()
-                .map(|session| session.session_id.as_str())
-                .collect::<Vec<_>>(),
-            ["child-a", "child-b"]
-        );
-        assert_eq!(parent_row.agent_count, None);
-        assert_eq!(parent_row.observed_agents, Some(Vec::new()));
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.session_id == "child-a")
-                .unwrap()
-                .parent_session_id
-                .as_deref(),
-            Some("parent")
-        );
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.session_id == "sibling")
-                .unwrap()
-                .parent_session_id,
-            None
-        );
-    }
-
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Explicit Pi Agent Lineage]]
     #[test]
     fn pi_agent_lineage_folds_child_into_parent_agent_rail() {
@@ -3060,8 +2884,6 @@ mod tests {
                 parent_session_id: "parent".into(),
             },
         );
-        tracker.set_pi_model("agent", host, "openai", "gpt-5.6-sol");
-
         let (keys, rows) = read_path(&tracker, Vec::new(), now);
 
         assert!(keys.iter().all(|(_, session_id, _)| session_id != "agent"));
@@ -3093,7 +2915,7 @@ mod tests {
             "linked"
         );
         let agent = &parent.observed_agents.as_ref().unwrap()[0];
-        assert_eq!(agent.model_id.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(agent.model_id, None);
         assert!(
             agent
                 .runtime_secs
@@ -3176,9 +2998,6 @@ mod tests {
             },
             Some("researcher"),
         );
-        tracker.set_pi_model("agent-a", "host", "anthropic", "claude-opus-5");
-        tracker.set_pi_model("agent-b", "host", "openai", "gpt-5.6-sol");
-
         let (_, rows) = read_path(&tracker, Vec::new(), now);
         assert_eq!(
             rows.iter()
@@ -4653,22 +4472,6 @@ mod tests {
             assert_eq!(session.live_tokens, None);
             assert_eq!(session.last_activity, parse("2026-08-08T00:00:00Z"));
         });
-
-        // Zero is still a folded usage total, so a concurrent push may not
-        // resume adding tokens merely because the cumulative total is zero.
-        fixture.append(&format!(
-            "{}\n",
-            pi_assistant("2026-08-08T00:00:06Z", "gpt-5.6-sol", 0)
-        ));
-        fixture.sweep(&tracker, parse("2026-08-08T00:00:40Z"));
-        assert!(!tracker.add_pi_live_tokens(
-            PI_SESSION,
-            local_observed_host().expect("local host"),
-            1,
-            0,
-            0,
-            0,
-        ));
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Session Activity]]
@@ -4719,96 +4522,88 @@ mod tests {
         );
     }
 
-    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Push Parity]]
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Pi Corpus Fold Regression]]
     #[test]
-    fn a_folded_pi_session_and_its_push_agree_on_one_row() {
-        let host = local_observed_host().expect("local host");
-        let now = Utc::now();
-        let at = |ago: i64| (now - TimeDelta::seconds(ago)).to_rfc3339();
-        let fixture = Fixture::pi(PI_SESSION);
-        fixture.write(&format!(
-            "{}\n{}\n{}\n{}\n",
-            pi_header(PI_SESSION, &at(300)),
-            pi_user(&at(240)),
-            pi_assistant(&at(180), "gpt-5.6-sol", 1_200),
-            pi_assistant(&at(120), "gpt-5.6-sol", 800)
-        ));
-
-        // What the extension pushes for the very same file.
-        let push = |tracker: &LiveTracker| {
-            tracker.start_pi_session(
-                PI_SESSION,
-                host,
-                Some("/home/user/project"),
-                false,
-                parse(&at(300)),
-                None,
-            );
-            for (seconds_ago, tokens) in [(180, 1_200), (120, 800)] {
-                tracker.record_pi_activity(PI_SESSION, host, parse(&at(seconds_ago)));
-                tracker.set_pi_model(PI_SESSION, host, "cliproxyapi", "gpt-5.6-sol");
-                tracker.add_pi_live_tokens(PI_SESSION, host, tokens, 0, 0, 0);
-            }
-        };
-        let row = |tracker: &LiveTracker| {
-            let mut rows = tracker.overlay(
-                Vec::new(),
-                &(now - TimeDelta::hours(1)).to_rfc3339(),
-                None,
-                Some(IntegrationProvider::Pi),
-                Some(10),
-            );
-            assert_eq!(rows.len(), 1, "exactly one visible Pi row");
-            rows.pop().expect("the single Pi row")
-        };
-
-        let folded = LiveTracker::new(None);
-        fixture.sweep(&folded, now);
-        let pushed = LiveTracker::new(None);
-        push(&pushed);
-
-        // The file states everything the push reports, so the two producers
-        // present the same row down to the serialized field.
-        let visible = |tracker: &LiveTracker| {
-            serde_json::to_value(row(tracker)).expect("serialize the visible row")
-        };
-        assert_eq!(visible(&folded), visible(&pushed));
-        assert_eq!(row(&folded).total_tokens, 2_000);
-        assert_eq!(row(&folded).project.as_deref(), Some("/home/user/project"));
-        for tracker in [&folded, &pushed] {
-            fixture.with_session(tracker, |session| {
-                assert_eq!(session.model_provider.as_deref(), Some("cliproxyapi"));
-                assert_eq!(session.model.as_deref(), Some("gpt-5.6-sol"));
-            });
+    fn real_pi_corpus_folds_models_tokens_activity_and_agent_rails() {
+        const ROOT: &str = "01a018c8-2867-71be-a72b-cdf822ddbe75";
+        const PARENT: &str = "01a018c8-9020-7321-bbc2-d6cc422c88ca";
+        const CHILD: &str = "01a018c8-bce5-7cb4-a057-b3d135887765";
+        const RUN: &str = "72fd0a56-62de-48e7-8658-fc6913d49611";
+        let corpus = tempfile::tempdir().expect("corpus directory");
+        let root = corpus.path().join(format!("root_{ROOT}.jsonl"));
+        let parent = corpus.path().join(format!("parent_{PARENT}.jsonl"));
+        let child = corpus
+            .path()
+            .join(format!("2026-08-19T06-49-52-416Z_{PARENT}"))
+            .join(RUN)
+            .join("run-0/session.jsonl");
+        let foreign = corpus
+            .path()
+            .join("subagent-artifacts")
+            .join("foreign.jsonl");
+        fs::create_dir_all(child.parent().expect("child directory")).unwrap();
+        fs::create_dir_all(foreign.parent().expect("foreign directory")).unwrap();
+        for (path, contents) in [
+            (&root, include_str!("fixtures/pi-parity-corpus/root.jsonl")),
+            (
+                &parent,
+                include_str!("fixtures/pi-parity-corpus/parent.jsonl"),
+            ),
+            (
+                &child,
+                include_str!("fixtures/pi-parity-corpus/child.jsonl"),
+            ),
+            (
+                &foreign,
+                include_str!("fixtures/pi-parity-corpus/subagent-artifacts/foreign.jsonl"),
+            ),
+        ] {
+            fs::write(path, contents).expect("write real Pi corpus");
         }
 
-        // Both producers running at once converge on that one row rather than
-        // opening a second identity, and the fold leaves the lineage only the
-        // push can prove alone.
-        let both = LiveTracker::new(None);
-        push(&both);
-        both.set_pi_lineage(PI_SESSION, host, PiLineage::Root);
-        fixture.sweep(&both, now);
-        let converged = row(&both);
-        assert_eq!(converged.total_tokens, row(&folded).total_tokens);
-        assert_eq!(converged.project, row(&folded).project);
-        assert_eq!(converged.last_active, row(&folded).last_active);
-        assert_eq!(converged.first_seen, row(&folded).first_seen);
-        assert_eq!(converged.pi_lineage, Some(PiLineage::Root));
+        let tracker = LiveTracker::new(None);
+        tracker.apply_paths([
+            (root, IntegrationProvider::Pi),
+            (parent, IntegrationProvider::Pi),
+            (child, IntegrationProvider::Pi),
+            (foreign, IntegrationProvider::Pi),
+        ]);
+        let host = local_observed_host().expect("local host");
+        let state = tracker.state.lock().unwrap();
+        for (session_id, tokens, activity) in [
+            (ROOT, 21_482, "2026-08-19T06:49:31.882Z"),
+            (PARENT, 87_413, "2026-08-19T06:50:23.071Z"),
+            (CHILD, 8_828, "2026-08-19T06:50:21.180Z"),
+        ] {
+            let session = state
+                .sessions
+                .get(&SessionKey {
+                    provider: IntegrationProvider::Pi.as_str().to_owned(),
+                    host: host.to_owned(),
+                    session_id: session_id.to_owned(),
+                })
+                .expect("folded corpus session");
+            assert_eq!(session.model_provider.as_deref(), Some("cliproxyapi"));
+            assert_eq!(session.model.as_deref(), Some("gpt-5.6-luna"));
+            assert_eq!(session.live_tokens, Some(tokens));
+            assert_eq!(session.last_activity, parse(activity));
+        }
+        assert_eq!(state.sessions.len(), 3, "foreign schema is rejected");
+        drop(state);
 
-        // A message neither has seen yet reaches the row exactly once, in
-        // whichever order the two producers happen to observe it.
-        fixture.append(&format!("{}\n", pi_assistant(&at(60), "gpt-5.6-sol", 500)));
-        both.record_pi_activity(PI_SESSION, host, parse(&at(60)));
-        both.add_pi_live_tokens(PI_SESSION, host, 500, 0, 0, 0);
-        fixture.sweep(&both, now);
-        assert_eq!(row(&both).total_tokens, 2_500);
-
-        let fold_first = LiveTracker::new(None);
-        fixture.sweep(&fold_first, now);
-        push(&fold_first);
-        fold_first.add_pi_live_tokens(PI_SESSION, host, 500, 0, 0, 0);
-        assert_eq!(row(&fold_first).total_tokens, 2_500);
+        let (_, rows) = read_path(&tracker, Vec::new(), parse("2026-08-19T07:00:00Z"));
+        assert_eq!(rows.len(), 2, "one row per root session");
+        assert!(rows.iter().any(|row| row.session_id == ROOT));
+        let parent = rows
+            .iter()
+            .find(|row| row.session_id == PARENT)
+            .expect("parent row");
+        assert!(rows.iter().all(|row| row.session_id != CHILD));
+        assert_eq!(parent.agent_count, Some(1));
+        let agent = &parent.observed_agents.as_ref().expect("agent rail")[0];
+        assert_eq!(agent.agent_id, CHILD);
+        assert_eq!(agent.model_id.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(agent.agent_type.as_deref(), Some("delegate"));
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Read Overlay]]

@@ -17,25 +17,19 @@ Invalid config causes no disk writes or registrations and emits one discoverable
 
 ## Tracking registration
 
-The extension registers every supported Pi lifecycle, agent, turn, message, tool-execution, model-select, and input handler.
+The extension registers lifecycle, agent, turn-end, tool-execution, and input handlers; persisted files supply model and assistant-message evidence.
 
 ## Reporter coexistence
 
-Compatible managed and npm copies elect one reporter, so every handler and stable lifecycle, model, and usage event registers or emits once.
-
-## Tracking envelopes
-
-Persistent-session handlers push protocol-v2 lifecycle and content-free protocol-v1 analytics acceleration.
-
-Assistant runtime closes on the first text-bearing assistant message rather than turn completion, so tool-only assistant messages do not invent `asst_text`. Quill derives stable live identity from provider and session identity.
+Compatible managed and npm copies elect one reporter, so every handler and stable lifecycle event registers or emits once.
 
 ## Protocol v2 fixture contract
 
 Deterministic TypeScript builders freeze the exact protocol-v2 generation and persisted-entry wire.
 
-The checked-in JSONL covers canonical identity, lifecycle occurrence fields, every start/end reason, delivery source, lineage state, optional field, exact-generation mismatch, and typed outcome. Valid `quill-tracking` entries contain no prompt, message, or tool output. Lifecycle live emission and persisted entries use protocol 2; native-derived model, usage, activity, and runtime acceleration remains protocol 1.
+The checked-in JSONL covers canonical identity, lifecycle occurrence fields, every start/end reason, delivery source, lineage state, optional field, exact-generation mismatch, and typed outcome. Valid `quill-tracking` entries contain no prompt, message, or tool output. Live emission and persisted entries use protocol 2.
 
-The same file also freezes each `/api/v1/pi/track` request the extension sends: the exact envelope bytes, the reporter headers accompanying them, and the status the router owes them. The records replay in order as one session, so the start opens it, the native events land on it, and the end closes it.
+The same file freezes each `/api/v1/pi/track` lifecycle request: exact envelope bytes, reporter headers, and router status. The records replay in order as one session, so the start opens it and the end closes it.
 
 ## Persisted lifecycle evidence
 
@@ -47,9 +41,9 @@ A session without a persistent Pi file appends and sends no tracking or health e
 
 ## Typed bounded delivery
 
-Lifecycle delivery has bounded retry, reload, periodic recovery, reannouncement, and inert-mismatch behavior.
+[[src-tauri/pi-integration/quill.ts#persistLifecycle]] delivers lifecycle with bounded retry, reload, periodic recovery, reannouncement, and inert-mismatch behavior.
 
-A persistent live session replays its exact start envelope every 30 seconds without appending another durable entry. Replay ticks skip an overlapping send and stop at shutdown, reporter release, or generation mismatch; no-session and disabled reporters schedule nothing. Timeout, `429`, and `503` retry once; `401` reloads config once; `409 unknown_session` reannounces the persisted start once before one mutation replay; a `426` rejecting the generation the sent envelope declared makes later live pushes inert while durable entries continue. A rejection naming an event-level failure, including the protocol-1 acceleration hint the protocol-2 route refuses, logs one bounded typed error and drops only that event, leaving the replay, later lifecycle pushes, and runtime messages alive. Hook and routing telemetry inspect non-2xx bodies and surface typed server codes without changing routing decisions or escaping handlers.
+A persistent live session replays its exact start envelope every 30 seconds without appending another durable entry. Replay ticks skip an overlapping send and stop at shutdown, reporter release, or generation mismatch; no-session and disabled reporters schedule nothing. Timeout, `429`, and `503` retry once; `401` reloads config once; `409 unknown_session` reannounces the persisted start once before one lifecycle replay; a `426` rejecting the generation the sent envelope declared makes later live pushes inert while durable entries continue. A `426` carrying an event-level code drops only that delivery, logs one bounded typed error, and leaves start replay and later lifecycle pushes live. Hook and routing telemetry inspect non-2xx bodies and surface typed server codes without changing routing decisions or escaping handlers.
 
 ## Handshake and lineage
 

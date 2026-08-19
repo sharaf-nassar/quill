@@ -5678,19 +5678,14 @@ pub struct Storage {
     db_path: PathBuf,
     model_usage_overview_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelUsageOverviewResponse>>>,
     context_savings_analytics_cache: Mutex<HashMap<CacheKey, CacheEntry<ContextSavingsAnalytics>>>,
+    #[cfg(test)]
     pi_extension_health_written: Mutex<Option<(PiExtensionHandshake, Instant)>>,
 }
 
-/// The handshake fields a Pi envelope restates on every send.
+#[cfg(test)]
 type PiExtensionHandshake = (String, String, String, String);
 
-/// How long an unchanged Pi handshake may go without rewriting `last_seen`.
-///
-/// Every accepted envelope used to rewrite five settings rows in a transaction
-/// on the one primary connection, so a busy fleet serialized all Pi ingest
-/// behind pure bookkeeping. Provider status resolves liveness at two- and
-/// fifteen-minute boundaries, so this stays far below the coarsest thing that
-/// reads it while removing nearly every write.
+#[cfg(test)]
 const PI_EXTENSION_HEALTH_REFRESH: Duration = Duration::from_secs(15);
 
 /// Result of a user-triggered database compaction attempt.
@@ -6314,10 +6309,10 @@ impl Storage {
         Ok(outcomes)
     }
 
-    /// Resolve a live hint against the current durable process without letting
+    /// Resolve a session message against the current durable process without letting
     /// an older process revive or mutate its replacement.
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Live Hint Recovery And Source Diagnostic]]
-    pub(crate) fn pi_live_hint_disposition(
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Lifecycle Recovery And Source Diagnostic]]
+    pub(crate) fn pi_session_message_disposition(
         &self,
         normalized_host: &str,
         session_id: &str,
@@ -6327,7 +6322,7 @@ impl Storage {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
-            .map_err(|error| format!("Begin Pi live-hint disposition: {error}"))?;
+            .map_err(|error| format!("Begin Pi session-message disposition: {error}"))?;
         let current = tx
             .query_row(
                 "SELECT process_instance_id, lifecycle_state
@@ -6337,7 +6332,7 @@ impl Storage {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
-            .map_err(|error| format!("Read Pi live-hint lifecycle: {error}"))?;
+            .map_err(|error| format!("Read Pi session-message lifecycle: {error}"))?;
         let outcome = match current {
             None => PiProtocolV2Outcome::UnknownSession,
             Some((_, ref state)) if state == "closed" => PiProtocolV2Outcome::UnknownSession,
@@ -6376,7 +6371,7 @@ impl Storage {
             Some(_) => PiProtocolV2Outcome::Applied,
         };
         tx.commit()
-            .map_err(|error| format!("Commit Pi live-hint disposition: {error}"))?;
+            .map_err(|error| format!("Commit Pi session-message disposition: {error}"))?;
         Ok(outcome)
     }
 
@@ -10624,6 +10619,7 @@ impl Storage {
             db_path: path,
             model_usage_overview_cache: Mutex::new(HashMap::new()),
             context_savings_analytics_cache: Mutex::new(HashMap::new()),
+            #[cfg(test)]
             pi_extension_health_written: Mutex::new(None),
         };
 
@@ -16632,7 +16628,7 @@ impl Storage {
         Ok(result)
     }
 
-    /// Persist the durable origin for a pushed Pi lifecycle event.
+    #[cfg(test)]
     pub(crate) fn upsert_pi_live_session(
         &self,
         session_id: &str,
@@ -16668,6 +16664,7 @@ impl Storage {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn close_pi_live_session(
         &self,
         session_id: &str,
@@ -16750,240 +16747,6 @@ impl Storage {
             .map_err(|error| format!("Commit Pi live source close: {error}"))
     }
 
-    pub(crate) fn store_pi_model_usage(
-        &self,
-        event: &crate::models::PiTrackEvent,
-        hostname: &str,
-        observed_at_ms: i64,
-    ) -> Result<bool, String> {
-        let crate::models::PiTrackEventKind::Usage {
-            model_provider,
-            model,
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            cost,
-        } = &event.kind
-        else {
-            return Err("Pushed Pi model usage requires a usage event".to_string());
-        };
-        let model_id = crate::model_usage::validate_model_id(&format!("{model_provider}/{model}"))
-            .map_err(|error| format!("Invalid pushed Pi model id: {error}"))?;
-        if event.event_uuid.is_empty() || event.session_id.is_empty() || hostname.is_empty() {
-            return Err("Pushed Pi usage identity must not be empty".to_string());
-        }
-        if observed_at_ms < 0
-            || [
-                *input_tokens,
-                *output_tokens,
-                *cache_write_tokens,
-                *cache_read_tokens,
-            ]
-            .into_iter()
-            .any(|value| !(0..=100_000_000).contains(&value))
-        {
-            return Err("Invalid pushed Pi usage token count".to_string());
-        }
-        if [
-            cost.input,
-            cost.output,
-            cost.cache_read,
-            cost.cache_write,
-            cost.total,
-        ]
-        .into_iter()
-        .any(|value| !value.is_finite() || value < 0.0)
-        {
-            return Err("Invalid pushed Pi usage cost".to_string());
-        }
-
-        let source_key = pi_source_key(hostname, &event.session_id)?;
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|error| format!("Begin pushed Pi usage insert: {error}"))?;
-        tx.execute(
-            "INSERT OR IGNORE INTO live_analytics_sessions (
-                 provider, session_id, hostname, updated_at, ephemeral,
-                 lifecycle_at_ms, closed_at_ms
-             ) VALUES ('pi', ?1, ?2, ?3, 0, 0, NULL)",
-            params![event.session_id, hostname, Utc::now().to_rfc3339()],
-        )
-        .map_err(|error| format!("Register pushed Pi usage session: {error}"))?;
-        tx.execute(
-            "INSERT INTO model_observation_sources (
-                 provider, source_key, source_root_key, source_path,
-                 source_session_id, analytics_session_id, chain_id,
-                 is_sidechain, cwd, hostname, first_activity_at_ms,
-                 last_activity_at_ms, seen_generation, processing_status,
-                 observation_count, last_attempt_at_ms, last_success_at_ms
-             ) VALUES (
-                 'pi', ?1, 'pi:sessions', ?1, ?2, ?2, ?2, 0,
-                 (SELECT cwd FROM live_analytics_sessions
-                  WHERE provider = 'pi' AND session_id = ?2),
-                 ?3, ?4, ?4, 0, 'ok', 0, ?4, ?4
-             )
-             ON CONFLICT(provider, source_key) DO UPDATE SET
-                 cwd = COALESCE(model_observation_sources.cwd, excluded.cwd),
-                 hostname = excluded.hostname,
-                 first_activity_at_ms = MIN(
-                     model_observation_sources.first_activity_at_ms,
-                     excluded.first_activity_at_ms
-                 ),
-                 last_activity_at_ms = MAX(
-                     model_observation_sources.last_activity_at_ms,
-                     excluded.last_activity_at_ms
-                 ),
-                 processing_status = 'ok',
-                 last_attempt_at_ms = excluded.last_attempt_at_ms,
-                 last_success_at_ms = excluded.last_success_at_ms",
-            params![source_key, event.session_id, hostname, observed_at_ms],
-        )
-        .map_err(|error| format!("Upsert pushed Pi usage source: {error}"))?;
-        let watermark_ms = tx
-            .query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                params![RETENTION_WATERMARK_KEY],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| format!("Read pushed Pi retention watermark: {error}"))?
-            .and_then(|raw| parse_watermark_setting(&raw))
-            .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
-            .map(|watermark| watermark.timestamp_millis());
-        if watermark_ms.is_some_and(|watermark| observed_at_ms < watermark) {
-            tx.commit()
-                .map_err(|error| format!("Commit suppressed Pi usage replay: {error}"))?;
-            return Ok(false);
-        }
-        let inserted = tx
-            .execute(
-                "INSERT OR IGNORE INTO model_usage_observations (
-                     provider, source_key, source_record_key, source_ordinal,
-                     observation_kind, source_session_id,
-                     analytics_session_id, chain_id, turn_id,
-                     raw_model_id, derived_model_id, hostname, is_sidechain,
-                     observed_at_ms, input_tokens, output_tokens,
-                     cache_creation_tokens, cache_read_tokens,
-                     model_evidence, token_evidence, event_uuid,
-                     input_cost, output_cost, cache_read_cost,
-                     cache_write_cost, total_cost
-                 ) VALUES (
-                     'pi', ?1, ?2, 0, 'turn', ?3, ?3, ?3, ?2,
-                     ?5, ?5, ?4, 0, ?6, ?7, ?8, ?9, ?10,
-                     'explicit', 'direct', ?2, ?11, ?12, ?13, ?14, ?15
-                 )",
-                params![
-                    source_key,
-                    event.event_uuid,
-                    event.session_id,
-                    hostname,
-                    model_id,
-                    observed_at_ms,
-                    input_tokens,
-                    output_tokens,
-                    cache_write_tokens,
-                    cache_read_tokens,
-                    cost.input,
-                    cost.output,
-                    cost.cache_read,
-                    cost.cache_write,
-                    cost.total,
-                ],
-            )
-            .map_err(|error| format!("Insert pushed Pi usage observation: {error}"))?
-            != 0;
-        if inserted {
-            tx.execute(
-                "INSERT INTO token_snapshots (
-                     provider, session_id, hostname, timestamp, input_tokens,
-                     output_tokens, cache_creation_input_tokens,
-                     cache_read_input_tokens, cwd, is_sidechain, agent_id,
-                     parent_uuid
-                 )
-                 SELECT 'pi', session_id, hostname, ?2, ?3, ?4, ?5, ?6,
-                        cwd, 0, NULL, NULL
-                 FROM live_analytics_sessions
-                 WHERE provider = 'pi' AND session_id = ?1
-                   AND hostname = ?7",
-                params![
-                    event.session_id,
-                    event.timestamp,
-                    input_tokens,
-                    output_tokens,
-                    cache_write_tokens,
-                    cache_read_tokens,
-                    hostname,
-                ],
-            )
-            .map_err(|error| format!("Store Pi token snapshot: {error}"))?;
-            tx.execute(
-                "UPDATE model_observation_sources
-                 SET observation_count = observation_count + 1
-                 WHERE provider = 'pi' AND source_key = ?1",
-                params![source_key],
-            )
-            .map_err(|error| format!("Count pushed Pi usage observation: {error}"))?;
-            tx.execute(
-                "INSERT INTO model_usage_hourly (
-                     hour_utc, provider, derived_model_id, source_key,
-                     analytics_session_id, obs_count, turn_count, token_count,
-                     sidechain_count, input_tokens, input_tokens_present,
-                     output_tokens, output_tokens_present, cache_creation_tokens,
-                     cache_creation_tokens_present, cache_read_tokens,
-                     cache_read_tokens_present, first_observed_at_ms,
-                     last_observed_at_ms, raw_pruned
-                 ) VALUES (
-                     (?1 / ?9) * ?9, 'pi', ?2, ?3, ?4, 1, 1, 0, 0,
-                     ?5, 1, ?6, 1, ?7, 1, ?8, 1, ?1, ?1, 0
-                 )
-                 ON CONFLICT(hour_utc, provider, derived_model_id, source_key)
-                 DO UPDATE SET
-                     obs_count = model_usage_hourly.obs_count + 1,
-                     turn_count = model_usage_hourly.turn_count + 1,
-                     input_tokens = model_usage_hourly.input_tokens + excluded.input_tokens,
-                     input_tokens_present = model_usage_hourly.input_tokens_present + 1,
-                     output_tokens = model_usage_hourly.output_tokens + excluded.output_tokens,
-                     output_tokens_present = model_usage_hourly.output_tokens_present + 1,
-                     cache_creation_tokens = model_usage_hourly.cache_creation_tokens
-                         + excluded.cache_creation_tokens,
-                     cache_creation_tokens_present =
-                         model_usage_hourly.cache_creation_tokens_present + 1,
-                     cache_read_tokens = model_usage_hourly.cache_read_tokens
-                         + excluded.cache_read_tokens,
-                     cache_read_tokens_present =
-                         model_usage_hourly.cache_read_tokens_present + 1,
-                     first_observed_at_ms = MIN(
-                         model_usage_hourly.first_observed_at_ms,
-                         excluded.first_observed_at_ms
-                     ),
-                     last_observed_at_ms = MAX(
-                         model_usage_hourly.last_observed_at_ms,
-                         excluded.last_observed_at_ms
-                     )
-                 WHERE model_usage_hourly.raw_pruned = 0",
-                params![
-                    observed_at_ms,
-                    model_id,
-                    source_key,
-                    event.session_id,
-                    input_tokens,
-                    output_tokens,
-                    cache_write_tokens,
-                    cache_read_tokens,
-                    MODEL_ROLLUP_HOUR_MS,
-                ],
-            )
-            .map_err(|error| format!("Fold pushed Pi usage rollup: {error}"))?;
-            bump_rollup_generation_in_transaction(&tx)?;
-            bump_model_data_revision(&tx)?;
-        }
-        tx.commit()
-            .map_err(|error| format!("Commit pushed Pi usage insert: {error}"))?;
-        Ok(inserted)
-    }
-
     /// Replace Pi's transcript-derived tool rows for one notified session.
     ///
     /// Notify uses this narrow replacement as a search-independent fast path;
@@ -17053,11 +16816,7 @@ impl Storage {
             .map_err(|e| format!("Commit Pi transcript tool replacement: {e}"))
     }
 
-    /// Store the newest Pi extension handshake as one settings transaction.
-    ///
-    /// An unchanged handshake only refreshes `last_seen` once per
-    /// [`PI_EXTENSION_HEALTH_REFRESH`]; any changed field writes through at
-    /// once so typed health never lags the extension that reported it.
+    #[cfg(test)]
     pub(crate) fn store_pi_extension_health(
         &self,
         protocol: u32,
@@ -22489,7 +22248,7 @@ mod tests {
         );
         assert_eq!(
             storage
-                .pi_live_hint_disposition("host", "missing", None, 3)
+                .pi_session_message_disposition("host", "missing", None, 3)
                 .unwrap(),
             PiProtocolV2Outcome::UnknownSession
         );
@@ -22530,13 +22289,13 @@ mod tests {
         assert_eq!(recovered[0].process_instance_id, "process-new");
         assert_eq!(
             storage
-                .pi_live_hint_disposition("host", "session", Some("process-old"), now + 20)
+                .pi_session_message_disposition("host", "session", Some("process-old"), now + 20)
                 .unwrap(),
             PiProtocolV2Outcome::Stale
         );
         assert_eq!(
             storage
-                .pi_live_hint_disposition("host", "session", Some("process-new"), now + 21)
+                .pi_session_message_disposition("host", "session", Some("process-new"), now + 21)
                 .unwrap(),
             PiProtocolV2Outcome::Applied
         );
@@ -23078,67 +22837,6 @@ mod tests {
             (4, None)
         );
         drop(storage);
-        clear_env();
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Persisted Source Presentation]]
-    #[test]
-    #[serial]
-    fn ephemeral_pi_breakdown_persists_pushed_usage_and_activity() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        let observed_at_ms = Utc::now().timestamp_millis();
-        let timestamp = DateTime::<Utc>::from_timestamp_millis(observed_at_ms)
-            .expect("valid timestamp")
-            .to_rfc3339();
-
-        storage
-            .upsert_pi_live_session("ephemeral", Some("/work/pi"), "host", true, 1)
-            .expect("upsert ephemeral lifecycle");
-        storage
-            .store_pi_model_usage(
-                &pushed_pi_usage_event(
-                    "ephemeral-usage",
-                    "ephemeral",
-                    observed_at_ms,
-                    "anthropic/claude-sonnet-4-5",
-                    [10, 20, 30, 40],
-                ),
-                "host",
-                observed_at_ms,
-            )
-            .expect("store ephemeral usage");
-        {
-            let conn = storage.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO response_times (
-                     provider, session_id, chain_id, timestamp, response_secs,
-                     is_sidechain
-                 ) VALUES ('pi', 'ephemeral', 'ephemeral', ?1, 1.0, 0)",
-                params![timestamp],
-            )
-            .expect("store ephemeral turn activity");
-            conn.execute(
-                "INSERT INTO live_analytics_sessions (
-                     provider, session_id, cwd, hostname, updated_at, ephemeral
-                 ) VALUES ('pi', 'ordinary', '/work/pi', 'host', ?1, 0)",
-                params![timestamp],
-            )
-            .expect("store ordinary lifecycle control");
-        }
-
-        let rows = storage
-            .get_session_breakdown("1h", None, Some(IntegrationProvider::Pi), Some(10))
-            .expect("read Pi breakdown");
-        assert_eq!(rows.len(), 1);
-        let row = &rows[0];
-        assert_eq!(row.session_id, "ephemeral");
-        assert_eq!(row.project.as_deref(), Some("/work/pi"));
-        assert_eq!(row.total_tokens, 100);
-        assert_eq!(row.turn_count, 1);
-        assert!(row.ephemeral);
-
         clear_env();
     }
 
@@ -27783,95 +27481,6 @@ mod tests {
             .expect("replace model source");
     }
 
-    fn seed_legacy_pi_model_source(storage: &Storage, source_key: &str) {
-        let now_ms = Utc::now().timestamp_millis() - 1_000;
-        let mut conn = storage.conn.lock().unwrap();
-        let tx = conn.transaction().expect("begin legacy Pi fixture");
-        tx.execute(
-            "INSERT INTO model_observation_sources (
-                 provider, source_key, source_root_key, source_path,
-                 source_session_id, analytics_session_id, chain_id,
-                 is_sidechain, cwd, hostname, first_activity_at_ms,
-                 last_activity_at_ms, seen_generation, processing_status,
-                 observation_count, last_attempt_at_ms, last_success_at_ms
-             ) VALUES (
-                 'pi', ?1, 'retired-pi-root', '/retired/pi.jsonl',
-                 'session-usage-v3', 'session-usage-v3', 'session-usage-v3',
-                 0, '/work/pi-usage', 'host-a', ?2, ?2, 1, 'ok', 3, ?2, ?2
-             )",
-            params![source_key, now_ms],
-        )
-        .expect("seed legacy Pi source");
-        for (ordinal, record_key, model, tokens) in [
-            (0, "main", "anthropic/claude-sonnet-4-5", [11, 7, 5, 3]),
-            (1, "abandoned", "openai/gpt-5.6", [13, 17, 23, 19]),
-            (2, "active", "google/gemini-2.5-pro", [29, 31, 41, 37]),
-        ] {
-            tx.execute(
-                "INSERT INTO model_usage_observations (
-                     provider, source_key, source_record_key, source_ordinal,
-                     observation_kind, source_session_id,
-                     analytics_session_id, chain_id, turn_id, raw_model_id,
-                     derived_model_id, cwd, hostname, is_sidechain,
-                     observed_at_ms, input_tokens, output_tokens,
-                     cache_creation_tokens, cache_read_tokens,
-                     model_evidence, token_evidence
-                 ) VALUES (
-                     'pi', ?1, ?2, ?3, 'turn', 'session-usage-v3',
-                     'session-usage-v3', 'session-usage-v3', ?2, ?4, ?4,
-                     '/work/pi-usage', 'host-a', 0, ?5, ?6, ?7, ?8, ?9,
-                     'explicit', 'direct'
-                 )",
-                params![
-                    source_key,
-                    record_key,
-                    ordinal,
-                    model,
-                    now_ms + ordinal,
-                    tokens[0],
-                    tokens[1],
-                    tokens[2],
-                    tokens[3],
-                ],
-            )
-            .expect("seed legacy Pi observation");
-        }
-        tx.commit().expect("commit legacy Pi fixture");
-    }
-
-    fn pushed_pi_usage_event(
-        event_uuid: &str,
-        session_id: &str,
-        observed_at_ms: i64,
-        model_id: &str,
-        tokens: [i64; 4],
-    ) -> crate::models::PiTrackEvent {
-        let (model_provider, model) = model_id.split_once('/').expect("provider/model fixture");
-        crate::models::PiTrackEvent {
-            event_uuid: event_uuid.to_string(),
-            session_id: session_id.to_string(),
-            hostname: "host".to_string(),
-            timestamp: DateTime::<Utc>::from_timestamp_millis(observed_at_ms)
-                .expect("valid pushed fixture timestamp")
-                .to_rfc3339(),
-            kind: crate::models::PiTrackEventKind::Usage {
-                model_provider: model_provider.to_string(),
-                model: model.to_string(),
-                input_tokens: tokens[0],
-                output_tokens: tokens[1],
-                cache_read_tokens: tokens[2],
-                cache_write_tokens: tokens[3],
-                cost: crate::models::PiUsageCost {
-                    input: 0.01,
-                    output: 0.02,
-                    cache_read: 0.03,
-                    cache_write: 0.04,
-                    total: 0.10,
-                },
-            },
-        }
-    }
-
     fn store_pi_runtime_batch(
         storage: &Storage,
         session_id: &str,
@@ -27927,7 +27536,7 @@ mod tests {
             .expect("store Pi runtime batch");
     }
 
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Pushed Usage Migration]]
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Native Usage Migration]]
     #[test]
     #[serial]
     fn migration_43_adds_pushed_usage_identity_and_cost_storage() {
@@ -28018,619 +27627,6 @@ mod tests {
             1
         );
         clear_env();
-    }
-
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Live Source Migration]]
-    #[test]
-    #[serial]
-    fn migration_44_owns_legacy_pi_evidence_without_changing_identity() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        let stamps = ["2026-08-01T10:00:00.000Z", "2026-08-01T10:01:00.000Z"];
-        let messages = [
-            LiveSessionMessageInput {
-                message_id: "runtime-user",
-                role: "user",
-                timestamp: stamps[0],
-                chain_id: "legacy-live",
-                parent_chain_id: None,
-                is_sidechain: false,
-                agent_id: None,
-                parent_uuid: None,
-            },
-            LiveSessionMessageInput {
-                message_id: "runtime-assistant",
-                role: "assistant",
-                timestamp: stamps[1],
-                chain_id: "legacy-live",
-                parent_chain_id: None,
-                is_sidechain: false,
-                agent_id: None,
-                parent_uuid: Some("runtime-user"),
-            },
-        ];
-        let events = [
-            LiveSessionEventInput {
-                message_id: "runtime-user",
-                event_ordinal: 0,
-                timestamp: stamps[0],
-                kind: crate::sessions::SessionEventKind::UserText,
-            },
-            LiveSessionEventInput {
-                message_id: "runtime-assistant",
-                event_ordinal: 0,
-                timestamp: stamps[1],
-                kind: crate::sessions::SessionEventKind::AsstText,
-            },
-        ];
-        storage
-            .store_live_session_analytics(
-                IntegrationProvider::Pi,
-                "legacy-live",
-                LiveAnalyticsOrigin {
-                    project: Some("legacy-project"),
-                    cwd: Some(Path::new("/work/legacy")),
-                    hostname: Some("legacy-host"),
-                },
-                LiveSessionAnalyticsRows {
-                    messages: &messages,
-                    session_events: &events,
-                    hook_invocations: &[],
-                },
-            )
-            .expect("seed legacy runtime");
-        let usage = pushed_pi_usage_event(
-            "legacy-usage-event",
-            "legacy-live",
-            DateTime::parse_from_rfc3339(stamps[1])
-                .expect("usage time")
-                .timestamp_millis(),
-            "anthropic/legacy-model",
-            [11, 13, 17, 19],
-        );
-        storage
-            .store_pi_model_usage(
-                &usage,
-                "legacy-host",
-                DateTime::parse_from_rfc3339(stamps[1])
-                    .expect("usage time")
-                    .timestamp_millis(),
-            )
-            .expect("seed legacy usage");
-        {
-            let conn = storage.conn.lock().unwrap();
-            conn.execute_batch(
-                "UPDATE session_events SET source_key = NULL
-                 WHERE provider = 'pi' AND session_id = 'legacy-live';
-                 UPDATE response_times SET source_key = NULL
-                 WHERE provider = 'pi' AND session_id = 'legacy-live';
-                 DELETE FROM runtime_hourly WHERE provider = 'pi';
-                 DELETE FROM runtime_turn_state WHERE provider = 'pi';
-                 DELETE FROM transcript_analytics_sources WHERE provider = 'pi';
-                 UPDATE model_usage_observations
-                 SET source_key = 'pi-push:legacy-live'
-                 WHERE provider = 'pi' AND analytics_session_id = 'legacy-live';
-                 UPDATE model_usage_hourly
-                 SET source_key = 'pi-push:legacy-live'
-                 WHERE provider = 'pi' AND analytics_session_id = 'legacy-live';
-                 UPDATE model_observation_sources
-                 SET source_key = 'pi-push:legacy-live',
-                     source_root_key = 'pi-push:legacy-live',
-                     source_path = 'pi-push:legacy-live'
-                 WHERE provider = 'pi' AND analytics_session_id = 'legacy-live';
-                 DELETE FROM schema_version WHERE version IN (44, 45, 46);
-                 DROP TABLE pi_event_receipts;
-                 DROP TABLE pi_session_lifecycle;
-                 DROP TABLE pi_reporter_health;
-                 ALTER TABLE transcript_analytics_sources DROP COLUMN source_kind;
-                 ALTER TABLE live_analytics_sessions DROP COLUMN closed_at_ms;
-                 ALTER TABLE live_analytics_sessions DROP COLUMN lifecycle_at_ms;
-                 ALTER TABLE runtime_turn_state RENAME TO runtime_turn_state_v45;
-                 CREATE TABLE runtime_turn_state (
-                     provider TEXT NOT NULL,
-                     source_key TEXT NOT NULL,
-                     finalized_through_rowid INTEGER NOT NULL DEFAULT 0,
-                     open_turn_started_ms INTEGER,
-                     PRIMARY KEY(provider, source_key),
-                     CHECK(finalized_through_rowid >= 0),
-                     CHECK(open_turn_started_ms IS NULL OR open_turn_started_ms >= 0)
-                 );
-                 INSERT INTO runtime_turn_state
-                 SELECT provider, source_key, finalized_through_rowid,
-                        open_turn_started_ms
-                 FROM runtime_turn_state_v45;
-                 DROP TABLE runtime_turn_state_v45;",
-            )
-            .expect("rewind database to schema 43");
-        }
-        drop(storage);
-
-        let migrated = init_storage_in(&dir);
-        {
-            let conn = migrated.conn.lock().unwrap();
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-                    [],
-                    |row| row.get::<_, i32>(0),
-                )
-                .expect("read migrated version"),
-                46
-            );
-            assert_eq!(
-                conn.query_row(
-                    "SELECT source_key, event_key, chain_id, timestamp, uuid,
-                            parent_uuid
-                     FROM session_events WHERE provider = 'pi' AND uuid =
-                          'runtime-assistant'",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, Option<String>>(5)?,
-                        ))
-                    },
-                )
-                .expect("read migrated runtime identity"),
-                (
-                    pi_source_key("legacy-host", "legacy-live")
-                        .expect("canonical legacy Pi source"),
-                    "runtime-assistant:0".to_string(),
-                    "legacy-live".to_string(),
-                    stamps[1].to_string(),
-                    "runtime-assistant".to_string(),
-                    Some("runtime-user".to_string()),
-                )
-            );
-            assert_eq!(
-                conn.query_row(
-                    "SELECT source_key, source_record_key, source_ordinal,
-                            event_uuid, analytics_session_id, chain_id,
-                            hostname, observed_at_ms, input_tokens,
-                            output_tokens, cache_creation_tokens,
-                            cache_read_tokens
-                     FROM model_usage_observations
-                     WHERE provider = 'pi'",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, i64>(7)?,
-                            row.get::<_, i64>(8)?,
-                            row.get::<_, i64>(9)?,
-                            row.get::<_, i64>(10)?,
-                            row.get::<_, i64>(11)?,
-                        ))
-                    },
-                )
-                .expect("read migrated usage identity"),
-                (
-                    pi_source_key("legacy-host", "legacy-live")
-                        .expect("canonical legacy Pi source"),
-                    "legacy-usage-event".to_string(),
-                    0,
-                    "legacy-usage-event".to_string(),
-                    "legacy-live".to_string(),
-                    "legacy-live".to_string(),
-                    "legacy-host".to_string(),
-                    DateTime::parse_from_rfc3339(stamps[1])
-                        .expect("usage time")
-                        .timestamp_millis(),
-                    11,
-                    13,
-                    19,
-                    17,
-                )
-            );
-            assert_eq!(
-                conn.query_row(
-                    "SELECT total_cost FROM model_usage_observations
-                     WHERE provider = 'pi'",
-                    [],
-                    |row| row.get::<_, f64>(0),
-                )
-                .expect("read migrated usage cost"),
-                0.10
-            );
-            assert_eq!(
-                scalar_count(
-                    &conn,
-                    "SELECT COUNT(*) FROM model_observation_sources
-                     WHERE provider = 'pi' AND source_key LIKE 'pi-push:%'"
-                ),
-                0
-            );
-            assert!(
-                conn.query_row(
-                    "SELECT open_turn_started_ms IS NULL
-                     FROM runtime_turn_state
-                     WHERE provider = 'pi' AND source_key = ?1",
-                    params![
-                        pi_source_key("legacy-host", "legacy-live")
-                            .expect("canonical legacy Pi source")
-                    ],
-                    |row| row.get::<_, bool>(0),
-                )
-                .expect("read migrated closed runtime state"),
-                "migration 45 must not reopen migration 44's sealed runtime"
-            );
-        }
-        drop(migrated);
-        let reopened = init_storage_in(&dir);
-        assert_eq!(
-            scalar_count(
-                &reopened.conn.lock().unwrap(),
-                "SELECT COUNT(*) FROM session_events WHERE provider = 'pi'"
-            ),
-            2
-        );
-        clear_env();
-    }
-
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Replay And Cost Storage]]
-    #[test]
-    #[serial]
-    fn pushed_pi_usage_deduplicates_and_stores_all_cost_dimensions() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        let observed_at_ms = Utc::now().timestamp_millis();
-        let event = pushed_pi_usage_event(
-            "event-1",
-            "session-1",
-            observed_at_ms,
-            "anthropic/claude-sonnet-4-5",
-            [10, 20, 30, 40],
-        );
-
-        assert!(
-            storage
-                .store_pi_model_usage(&event, "host", observed_at_ms)
-                .expect("insert pushed usage")
-        );
-        assert!(
-            !storage
-                .store_pi_model_usage(&event, "host", observed_at_ms)
-                .expect("ignore replayed pushed usage")
-        );
-
-        let conn = storage.conn.lock().unwrap();
-        let row = conn
-            .query_row(
-                "SELECT event_uuid, source_key, raw_model_id,
-                        input_tokens, output_tokens,
-                        cache_creation_tokens, cache_read_tokens,
-                        input_cost, output_cost, cache_read_cost,
-                        cache_write_cost, total_cost
-                 FROM model_usage_observations",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, f64>(7)?,
-                        row.get::<_, f64>(8)?,
-                        row.get::<_, f64>(9)?,
-                        row.get::<_, f64>(10)?,
-                        row.get::<_, f64>(11)?,
-                    ))
-                },
-            )
-            .expect("read pushed usage row");
-        assert_eq!(
-            row,
-            (
-                "event-1".into(),
-                pi_source_key("host", "session-1").expect("canonical Pi source"),
-                "anthropic/claude-sonnet-4-5".into(),
-                10,
-                20,
-                40,
-                30,
-                0.01,
-                0.02,
-                0.03,
-                0.04,
-                0.10,
-            )
-        );
-        assert_eq!(
-            scalar_count(&conn, "SELECT COUNT(*) FROM model_usage_observations"),
-            1
-        );
-        // An ordinary (non-ephemeral) origin still feeds the token series, and
-        // the observation dedupe keeps the replay from doubling it.
-        assert_eq!(
-            scalar_count(
-                &conn,
-                "SELECT COUNT(*) FROM token_snapshots WHERE provider = 'pi'"
-            ),
-            1
-        );
-        drop(conn);
-
-        let other_session = pushed_pi_usage_event(
-            "event-1",
-            "session-2",
-            observed_at_ms,
-            "anthropic/claude-sonnet-4-5",
-            [1, 2, 3, 4],
-        );
-        assert!(
-            storage
-                .store_pi_model_usage(&other_session, "host", observed_at_ms)
-                .expect("same event id belongs to a different session")
-        );
-        assert_eq!(
-            scalar_count(
-                &storage.conn.lock().unwrap(),
-                "SELECT COUNT(*) FROM model_usage_observations"
-            ),
-            2
-        );
-        clear_env();
-    }
-
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Upgrade Coexistence]]
-    #[test]
-    #[serial]
-    fn resumed_pi_session_unions_legacy_and_pushed_rows_after_cutover() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        seed_legacy_pi_model_source(&storage, "legacy-pi");
-        let observed_at_ms = Utc::now().timestamp_millis();
-        let event = pushed_pi_usage_event(
-            "resumed-event",
-            "session-usage-v3",
-            observed_at_ms,
-            "anthropic/pushed-model",
-            [2, 3, 5, 7],
-        );
-        storage
-            .store_pi_model_usage(&event, "host-a", observed_at_ms)
-            .expect("insert resumed pushed usage");
-        storage
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE rollup_meta SET model_backfill_status = 'complete' WHERE id = 1",
-                [],
-            )
-            .expect("complete model rollup fixture");
-
-        let overview = storage
-            .get_model_usage_overview(ModelRange::SevenDays, Some("pi"))
-            .expect("read legacy/pushed union");
-        assert_eq!(overview.totals.total_tokens, 253);
-        assert_eq!(overview.models.len(), 4);
-
-        let history = storage
-            .get_session_model_history("pi", "session-usage-v3", ModelRange::SevenDays)
-            .expect("read resumed session history");
-        assert_eq!(history.token_scope, ModelTokenScope::AllBranches);
-        assert_eq!(history.attributed_tokens, 253);
-        clear_env();
-    }
-
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Live Source Retention]]
-    #[test]
-    #[serial]
-    fn pi_retention_watermark_blocks_active_and_closed_replay() {
-        clear_env();
-        let cutoff = "2026-08-14T00:00:00.000Z";
-        let old_times = vec![
-            "2026-08-01T00:00:00.000Z".to_string(),
-            "2026-08-01T00:01:00.000Z".to_string(),
-        ];
-        let current_times = vec![
-            "2026-08-14T00:01:00.000Z".to_string(),
-            "2026-08-14T00:02:00.000Z".to_string(),
-        ];
-
-        for closed in [false, true] {
-            let dir = TempDir::new().expect("tempdir");
-            let storage = init_storage_in(&dir);
-            storage
-                .run_runtime_rollup_backfill()
-                .expect("complete empty runtime backfill");
-            let lifecycle = if closed { "closed" } else { "active" };
-            let session_id = format!("pi-replay-{lifecycle}");
-            store_pi_runtime_batch(&storage, &session_id, "old", &old_times);
-            let old_usage_ms = DateTime::parse_from_rfc3339(&old_times[1])
-                .expect("old usage timestamp")
-                .timestamp_millis();
-            let old_usage = pushed_pi_usage_event(
-                &format!("old-usage-{lifecycle}"),
-                &session_id,
-                old_usage_ms,
-                "anthropic/model",
-                [1, 2, 3, 4],
-            );
-            assert!(
-                storage
-                    .store_pi_model_usage(&old_usage, "host", old_usage_ms)
-                    .expect("store old Pi usage")
-            );
-            if closed {
-                storage
-                    .close_pi_live_session(&session_id, old_usage_ms + 1)
-                    .expect("close Pi replay source");
-            }
-
-            let request = crate::retention_engine::RetentionDeleteRequest {
-                cutoff: cutoff.to_string(),
-                window_days: 30,
-                bytes_before: std::fs::metadata(storage.database_path())
-                    .expect("stat database")
-                    .len(),
-                ran_at: DateTime::parse_from_rfc3339("2026-08-15T00:00:00Z")
-                    .expect("retention run time")
-                    .with_timezone(&Utc),
-            };
-            crate::retention_engine::run_retention_delete_phase(
-                &storage,
-                &request,
-                &crate::retention_engine::RetentionDeleteControls::default(),
-            )
-            .expect("prune Pi replay fixture");
-            {
-                let conn = storage.conn.lock().unwrap();
-                for (table, session_column) in [
-                    ("session_events", "session_id"),
-                    ("response_times", "session_id"),
-                    ("model_usage_observations", "analytics_session_id"),
-                ] {
-                    assert_eq!(
-                        conn.query_row(
-                            &format!(
-                                "SELECT COUNT(*) FROM {table} WHERE provider = 'pi' AND \
-                                 {session_column} = ?1"
-                            ),
-                            params![session_id],
-                            |row| row.get::<_, i64>(0),
-                        )
-                        .expect("count pruned Pi evidence"),
-                        0,
-                        "{lifecycle} {table} must be pruned"
-                    );
-                }
-                let source_key =
-                    pi_source_key("host", &session_id).expect("canonical retained Pi source key");
-                for owner in ["transcript_analytics_sources", "model_observation_sources"] {
-                    assert_eq!(
-                        conn.query_row(
-                            &format!(
-                                "SELECT COUNT(*) FROM {owner}
-                                 WHERE provider = 'pi' AND source_key = ?1"
-                            ),
-                            params![source_key],
-                            |row| row.get::<_, i64>(0),
-                        )
-                        .expect("count retained Pi owner"),
-                        1,
-                        "retention must preserve the canonical {owner} owner"
-                    );
-                }
-            }
-
-            store_pi_runtime_batch(&storage, &session_id, "old", &old_times);
-            assert!(
-                !storage
-                    .store_pi_model_usage(&old_usage, "host", old_usage_ms)
-                    .expect("suppress old Pi usage replay")
-            );
-            {
-                let conn = storage.conn.lock().unwrap();
-                assert_eq!(
-                    conn.query_row(
-                        "SELECT COUNT(*) FROM session_events
-                         WHERE provider = 'pi' AND session_id = ?1",
-                        params![session_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .expect("count suppressed runtime replay"),
-                    0
-                );
-                assert_eq!(
-                    conn.query_row(
-                        "SELECT COUNT(*) FROM response_times
-                         WHERE provider = 'pi' AND session_id = ?1",
-                        params![session_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .expect("count suppressed response replay"),
-                    0
-                );
-            }
-
-            store_pi_runtime_batch(&storage, &session_id, "current", &current_times);
-            let current_usage_ms = DateTime::parse_from_rfc3339(&current_times[1])
-                .expect("current usage timestamp")
-                .timestamp_millis();
-            let current_usage = pushed_pi_usage_event(
-                &format!("current-usage-{lifecycle}"),
-                &session_id,
-                current_usage_ms,
-                "anthropic/model",
-                [5, 7, 11, 13],
-            );
-            assert!(
-                storage
-                    .store_pi_model_usage(&current_usage, "host", current_usage_ms,)
-                    .expect("store current Pi usage")
-            );
-            store_pi_runtime_batch(&storage, &session_id, "current", &current_times);
-            assert!(
-                !storage
-                    .store_pi_model_usage(&current_usage, "host", current_usage_ms,)
-                    .expect("deduplicate current Pi usage")
-            );
-            let conn = storage.conn.lock().unwrap();
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COUNT(*) FROM session_events
-                     WHERE provider = 'pi' AND session_id = ?1",
-                    params![session_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("count current runtime"),
-                2
-            );
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COUNT(*) FROM response_times
-                     WHERE provider = 'pi' AND session_id = ?1",
-                    params![session_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("count current response"),
-                1
-            );
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COALESCE(SUM(input_tokens + output_tokens
-                                         + cache_creation_tokens
-                                         + cache_read_tokens), 0)
-                     FROM model_usage_observations
-                     WHERE provider = 'pi' AND analytics_session_id = ?1",
-                    params![session_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("read current Pi usage total"),
-                36
-            );
-            assert_eq!(
-                conn.query_row(
-                    "SELECT closed_at_ms IS NOT NULL FROM live_analytics_sessions
-                     WHERE provider = 'pi' AND session_id = ?1",
-                    params![session_id],
-                    |row| row.get::<_, bool>(0),
-                )
-                .expect("read replay lifecycle"),
-                closed
-            );
-            drop(conn);
-            drop(storage);
-            clear_env();
-        }
     }
 
     // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Pi Sequential Ingest Bound]]
@@ -28747,183 +27743,6 @@ mod tests {
                 .expect("count out-of-order replay"),
             3
         );
-        clear_env();
-    }
-
-    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Pi Live Source Plateau]]
-    #[test]
-    #[serial]
-    fn confirmed_retention_plateaus_active_pi_at_its_open_tail() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        storage
-            .run_runtime_rollup_backfill()
-            .expect("complete empty runtime backfill");
-        storage
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE rollup_meta SET model_backfill_status = 'complete' WHERE id = 1",
-                [],
-            )
-            .expect("complete model rollup fixture");
-        let session_id = "pi-volume";
-        let anchor = DateTime::parse_from_rfc3339("2026-08-15T00:00:00Z")
-            .expect("retention anchor")
-            .with_timezone(&Utc);
-
-        for (cycle, (window_days, event_start, tail_start)) in [
-            (365, "2025-01-01T00:00:00Z", "2025-09-01T00:00:00Z"),
-            (180, "2025-10-01T00:00:00Z", "2026-03-01T00:00:00Z"),
-            (90, "2026-03-02T00:00:00Z", "2026-06-01T00:00:00Z"),
-            (30, "2026-06-02T00:00:00Z", "2026-08-01T00:00:00Z"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let start = DateTime::parse_from_rfc3339(event_start)
-                .expect("event start")
-                .with_timezone(&Utc);
-            let tail = DateTime::parse_from_rfc3339(tail_start)
-                .expect("tail start")
-                .with_timezone(&Utc);
-            storage
-                .upsert_pi_live_session(
-                    session_id,
-                    Some("/work/pi-volume"),
-                    "host",
-                    false,
-                    start.timestamp_millis(),
-                )
-                .expect("open Pi volume source");
-            let timestamps = (0..1_000)
-                .map(|index| {
-                    (start + chrono::Duration::milliseconds(index * 60))
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                })
-                .collect::<Vec<_>>();
-            store_pi_runtime_batch(
-                &storage,
-                session_id,
-                &format!("volume-{cycle}"),
-                &timestamps,
-            );
-            let tail_timestamps = [tail, tail + chrono::Duration::minutes(1)]
-                .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
-            store_pi_runtime_batch(
-                &storage,
-                session_id,
-                &format!("tail-{cycle}"),
-                &tail_timestamps,
-            );
-            let old_usage = pushed_pi_usage_event(
-                &format!("old-usage-{cycle}"),
-                session_id,
-                start.timestamp_millis(),
-                "anthropic/model",
-                [1, 2, 3, 4],
-            );
-            storage
-                .store_pi_model_usage(&old_usage, "host", start.timestamp_millis())
-                .expect("store old Pi volume usage");
-            let current_usage = pushed_pi_usage_event(
-                &format!("current-usage-{cycle}"),
-                session_id,
-                tail.timestamp_millis(),
-                "anthropic/model",
-                [5, 7, 11, 13],
-            );
-            storage
-                .store_pi_model_usage(&current_usage, "host", tail.timestamp_millis())
-                .expect("store current Pi volume usage");
-            let query_now = tail + chrono::Duration::minutes(2);
-            let runtime_before = with_pinned_query_now(query_now, || {
-                storage
-                    .get_llm_runtime_stats("90d", None)
-                    .expect("read Pi runtime before retention")
-            });
-            let models_before = storage
-                .get_model_usage_overview_uncached(ModelRange::NinetyDays, Some("pi"), query_now)
-                .expect("read Pi model totals before retention");
-
-            let cutoff = crate::retention::derive_retention_cutoff(anchor, window_days)
-                .expect("derive retention cutoff");
-            let request = crate::retention_engine::RetentionDeleteRequest {
-                cutoff,
-                window_days,
-                bytes_before: std::fs::metadata(storage.database_path())
-                    .expect("stat database")
-                    .len(),
-                ran_at: anchor,
-            };
-            let report = crate::retention_engine::run_retention_delete_phase(
-                &storage,
-                &request,
-                &crate::retention_engine::RetentionDeleteControls::default(),
-            )
-            .expect("run confirmed retention");
-            assert_eq!(
-                report.deleted.session_events,
-                if cycle == 0 { 1_000 } else { 1_002 }
-            );
-            assert_eq!(
-                report.deleted.model_usage_observations,
-                if cycle == 0 { 1 } else { 2 }
-            );
-            {
-                let conn = storage.conn.lock().unwrap();
-                assert_eq!(
-                    scalar_count(&conn, "SELECT COUNT(*) FROM session_events"),
-                    2
-                );
-                assert_eq!(
-                    scalar_count(&conn, "SELECT COUNT(*) FROM model_usage_observations"),
-                    1
-                );
-                assert!(
-                    conn.query_row(
-                        "SELECT closed_at_ms IS NULL FROM live_analytics_sessions
-                         WHERE provider = 'pi' AND session_id = 'pi-volume'",
-                        [],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .expect("read active Pi lifecycle")
-                );
-            }
-            let runtime_after = with_pinned_query_now(query_now, || {
-                storage
-                    .get_llm_runtime_stats("90d", None)
-                    .expect("read retained Pi runtime")
-            });
-            assert_eq!(runtime_after.turn_count, runtime_before.turn_count);
-            assert_eq!(runtime_after.session_count, runtime_before.session_count);
-            assert_eq!(
-                runtime_after.total_runtime_secs,
-                runtime_before.total_runtime_secs
-            );
-            assert_eq!(runtime_after.sparkline, runtime_before.sparkline);
-            let models_after = storage
-                .get_model_usage_overview_uncached(ModelRange::NinetyDays, Some("pi"), query_now)
-                .expect("read Pi model totals after retention");
-            assert_eq!(
-                (
-                    models_after.totals.sessions,
-                    models_after.totals.turns,
-                    models_after.totals.attributed_tokens,
-                    models_after.totals.total_tokens,
-                    models_after.totals.distinct_models,
-                ),
-                (
-                    models_before.totals.sessions,
-                    models_before.totals.turns,
-                    models_before.totals.attributed_tokens,
-                    models_before.totals.total_tokens,
-                    models_before.totals.distinct_models,
-                )
-            );
-        }
         clear_env();
     }
 

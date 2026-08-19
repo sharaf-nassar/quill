@@ -28,9 +28,7 @@ const FEATURES = {
   activity_tracking: true,
   context_telemetry: true,
 };
-const PROTOCOL_VERSION = 1;
 export const EXTENSION_VERSION = "0.2.0";
-const MIN_QUILL_VERSION = "0.9.0";
 
 export const PI_PROTOCOL_V2 = 2;
 export const PI_PROTOCOL_V2_REPORTER_VERSION = EXTENSION_VERSION;
@@ -237,12 +235,9 @@ const TRACKING_EVENTS = new Set([
   "session_shutdown",
   "agent_start",
   "agent_settled",
-  "turn_start",
   "turn_end",
-  "message_end",
   "tool_execution_start",
   "tool_execution_end",
-  "model_select",
   "input",
 ]);
 
@@ -754,9 +749,8 @@ async function sendTracked(config, state, endpoint, payload) {
       }
     }
     // Only a rejection of the generation this payload declared makes the whole
-    // reporter inert. An event-level rejection - including a protocol-1
-    // acceleration hint the protocol-2 route refuses - drops that one event and
-    // leaves lifecycle, the cached start replay, and runtime messages alive.
+    // reporter inert. An event-level lifecycle rejection drops that delivery
+    // while leaving the cached start replay available.
     if (
       error instanceof ProtocolMismatchError &&
       payload?.protocol === PI_PROTOCOL_V2
@@ -1806,11 +1800,9 @@ export function protocolV2FixtureJsonl() {
     },
   );
 
-  // Exact `/api/v1/pi/track` request bytes for every payload builder in this
-  // file, so the real router is asserted against what the extension emits
-  // rather than against shapes it already accepts. The records replay in order
-  // as one session: the start opens it, the native events land on it, and the
-  // end closes it.
+  // Exact `/api/v1/pi/track` request bytes for every lifecycle builder in
+  // this file, so the real router is asserted against what the extension emits
+  // rather than against shapes it already accepts.
   const wireHeaders = headers(
     {
       secret: "fixture-secret",
@@ -1833,74 +1825,7 @@ export function protocolV2FixtureJsonl() {
       wire: JSON.stringify(value),
     });
   };
-  // Mirrors `trackEvent`: native events carry the unnormalized reporter
-  // hostname and a stable identity, never a normalized host or a sequence.
-  const nativeEvent = (type, identity, fields = {}) => ({
-    type,
-    event_uuid: stableId("pi", "session-root", type, identity),
-    session_id: "session-root",
-    hostname: "pi-host",
-    timestamp: "2026-08-18T02:00:30.000Z",
-    ...fields,
-  });
-  const usageCommon = {
-    session_id: "session-root",
-    hostname: "pi-host",
-    timestamp: "2026-08-18T02:00:32.000Z",
-  };
-
   addWire(["session_start"], 202, buildProtocolV2Envelope([fixtureEvent(21)]));
-  addWire(
-    ["activity"],
-    202,
-    trackEnvelope([nativeEvent("activity", "turn:0")]),
-  );
-  addWire(
-    ["model"],
-    202,
-    trackEnvelope([
-      nativeEvent("model", "model:openai:gpt-5", {
-        model_provider: "openai",
-        model: "gpt-5",
-      }),
-    ]),
-  );
-  addWire(
-    ["model", "usage"],
-    202,
-    trackEnvelope([
-      {
-        ...usageCommon,
-        type: "model",
-        event_uuid: stableId(
-          "pi",
-          "session-root",
-          "message-model",
-          "response-1",
-        ),
-        model_provider: "openai",
-        model: "gpt-5",
-      },
-      {
-        ...usageCommon,
-        type: "usage",
-        event_uuid: stableId("pi", "session-root", "usage", "response-1"),
-        model_provider: "openai",
-        model: "gpt-5",
-        input_tokens: 5,
-        output_tokens: 4,
-        cache_read_tokens: 1,
-        cache_write_tokens: 6,
-        cost: {
-          input: 0.05,
-          output: 0.08,
-          cache_read: 0.01,
-          cache_write: 0.06,
-          total: 0.2,
-        },
-      },
-    ]),
-  );
   addWire(
     ["session_end"],
     202,
@@ -1910,15 +1835,6 @@ export function protocolV2FixtureJsonl() {
   );
 
   return `${cases.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
-}
-
-function trackEnvelope(events) {
-  return {
-    protocol: PROTOCOL_VERSION,
-    extension_version: EXTENSION_VERSION,
-    min_quill_version: MIN_QUILL_VERSION,
-    events,
-  };
 }
 
 function persistLifecycle(config, state, info, type, fields) {
@@ -1968,57 +1884,9 @@ function persistLifecycle(config, state, info, type, fields) {
   return sendTracked(config, state, "/api/v1/pi/track", envelope);
 }
 
-function trackEvent(
-  config,
-  state,
-  info,
-  type,
-  fields = {},
-  identity = randomUUID(),
-) {
+function trackLifecycle(config, state, info, type, fields = {}) {
   if (!info.file) return Promise.resolve(true);
-  if (type === "session_start" || type === "session_end") {
-    return persistLifecycle(config, state, info, type, fields);
-  }
-  const timestamp = fields.timestamp || isoTimestamp();
-  const event = {
-    type,
-    event_uuid: stableId("pi", info.id, type, identity),
-    session_id: info.id,
-    hostname: config.hostname,
-    timestamp,
-    ...fields,
-  };
-  return sendTracked(config, state, "/api/v1/pi/track", trackEnvelope([event]));
-}
-
-function trackEvents(config, state, info, events) {
-  if (!info.file) return Promise.resolve(true);
-  return sendTracked(config, state, "/api/v1/pi/track", trackEnvelope(events));
-}
-
-function runtimeMessage(config, state, info, message) {
-  if (!info.file) return Promise.resolve(true);
-  const payload = {
-    provider: "pi",
-    host: config.hostname,
-    session_id: info.id,
-    project: info.cwd || "unknown",
-    cwd: info.cwd,
-    messages: [
-      {
-        uuid: message.uuid,
-        type: message.type,
-        timestamp: message.timestamp,
-        content: "",
-        role: message.role,
-        tools_used: message.tools || [],
-        files_modified: [],
-        event_kinds: message.eventKinds,
-      },
-    ],
-  };
-  return sendTracked(config, state, "/api/v1/sessions/messages", payload);
+  return persistLifecycle(config, state, info, type, fields);
 }
 
 function notifySession(config, state, info, lineage) {
@@ -2071,7 +1939,6 @@ function registerHandler(pi, config, event, handler) {
 
 function registerTracking(pi, config, trackingOnlyChild) {
   const state = {
-    assistantTextMessages: new Set(),
     inert: false,
     liveReannounceInFlight: null,
     liveReannounceTimer: null,
@@ -2082,19 +1949,10 @@ function registerTracking(pi, config, trackingOnlyChild) {
     shutdown: false,
     startEnvelope: null,
   };
-  const activity = (event, ctx, name, hookEvent) => {
+  const telemetry = (event, ctx, hookEvent) => {
     defer(config, () => {
-      const info = sessionInfo(ctx);
-      if (!info.file) return;
-      postTelemetry(config, event, ctx, hookEvent);
-      return trackEvent(
-        config,
-        state,
-        info,
-        "activity",
-        {},
-        `${name}:${randomUUID()}`,
-      );
+      if (!sessionInfo(ctx).file) return;
+      return postTelemetry(config, event, ctx, hookEvent);
     });
   };
 
@@ -2106,7 +1964,7 @@ function registerTracking(pi, config, trackingOnlyChild) {
       const { lineage, previousSessionId } = resolveStart(event, info);
       state.notify = { info, lineage };
       postTelemetry(config, event, ctx, EVENT_MAP.session_start);
-      const handshake = trackEvent(config, state, info, "session_start", {
+      const handshake = trackLifecycle(config, state, info, "session_start", {
         reason: event.reason,
         ...(previousSessionId
           ? { previous_session_id: previousSessionId }
@@ -2125,7 +1983,7 @@ function registerTracking(pi, config, trackingOnlyChild) {
       const info = sessionInfo(ctx);
       if (!info.file || state.released) return;
       postTelemetry(config, event, ctx, EVENT_MAP.session_shutdown);
-      await trackEvent(config, state, info, "session_end", {
+      await trackLifecycle(config, state, info, "session_end", {
         reason: event.reason,
       });
     } catch (error) {
@@ -2136,192 +1994,24 @@ function registerTracking(pi, config, trackingOnlyChild) {
     }
   });
   registerHandler(pi, config, "agent_start", (event, ctx) =>
-    activity(
-      event,
-      ctx,
-      "agent_start",
-      trackingOnlyChild ? "SubagentStart" : undefined,
-    ),
+    telemetry(event, ctx, trackingOnlyChild ? "SubagentStart" : undefined),
   );
   registerHandler(pi, config, "agent_settled", (event, ctx) =>
-    activity(
-      event,
-      ctx,
-      "agent_settled",
-      trackingOnlyChild ? "SubagentStop" : "Stop",
-    ),
+    telemetry(event, ctx, trackingOnlyChild ? "SubagentStop" : "Stop"),
   );
-  registerHandler(pi, config, "turn_start", (event, ctx) =>
-    activity(event, ctx, "turn_start"),
+  registerHandler(pi, config, "input", (event, ctx) =>
+    telemetry(event, ctx, EVENT_MAP.input),
   );
-  registerHandler(pi, config, "input", (event, ctx) => {
-    defer(config, () => {
-      const info = sessionInfo(ctx);
-      if (!info.file) return;
-      const timestamp = isoTimestamp();
-      postTelemetry(config, event, ctx, EVENT_MAP.input);
-      void trackEvent(
-        config,
-        state,
-        info,
-        "activity",
-        { timestamp },
-        `input:${randomUUID()}`,
-      );
-      return runtimeMessage(config, state, info, {
-        uuid: stableId("pi_msg", info.id, "input", timestamp),
-        type: "user",
-        timestamp,
-        role: "user",
-        eventKinds: ["user_text"],
-      });
-    });
-  });
-  registerHandler(pi, config, "tool_execution_start", (event, ctx) => {
-    defer(config, () => {
-      const info = sessionInfo(ctx);
-      if (!info.file) return;
-      const timestamp = isoTimestamp();
-      postTelemetry(config, event, ctx, EVENT_MAP.tool_execution_start);
-      void trackEvent(
-        config,
-        state,
-        info,
-        "activity",
-        { timestamp },
-        `tool-start:${event.toolCallId}`,
-      );
-      return runtimeMessage(config, state, info, {
-        uuid: stableId("pi_msg", info.id, "tool-start", event.toolCallId),
-        type: "assistant_tool_use",
-        timestamp,
-        role: "assistant",
-        tools: [event.toolName],
-        eventKinds: ["asst_tool_use"],
-      });
-    });
-  });
-  registerHandler(pi, config, "tool_execution_end", (event, ctx) => {
-    defer(config, () => {
-      const info = sessionInfo(ctx);
-      if (!info.file) return;
-      const timestamp = isoTimestamp();
-      postTelemetry(config, event, ctx, EVENT_MAP.tool_execution_end);
-      void trackEvent(
-        config,
-        state,
-        info,
-        "activity",
-        { timestamp },
-        `tool-end:${event.toolCallId}`,
-      );
-      return runtimeMessage(config, state, info, {
-        uuid: stableId("pi_msg", info.id, "tool-end", event.toolCallId),
-        type: "tool_result",
-        timestamp,
-        role: "user",
-        eventKinds: ["user_tool_result"],
-      });
-    });
-  });
-  registerHandler(pi, config, "model_select", (event, ctx) => {
-    defer(config, () => {
-      const info = sessionInfo(ctx);
-      if (!info.file) return;
-      return trackEvent(
-        config,
-        state,
-        info,
-        "model",
-        {
-          model_provider: event.model.provider,
-          model: event.model.id,
-        },
-        `model:${event.model.provider}:${event.model.id}:${randomUUID()}`,
-      );
-    });
-  });
-  registerHandler(pi, config, "message_end", (event, ctx) => {
-    if (event.message?.role !== "assistant") return;
-    defer(config, () => {
-      const info = sessionInfo(ctx);
-      if (!info.file) return;
-      const message = event.message;
-      const timestamp = isoTimestamp(message.timestamp);
-      const identity =
-        message.responseId ||
-        stableId(
-          "response",
-          info.id,
-          timestamp,
-          message.provider,
-          message.model,
-        );
-      const hasText = message.content?.some(
-        (part) =>
-          part?.type === "text" &&
-          typeof part.text === "string" &&
-          part.text.trim().length > 0,
-      );
-      if (hasText && !state.assistantTextMessages.has(identity)) {
-        state.assistantTextMessages.add(identity);
-        void runtimeMessage(config, state, info, {
-          uuid: stableId("pi_msg", info.id, "text", identity),
-          type: "assistant",
-          timestamp,
-          role: "assistant",
-          eventKinds: ["asst_text"],
-        });
-      }
-      if (!message.usage) return;
-      const cost = message.usage.cost || {};
-      const common = {
-        session_id: info.id,
-        hostname: config.hostname,
-        timestamp,
-      };
-      return trackEvents(config, state, info, [
-        {
-          ...common,
-          type: "model",
-          event_uuid: stableId("pi", info.id, "message-model", identity),
-          model_provider: message.provider,
-          model: message.model,
-        },
-        {
-          ...common,
-          type: "usage",
-          event_uuid: stableId("pi", info.id, "usage", identity),
-          model_provider: message.provider,
-          model: message.model,
-          input_tokens: Number(message.usage.input || 0),
-          output_tokens: Number(message.usage.output || 0),
-          cache_read_tokens: Number(message.usage.cacheRead || 0),
-          cache_write_tokens: Number(message.usage.cacheWrite || 0),
-          cost: {
-            input: Number(cost.input || 0),
-            output: Number(cost.output || 0),
-            cache_read: Number(cost.cacheRead || 0),
-            cache_write: Number(cost.cacheWrite || 0),
-            total: Number(cost.total || 0),
-          },
-        },
-      ]);
-    });
-  });
+  registerHandler(pi, config, "tool_execution_start", (event, ctx) =>
+    telemetry(event, ctx, EVENT_MAP.tool_execution_start),
+  );
+  registerHandler(pi, config, "tool_execution_end", (event, ctx) =>
+    telemetry(event, ctx, EVENT_MAP.tool_execution_end),
+  );
   registerHandler(pi, config, "turn_end", (event, ctx) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
       if (!info.file) return;
-      const timestamp = isoTimestamp(event.message?.timestamp);
-      void trackEvent(
-        config,
-        state,
-        info,
-        "activity",
-        { timestamp },
-        `turn:${event.turnIndex}`,
-      );
       if (state.notify) {
         void notifySession(
           config,

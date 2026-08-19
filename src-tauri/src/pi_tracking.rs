@@ -921,8 +921,7 @@ mod tests {
                     decode_protocol_v2_response(case.wire.as_bytes()).map(|_| ())
                 }
                 // Wire records are replayed against the real router in
-                // server.rs, including the protocol-1 shapes this decoder is
-                // not meant to read. Pin only the request they describe.
+                // server.rs. Pin only the lifecycle request they describe.
                 FixtureKind::Wire => {
                     assert!(
                         case.status.is_some(),

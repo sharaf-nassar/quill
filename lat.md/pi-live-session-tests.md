@@ -4,7 +4,7 @@ lat:
 ---
 # Pi Live Session Test Specs
 
-These tests pin Pi's extension-pushed live sessions after transcript tracking removal.
+These tests pin Pi protocol-2 lifecycle state alongside persisted session reconciliation.
 
 ## Push Lifecycle
 
@@ -13,10 +13,6 @@ Pushed starts create normalized Pi live keys, replacement starts remove the prio
 ## Push Continuity
 
 Startup or reload of the same stable id preserves its original start while advancing activity and ignores a shutdown older than the continued session.
-
-## Push Mutations
-
-Activity, model, lineage, and cumulative-token pushes update an existing Pi session but never invent one without lifecycle evidence.
 
 ## Push Crash Eviction
 
@@ -32,10 +28,6 @@ One atomic settings write records the handshake protocol, extension version, min
 
 An unchanged handshake repeated inside the refresh window writes nothing, while any changed field writes through at once.
 
-## Tracking Request Validation
-
-The Pi tracking boundary rejects bad bearer authentication with typed `401`, malformed or invalid authenticated bodies with typed `400`, and exact-generation mismatch with typed `426` before lifecycle mutation.
-
 ## Authenticated Protocol v2 Router
 
 The real `/api/v1/pi/track` router authenticates and validates canonical reporter identity before lifecycle mutation.
@@ -48,9 +40,9 @@ Accepted responses include exact Quill build, protocol, reporter version, capabi
 
 Every payload builder in the extension that posts to `/api/v1/pi/track` has a generated wire fixture, and the real router answers each one's exact request bytes and reporter headers.
 
-The builders are enumerated from the extension source rather than from the endpoint string, so a new event kind on the tracking wire fails the suite until it carries a fixture.
+The lifecycle builders are enumerated from the extension source rather than from the endpoint string, so a new tracking shape fails the suite until it carries a fixture.
 
-The protocol-2 lifecycle shapes and the protocol-1 activity, model, and usage shapes are all accepted, because the route dispatches on the protocol each envelope declares. A protocol-1 hint envelope answers `202` with `{"status": "accepted"}` and folds its events into `LiveTracker`; only a protocol neither shape claims answers `426`.
+Only protocol-2 lifecycle shapes are accepted; any other generation receives the typed mismatch response.
 
 ## Transactional Lifecycle Disposition
 
@@ -58,27 +50,22 @@ One SQLite transaction returns `applied`, `duplicate`, `stale`, or `unknown_sess
 
 Only committed `applied` events mutate `LiveTracker`; newer process starts supersede older instances, while stale process ends and reconciliation cannot reopen or remove the replacement.
 
-Durable open rows load as recovering after restart or tracking re-enable. Same-process lifecycle or live-hint evidence can prove them live; a mismatched process is stale and an absent or closed lifecycle returns `unknown_session`.
+Durable open rows load as recovering after restart or tracking re-enable. Same-process lifecycle evidence can prove them live; a mismatched process is stale and an absent or closed lifecycle returns `unknown_session`.
 
-## Live Hint Recovery And Source Diagnostic
+## Lifecycle Recovery And Source Diagnostic
 
-Pi session-message hints consult durable lifecycle before analytics mutation, returning typed `409` for unknown or stale ownership.
-
-While a persistent Pi session remains live, its reporter replays the identical start envelope every 30 seconds without another persisted entry. Overlapping sends are skipped, and shutdown, reporter release, or protocol mismatch stops the replay so recovery cannot revive an ended or incompatible session.
+A persistent Pi session replays its start envelope every 30 seconds. Shutdown, reporter release, or generation mismatch stops recovery from reviving an ended or incompatible session.
 
 A live start without a reconciled file records `source_not_persisted`; validated notify or committed persisted-source reconciliation clears only that process's diagnostic.
 
+## Persisted Turn Recovery
+
+Persisted Pi user and assistant messages produce source-owned `response_times`, so removing runtime-message acceleration does not remove turn pairing.
 ## Protocol v2 decoder contract
 
 The pure Rust decoder accepts only the exact protocol-v2 generation and persisted-entry schema.
 
 It reads open generation metadata before closed lifecycle/lineage variants, rejects unknown or null optional fields, validates canonical Pi identity and occurrence ordering, and decodes typed accepted, mismatch, and unknown-session responses from the exact TypeScript fixture bytes.
-
-## Agent Lineage Protocol
-
-The Pi tracking protocol accepts explicit agent lineage with a validated parent session id so the extension marker survives the HTTP boundary.
-
-A child enters this guarantee only when its launcher explicitly loads Quill. Generic runtime acknowledgement is useful evidence, but Quill does not auto-propagate the active reporter path; unconfigured ambient-disabled children remain unsupported.
 
 ## Tracking Rate Headroom
 
@@ -102,21 +89,9 @@ Later replies inside the same turn stay unpaired, so one prompt counts as one tu
 
 Pi runtime messages normalize their hostname to the same lowercase short key used by lifecycle tracking before analytics storage.
 
-## Demo Gate
-
-Demo mode returns a typed unavailable result without changing extension health, durable lifecycle origin, or LiveTracker state.
-
-## Tracking Ingestion
-
-A valid session-start envelope lowercases and shortens its hostname once, then uses that same key for durable lifecycle origin, live state, and extension health.
-
 ## Cumulative Token Display
 
 A live Pi row renders the cumulative total maintained by pushed usage instead of replacing it with an em dash.
-
-## Proven Live Lineage
-
-One parent with two live children linked by pushed proof exposes exactly two linked sessions while a pushed root sibling stays independent and Pi native agent count stays unknown.
 
 ## Explicit Pi Agent Lineage
 

@@ -1,4 +1,0 @@
-{"type":"session","version":3,"id":"compact-session","timestamp":"2026-08-14T11:00:00Z","cwd":"/work/compact"}
-{"type":"message","id":"compact-a1","parentId":null,"timestamp":"2026-08-14T11:00:01Z","message":{"role":"assistant","provider":"google","model":"gemini-2.5-pro","usage":{"input":5,"output":3,"cacheRead":2,"cacheWrite":1}}}
-{"type":"compaction","id":"compact-summary","parentId":"compact-a1","timestamp":"2026-08-14T11:00:02Z","summary":"bounded summary"}
-{"type":"message","id":"compact-a2","parentId":"compact-summary","timestamp":"2026-08-14T11:00:03Z","message":{"role":"assistant","provider":"google","model":"gemini-2.5-pro","usage":{"input":6,"output":4,"cacheRead":1,"cacheWrite":2}}}

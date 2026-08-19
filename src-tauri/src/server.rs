@@ -25,8 +25,7 @@ use crate::models::{
     ContextSavingsEventPayload, ContextSavingsEventsBatchPayload, LearnedRulePayload,
     LearningRunPayload, ObservationPayload, ObservedHookObservation, PiLineage,
     PiProtocolV2ErrorCode, PiProtocolV2Generation, PiProtocolV2Outcome, PiProtocolV2Response,
-    PiTrackEnvelope, PiTrackEventKind, SessionMessagePayload, SessionMessagesPayload,
-    SessionNotifyPayload, TokenReportPayload,
+    SessionMessagePayload, SessionMessagesPayload, SessionNotifyPayload, TokenReportPayload,
 };
 use crate::sessions;
 use crate::storage::Storage;
@@ -58,10 +57,7 @@ const MAX_SESSION_NOTIFY_REQUESTS: usize = 500;
 const MAX_SESSION_MSG_REQUESTS: usize = 100;
 const MAX_PI_SESSION_MSG_REQUESTS: usize = 4_000;
 const MAX_PI_TRACK_REQUESTS: usize = 4_000;
-const MAX_PI_TRACK_EVENTS_PER_REQUEST: usize = 200;
 const MAX_PI_TRACK_BODY_BYTES: usize = 1024 * 1024;
-const MAX_PI_LAST_ERROR_LEN: usize = 2_048;
-const PI_TRACK_PROTOCOL: u32 = 1;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_CONTENT_LEN: usize = 1_000_000;
 // Must match MAX_MESSAGES_PER_REQUEST in the deployed Claude session-sync bridge.
@@ -391,378 +387,6 @@ fn session_messages_rate_limit<'a>(
     } else {
         (shared, MAX_SESSION_MSG_REQUESTS)
     }
-}
-
-#[derive(Debug)]
-struct PiTrackError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
-}
-
-impl PiTrackError {
-    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            code,
-            message: message.into(),
-        }
-    }
-
-    fn internal(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal_error",
-            message: message.into(),
-        }
-    }
-
-    fn response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({
-                "error": self.code,
-                "message": self.message,
-            })),
-        )
-            .into_response()
-    }
-}
-
-#[cfg(test)]
-fn validate_pi_track_auth(headers: &HeaderMap, secret: &str) -> StatusCode {
-    if check_auth(headers, secret) {
-        StatusCode::OK
-    } else {
-        StatusCode::UNAUTHORIZED
-    }
-}
-
-fn validate_pi_track_name(value: &str, label: &'static str) -> Result<(), PiTrackError> {
-    if value.trim().is_empty()
-        || value.trim() != value
-        || value.len() > MAX_STRING_LEN
-        || value.chars().any(char::is_control)
-    {
-        return Err(PiTrackError::bad_request(
-            "invalid_event",
-            format!("Invalid {label}"),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_pi_lineage(lineage: &PiLineage) -> Result<(), PiTrackError> {
-    match lineage {
-        PiLineage::Root => Ok(()),
-        PiLineage::Linked { parent_session_id } | PiLineage::Agent { parent_session_id } => {
-            validate_pi_track_name(parent_session_id, "parent_session_id")
-        }
-        PiLineage::Unresolved { reason } => validate_pi_track_name(reason, "lineage reason"),
-    }
-}
-
-fn pi_model_id(model_provider: &str, model: &str) -> Result<String, PiTrackError> {
-    validate_pi_track_name(model_provider, "model_provider")?;
-    let provider = crate::model_usage::validate_model_id(model_provider)
-        .map_err(|_| PiTrackError::bad_request("invalid_event", "Invalid model provider"))?;
-    let model = crate::model_usage::validate_model_id(model)
-        .map_err(|_| PiTrackError::bad_request("invalid_event", "Invalid model"))?;
-    crate::model_usage::validate_model_id(&format!("{provider}/{model}"))
-        .map_err(|_| PiTrackError::bad_request("invalid_event", "Invalid provider/model"))
-}
-
-fn validate_pi_token_counts(counts: [i64; 4]) -> Result<(), PiTrackError> {
-    if counts
-        .iter()
-        .any(|count| !(0..=MAX_TOKEN_VALUE).contains(count))
-        || counts
-            .into_iter()
-            .try_fold(0_i64, i64::checked_add)
-            .is_none()
-    {
-        return Err(PiTrackError::bad_request(
-            "invalid_event",
-            "Invalid token counts",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_pi_track_envelope(payload: &PiTrackEnvelope) -> Result<(), PiTrackError> {
-    validate_pi_track_name(&payload.extension_version, "extension_version")?;
-    validate_pi_track_name(&payload.min_quill_version, "min_quill_version")?;
-    if payload.last_error.as_ref().is_some_and(|error| {
-        error.len() > MAX_PI_LAST_ERROR_LEN || error.chars().any(char::is_control)
-    }) {
-        return Err(PiTrackError::bad_request(
-            "invalid_handshake",
-            "Invalid last_error",
-        ));
-    }
-    if payload.protocol != PI_TRACK_PROTOCOL {
-        return Err(PiTrackError::bad_request(
-            "protocol_mismatch",
-            format!(
-                "Unsupported Pi tracking protocol {}; expected {PI_TRACK_PROTOCOL}",
-                payload.protocol
-            ),
-        ));
-    }
-    if payload.events.is_empty() || payload.events.len() > MAX_PI_TRACK_EVENTS_PER_REQUEST {
-        return Err(PiTrackError::bad_request(
-            "invalid_envelope",
-            format!("events must contain 1..={MAX_PI_TRACK_EVENTS_PER_REQUEST} items"),
-        ));
-    }
-
-    let mut event_ids = HashSet::with_capacity(payload.events.len());
-    for event in &payload.events {
-        validate_pi_track_name(&event.event_uuid, "event_uuid")?;
-        if !event_ids.insert(event.event_uuid.as_str()) {
-            return Err(PiTrackError::bad_request(
-                "invalid_event",
-                "Duplicate event_uuid",
-            ));
-        }
-        validate_pi_track_name(&event.session_id, "session_id")?;
-        if crate::live_tracker::normalize_observed_hostname(&event.hostname).is_none() {
-            return Err(PiTrackError::bad_request(
-                "invalid_event",
-                "Invalid hostname",
-            ));
-        }
-        if event.timestamp.len() > MAX_STRING_LEN
-            || chrono::DateTime::parse_from_rfc3339(&event.timestamp).is_err()
-        {
-            return Err(PiTrackError::bad_request(
-                "invalid_event",
-                "Invalid timestamp",
-            ));
-        }
-        match &event.kind {
-            PiTrackEventKind::SessionStart {
-                cwd,
-                reason,
-                previous_session_id,
-                lineage,
-                ..
-            } => {
-                if cwd.as_ref().is_some_and(|cwd| {
-                    cwd.len() > MAX_CWD_LEN || cwd.trim() != cwd || !Path::new(cwd).is_absolute()
-                }) {
-                    return Err(PiTrackError::bad_request("invalid_event", "Invalid cwd"));
-                }
-                if let Some(previous) = previous_session_id {
-                    validate_pi_track_name(previous, "previous_session_id")?;
-                }
-                if matches!(
-                    reason,
-                    crate::models::PiSessionStartReason::Startup
-                        | crate::models::PiSessionStartReason::Reload
-                ) && previous_session_id.is_some()
-                {
-                    return Err(PiTrackError::bad_request(
-                        "invalid_event",
-                        "Continuity starts cannot replace another session",
-                    ));
-                }
-                validate_pi_lineage(lineage)?;
-            }
-            PiTrackEventKind::SessionEnd { reason } => {
-                log::trace!("Validated Pi session shutdown reason: {reason:?}");
-            }
-            PiTrackEventKind::Activity => {}
-            PiTrackEventKind::Model {
-                model_provider,
-                model,
-            } => {
-                pi_model_id(model_provider, model)?;
-            }
-            PiTrackEventKind::Lineage { lineage } => validate_pi_lineage(lineage)?,
-            PiTrackEventKind::LiveTokens {
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-            } => {
-                validate_pi_token_counts([
-                    *input_tokens,
-                    *output_tokens,
-                    *cache_read_tokens,
-                    *cache_write_tokens,
-                ])?;
-            }
-            PiTrackEventKind::Usage {
-                model_provider,
-                model,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-                cost,
-            } => {
-                pi_model_id(model_provider, model)?;
-                validate_pi_token_counts([
-                    *input_tokens,
-                    *output_tokens,
-                    *cache_read_tokens,
-                    *cache_write_tokens,
-                ])?;
-                if [
-                    cost.input,
-                    cost.output,
-                    cost.cache_read,
-                    cost.cache_write,
-                    cost.total,
-                ]
-                .into_iter()
-                .any(|value| !value.is_finite() || value < 0.0)
-                {
-                    return Err(PiTrackError::bad_request(
-                        "invalid_event",
-                        "Invalid usage cost",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ingest_pi_track(
-    storage: &Storage,
-    live_tracker: &crate::live_tracker::LiveTracker,
-    payload: &PiTrackEnvelope,
-    demo_mode: bool,
-) -> Result<(), PiTrackError> {
-    if demo_mode {
-        return Err(PiTrackError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "demo_mode",
-            message: "Pi tracking ingestion is disabled in demo mode".to_owned(),
-        });
-    }
-    if let Err(error) = validate_pi_track_envelope(payload) {
-        if error.code == "protocol_mismatch" {
-            storage
-                .store_pi_extension_health(
-                    payload.protocol,
-                    &payload.extension_version,
-                    &payload.min_quill_version,
-                    Some("protocol_mismatch"),
-                )
-                .map_err(PiTrackError::internal)?;
-        }
-        return Err(error);
-    }
-    storage
-        .store_pi_extension_health(
-            payload.protocol,
-            &payload.extension_version,
-            &payload.min_quill_version,
-            payload.last_error.as_deref(),
-        )
-        .map_err(PiTrackError::internal)?;
-
-    for event in &payload.events {
-        let host = crate::live_tracker::normalize_observed_hostname(&event.hostname)
-            .expect("validated hostname");
-        let at = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
-            .expect("validated timestamp")
-            .with_timezone(&chrono::Utc);
-        match &event.kind {
-            PiTrackEventKind::SessionStart {
-                cwd,
-                ephemeral,
-                previous_session_id,
-                lineage,
-                ..
-            } => {
-                storage
-                    .upsert_pi_live_session(
-                        &event.session_id,
-                        cwd.as_deref(),
-                        &host,
-                        *ephemeral,
-                        at.timestamp_millis(),
-                    )
-                    .map_err(PiTrackError::internal)?;
-                live_tracker.start_pi_session(
-                    &event.session_id,
-                    &host,
-                    cwd.as_deref(),
-                    *ephemeral,
-                    at,
-                    previous_session_id.as_deref(),
-                );
-                live_tracker.set_pi_lineage(&event.session_id, &host, lineage.clone());
-            }
-            PiTrackEventKind::SessionEnd { reason } => {
-                log::trace!("Closing Pi session after {reason:?}");
-                storage
-                    .close_pi_live_session(&event.session_id, at.timestamp_millis())
-                    .map_err(PiTrackError::internal)?;
-                live_tracker.end_pi_session(&event.session_id, &host, at);
-            }
-            PiTrackEventKind::Activity => {
-                live_tracker.record_pi_activity(&event.session_id, &host, at);
-            }
-            PiTrackEventKind::Model {
-                model_provider,
-                model,
-            } => {
-                live_tracker.record_pi_activity(&event.session_id, &host, at);
-                live_tracker.set_pi_model(&event.session_id, &host, model_provider, model);
-            }
-            PiTrackEventKind::Lineage { lineage } => {
-                live_tracker.record_pi_activity(&event.session_id, &host, at);
-                live_tracker.set_pi_lineage(&event.session_id, &host, lineage.clone());
-            }
-            PiTrackEventKind::LiveTokens {
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-            } => {
-                live_tracker.record_pi_activity(&event.session_id, &host, at);
-                live_tracker.set_pi_live_tokens(
-                    &event.session_id,
-                    &host,
-                    *input_tokens,
-                    *output_tokens,
-                    *cache_read_tokens,
-                    *cache_write_tokens,
-                );
-            }
-            PiTrackEventKind::Usage {
-                model_provider,
-                model,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-                cost: _,
-            } => {
-                let inserted = storage
-                    .store_pi_model_usage(event, &host, at.timestamp_millis())
-                    .map_err(PiTrackError::internal)?;
-                live_tracker.record_pi_activity(&event.session_id, &host, at);
-                live_tracker.set_pi_model(&event.session_id, &host, model_provider, model);
-                if inserted {
-                    live_tracker.add_pi_live_tokens(
-                        &event.session_id,
-                        &host,
-                        *input_tokens,
-                        *output_tokens,
-                        *cache_read_tokens,
-                        *cache_write_tokens,
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -1180,71 +804,6 @@ fn pi_decode_status(code: PiProtocolV2ErrorCode) -> StatusCode {
     }
 }
 
-/// The protocol-1 half of `/api/v1/pi/track`: activity, model, lineage,
-/// live-token, and per-message usage hints that accelerate live state ahead of
-/// reconciliation. It shares auth, the body bound, the rate limiter, and
-/// demo-mode gating with the lifecycle path but none of its guarantees - no
-/// generation acknowledgement, no durable receipt, no reporter-subject match -
-/// because the persisted snapshot overwrites whatever a hint reports.
-// @lat: [[data-flow#Data Flow#Live Session Tracker]]
-async fn ingest_pi_track_v1(state: &PiTrackRouteState, bytes: &[u8]) -> Response {
-    let payload = match serde_json::from_slice::<PiTrackEnvelope>(bytes) {
-        Ok(payload) => payload,
-        Err(error) => {
-            return PiTrackError::bad_request(
-                "invalid_envelope",
-                format!("Invalid Pi tracking envelope: {error}"),
-            )
-            .response();
-        }
-    };
-    if crate::ingest_is_quiesced() {
-        return PiTrackError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "quiesced",
-            message: "Database maintenance in progress; retry shortly".to_owned(),
-        }
-        .response();
-    }
-    if !check_rate_limit_with_cost(
-        &state.rate_limiter,
-        MAX_PI_TRACK_REQUESTS,
-        payload.events.len().max(1),
-    ) {
-        return PiTrackError {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            code: "rate_limited",
-            message: "Rate limit exceeded".to_owned(),
-        }
-        .response();
-    }
-
-    let storage = state.storage;
-    let tracker = Arc::clone(&state.live_tracker);
-    let demo_mode = state.demo_mode;
-    match tokio::task::spawn_blocking(move || {
-        crate::with_ingest_write_permit(|| ingest_pi_track(storage, &tracker, &payload, demo_mode))
-    })
-    .await
-    {
-        Ok(Ok(())) => {
-            if let Some(app_handle) = &state.app_handle {
-                let _ = app_handle.emit(crate::SESSIONS_LIVE_UPDATED_EVENT, ());
-            }
-            (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({"status": "accepted"})),
-            )
-                .into_response()
-        }
-        Ok(Err(error)) => error.response(),
-        Err(error) => {
-            log::error!("Pi tracking worker failed: {error}");
-            PiTrackError::internal("Pi tracking worker failed").response()
-        }
-    }
-}
-
 // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Authenticated Protocol v2 Router]]
 async fn post_pi_track(
     State(state): State<Arc<PiTrackRouteState>>,
@@ -1296,13 +855,6 @@ async fn post_pi_track(
             );
         }
     };
-    // Only lifecycle moved to protocol 2; activity, model, lineage, live
-    // tokens, and usage still arrive as protocol-1 hints. Anything else -
-    // including a body that declares no readable protocol - stays with the
-    // lifecycle decoder and its typed generation rejection.
-    if crate::pi_tracking::envelope_protocol(&bytes) == Some(PI_TRACK_PROTOCOL) {
-        return ingest_pi_track_v1(&state, &bytes).await;
-    }
     let payload = match crate::pi_tracking::decode_protocol_v2_envelope(&bytes) {
         Ok(payload) => payload,
         Err(error) => {
@@ -2890,7 +2442,7 @@ async fn post_session_messages(
             .map(|timestamp| timestamp.timestamp_millis())
             .max()
             .unwrap_or_else(|| Utc::now().timestamp_millis());
-        let disposition = match state.storage.pi_live_hint_disposition(
+        let disposition = match state.storage.pi_session_message_disposition(
             &payload.host,
             &payload.session_id,
             payload.process_instance_id.as_deref(),
@@ -3273,27 +2825,6 @@ mod observed_subagent_tests {
         assert!(validate_context_savings_batch(&payload).is_ok());
     }
 
-    fn pi_envelope(protocol: u32) -> PiTrackEnvelope {
-        serde_json::from_value(serde_json::json!({
-            "protocol": protocol,
-            "extension_version": "1.2.3",
-            "min_quill_version": "0.9.0",
-            "last_error": "spool_corrupt",
-            "events": [{
-                "type": "session_start",
-                "event_uuid": "event-1",
-                "session_id": "session-1",
-                "hostname": "HOST.EXAMPLE.COM",
-                "timestamp": "2026-08-14T08:00:00Z",
-                "cwd": "/work/pi",
-                "ephemeral": true,
-                "reason": "startup",
-                "lineage": { "kind": "root" }
-            }]
-        }))
-        .expect("deserialize Pi tracking envelope")
-    }
-
     fn protocol_v2_fixture(name: &str) -> String {
         include_str!("../pi-integration/fixtures/protocol-v2.jsonl")
             .lines()
@@ -3313,33 +2844,18 @@ mod observed_subagent_tests {
             .collect()
     }
 
-    /// Event kinds `quill.ts` posts to `/api/v1/pi/track`. Every body reaching
-    /// that endpoint is built by `trackEvent` (one event) or `trackEvents` (a
-    /// batch), and both name the kind as a literal, so scanning those two call
-    /// shapes enumerates the wire without depending on the endpoint string.
+    /// Event kinds `quill.ts` posts to `/api/v1/pi/track`. Lifecycle is the
+    /// only remaining builder, and its literal call sites enumerate the wire.
     fn pi_track_event_kinds_in_extension() -> std::collections::BTreeSet<String> {
         const SOURCE: &str = include_str!("../pi-integration/quill.ts");
-        let single = regex::Regex::new(r#"trackEvent\(\s*config,\s*state,\s*info,\s*"(\w+)""#)
-            .expect("single-event pattern");
-        let batch =
-            regex::Regex::new(r#"(?s)trackEvents\(\s*config,\s*state,\s*info,\s*\[(.*?)\]\s*\)"#)
-                .expect("batch pattern");
-        let batch_kind = regex::Regex::new(r#"type:\s*"(\w+)""#).expect("batch kind pattern");
-        let mut kinds = single
+        let lifecycle =
+            regex::Regex::new(r#"trackLifecycle\(\s*config,\s*state,\s*info,\s*"(\w+)""#)
+                .expect("lifecycle pattern");
+        let kinds = lifecycle
             .captures_iter(SOURCE)
             .map(|captures| captures[1].to_owned())
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(!kinds.is_empty(), "quill.ts still posts single events");
-        let mut batches = 0;
-        for events in batch.captures_iter(SOURCE) {
-            batches += 1;
-            kinds.extend(
-                batch_kind
-                    .captures_iter(&events[1])
-                    .map(|captures| captures[1].to_owned()),
-            );
-        }
-        assert!(batches > 0, "quill.ts still posts batched events");
+        assert!(!kinds.is_empty(), "quill.ts still posts lifecycle events");
         kinds
     }
 
@@ -3667,129 +3183,6 @@ mod observed_subagent_tests {
         );
     }
 
-    // @lat: [[data-flow#Data Flow#Live Session Tracker]]
-    #[tokio::test]
-    async fn real_pi_router_folds_protocol_v1_hints_into_live_state() {
-        let client = reqwest::Client::new();
-        let state = pi_route_state(false);
-        let url = spawn_pi_route(Arc::clone(&state)).await;
-
-        let response = client
-            .post(&url)
-            .bearer_auth("route-secret")
-            .body(
-                serde_json::json!({
-                    "protocol": PI_TRACK_PROTOCOL,
-                    "extension_version": "0.2.0",
-                    "min_quill_version": "0.9.0",
-                    "events": [
-                        {
-                            "type": "session_start",
-                            "event_uuid": "hint-start",
-                            "session_id": "hint-session",
-                            "hostname": "pi-host",
-                            "timestamp": "2026-08-18T02:00:00Z",
-                            "cwd": "/work/pi",
-                            "reason": "startup",
-                            "lineage": { "kind": "root" }
-                        },
-                        {
-                            "type": "usage",
-                            "event_uuid": "hint-usage",
-                            "session_id": "hint-session",
-                            "hostname": "pi-host",
-                            "timestamp": "2026-08-18T02:00:01Z",
-                            "model_provider": "openai",
-                            "model": "gpt-5",
-                            "input_tokens": 5,
-                            "output_tokens": 4,
-                            "cache_read_tokens": 1,
-                            "cache_write_tokens": 6,
-                            "cost": {
-                                "input": 0.05,
-                                "output": 0.08,
-                                "cache_read": 0.01,
-                                "cache_write": 0.06,
-                                "total": 0.2
-                            }
-                        }
-                    ]
-                })
-                .to_string(),
-            )
-            .send()
-            .await
-            .expect("protocol-1 hint request");
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        assert_eq!(
-            response.json::<serde_json::Value>().await.unwrap(),
-            serde_json::json!({"status": "accepted"})
-        );
-
-        assert_eq!(
-            state.live_tracker.session_ranking_keys(),
-            vec![("pi".into(), "hint-session".into(), "pi-host".into())]
-        );
-        let rows = state.live_tracker.overlay(
-            Vec::new(),
-            "2026-08-18T00:00:00Z",
-            Some("pi-host"),
-            Some(IntegrationProvider::Pi),
-            Some(10),
-        );
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].total_tokens, 16);
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Agent Lineage Protocol]]
-    #[test]
-    fn pi_tracking_protocol_accepts_agent_lineage() {
-        let payload = serde_json::from_value::<PiTrackEnvelope>(serde_json::json!({
-            "protocol": PI_TRACK_PROTOCOL,
-            "extension_version": "1.2.3",
-            "min_quill_version": "0.9.0",
-            "events": [{
-                "type": "session_start",
-                "event_uuid": "event-agent",
-                "session_id": "child",
-                "hostname": "host",
-                "timestamp": "2026-08-14T08:00:00Z",
-                "cwd": "/work/pi",
-                "ephemeral": false,
-                "reason": "startup",
-                "lineage": {
-                    "kind": "agent",
-                    "parent_session_id": "parent"
-                }
-            }]
-        }));
-
-        assert!(
-            payload.is_ok(),
-            "agent lineage must cross the tracking protocol"
-        );
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Tracking Request Validation]]
-    #[test]
-    fn pi_track_rejects_bad_auth_and_protocol_with_typed_statuses() {
-        let headers = HeaderMap::new();
-        assert_eq!(
-            validate_pi_track_auth(&headers, "secret"),
-            StatusCode::UNAUTHORIZED
-        );
-
-        let error = validate_pi_track_envelope(&pi_envelope(PI_TRACK_PROTOCOL + 1))
-            .expect_err("reject protocol mismatch");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert_eq!(error.code, "protocol_mismatch");
-
-        let mut payload = pi_envelope(PI_TRACK_PROTOCOL);
-        payload.events[0].hostname = "host\nforged".into();
-        let error = validate_pi_track_envelope(&payload).expect_err("reject control hostname");
-        assert_eq!(error.code, "invalid_event");
-    }
-
     // @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Pushed Search Parent]]
     #[test]
     fn pi_notify_parent_uses_pushed_proof_instead_of_transcript_parent() {
@@ -4075,113 +3468,6 @@ mod observed_subagent_tests {
         validate_session_messages_payload(&mut payload).expect("validate Pi runtime payload");
 
         assert_eq!(payload.host, "host");
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Demo Gate]]
-    #[test]
-    #[serial_test::serial]
-    fn pi_track_demo_mode_ingests_nothing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
-        let tracker = crate::live_tracker::LiveTracker::new(None);
-
-        let error = ingest_pi_track(&storage, &tracker, &pi_envelope(PI_TRACK_PROTOCOL), true)
-            .expect_err("demo gate");
-        assert_eq!(error.code, "demo_mode");
-        assert!(tracker.session_ranking_keys().is_empty());
-        assert!(
-            storage
-                .get_setting("pi_extension.last_seen")
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Tracking Ingestion]]
-    #[test]
-    #[serial_test::serial]
-    fn pi_track_ingests_lowercase_hostname_lifecycle_and_health() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
-        let tracker = crate::live_tracker::LiveTracker::new(None);
-
-        ingest_pi_track(&storage, &tracker, &pi_envelope(PI_TRACK_PROTOCOL), false).unwrap();
-
-        assert_eq!(
-            tracker.session_ranking_keys(),
-            vec![("pi".into(), "session-1".into(), "host".into())]
-        );
-        assert_eq!(
-            storage
-                .get_setting("pi_extension.last_error")
-                .unwrap()
-                .as_deref(),
-            Some("spool_corrupt")
-        );
-    }
-
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Tracking Replay And Live Totals]]
-    #[test]
-    #[serial_test::serial]
-    fn pi_track_usage_replay_is_deduplicated_and_keeps_live_tokens_cumulative() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
-        let tracker = crate::live_tracker::LiveTracker::new(None);
-        let payload: PiTrackEnvelope = serde_json::from_value(serde_json::json!({
-            "protocol": PI_TRACK_PROTOCOL,
-            "extension_version": "1.2.3",
-            "min_quill_version": "0.9.0",
-            "events": [
-                {
-                    "type": "session_start",
-                    "event_uuid": "start-1",
-                    "session_id": "usage-session",
-                    "hostname": "HOST.EXAMPLE.COM",
-                    "timestamp": "2026-08-14T08:00:00Z",
-                    "cwd": "/work/pi",
-                    "reason": "startup",
-                    "lineage": { "kind": "root" }
-                },
-                {
-                    "type": "usage",
-                    "event_uuid": "usage-1",
-                    "session_id": "usage-session",
-                    "hostname": "HOST.EXAMPLE.COM",
-                    "timestamp": "2026-08-14T08:00:01Z",
-                    "model_provider": "anthropic",
-                    "model": "claude-sonnet-4-5",
-                    "input_tokens": 10,
-                    "output_tokens": 20,
-                    "cache_read_tokens": 30,
-                    "cache_write_tokens": 40,
-                    "cost": {
-                        "input": 0.01,
-                        "output": 0.02,
-                        "cache_read": 0.03,
-                        "cache_write": 0.04,
-                        "total": 0.10
-                    }
-                }
-            ]
-        }))
-        .expect("deserialize Pi usage envelope");
-
-        ingest_pi_track(&storage, &tracker, &payload, false).unwrap();
-        ingest_pi_track(&storage, &tracker, &payload, false).unwrap();
-
-        let rows = tracker.overlay(
-            Vec::new(),
-            "2026-08-14T00:00:00Z",
-            Some("host"),
-            Some(IntegrationProvider::Pi),
-            Some(10),
-        );
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].total_tokens, 100);
-        let overview = storage
-            .get_model_usage_overview(crate::models::ModelRange::SevenDays, Some("pi"))
-            .expect("read pushed Pi usage");
-        assert_eq!(overview.totals.total_tokens, 100);
     }
 
     // @lat: [[pi-spool-tests#Pi Spool Retirement Test Specs#Cutover sequencing]]

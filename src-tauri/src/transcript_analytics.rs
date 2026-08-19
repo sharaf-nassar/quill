@@ -2236,6 +2236,37 @@ mod tests {
         discovered_source(provider, path, layout_hint)
     }
 
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Persisted Turn Recovery]]
+    #[test]
+    fn persisted_pi_corpus_derives_source_owned_response_times() {
+        let dir = TempDir::new().expect("corpus directory");
+        let session_id = "01a018c8-2867-71be-a72b-cdf822ddbe75";
+        let path = dir.path().join("root.jsonl");
+        std::fs::write(&path, include_str!("fixtures/pi-parity-corpus/root.jsonl"))
+            .expect("write corpus session");
+        let source_key = crate::storage::pi_source_key(TEST_HOSTNAME, session_id)
+            .expect("canonical Pi source key");
+        let source = DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: source_root_key(IntegrationProvider::Pi),
+            source_key: source_key.clone(),
+            filesystem_path: path.clone(),
+            canonical_path: path,
+            layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
+        };
+
+        let parsed = parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+            .expect("parse persisted Pi session");
+        assert_eq!(parsed.snapshot.response_times.len(), 1);
+        assert!(
+            parsed
+                .snapshot
+                .response_times
+                .iter()
+                .all(|row| row.source_key == source_key)
+        );
+    }
+
     fn set_mtime_ns(path: &Path, mtime_ns: i64) {
         let file = File::options()
             .write(true)

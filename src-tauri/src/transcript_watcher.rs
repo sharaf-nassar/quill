@@ -436,12 +436,22 @@ mod tests {
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Recovery]]
     #[test]
+    #[serial]
     fn configured_roots_include_persisted_pi() {
+        let prior = std::env::var("QUILL_DEMO_MODE").ok();
+        unsafe { std::env::set_var("QUILL_DEMO_MODE", "1") };
         assert!(
             transcript_roots()
                 .iter()
                 .any(|root| root.provider == IntegrationProvider::Pi)
         );
+        unsafe {
+            if let Some(prior) = prior {
+                std::env::set_var("QUILL_DEMO_MODE", prior);
+            } else {
+                std::env::remove_var("QUILL_DEMO_MODE");
+            }
+        }
     }
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Recovery]]

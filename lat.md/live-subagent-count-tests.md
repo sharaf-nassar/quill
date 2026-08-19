@@ -206,11 +206,11 @@ A rewritten file is shorter than the offset already consumed, which clears the a
 
 Pi activity advances from `user`, `assistant`, and `toolResult` entries only, so custom extension records, the reporter's own `quill-tracking` entry, and thinking-level and compaction markers written after a turn cannot reopen a finished session.
 
-## Live Tracker Pi Push Parity
+## Pi Corpus Fold Regression
 
-A Pi session folded from its own file and the same session reported by the extension present the identical Sessions row, down to the serialized field, because the file states everything the push reports.
+The real headless Pi corpus folds `cliproxyapi/gpt-5.6-luna` with root `21482`, parent `87413`, child `8828`, and recorded activity timestamps.
 
-Both producers running at once converge on that one row rather than a second identity: the fold leaves pushed lineage alone, and a message neither has seen yet reaches the total exactly once in whichever order the two observe it.
+Its nested child is omitted as a row and appears on the parent agent rail as `delegate`; the foreign pi-subagents artifact is rejected.
 
 ## Live Tracker Read Overlay
 
