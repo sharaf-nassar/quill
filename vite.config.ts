@@ -58,7 +58,7 @@ export default defineConfig({
     port: 8181,
     strictPort: true,
     watch: {
-      ignored: ["**/src-tauri/**"],
+      ignored: ["**/src-tauri/**", "**/.worktrees/**"],
     },
   },
   build: {

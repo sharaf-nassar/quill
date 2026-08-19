@@ -91,6 +91,8 @@ A live Pi row renders the cumulative total maintained by pushed usage instead of
 
 An explicitly marked Pi subagent becomes a live agent on its resolved root with model, validated launcher role, count, runtime, and activity while its child session row is omitted; generic Pi links remain separate.
 
+While any child stays open, the root's activity reads as the overlay instant itself rather than the newest transcript flush, so a root turn-settle terminal older than that instant can never present the rail's session as ended while its agents are still working.
+
 ## Depth-Bounded Agent Projection
 
 Nested explicit agents preserve direct lineage internally but flatten into one visible root rail.

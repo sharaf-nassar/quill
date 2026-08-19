@@ -47,7 +47,9 @@ Tier-1 normalization is a pure function of the stored string (strip Pi's
 backfill, and no backend field while its only consumer is chart grouping —
 `get_model_sessions` has no frontend caller. Frontend
 `normalizeModelId()` + Model-dimension regroup, filed as `quill-dbs1`,
-unlanded as of this writing. Tier-2 (catalog/alias knowledge not derivable
+landed in `844ceaf`: the helper lives at
+`src/components/widget/chartDimensions.ts:35` and Model grouping keys on
+`model:${normalized}` at `:60`, with no schema or backend change. Tier-2 (catalog/alias knowledge not derivable
 from the string, e.g. mapping dated `claude-haiku-4-5-20251001` to a
 family, or vendor-labeling cross-routed traffic) requires a sibling
 derived column with versioned re-stamping — the migration-29 playbook.

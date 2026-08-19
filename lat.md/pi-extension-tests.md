@@ -51,11 +51,13 @@ Pi names the session file at start but writes it only once the first assistant m
 
 ## Environment Agent Lineage
 
-A Pi process marked as a subagent uses its validated parent-session environment id when its fresh session header has no parent path, and pushes explicit agent lineage to tracking and search notify.
+A Pi process marked as a subagent uses its validated parent-session environment id when its fresh session header has no parent path, and pushes explicit agent lineage with the launcher's agent role to tracking and search notify.
+
+The session start carries the launcher's validated agent-name environment value as the agent role, so the rail can name the child before its transcript first flushes. An unmarked process never sends a role even when that environment value leaks.
 
 ## Invalid Environment Agent Lineage
 
-A marked Pi subagent with an unusable parent-session environment id pushes unresolved proof instead of masquerading as a root session.
+A marked Pi subagent with an unusable parent-session environment id pushes unresolved proof instead of masquerading as a root session, and an unusable agent-name environment value is omitted rather than sent.
 
 ## Invalid Header Agent Lineage
 

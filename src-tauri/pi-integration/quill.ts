@@ -1138,7 +1138,11 @@ function resolveStart(event, info) {
       previousSessionId = undefined;
     }
   }
-  return { lineage, previousSessionId };
+  // A marked child's launcher names its role; agent and unresolved lineage
+  // are the only kinds the tracking endpoint accepts a role for.
+  const envRole = process.env.PI_SUBAGENT_CHILD_AGENT;
+  const agentRole = subagent && trackedName(envRole) ? envRole : undefined;
+  return { lineage, previousSessionId, agentRole };
 }
 
 export function buildProtocolV2Event(fields) {
@@ -1540,6 +1544,7 @@ function persistLifecycle(config, state, info, type, fields) {
       ? { previous_session_id: fields.previous_session_id }
       : {}),
     ...(fields.lineage ? { lineage: fields.lineage } : {}),
+    ...(fields.agent_role ? { agent_role: fields.agent_role } : {}),
   });
   const entry = buildQuillTrackingEntry(event);
   try {
@@ -1627,7 +1632,10 @@ function registerTracking(pi, config, trackingOnlyChild) {
     defer(config, () => {
       const info = sessionInfo(ctx);
       if (!info.file) return;
-      const { lineage, previousSessionId } = resolveStart(event, info);
+      const { lineage, previousSessionId, agentRole } = resolveStart(
+        event,
+        info,
+      );
       state.notify = { info, lineage };
       postTelemetry(config, event, ctx, EVENT_MAP.session_start);
       const handshake = trackLifecycle(config, state, info, "session_start", {
@@ -1636,6 +1644,7 @@ function registerTracking(pi, config, trackingOnlyChild) {
           ? { previous_session_id: previousSessionId }
           : {}),
         lineage,
+        ...(agentRole ? { agent_role: agentRole } : {}),
       });
       void notifySession(config, state, info, lineage);
       return handshake;

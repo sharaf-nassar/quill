@@ -147,11 +147,13 @@ async function withHome(config, run) {
   const oldHome = process.env.HOME;
   const oldChild = process.env.PI_SUBAGENT_CHILD;
   const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
+  const oldAgent = process.env.PI_SUBAGENT_CHILD_AGENT;
   const oldDebug = process.env.QUILL_DEBUG;
   process.env.HOME = root;
   delete process.env.QUILL_DEBUG;
   delete process.env.PI_SUBAGENT_CHILD;
   delete process.env.PI_SUBAGENT_PARENT_SESSION;
+  delete process.env.PI_SUBAGENT_CHILD_AGENT;
   try {
     return await run(root);
   } finally {
@@ -161,6 +163,8 @@ async function withHome(config, run) {
     else process.env.PI_SUBAGENT_CHILD = oldChild;
     if (oldParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
     else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
+    if (oldAgent === undefined) delete process.env.PI_SUBAGENT_CHILD_AGENT;
+    else process.env.PI_SUBAGENT_CHILD_AGENT = oldAgent;
     if (oldDebug === undefined) delete process.env.QUILL_DEBUG;
     else process.env.QUILL_DEBUG = oldDebug;
     rmSync(root, { recursive: true, force: true });
@@ -666,6 +670,8 @@ test("session start resolves lineage once and notifies only persisted sessions",
           sessionFile: child,
           parentSession: parent,
         });
+        // A leaked launcher role never rides along without the child marker.
+        process.env.PI_SUBAGENT_CHILD_AGENT = "researcher";
         pi.handlers.get("session_start")[0](
           {
             type: "session_start",
@@ -683,6 +689,7 @@ test("session start resolves lineage once and notifies only persisted sessions",
           parent_session_id: "parent-id",
         });
         assert.equal(start.previous_session_id, "parent-id");
+        assert.equal("agent_role" in start, false);
         const notify = calls.find((call) =>
           call.url.endsWith("/api/v1/sessions/notify"),
         );
@@ -747,6 +754,7 @@ test("env-marked Pi child reports agent lineage without a parent header", async 
       const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
       process.env.PI_SUBAGENT_CHILD = "1";
       process.env.PI_SUBAGENT_PARENT_SESSION = "parent-id";
+      process.env.PI_SUBAGENT_CHILD_AGENT = "researcher";
       globalThis.fetch = async (url, options) => {
         calls.push({ url: String(url), body: JSON.parse(options.body) });
         return { ok: true, status: 202, body: { cancel: async () => {} } };
@@ -759,11 +767,11 @@ test("env-marked Pi child reports agent lineage without a parent header", async 
         await flushRequests();
 
         const lineage = { kind: "agent", parent_session_id: "parent-id" };
-        assert.deepEqual(
-          calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body
-            .events[0].lineage,
-          lineage,
-        );
+        const start = calls.find((call) =>
+          call.url.endsWith("/api/v1/pi/track"),
+        ).body.events[0];
+        assert.deepEqual(start.lineage, lineage);
+        assert.equal(start.agent_role, "researcher");
         assert.deepEqual(
           calls.find((call) => call.url.endsWith("/api/v1/sessions/notify"))
             .body.lineage,
@@ -794,6 +802,7 @@ test("env-marked Pi child with an invalid parent reports unresolved lineage", as
       const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
       process.env.PI_SUBAGENT_CHILD = "1";
       process.env.PI_SUBAGENT_PARENT_SESSION = " parent-id ";
+      process.env.PI_SUBAGENT_CHILD_AGENT = " padded role ";
       globalThis.fetch = async (url, options) => {
         calls.push({ url: String(url), body: JSON.parse(options.body) });
         return { ok: true, status: 202, body: { cancel: async () => {} } };
@@ -805,11 +814,14 @@ test("env-marked Pi child with an invalid parent reports unresolved lineage", as
         );
         await flushRequests();
 
-        assert.deepEqual(
-          calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body
-            .events[0].lineage,
-          { kind: "unresolved", reason: "subagent_parent_unavailable" },
-        );
+        const start = calls.find((call) =>
+          call.url.endsWith("/api/v1/pi/track"),
+        ).body.events[0];
+        assert.deepEqual(start.lineage, {
+          kind: "unresolved",
+          reason: "subagent_parent_unavailable",
+        });
+        assert.equal("agent_role" in start, false);
       } finally {
         globalThis.fetch = oldFetch;
         if (oldChild === undefined) delete process.env.PI_SUBAGENT_CHILD;

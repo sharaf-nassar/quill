@@ -1277,14 +1277,12 @@ impl LiveTracker {
                                     .is_some_and(|root| !root.recovering) =>
                         {
                             agent_child_keys.insert(child_key.clone());
-                            agent_activity_by_parent
-                                .entry(root_key.clone())
-                                .and_modify(|activity| {
-                                    if child.last_activity > *activity {
-                                        *activity = child.last_activity;
-                                    }
-                                })
-                                .or_insert(child.last_activity);
+                            // An open child is positive liveness at this
+                            // instant, not stale transcript recency: while any
+                            // child stays open its root reads as active now, so
+                            // a root turn-settle terminal cannot outrank the
+                            // rail and hide agents that are still working.
+                            agent_activity_by_parent.insert(root_key.clone(), now);
                             agents_by_parent.entry(root_key).or_default().push(
                                 ObservedSessionAgent {
                                     agent_id: child_key.session_id.clone(),
@@ -2909,7 +2907,9 @@ mod tests {
                 .runtime_as_of_ms
                 .is_some_and(|timestamp| timestamp >= now.timestamp_millis())
         );
-        assert!(utc(&parent.last_active).is_some_and(|last_active| last_active >= agent_started));
+        // An open child keeps the root current: a Stop-derived terminal older
+        // than this instant can never outrank the rail while agents work.
+        assert!(utc(&parent.last_active).is_some_and(|last_active| last_active >= now));
         assert_eq!(
             parent.live_linked_sessions.as_ref().unwrap()[0].session_id,
             "linked"
