@@ -22,27 +22,21 @@ A pushed Pi session with no shutdown ages out through the shared 15-minute idle 
 
 Persisted Pi work never renders the retired EPHEMERAL badge. The additive database field remains inert for schema compatibility, while no-file sessions intentionally produce no row.
 
-## Extension Health Persistence
-
-One atomic settings write records the handshake protocol, extension version, minimum Quill version, last report time, and typed last error.
-
-An unchanged handshake repeated inside the refresh window writes nothing, while any changed field writes through at once.
-
 ## Authenticated Protocol v2 Router
 
-The real `/api/v1/pi/track` router authenticates and validates canonical reporter identity before lifecycle mutation.
+The real `/api/v1/pi/track` router authenticates and validates protocol-2 lifecycle before mutation.
 
-It bounds the body at 1 MiB, matches identity/generation headers to the envelope, feeds exact fixture bytes through the open protocol-v2 decoder, and returns typed `400`, `401`, `409`, `426`, `429`, and `503` responses.
+It bounds the body at 1 MiB, feeds exact fixture bytes through the open protocol-v2 decoder, and returns typed `400`, `401`, `409`, `429`, and `503` responses. Reporter/build/capability metadata remains bounded and non-empty but is not an exact desktop-generation latch.
 
-Accepted responses include exact Quill build, protocol, reporter version, capability digest, and ordered dispositions. Authenticated mismatch, unknown-session, rate, and availability outcomes write typed reporter health; successful evidence recovers only the matching subject and dimension.
+Accepted responses include current Quill build, protocol, reporter version, capability digest, and ordered dispositions. A legacy protocol-2 generation is accepted; a different protocol receives `400` without reporter-health persistence or reload remediation.
 
 ## Extension Track Wire Contract
 
-Every payload builder in the extension that posts to `/api/v1/pi/track` has a generated wire fixture, and the real router answers each one's exact request bytes and reporter headers.
+Every payload builder in the extension that posts to `/api/v1/pi/track` has a generated wire fixture, and the real router answers each one's exact request bytes and lifecycle identity headers.
 
 The lifecycle builders are enumerated from the extension source rather than from the endpoint string, so a new tracking shape fails the suite until it carries a fixture.
 
-Only protocol-2 lifecycle shapes are accepted; any other generation receives the typed mismatch response.
+Only protocol-2 lifecycle shapes are accepted; reporter, build, and capability generation metadata may be older.
 
 ## Transactional Lifecycle Disposition
 
@@ -52,11 +46,11 @@ Only committed `applied` events mutate `LiveTracker`; newer process starts super
 
 Durable open rows load as recovering after restart or tracking re-enable. Same-process lifecycle evidence can prove them live; a mismatched process is stale and an absent or closed lifecycle returns `unknown_session`.
 
-## Lifecycle Recovery And Source Diagnostic
+## Lifecycle Recovery
 
-A persistent Pi session replays its start envelope every 30 seconds. Shutdown, reporter release, or generation mismatch stops recovery from reviving an ended or incompatible session.
+A persistent Pi session sends its start once. Fold sweeps recover local persisted sessions, while `409 unknown_session` triggers one targeted start reannouncement before retrying the current lifecycle event.
 
-A live start without a reconciled file records `source_not_persisted`; validated notify or committed persisted-source reconciliation clears only that process's diagnostic.
+Durable lifecycle and receipt rows remain for remote-host ordering, idempotency, and lineage; no reporter-health diagnostic row is created.
 
 ## Persisted Turn Recovery
 

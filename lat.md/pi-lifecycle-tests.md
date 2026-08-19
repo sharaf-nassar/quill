@@ -40,7 +40,7 @@ Install and uninstall preserve existing AGENTS.md bytes and unrelated Pi extensi
 
 ## Transactional repair rollback
 
-A repair failure after config, reporter bytes, and database gates change restores exact prior config, extension, instruction/state bytes, and reporter/listener settings through [[src-tauri/src/integrations/pi.rs#restore_reporter_settings]].
+A repair failure after config, extension bytes, and database gates change restores exact prior config, extension, instruction/state bytes, and lifecycle-ingestion/listener settings through [[src-tauri/src/integrations/pi.rs#restore_reporter_settings]].
 
 ## Crash Recovery
 
@@ -78,11 +78,9 @@ Saved enablement cannot hide a fresh version, path, or writability error reporte
 
 Install enables the setting-gated loopback context listener, uninstall persists it false, and both changes share the recoverable deployment transaction.
 
-## Reload and disable status
+## Disable status
 
-Install and repair require a Pi reload until Quill observes the exact reporter generation.
-
-Disable immediately gates every reporter channel and exposes typed disabled remediation without removing npm, project, development, or foreign files.
+Disable immediately gates lifecycle ingestion and removes Quill-owned files without generation-health remediation.
 
 ## Feature-gated Payload
 

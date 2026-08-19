@@ -146,21 +146,6 @@
   color: var(--provider-pi);
 }
 
-.pi-extension-health {
-  display: block;
-  margin-top: 2px;
-  color: var(--faint);
-  font-variant-numeric: tabular-nums;
-}
-
-.pi-extension-health[data-state="never_connected"] {
-  color: var(--meter-amber);
-}
-
-.pi-extension-health[data-state="alive"] {
-  color: var(--meter-green);
-}
-
 .settings-rollup-status {
   overflow-wrap: anywhere;
   font-variant-numeric: tabular-nums;

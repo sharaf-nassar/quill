@@ -146,21 +146,6 @@ const providerStatuses: ProviderStatus[] = [
     userHasMadeChoice: true,
     lastError: null,
     lastVerifiedAt: iso(2 * M),
-    piExtensionHealth: {
-      state: "alive",
-      lastSeen: iso(20 * 1000),
-      protocol: "2",
-      extensionVersion: "0.2.0",
-      minQuillVersion: "0.9.0",
-      lastError: null,
-      affectedReporters: 0,
-      affectedSessions: 0,
-      remediation: null,
-      lastRecoveredAt: iso(4 * M),
-      requiredProtocol: null,
-      requiredExtensionVersion: null,
-      requiredQuillVersion: null,
-    },
   },
   // Enabled but not answering: exercises the widget LIMITS row's SETUP state
   // (paired with the `auth` provider error below), which is the only way to

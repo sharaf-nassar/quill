@@ -24,8 +24,8 @@ use crate::integrations::IntegrationProvider;
 use crate::models::{
     ContextSavingsEventPayload, ContextSavingsEventsBatchPayload, LearnedRulePayload,
     LearningRunPayload, ObservationPayload, ObservedHookObservation, PiLineage,
-    PiProtocolV2ErrorCode, PiProtocolV2Generation, PiProtocolV2Outcome, PiProtocolV2Response,
-    SessionMessagePayload, SessionMessagesPayload, SessionNotifyPayload, TokenReportPayload,
+    PiProtocolV2ErrorCode, PiProtocolV2Outcome, PiProtocolV2Response, SessionMessagePayload,
+    SessionMessagesPayload, SessionNotifyPayload, TokenReportPayload,
 };
 use crate::sessions;
 use crate::storage::Storage;
@@ -68,8 +68,6 @@ const RETAINED_VALIDATE_RETRY_CAP: u32 = 5;
 const PI_SPOOL_RETIRE_INTERVAL: Duration = Duration::from_secs(15);
 const PI_SPOOL_RETIRE_GAP: &str = "spool_retired_without_import";
 const PI_REPORTER_ENABLED_KEY: &str = "pi_reporter.enabled";
-const PI_REPORTER_RELOAD_REQUIRED_KEY: &str = "pi_reporter.reload_required";
-const PI_REPORTER_EXACT_SEEN_KEY: &str = "pi_reporter.exact_seen";
 
 struct PendingSessionNotify {
     generation: u64,
@@ -581,27 +579,13 @@ fn pi_spool_root() -> PathBuf {
         .join("pi-spool")
 }
 
-fn pi_generation_key() -> String {
-    let generation = pi_required_generation();
-    format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-        generation.protocol,
-        generation.reporter_version,
-        generation.quill_build,
-        generation.capability_digest
-    )
-}
-
 fn pi_spool_retirement_ready(storage: &Storage) -> bool {
     matches!(
         (
             storage.get_setting("pi_spool_cleanup_pending"),
             storage.get_setting("pi_persisted_source_reconciliation_pending"),
-            storage.get_setting(PI_REPORTER_RELOAD_REQUIRED_KEY),
-            storage.get_setting(PI_REPORTER_EXACT_SEEN_KEY),
         ),
-        (Ok(Some(pending)), Ok(None), Ok(Some(reload)), Ok(Some(exact)))
-            if pending == "1" && reload == "false" && exact == pi_generation_key()
+        (Ok(Some(pending)), Ok(None)) if pending == "1"
     )
 }
 
@@ -644,164 +628,26 @@ fn pi_track_router(state: Arc<PiTrackRouteState>) -> Router {
         .with_state(state)
 }
 
-fn pi_reporter_health_subject(
-    headers: &HeaderMap,
-) -> Result<Option<crate::pi_tracking::PiReporterHealthSubject>, String> {
-    let values = [
-        crate::pi_tracking::PI_REPORTER_HOST_HEADER,
-        crate::pi_tracking::PI_REPORTER_PROCESS_HEADER,
-        crate::pi_tracking::PI_REPORTER_CHANNEL_HEADER,
-        crate::pi_tracking::PI_REPORTER_PROTOCOL_HEADER,
-        crate::pi_tracking::PI_REPORTER_VERSION_HEADER,
-        crate::pi_tracking::PI_REPORTER_BUILD_HEADER,
-        crate::pi_tracking::PI_REPORTER_CAPABILITY_HEADER,
-    ]
-    .map(|name| {
-        headers
-            .get(name)
-            .map(|value| value.to_str().map(str::to_owned))
-            .transpose()
-            .map_err(|_| format!("Invalid {name} header"))
-    });
-    let [
-        host,
-        process,
-        channel,
-        protocol,
-        reporter,
-        build,
-        capability,
-    ] = values;
-    let [
-        host,
-        process,
-        channel,
-        protocol,
-        reporter,
-        build,
-        capability,
-    ] = [
-        host?,
-        process?,
-        channel?,
-        protocol?,
-        reporter?,
-        build?,
-        capability?,
-    ];
-    if [
-        host.is_some(),
-        process.is_some(),
-        channel.is_some(),
-        protocol.is_some(),
-        reporter.is_some(),
-        build.is_some(),
-        capability.is_some(),
-    ]
-    .into_iter()
-    .all(|present| !present)
-    {
-        return Ok(None);
-    }
-    let protocol = protocol
-        .ok_or_else(|| "Missing Pi reporter protocol header".to_owned())?
-        .parse::<u32>()
-        .map_err(|_| "Invalid Pi reporter protocol header".to_owned())?;
-    crate::pi_tracking::PiReporterHealthSubject::new(
-        host.as_deref()
-            .ok_or_else(|| "Missing Pi reporter host header".to_owned())?,
-        process
-            .as_deref()
-            .ok_or_else(|| "Missing Pi reporter process header".to_owned())?,
-        channel
-            .as_deref()
-            .ok_or_else(|| "Missing Pi reporter channel header".to_owned())?,
-        protocol,
-        reporter
-            .as_deref()
-            .ok_or_else(|| "Missing Pi reporter version header".to_owned())?,
-        build
-            .as_deref()
-            .ok_or_else(|| "Missing Pi reporter build header".to_owned())?,
-        capability
-            .as_deref()
-            .ok_or_else(|| "Missing Pi reporter capability header".to_owned())?,
-    )
-    .map(Some)
-}
-
-fn record_pi_telemetry_status(
-    storage: &Storage,
-    subject: Option<&crate::pi_tracking::PiReporterHealthSubject>,
-    status: StatusCode,
-) {
-    let Some(subject) = subject else {
-        return;
-    };
-    let now_ms = Utc::now().timestamp_millis();
-    let result = if status.is_success() {
-        storage.record_pi_reporter_recovery(
-            subject,
-            crate::pi_tracking::PiReporterHealthDimension::Transport,
-            now_ms,
-        )
-    } else {
-        storage.record_pi_reporter_failure(
-            subject,
-            crate::pi_tracking::PiReporterHealthCode::TelemetryRejected,
-            1,
-            now_ms,
-        )
-    };
-    if let Err(error) = result {
-        log::warn!("Could not persist Pi telemetry health: {error}");
-    }
-}
-
-fn pi_required_generation() -> PiProtocolV2Generation {
-    PiProtocolV2Generation {
-        protocol: crate::pi_tracking::PI_PROTOCOL_V2,
-        reporter_version: crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION.to_owned(),
-        quill_build: crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD.to_owned(),
-        capability_digest: crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST.to_owned(),
-    }
-}
-
 fn pi_v2_error(
     status: StatusCode,
     code: PiProtocolV2ErrorCode,
     message: impl Into<String>,
     retry_after_ms: Option<u64>,
 ) -> Response {
-    let required = matches!(
-        code,
-        PiProtocolV2ErrorCode::ProtocolMismatch
-            | PiProtocolV2ErrorCode::ReporterVersionMismatch
-            | PiProtocolV2ErrorCode::QuillBuildMismatch
-            | PiProtocolV2ErrorCode::CapabilityMismatch
-    )
-    .then(pi_required_generation);
     (
         status,
         Json(PiProtocolV2Response::Error {
             code,
             message: message.into(),
-            required,
+            required: None,
             retry_after_ms,
         }),
     )
         .into_response()
 }
 
-fn pi_decode_status(code: PiProtocolV2ErrorCode) -> StatusCode {
-    match code {
-        PiProtocolV2ErrorCode::ProtocolMismatch
-        | PiProtocolV2ErrorCode::ReporterVersionMismatch
-        | PiProtocolV2ErrorCode::QuillBuildMismatch
-        | PiProtocolV2ErrorCode::CapabilityMismatch
-        | PiProtocolV2ErrorCode::TrackingSchemaMismatch => StatusCode::UPGRADE_REQUIRED,
-        _ => StatusCode::BAD_REQUEST,
-    }
+fn pi_decode_status(_code: PiProtocolV2ErrorCode) -> StatusCode {
+    StatusCode::BAD_REQUEST
 }
 
 // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Authenticated Protocol v2 Router]]
@@ -818,17 +664,6 @@ async fn post_pi_track(
             None,
         );
     }
-    let reporter_subject = match pi_reporter_health_subject(&headers) {
-        Ok(subject) => subject,
-        Err(error) => {
-            return pi_v2_error(
-                StatusCode::BAD_REQUEST,
-                PiProtocolV2ErrorCode::InvalidEnvelope,
-                error,
-                None,
-            );
-        }
-    };
     if state
         .storage
         .get_setting(PI_REPORTER_ENABLED_KEY)
@@ -858,21 +693,6 @@ async fn post_pi_track(
     let payload = match crate::pi_tracking::decode_protocol_v2_envelope(&bytes) {
         Ok(payload) => payload,
         Err(error) => {
-            if let Some(code) = crate::pi_tracking::PiReporterHealthCode::from_str(
-                &serde_json::to_value(error.code)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_default(),
-            ) && let Some(subject) = reporter_subject.as_ref()
-                && let Err(health_error) = state.storage.record_pi_reporter_failure(
-                    subject,
-                    code,
-                    1,
-                    Utc::now().timestamp_millis(),
-                )
-            {
-                log::warn!("Could not persist Pi compatibility health: {health_error}");
-            }
             return pi_v2_error(
                 pi_decode_status(error.code),
                 error.code,
@@ -881,36 +701,7 @@ async fn post_pi_track(
             );
         }
     };
-    if let Some(subject) = reporter_subject.as_ref() {
-        let envelope_subject = match crate::pi_tracking::PiReporterHealthSubject::from_envelope(
-            &payload,
-            &subject.install_channel,
-        ) {
-            Ok(subject) => subject,
-            Err(error) => {
-                return pi_v2_error(
-                    StatusCode::BAD_REQUEST,
-                    PiProtocolV2ErrorCode::InvalidEnvelope,
-                    error,
-                    None,
-                );
-            }
-        };
-        if envelope_subject != *subject {
-            return pi_v2_error(
-                StatusCode::BAD_REQUEST,
-                PiProtocolV2ErrorCode::InvalidEnvelope,
-                "Pi reporter headers do not match envelope identity",
-                None,
-            );
-        }
-    }
     if state.demo_mode || crate::ingest_is_quiesced() {
-        record_pi_telemetry_status(
-            state.storage,
-            reporter_subject.as_ref(),
-            StatusCode::SERVICE_UNAVAILABLE,
-        );
         return pi_v2_error(
             StatusCode::SERVICE_UNAVAILABLE,
             PiProtocolV2ErrorCode::Unavailable,
@@ -923,11 +714,6 @@ async fn post_pi_track(
         MAX_PI_TRACK_REQUESTS,
         payload.events.len(),
     ) {
-        record_pi_telemetry_status(
-            state.storage,
-            reporter_subject.as_ref(),
-            StatusCode::TOO_MANY_REQUESTS,
-        );
         return pi_v2_error(
             StatusCode::TOO_MANY_REQUESTS,
             PiProtocolV2ErrorCode::RateLimited,
@@ -938,10 +724,9 @@ async fn post_pi_track(
 
     let storage = state.storage;
     let committed_payload = payload.clone();
-    let committed_subject = reporter_subject.clone();
     let outcomes = match tokio::task::spawn_blocking(move || {
         crate::with_ingest_write_permit(|| {
-            storage.apply_pi_protocol_v2_envelope(&committed_payload, committed_subject.as_ref())
+            storage.apply_pi_protocol_v2_envelope(&committed_payload)
         })
     })
     .await
@@ -949,11 +734,6 @@ async fn post_pi_track(
         Ok(Ok(outcomes)) => outcomes,
         Ok(Err(error)) => {
             log::error!("Pi protocol-v2 lifecycle transaction failed: {error}");
-            record_pi_telemetry_status(
-                storage,
-                reporter_subject.as_ref(),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
             return pi_v2_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 PiProtocolV2ErrorCode::Unavailable,
@@ -963,11 +743,6 @@ async fn post_pi_track(
         }
         Err(error) => {
             log::error!("Pi protocol-v2 worker failed: {error}");
-            record_pi_telemetry_status(
-                storage,
-                reporter_subject.as_ref(),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
             return pi_v2_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 PiProtocolV2ErrorCode::Unavailable,
@@ -976,20 +751,6 @@ async fn post_pi_track(
             );
         }
     };
-
-    let exact_generation = pi_generation_key();
-    if let Err(error) = storage.set_settings_atomically(&[
-        (PI_REPORTER_RELOAD_REQUIRED_KEY, "false"),
-        (PI_REPORTER_EXACT_SEEN_KEY, &exact_generation),
-    ]) {
-        log::error!("Pi exact-reporter acknowledgement failed: {error}");
-        return pi_v2_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            PiProtocolV2ErrorCode::Unavailable,
-            "Pi reporter acknowledgement failed",
-            Some(1500),
-        );
-    }
 
     let mut changed = false;
     for (event, outcome) in payload.events.iter().zip(&outcomes) {
@@ -1001,19 +762,6 @@ async fn post_pi_track(
         let _ = app_handle.emit(crate::SESSIONS_LIVE_UPDATED_EVENT, ());
     }
     if outcomes.contains(&PiProtocolV2Outcome::UnknownSession) {
-        if let Some(subject) = reporter_subject.as_ref()
-            && let Err(error) = storage.record_pi_reporter_failure(
-                subject,
-                crate::pi_tracking::PiReporterHealthCode::UnknownSession,
-                outcomes
-                    .iter()
-                    .filter(|outcome| **outcome == PiProtocolV2Outcome::UnknownSession)
-                    .count(),
-                Utc::now().timestamp_millis(),
-            )
-        {
-            log::warn!("Could not persist Pi unknown-session health: {error}");
-        }
         return pi_v2_error(
             StatusCode::CONFLICT,
             PiProtocolV2ErrorCode::UnknownSession,
@@ -1752,28 +1500,20 @@ async fn post_hook_observed(
     if !check_auth(&headers, &state.secret) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
     }
-    let reporter_subject = match pi_reporter_health_subject(&headers) {
-        Ok(subject) => subject,
-        Err(error) => return (StatusCode::BAD_REQUEST, error),
-    };
-    let respond = |status, message: String| {
-        record_pi_telemetry_status(state.storage, reporter_subject.as_ref(), status);
-        (status, message)
-    };
     if !check_rate_limit_with_max(&state.obs_rate_limiter, MAX_OBS_REQUESTS) {
-        return respond(
+        return (
             StatusCode::TOO_MANY_REQUESTS,
             "Rate limit exceeded".to_string(),
         );
     }
     if payload.session_id.is_empty() || payload.session_id.len() > MAX_SESSION_ID_LEN {
-        return respond(StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
+        return (StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
     }
     if !is_supported_observed_hook_provider(payload.provider) {
-        return respond(StatusCode::BAD_REQUEST, "Invalid provider".to_string());
+        return (StatusCode::BAD_REQUEST, "Invalid provider".to_string());
     }
     if !is_supported_observed_hook_event(payload.provider, &payload.hook_event) {
-        return respond(
+        return (
             StatusCode::BAD_REQUEST,
             format!("Unknown hook_event: {}", payload.hook_event),
         );
@@ -1784,44 +1524,44 @@ async fn post_hook_observed(
         .as_ref()
         .is_some_and(|t| t.len() > MAX_STRING_LEN)
     {
-        return respond(StatusCode::BAD_REQUEST, "tool_name too long".to_string());
+        return (StatusCode::BAD_REQUEST, "tool_name too long".to_string());
     }
     if payload.cwd.as_ref().is_some_and(|c| c.len() > MAX_CWD_LEN) {
-        return respond(StatusCode::BAD_REQUEST, "cwd too long".to_string());
+        return (StatusCode::BAD_REQUEST, "cwd too long".to_string());
     }
     if payload
         .hostname
         .as_ref()
         .is_some_and(|hostname| hostname.len() > MAX_STRING_LEN)
     {
-        return respond(StatusCode::BAD_REQUEST, "hostname too long".to_string());
+        return (StatusCode::BAD_REQUEST, "hostname too long".to_string());
     }
     if payload
         .hook_matcher
         .as_ref()
         .is_some_and(|m| m.len() > MAX_STRING_LEN)
     {
-        return respond(StatusCode::BAD_REQUEST, "hook_matcher too long".to_string());
+        return (StatusCode::BAD_REQUEST, "hook_matcher too long".to_string());
     }
     if payload
         .agent_id
         .as_ref()
         .is_some_and(|a| a.len() > MAX_STRING_LEN)
     {
-        return respond(StatusCode::BAD_REQUEST, "agent_id too long".to_string());
+        return (StatusCode::BAD_REQUEST, "agent_id too long".to_string());
     }
     if payload.ts.is_empty() || payload.ts.len() > 64 {
-        return respond(StatusCode::BAD_REQUEST, "Invalid ts".to_string());
+        return (StatusCode::BAD_REQUEST, "Invalid ts".to_string());
     }
     if chrono::DateTime::parse_from_rfc3339(&payload.ts).is_err() {
-        return respond(
+        return (
             StatusCode::BAD_REQUEST,
             "ts must be ISO-8601 with offset".to_string(),
         );
     }
 
     store_hook_in_background(state.storage, state.app_handle.clone(), payload);
-    respond(StatusCode::ACCEPTED, "queued".to_string())
+    (StatusCode::ACCEPTED, "queued".to_string())
 }
 
 fn is_supported_observed_hook_provider(provider: IntegrationProvider) -> bool {
@@ -2144,35 +1884,16 @@ async fn post_context_savings_events(
             Json(serde_json::json!({"error": "Unauthorized"})),
         );
     }
-    let reporter_subject = match pi_reporter_health_subject(&headers) {
-        Ok(subject) => subject,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": error})),
-            );
-        }
-    };
     if !check_rate_limit_with_max(
         &state.context_savings_rate_limiter,
         MAX_CONTEXT_SAVINGS_REQUESTS,
     ) {
-        record_pi_telemetry_status(
-            state.storage,
-            reporter_subject.as_ref(),
-            StatusCode::TOO_MANY_REQUESTS,
-        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error": "Rate limit exceeded"})),
         );
     }
     if let Err(error) = validate_context_savings_batch(&payload) {
-        record_pi_telemetry_status(
-            state.storage,
-            reporter_subject.as_ref(),
-            StatusCode::BAD_REQUEST,
-        );
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": error})),
@@ -2181,17 +1902,11 @@ async fn post_context_savings_events(
 
     match state.storage.store_context_savings_events(&payload.events) {
         Ok(result) => {
-            record_pi_telemetry_status(state.storage, reporter_subject.as_ref(), StatusCode::OK);
             let _ = state.app_handle.emit("context-savings-updated", ());
             (StatusCode::OK, Json(serde_json::json!(result)))
         }
         Err(error) => {
             log::error!("Failed to store context savings events: {error}");
-            record_pi_telemetry_status(
-                state.storage,
-                reporter_subject.as_ref(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal server error"})),
@@ -2298,16 +2013,6 @@ async fn post_session_notify(
     if let Some(source) = retained_source {
         // A validated persisted source is the recovery path for an unknown
         // live session, so notify never returns a false accepted no-op.
-        if provider == IntegrationProvider::Pi
-            && let Some(host) = payload
-                .host
-                .as_deref()
-                .and_then(crate::live_tracker::normalize_observed_hostname)
-        {
-            let _ = state
-                .storage
-                .clear_pi_source_not_persisted(&host, &payload.session_id);
-        }
         // Session Search availability cannot suppress either analytics domain.
         enqueue_validated_retained_source(&state, source);
     }
@@ -2888,37 +2593,7 @@ mod observed_subagent_tests {
         url: impl reqwest::IntoUrl,
         wire: String,
     ) -> reqwest::RequestBuilder {
-        let envelope = serde_json::from_str::<serde_json::Value>(&wire).expect("reporter wire");
-        let event = &envelope["events"][0];
-        client
-            .post(url)
-            .bearer_auth("route-secret")
-            .header(
-                crate::pi_tracking::PI_REPORTER_HOST_HEADER,
-                event["normalized_host"].as_str().unwrap(),
-            )
-            .header(
-                crate::pi_tracking::PI_REPORTER_PROCESS_HEADER,
-                event["process_instance_id"].as_str().unwrap(),
-            )
-            .header(crate::pi_tracking::PI_REPORTER_CHANNEL_HEADER, "managed")
-            .header(
-                crate::pi_tracking::PI_REPORTER_PROTOCOL_HEADER,
-                envelope["protocol"].as_u64().unwrap(),
-            )
-            .header(
-                crate::pi_tracking::PI_REPORTER_VERSION_HEADER,
-                envelope["reporter_version"].as_str().unwrap(),
-            )
-            .header(
-                crate::pi_tracking::PI_REPORTER_BUILD_HEADER,
-                envelope["quill_build"].as_str().unwrap(),
-            )
-            .header(
-                crate::pi_tracking::PI_REPORTER_CAPABILITY_HEADER,
-                envelope["capability_digest"].as_str().unwrap(),
-            )
-            .body(wire)
+        client.post(url).bearer_auth("route-secret").body(wire)
     }
 
     async fn spawn_pi_route(state: Arc<PiTrackRouteState>) -> String {
@@ -2981,24 +2656,25 @@ mod observed_subagent_tests {
         .send()
         .await
         .expect("mismatch request");
-        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(matches!(
             response.json::<PiProtocolV2Response>().await.unwrap(),
             PiProtocolV2Response::Error {
                 code: PiProtocolV2ErrorCode::ProtocolMismatch,
-                required: Some(_),
+                required: None,
                 ..
             }
         ));
-        assert_eq!(
-            state
-                .storage
-                .pi_reporter_health_summary_at(Utc::now().timestamp_millis())
-                .unwrap()
-                .unwrap()
-                .worst_code,
-            Some(crate::pi_tracking::PiReporterHealthCode::ProtocolMismatch),
-        );
+        let legacy_url = spawn_pi_route(pi_route_state(false)).await;
+        let response = pi_reporter_request(
+            &client,
+            &legacy_url,
+            protocol_v2_fixture("envelope.legacy_generation"),
+        )
+        .send()
+        .await
+        .expect("legacy generation request");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
 
         let response = pi_reporter_request(&client, &url, start.clone())
             .send()
@@ -3013,23 +2689,6 @@ mod observed_subagent_tests {
                 ..
             } if outcomes == vec![PiProtocolV2Outcome::Applied]
         ));
-        assert_eq!(
-            state
-                .storage
-                .get_setting(PI_REPORTER_RELOAD_REQUIRED_KEY)
-                .unwrap()
-                .as_deref(),
-            Some("false")
-        );
-        assert_eq!(
-            state
-                .storage
-                .get_setting(PI_REPORTER_EXACT_SEEN_KEY)
-                .unwrap()
-                .as_deref(),
-            Some(pi_generation_key().as_str())
-        );
-
         let response = pi_reporter_request(&client, &url, start)
             .send()
             .await
@@ -3078,16 +2737,6 @@ mod observed_subagent_tests {
                 ..
             }
         ));
-        assert_eq!(
-            unknown_state
-                .storage
-                .pi_reporter_health_summary_at(Utc::now().timestamp_millis())
-                .unwrap()
-                .unwrap()
-                .worst_code,
-            Some(crate::pi_tracking::PiReporterHealthCode::UnknownSession),
-        );
-
         let limited = pi_route_state(false);
         limited
             .rate_limiter
@@ -3468,26 +3117,6 @@ mod observed_subagent_tests {
         validate_session_messages_payload(&mut payload).expect("validate Pi runtime payload");
 
         assert_eq!(payload.host, "host");
-    }
-
-    // @lat: [[pi-spool-tests#Pi Spool Retirement Test Specs#Cutover sequencing]]
-    #[test]
-    fn pi_spool_retirement_waits_for_reconciliation_and_exact_reporter_reload() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let storage = Storage::init_at(dir.path().join("usage.db"), false).expect("init storage");
-
-        assert!(!pi_spool_retirement_ready(&storage));
-        storage
-            .set_settings_atomically(&[
-                (PI_REPORTER_RELOAD_REQUIRED_KEY, "false"),
-                (PI_REPORTER_EXACT_SEEN_KEY, &pi_generation_key()),
-            ])
-            .unwrap();
-        assert!(!pi_spool_retirement_ready(&storage));
-        storage
-            .delete_setting("pi_persisted_source_reconciliation_pending")
-            .unwrap();
-        assert!(pi_spool_retirement_ready(&storage));
     }
 
     // @lat: [[pi-spool-tests#Pi Spool Retirement Test Specs#Cutover sequencing]]

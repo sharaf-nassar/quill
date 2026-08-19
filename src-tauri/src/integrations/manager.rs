@@ -3,13 +3,10 @@ use crate::brevity;
 use crate::integrations::cpa::{
     CpaConnectError, CpaConnectResult, CpaConnectionStatus, ValidatedCpaConnection,
 };
-use crate::integrations::types::{
-    IntegrationProvider, PiExtensionErrorKind, PiExtensionHealth, PiExtensionHealthState,
-    ProviderSetupState, ProviderStatus,
-};
+use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
 use crate::models::{ContextPreservationStatus, IntegrationFeatures};
 use crate::storage::Storage;
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::Utc;
 use tauri::{AppHandle, Emitter};
 
 const CONTEXT_PRESERVATION_ENABLED_KEY: &str = "context_preservation.enabled";
@@ -18,196 +15,6 @@ const CONTEXT_TELEMETRY_ENABLED_KEY: &str = "feature.context_telemetry.enabled";
 const BREVITY_ENABLED_KEY: &str = "feature.brevity.enabled";
 const LEGACY_PROVIDER_STATUSES_KEY: &str = "integration.providers.v1";
 const PI_PROVIDER_STATUS_KEY: &str = "integration.provider.pi.v1";
-const PI_EXTENSION_ALIVE_AFTER: TimeDelta = TimeDelta::minutes(2);
-const PI_EXTENSION_STALE_AFTER: TimeDelta = TimeDelta::minutes(15);
-
-fn pi_extension_error(value: &str) -> Option<PiExtensionErrorKind> {
-    match value {
-        "" => None,
-        "ConfigError" => Some(PiExtensionErrorKind::Config),
-        "TransportError" => Some(PiExtensionErrorKind::Transport),
-        "ProtocolMismatchError"
-        | "protocol_mismatch"
-        | "reporter_version_mismatch"
-        | "quill_build_mismatch"
-        | "capability_mismatch"
-        | "tracking_schema_mismatch" => Some(PiExtensionErrorKind::ProtocolMismatch),
-        "unknown_session" | "reannounce_required" => Some(PiExtensionErrorKind::UnknownSession),
-        "child_reporter_missing" => Some(PiExtensionErrorKind::ChildReporterMissing),
-        "source_not_persisted" | "source_recovering" => {
-            Some(PiExtensionErrorKind::SourceRecovering)
-        }
-        "reconciliation_failed" => Some(PiExtensionErrorKind::ReconciliationFailed),
-        "telemetry_rejected" | "rate_limited" | "unavailable" => {
-            Some(PiExtensionErrorKind::TelemetryRejected)
-        }
-        "saturated" => Some(PiExtensionErrorKind::Saturated),
-        "ReporterReloadRequired" => Some(PiExtensionErrorKind::ReporterReloadRequired),
-        "ReporterDisabled" => Some(PiExtensionErrorKind::Disabled),
-        "RegistrationError" => Some(PiExtensionErrorKind::Registration),
-        "SpoolError"
-        | "spool_corrupt"
-        | "spool_corrupt_gap"
-        | "spool_drop_gap"
-        | "spool_retired_without_import" => Some(PiExtensionErrorKind::Spool),
-        _ => Some(PiExtensionErrorKind::Unknown),
-    }
-}
-
-fn pi_health_remediation(error: PiExtensionErrorKind) -> &'static str {
-    match error {
-        PiExtensionErrorKind::ProtocolMismatch => {
-            "Install the exact Quill and reporter versions, then reload Pi."
-        }
-        PiExtensionErrorKind::UnknownSession => {
-            "Keep Pi running while the reporter reannounces the session and retries once."
-        }
-        PiExtensionErrorKind::ChildReporterMissing => {
-            "Load the Quill extension in the configured child launcher, then restart that child."
-        }
-        PiExtensionErrorKind::SourceRecovering => {
-            "Wait for persisted-source reconciliation to verify live state."
-        }
-        PiExtensionErrorKind::ReconciliationFailed => {
-            "Repair the persisted Pi session source, then retry reconciliation."
-        }
-        PiExtensionErrorKind::TelemetryRejected => {
-            "Check Quill ingestion status and logs, then retry the Pi operation."
-        }
-        PiExtensionErrorKind::Saturated => {
-            "Close stale Pi processes; health admission resumes below the per-host cap."
-        }
-        PiExtensionErrorKind::ReporterReloadRequired => {
-            "Remove the legacy reporter or reload Pi to activate the elected reporter."
-        }
-        PiExtensionErrorKind::Disabled => "Enable the Pi integration to resume reporting.",
-        PiExtensionErrorKind::Config => "Repair the Quill Pi configuration and reload Pi.",
-        PiExtensionErrorKind::Transport => "Check the local Quill server and retry.",
-        PiExtensionErrorKind::Registration => "Reload Pi after repairing the extension install.",
-        PiExtensionErrorKind::Spool => {
-            "Review the recorded retirement gap; no replay is available."
-        }
-        PiExtensionErrorKind::Unknown => "Check Quill logs for the typed reporter failure.",
-    }
-}
-
-fn pi_extension_health_at(
-    storage: &Storage,
-    now: DateTime<Utc>,
-) -> Result<PiExtensionHealth, String> {
-    let reporter = storage.pi_reporter_health_summary_at(now.timestamp_millis())?;
-    let legacy_last_seen = storage.get_setting("pi_extension.last_seen")?;
-    let reporter_last_seen = reporter
-        .as_ref()
-        .and_then(|summary| summary.last_heartbeat_ms)
-        .and_then(DateTime::<Utc>::from_timestamp_millis)
-        .map(|value| value.to_rfc3339());
-    let last_seen = reporter_last_seen.or(legacy_last_seen);
-    let known_acceptance = reporter
-        .as_ref()
-        .and_then(|summary| summary.last_acceptance_ms)
-        .and_then(DateTime::<Utc>::from_timestamp_millis);
-    let reporter_health_present = reporter.is_some();
-    let state = known_acceptance
-        .or_else(|| {
-            last_seen
-                .as_deref()
-                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                .map(|value| value.with_timezone(&Utc))
-        })
-        .map(|seen| now.signed_duration_since(seen))
-        .map_or(PiExtensionHealthState::NeverConnected, |age| {
-            if reporter_health_present && known_acceptance.is_none() {
-                PiExtensionHealthState::NeverConnected
-            } else if age <= PI_EXTENSION_ALIVE_AFTER {
-                PiExtensionHealthState::Alive
-            } else if age <= PI_EXTENSION_STALE_AFTER {
-                PiExtensionHealthState::Idle
-            } else {
-                PiExtensionHealthState::Stale
-            }
-        });
-    let configured_error =
-        if storage.get_setting("pi_reporter.enabled")?.as_deref() == Some("false") {
-            Some("ReporterDisabled".to_string())
-        } else if storage
-            .get_setting("pi_reporter.reload_required")?
-            .as_deref()
-            == Some("true")
-        {
-            Some("ReporterReloadRequired".to_string())
-        } else {
-            storage
-                .get_setting("pi_extension.spool_gap")?
-                .filter(|value| !value.is_empty())
-        };
-    let reporter_error = reporter
-        .as_ref()
-        .and_then(|summary| summary.worst_code)
-        .and_then(|code| pi_extension_error(code.as_str()));
-    let legacy_error = storage
-        .get_setting("pi_extension.last_error")?
-        .filter(|value| !value.is_empty())
-        .as_deref()
-        .and_then(pi_extension_error);
-    let last_error = configured_error
-        .as_deref()
-        .and_then(pi_extension_error)
-        .or(reporter_error)
-        .or(legacy_error);
-    let worst_subject = reporter
-        .as_ref()
-        .and_then(|summary| summary.worst_subject.as_ref());
-    let protocol = worst_subject
-        .map(|subject| subject.protocol.to_string())
-        .or(storage.get_setting("pi_extension.protocol")?);
-    let extension_version = worst_subject
-        .map(|subject| subject.reporter_version.clone())
-        .or(storage.get_setting("pi_extension.extension_version")?);
-    let affected_reporters = reporter
-        .as_ref()
-        .map_or(usize::from(last_error.is_some()), |summary| {
-            summary.affected_reporters
-        });
-    let affected_sessions = reporter
-        .as_ref()
-        .map_or(0, |summary| summary.affected_sessions);
-    let mismatch = last_error == Some(PiExtensionErrorKind::ProtocolMismatch);
-    Ok(PiExtensionHealth {
-        state,
-        last_seen,
-        protocol,
-        extension_version,
-        min_quill_version: storage.get_setting("pi_extension.min_quill_version")?,
-        last_error,
-        affected_reporters,
-        affected_sessions,
-        remediation: last_error.map(pi_health_remediation).map(str::to_owned),
-        last_recovered_at: reporter
-            .as_ref()
-            .and_then(|summary| summary.recovered_at_ms)
-            .and_then(DateTime::<Utc>::from_timestamp_millis)
-            .map(|value| value.to_rfc3339()),
-        required_protocol: mismatch.then(|| crate::pi_tracking::PI_PROTOCOL_V2.to_string()),
-        required_extension_version: mismatch
-            .then(|| crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION.to_owned()),
-        required_quill_version: mismatch
-            .then(|| crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD.to_owned()),
-    })
-}
-
-fn attach_pi_extension_health(
-    storage: &Storage,
-    statuses: &mut [ProviderStatus],
-) -> Result<(), String> {
-    if let Some(pi) = statuses
-        .iter_mut()
-        .find(|status| status.provider == IntegrationProvider::Pi)
-    {
-        pi.pi_extension_health = Some(pi_extension_health_at(storage, Utc::now())?);
-    }
-    Ok(())
-}
 
 fn demo_mode_active() -> bool {
     std::env::var("QUILL_DEMO_MODE").ok().as_deref() == Some("1")
@@ -536,9 +343,7 @@ pub fn force_rescan(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
 }
 
 pub fn load_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
-    let mut statuses = load_saved_statuses(storage)?;
-    attach_pi_extension_health(storage, &mut statuses)?;
-    Ok(statuses)
+    load_saved_statuses(storage)
 }
 
 pub fn get_context_preservation_status(
@@ -645,7 +450,7 @@ fn sync_brevity_blocks(
 }
 
 fn detect_all_with_storage(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
-    let mut statuses = [
+    [
         IntegrationProvider::Claude,
         IntegrationProvider::Codex,
         IntegrationProvider::Pi,
@@ -654,9 +459,7 @@ fn detect_all_with_storage(storage: &Storage) -> Result<Vec<ProviderStatus>, Str
     .into_iter()
     .map(detect_provider)
     .collect::<Result<Vec<_>, _>>()
-    .and_then(|detected| merge_saved_statuses(storage, detected))?;
-    attach_pi_extension_health(storage, &mut statuses)?;
-    Ok(statuses)
+    .and_then(|detected| merge_saved_statuses(storage, detected))
 }
 
 fn detect_provider(provider: IntegrationProvider) -> Result<ProviderStatus, String> {
@@ -944,193 +747,6 @@ mod tests {
     }
     use tempfile::TempDir;
 
-    // @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Extension health state machine]]
-    #[test]
-    fn pi_extension_health_distinguishes_never_connected_alive_idle_and_stale() {
-        let dir = TempDir::new().expect("tempdir");
-        let storage = Storage::init_at(dir.path().join("quill.db"), false)
-            .expect("initialize temporary storage");
-        let now = Utc::now();
-
-        assert_eq!(
-            pi_extension_health_at(&storage, now).unwrap().state,
-            PiExtensionHealthState::NeverConnected
-        );
-        storage
-            .set_settings_atomically(&[
-                ("pi_extension.protocol", "1"),
-                ("pi_extension.extension_version", "0.1.0"),
-                ("pi_extension.min_quill_version", "0.9.0"),
-                ("pi_extension.last_error", ""),
-            ])
-            .unwrap();
-        for (age, expected) in [
-            (TimeDelta::seconds(30), PiExtensionHealthState::Alive),
-            (TimeDelta::minutes(5), PiExtensionHealthState::Idle),
-            (TimeDelta::minutes(20), PiExtensionHealthState::Stale),
-        ] {
-            storage
-                .set_setting("pi_extension.last_seen", &(now - age).to_rfc3339())
-                .unwrap();
-            assert_eq!(
-                pi_extension_health_at(&storage, now).unwrap().state,
-                expected
-            );
-        }
-    }
-
-    // @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Typed extension error detail]]
-    #[test]
-    fn pi_extension_health_types_protocol_mismatch_and_retains_detail() {
-        let dir = TempDir::new().expect("tempdir");
-        let storage = Storage::init_at(dir.path().join("quill.db"), false)
-            .expect("initialize temporary storage");
-        storage
-            .set_settings_atomically(&[
-                ("pi_extension.last_seen", &Utc::now().to_rfc3339()),
-                ("pi_extension.protocol", "2"),
-                ("pi_extension.extension_version", "0.1.0"),
-                ("pi_extension.min_quill_version", "0.9.0"),
-                ("pi_extension.last_error", "protocol_mismatch"),
-            ])
-            .unwrap();
-
-        let health = pi_extension_health_at(&storage, Utc::now()).unwrap();
-        assert_eq!(
-            health.last_error,
-            Some(PiExtensionErrorKind::ProtocolMismatch)
-        );
-        assert_eq!(health.protocol.as_deref(), Some("2"));
-    }
-
-    #[test]
-    fn pi_extension_health_aggregates_worst_reporter_and_recovery_detail() {
-        let dir = TempDir::new().expect("tempdir");
-        let storage = Storage::init_at(dir.path().join("quill.db"), false).unwrap();
-        let now = Utc::now();
-        let mismatch = crate::pi_tracking::PiReporterHealthSubject::new(
-            "host",
-            "mismatch",
-            "managed",
-            1,
-            "0.1.0",
-            "old-build",
-            "old-capability",
-        )
-        .unwrap();
-        let unknown = crate::pi_tracking::PiReporterHealthSubject::new(
-            "host",
-            "unknown",
-            "npm",
-            2,
-            crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION,
-            crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD,
-            crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST,
-        )
-        .unwrap();
-        storage
-            .record_pi_reporter_failure(
-                &mismatch,
-                crate::pi_tracking::PiReporterHealthCode::ProtocolMismatch,
-                2,
-                now.timestamp_millis(),
-            )
-            .unwrap();
-        storage
-            .record_pi_reporter_failure(
-                &unknown,
-                crate::pi_tracking::PiReporterHealthCode::UnknownSession,
-                1,
-                now.timestamp_millis() + 1,
-            )
-            .unwrap();
-
-        let health = pi_extension_health_at(&storage, now + TimeDelta::seconds(1)).unwrap();
-        assert_eq!(
-            health.last_error,
-            Some(PiExtensionErrorKind::ProtocolMismatch)
-        );
-        assert_eq!(health.affected_reporters, 2);
-        assert_eq!(health.affected_sessions, 3);
-        assert_eq!(health.protocol.as_deref(), Some("1"));
-        assert_eq!(health.required_protocol.as_deref(), Some("2"));
-        assert!(health.remediation.as_deref().unwrap().contains("exact"));
-
-        storage
-            .record_pi_reporter_recovery(
-                &mismatch,
-                crate::pi_tracking::PiReporterHealthDimension::Compatibility,
-                now.timestamp_millis() + 2,
-            )
-            .unwrap();
-        let recovered = pi_extension_health_at(&storage, now + TimeDelta::seconds(1)).unwrap();
-        assert_eq!(
-            recovered.last_error,
-            Some(PiExtensionErrorKind::UnknownSession)
-        );
-        assert_eq!(recovered.affected_reporters, 1);
-        assert!(recovered.last_recovered_at.is_some());
-    }
-
-    // @lat: [[pi-spool-tests#Pi Spool Retirement Test Specs#Typed retirement gap]]
-    #[test]
-    fn pi_extension_health_surfaces_spool_drop_and_corrupt_gaps() {
-        assert_eq!(
-            pi_extension_error("spool_drop_gap"),
-            Some(PiExtensionErrorKind::Spool)
-        );
-        assert_eq!(
-            pi_extension_error("spool_corrupt_gap"),
-            Some(PiExtensionErrorKind::Spool)
-        );
-        assert_eq!(
-            pi_extension_error("spool_retired_without_import"),
-            Some(PiExtensionErrorKind::Spool)
-        );
-
-        let dir = TempDir::new().expect("tempdir");
-        let storage = Storage::init_at(dir.path().join("quill.db"), false).unwrap();
-        storage
-            .set_settings_atomically(&[
-                ("pi_extension.last_error", ""),
-                ("pi_extension.spool_gap", "spool_drop_gap"),
-            ])
-            .unwrap();
-        assert_eq!(
-            pi_extension_health_at(&storage, Utc::now())
-                .unwrap()
-                .last_error,
-            Some(PiExtensionErrorKind::Spool)
-        );
-    }
-
-    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Reload and disable status]]
-    #[test]
-    fn pi_extension_health_types_reload_and_disable_remediation() {
-        let dir = TempDir::new().expect("tempdir");
-        let storage = Storage::init_at(dir.path().join("quill.db"), false).unwrap();
-        storage
-            .set_settings_atomically(&[
-                ("pi_reporter.enabled", "true"),
-                ("pi_reporter.reload_required", "true"),
-            ])
-            .unwrap();
-        assert_eq!(
-            pi_extension_health_at(&storage, Utc::now())
-                .unwrap()
-                .last_error,
-            Some(PiExtensionErrorKind::ReporterReloadRequired)
-        );
-
-        storage.set_setting("pi_reporter.enabled", "false").unwrap();
-        assert_eq!(
-            pi_extension_health_at(&storage, Utc::now())
-                .unwrap()
-                .last_error,
-            Some(PiExtensionErrorKind::Disabled)
-        );
-    }
-
     #[test]
     // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Saved Status Tolerance]]
     fn saved_statuses_skip_unknown_providers_without_dropping_known_entries() {
@@ -1179,7 +795,6 @@ mod tests {
             user_has_made_choice: true,
             last_error: None,
             last_verified_at: None,
-            pi_extension_health: None,
             last_detection_attempts: Vec::new(),
         };
         let mixed_statuses = vec![
@@ -1254,7 +869,6 @@ mod tests {
             user_has_made_choice: true,
             last_error: None,
             last_verified_at: None,
-            pi_extension_health: None,
             last_detection_attempts: Vec::new(),
         };
 
@@ -1278,7 +892,6 @@ mod tests {
             user_has_made_choice: true,
             last_error: None,
             last_verified_at: None,
-            pi_extension_health: None,
             last_detection_attempts: Vec::new(),
         };
 
@@ -1304,7 +917,6 @@ mod tests {
             user_has_made_choice: false,
             last_error: Some("Pi extensions directory is not writable".to_string()),
             last_verified_at: None,
-            pi_extension_health: None,
             last_detection_attempts: Vec::new(),
         };
         let mut saved = detected.clone();

@@ -19,17 +19,13 @@ Invalid config causes no disk writes or registrations and emits one discoverable
 
 The extension registers lifecycle, agent, turn-end, tool-execution, and input handlers; persisted files supply model and assistant-message evidence.
 
-## Reporter coexistence
-
-Compatible managed and npm copies elect one reporter, so every handler and stable lifecycle event registers or emits once.
-
 ## Protocol v2 fixture contract
 
-Deterministic TypeScript builders freeze the exact protocol-v2 generation and persisted-entry wire.
+Deterministic TypeScript builders freeze the protocol-v2 lifecycle and persisted-entry wire.
 
-The checked-in JSONL covers canonical identity, lifecycle occurrence fields, every start/end reason, delivery source, lineage state, optional field, exact-generation mismatch, and typed outcome. Valid `quill-tracking` entries contain no prompt, message, or tool output. Live emission and persisted entries use protocol 2.
+The checked-in JSONL covers canonical identity, lifecycle occurrence fields, every start/end reason, delivery source, lineage state, optional field, legacy generation metadata, protocol mismatch, and typed outcome. Valid `quill-tracking` entries contain no prompt, message, or tool output. Live emission and persisted entries use protocol 2.
 
-The same file freezes each `/api/v1/pi/track` lifecycle request: exact envelope bytes, reporter headers, and router status. The records replay in order as one session, so the start opens it and the end closes it.
+The same file freezes each `/api/v1/pi/track` lifecycle request: exact envelope bytes, lifecycle identity headers, and router status. The records replay in order as one session, so the start opens it and the end closes it.
 
 ## Persisted lifecycle evidence
 
@@ -37,13 +33,13 @@ A persistent session appends `quill-tracking` lifecycle/direct-lineage data thro
 
 ## No-session tracking boundary
 
-A session without a persistent Pi file appends and sends no tracking or health evidence while retaining the root process's eight tools and context router.
+A session without a persistent Pi file appends and sends no tracking evidence while retaining the root process's eight tools and context router.
 
 ## Typed bounded delivery
 
-[[src-tauri/pi-integration/quill.ts#persistLifecycle]] delivers lifecycle with bounded retry, reload, periodic recovery, reannouncement, and inert-mismatch behavior.
+[[src-tauri/pi-integration/quill.ts#persistLifecycle]] delivers lifecycle with bounded retry, authentication reload, and unknown-session reannouncement.
 
-A persistent live session replays its exact start envelope every 30 seconds without appending another durable entry. Replay ticks skip an overlapping send and stop at shutdown, reporter release, or generation mismatch; no-session and disabled reporters schedule nothing. Timeout, `429`, and `503` retry once; `401` reloads config once; `409 unknown_session` reannounces the persisted start once before one lifecycle replay; a `426` rejecting the generation the sent envelope declared makes later live pushes inert while durable entries continue. A `426` carrying an event-level code drops only that delivery, logs one bounded typed error, and leaves start replay and later lifecycle pushes live. Hook and routing telemetry inspect non-2xx bodies and surface typed server codes without changing routing decisions or escaping handlers.
+Timeout, `429`, and `503` retry once; `401` reloads config once; `409 unknown_session` reannounces the persisted start once before one lifecycle replay. No periodic 30-second replay or generation-mismatch latch remains because the folded sweep recovers local sessions. A contained event-level rejection drops only that delivery and leaves later lifecycle pushes live. Hook and routing telemetry never change Pi behavior or escape handlers; unavailable-server and contained protocol failures are silent unless `QUILL_DEBUG` is set.
 
 ## Handshake and lineage
 

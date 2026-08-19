@@ -44,134 +44,7 @@ const baseStatus = {
   userHasMadeChoice: false,
   lastError: null,
   lastVerifiedAt: null,
-  piExtensionHealth: null,
 };
-
-// @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Extension health presentation]]
-test("Pi health renders current status and typed error detail without red", () => {
-  const features = {
-    features: { contextPreservation: false, activityTracking: true, contextTelemetry: true, brevity: false },
-    loading: false,
-    saving: false,
-  };
-  for (const [state, label] of [
-    ["never_connected", "Never connected"],
-    ["alive", "Alive"],
-    ["idle", "Idle"],
-    ["stale", "Stale"],
-  ]) {
-    const markup = renderToStaticMarkup(createElement(integrationsModule.default, {
-      integrations: {
-        statuses: [{
-          ...baseStatus,
-          enabled: true,
-          setupState: "installed",
-          piExtensionHealth: {
-            state,
-            lastSeen: "2026-08-14T08:00:00Z",
-            protocol: "2",
-            extensionVersion: "0.1.0",
-            minQuillVersion: "0.9.0",
-            lastError: state === "stale" ? "protocol_mismatch" : null,
-          },
-        }],
-        loading: false,
-        error: null,
-        providerActionErrors: {},
-        inFlightProviders: new Set(),
-        indicatorPrimaryProvider: null,
-        rescanInFlight: false,
-      },
-      features,
-    }));
-    assert.match(markup, new RegExp(`Extension: ${label}`));
-    assert.doesNotMatch(markup, /meter-red|settings-toggle--error/);
-    if (state === "stale") {
-      assert.match(markup, /Exact reporter mismatch/);
-      assert.match(markup, /protocol 2/);
-    }
-  }
-});
-
-// @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Typed extension error detail]]
-test("Pi health keeps remediation, affected counts, recovery, and no-session absence compact", () => {
-  const features = {
-    features: { contextPreservation: false, activityTracking: true, contextTelemetry: true, brevity: false },
-    loading: false,
-    saving: false,
-  };
-  for (const [kind, copy] of [
-    ["protocol_mismatch", /Exact reporter mismatch/],
-    ["unknown_session", /Unknown session/],
-    ["child_reporter_missing", /Configured child reporter missing/],
-    ["source_recovering", /Recovering persisted source/],
-    ["reconciliation_failed", /Reconciliation failed/],
-    ["telemetry_rejected", /Telemetry rejected/],
-    ["saturated", /Reporter health saturated/],
-  ]) {
-    const markup = renderToStaticMarkup(createElement(integrationsModule.default, {
-      integrations: {
-        statuses: [{
-          ...baseStatus,
-          enabled: true,
-          setupState: "installed",
-          piExtensionHealth: {
-            state: "alive",
-            lastSeen: "2026-08-14T08:00:00Z",
-            protocol: "1",
-            extensionVersion: "0.1.0",
-            minQuillVersion: "0.9.0",
-            lastError: kind,
-            affectedReporters: 2,
-            affectedSessions: 3,
-            remediation: "Reload Pi after repair.",
-            lastRecoveredAt: "2026-08-14T07:55:00Z",
-            requiredProtocol: "2",
-            requiredExtensionVersion: "0.2.0",
-            requiredQuillVersion: "1.0.0",
-          },
-        }],
-        loading: false,
-        error: null,
-        providerActionErrors: {},
-        inFlightProviders: new Set(),
-        indicatorPrimaryProvider: null,
-        rescanInFlight: false,
-      },
-      features,
-    }));
-    assert.match(markup, copy);
-    assert.match(markup, /2 reporters affected/);
-    assert.match(markup, /3 sessions affected/);
-    assert.match(markup, /Reload Pi after repair/);
-    assert.match(markup, /Recovery verified/);
-    assert.match(markup, /No-session runs are intentionally absent/);
-    assert.match(markup, /role="status"/);
-    assert.doesNotMatch(markup, /meter-red|settings-toggle--error/);
-  }
-});
-
-// @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Missing health fallback]]
-test("enabled Pi without health data renders a slate unavailable detail", () => {
-  const markup = renderToStaticMarkup(createElement(integrationsModule.default, {
-    integrations: {
-      statuses: [{ ...baseStatus, enabled: true, setupState: "installed" }],
-      loading: false,
-      error: null,
-      providerActionErrors: {},
-      inFlightProviders: new Set(),
-      indicatorPrimaryProvider: null,
-      rescanInFlight: false,
-    },
-    features: {
-      features: { contextPreservation: false, activityTracking: true, contextTelemetry: true, brevity: false },
-      loading: false,
-      saving: false,
-    },
-  }));
-  assert.match(markup, /Extension: Status unavailable/);
-  assert.doesNotMatch(markup, /meter-red|settings-toggle--error/);
-});
 
 // @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Pi card states]]
 test("Pi card exposes detected, enabled, and error states", () => {
@@ -261,7 +134,6 @@ test("Pi consent discloses installed files, credentials, repair, and reload", ()
   );
 });
 
-// @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Extension health presentation]]
 test("Sessions names recovering and configured-child gaps without a new row", () => {
   const common = {
     provider: "pi",

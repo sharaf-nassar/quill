@@ -19,11 +19,6 @@ use crate::model_usage::{
     CompletedModelSourceRoot, ModelUsageDiagnostic, NormalizedObservation, NormalizedSource,
     SourceProcessingStatus,
 };
-use crate::pi_tracking::{
-    PI_REPORTER_ACTIVE_TTL_MS, PI_REPORTER_ROWS_PER_HOST, PI_REPORTER_TERMINAL_RETENTION_MS,
-    PiReporterHealthCode, PiReporterHealthDimension, PiReporterHealthRow, PiReporterHealthSubject,
-    PiReporterHealthSummary, summarize_reporter_health,
-};
 use crate::retention::{
     RETENTION_LAST_RUN_KEY, RETENTION_WATERMARK_KEY, RETENTION_WINDOW_DAYS_KEY,
     RetentionAuditRecord, RetentionInsertVerdict, RetentionPolicy, advanced_watermark,
@@ -107,7 +102,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 46;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 47;
 
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
@@ -143,191 +138,6 @@ struct CurrentPiLifecycle {
     process_instance_id: String,
     sequence: i64,
     occurred_at_ms: i64,
-}
-
-fn pi_reporter_saturation_key(host: &str) -> String {
-    format!("pi_reporter_health.saturation:{host}")
-}
-
-fn maintain_pi_reporter_health_in_transaction(
-    tx: &rusqlite::Transaction<'_>,
-    now_ms: i64,
-) -> Result<(), String> {
-    let active_cutoff = now_ms.saturating_sub(PI_REPORTER_ACTIVE_TTL_MS);
-    let retention_cutoff = now_ms.saturating_sub(PI_REPORTER_TERMINAL_RETENTION_MS);
-    tx.execute(
-        "UPDATE pi_reporter_health
-         SET resolved_at_ms=COALESCE(resolved_at_ms, last_heartbeat_ms)
-         WHERE resolved_at_ms IS NULL
-           AND COALESCE(last_heartbeat_ms, 0) < ?1",
-        params![active_cutoff],
-    )
-    .map_err(|error| format!("Expire inactive Pi reporter health: {error}"))?;
-    tx.execute(
-        "DELETE FROM pi_reporter_health
-         WHERE resolved_at_ms IS NOT NULL AND resolved_at_ms < ?1",
-        params![retention_cutoff],
-    )
-    .map_err(|error| format!("Prune retained Pi reporter health: {error}"))?;
-    tx.execute(
-        "DELETE FROM pi_reporter_health
-         WHERE rowid IN (
-             SELECT rowid FROM (
-                 SELECT rowid,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY normalized_hostname
-                            ORDER BY resolved_at_ms DESC,
-                                     process_instance_id DESC,
-                                     install_channel DESC
-                        ) AS retained_rank
-                 FROM pi_reporter_health
-                 WHERE resolved_at_ms IS NOT NULL
-             ) WHERE retained_rank > ?1
-         )",
-        params![i64::try_from(PI_REPORTER_ROWS_PER_HOST).unwrap_or(i64::MAX)],
-    )
-    .map_err(|error| format!("Cap retained Pi reporter health: {error}"))?;
-    Ok(())
-}
-
-fn ensure_pi_reporter_health_row(
-    tx: &rusqlite::Transaction<'_>,
-    subject: &PiReporterHealthSubject,
-    now_ms: i64,
-) -> Result<bool, String> {
-    maintain_pi_reporter_health_in_transaction(tx, now_ms)?;
-    let exists = tx
-        .query_row(
-            "SELECT 1 FROM pi_reporter_health
-             WHERE normalized_hostname=?1 AND process_instance_id=?2
-               AND install_channel=?3",
-            params![
-                subject.normalized_hostname,
-                subject.process_instance_id,
-                subject.install_channel,
-            ],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|error| format!("Read Pi reporter health subject: {error}"))?
-        .is_some();
-    if !exists {
-        let active = tx
-            .query_row(
-                "SELECT COUNT(*) FROM pi_reporter_health
-                 WHERE normalized_hostname=?1 AND resolved_at_ms IS NULL",
-                params![subject.normalized_hostname],
-                |row| row.get::<_, usize>(0),
-            )
-            .map_err(|error| format!("Count active Pi reporter health: {error}"))?;
-        if active >= PI_REPORTER_ROWS_PER_HOST {
-            let key = pi_reporter_saturation_key(&subject.normalized_hostname);
-            let previous = tx
-                .query_row(
-                    "SELECT value FROM settings WHERE key=?1",
-                    params![key],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|error| format!("Read Pi reporter saturation: {error}"))?;
-            let count = previous
-                .as_deref()
-                .and_then(|value| value.split_once(':'))
-                .and_then(|(count, _)| count.parse::<usize>().ok())
-                .unwrap_or(0)
-                .saturating_add(1);
-            tx.execute(
-                "INSERT INTO settings(key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![key, format!("{count}:{now_ms}")],
-            )
-            .map_err(|error| format!("Record Pi reporter saturation: {error}"))?;
-            return Ok(false);
-        }
-        tx.execute(
-            "INSERT INTO pi_reporter_health (
-                 normalized_hostname, process_instance_id, install_channel,
-                 reporter_protocol, reporter_version, quill_build,
-                 capability_digest, last_heartbeat_ms, connection_state,
-                 compatibility_state, lifecycle_state, child_ack_state,
-                 source_state, transport_state, affected_sessions
-             ) VALUES (
-                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'connected',
-                 'compatible', 'unknown', 'unknown', 'healthy', 'healthy', 0
-             )",
-            params![
-                subject.normalized_hostname,
-                subject.process_instance_id,
-                subject.install_channel,
-                subject.protocol,
-                subject.reporter_version,
-                subject.quill_build,
-                subject.capability_digest,
-                now_ms,
-            ],
-        )
-        .map_err(|error| format!("Insert Pi reporter health subject: {error}"))?;
-    } else {
-        tx.execute(
-            "UPDATE pi_reporter_health
-             SET reporter_protocol=?4, reporter_version=?5, quill_build=?6,
-                 capability_digest=?7, last_heartbeat_ms=?8,
-                 connection_state='connected', resolved_at_ms=NULL
-             WHERE normalized_hostname=?1 AND process_instance_id=?2
-               AND install_channel=?3",
-            params![
-                subject.normalized_hostname,
-                subject.process_instance_id,
-                subject.install_channel,
-                subject.protocol,
-                subject.reporter_version,
-                subject.quill_build,
-                subject.capability_digest,
-                now_ms,
-            ],
-        )
-        .map_err(|error| format!("Refresh Pi reporter health subject: {error}"))?;
-    }
-    let active = tx
-        .query_row(
-            "SELECT COUNT(*) FROM pi_reporter_health
-             WHERE normalized_hostname=?1 AND resolved_at_ms IS NULL",
-            params![subject.normalized_hostname],
-            |row| row.get::<_, usize>(0),
-        )
-        .map_err(|error| format!("Count refreshed Pi reporter health: {error}"))?;
-    if active < PI_REPORTER_ROWS_PER_HOST {
-        tx.execute(
-            "DELETE FROM settings WHERE key=?1",
-            params![pi_reporter_saturation_key(&subject.normalized_hostname)],
-        )
-        .map_err(|error| format!("Clear Pi reporter saturation: {error}"))?;
-    }
-    Ok(true)
-}
-
-fn pi_reporter_subject_for_event(
-    envelope: &PiProtocolV2Envelope,
-    event: &crate::models::PiProtocolV2Event,
-    subject: Option<&PiReporterHealthSubject>,
-) -> Result<PiReporterHealthSubject, String> {
-    let channel = subject.map_or("unknown", |subject| subject.install_channel.as_str());
-    let derived = PiReporterHealthSubject::new(
-        &event.normalized_host,
-        &event.process_instance_id,
-        channel,
-        envelope.protocol,
-        &envelope.reporter_version,
-        &envelope.quill_build,
-        &envelope.capability_digest,
-    )?;
-    if subject.is_some_and(|subject| {
-        subject.normalized_hostname != derived.normalized_hostname
-            || subject.process_instance_id != derived.process_instance_id
-    }) {
-        return Err("Pi reporter headers do not match event identity".to_owned());
-    }
-    Ok(derived)
 }
 
 fn pi_lineage_columns(lineage: &PiProtocolV2Lineage) -> (&'static str, Option<&str>, Option<&str>) {
@@ -5678,15 +5488,7 @@ pub struct Storage {
     db_path: PathBuf,
     model_usage_overview_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelUsageOverviewResponse>>>,
     context_savings_analytics_cache: Mutex<HashMap<CacheKey, CacheEntry<ContextSavingsAnalytics>>>,
-    #[cfg(test)]
-    pi_extension_health_written: Mutex<Option<(PiExtensionHandshake, Instant)>>,
 }
-
-#[cfg(test)]
-type PiExtensionHandshake = (String, String, String, String);
-
-#[cfg(test)]
-const PI_EXTENSION_HEALTH_REFRESH: Duration = Duration::from_secs(15);
 
 /// Result of a user-triggered database compaction attempt.
 ///
@@ -5732,218 +5534,13 @@ fn transcript_analytics_generation_key(provider: IntegrationProvider, root: &str
 }
 
 impl Storage {
-    pub(crate) fn maintain_pi_reporter_health_at(&self, now_ms: i64) -> Result<(), String> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|error| format!("Begin Pi reporter health maintenance: {error}"))?;
-        maintain_pi_reporter_health_in_transaction(&tx, now_ms)?;
-        tx.commit()
-            .map_err(|error| format!("Commit Pi reporter health maintenance: {error}"))
-    }
-
-    pub(crate) fn record_pi_reporter_failure(
-        &self,
-        subject: &PiReporterHealthSubject,
-        code: PiReporterHealthCode,
-        affected_sessions: usize,
-        now_ms: i64,
-    ) -> Result<(), String> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|error| format!("Begin Pi reporter failure: {error}"))?;
-        if !ensure_pi_reporter_health_row(&tx, subject, now_ms)? {
-            tx.commit()
-                .map_err(|error| format!("Commit Pi reporter saturation: {error}"))?;
-            return Ok(());
-        }
-        let (column, state) = match code.dimension() {
-            PiReporterHealthDimension::Compatibility => ("compatibility_state", "incompatible"),
-            PiReporterHealthDimension::Lifecycle => ("lifecycle_state", "unknown_session"),
-            PiReporterHealthDimension::ChildAck => ("child_ack_state", "missing"),
-            PiReporterHealthDimension::Source => (
-                "source_state",
-                if code == PiReporterHealthCode::ReconciliationFailed {
-                    "reconciliation_failed"
-                } else {
-                    "source_not_persisted"
-                },
-            ),
-            PiReporterHealthDimension::Transport => ("transport_state", "failed"),
-        };
-        tx.execute(
-            &format!(
-                "UPDATE pi_reporter_health
-                 SET {column}=?4, latest_code=?5,
-                     affected_sessions=MAX(affected_sessions, ?6),
-                     last_heartbeat_ms=?7, resolved_at_ms=NULL
-                 WHERE normalized_hostname=?1 AND process_instance_id=?2
-                   AND install_channel=?3"
-            ),
-            params![
-                subject.normalized_hostname,
-                subject.process_instance_id,
-                subject.install_channel,
-                state,
-                code.as_str(),
-                i64::try_from(affected_sessions).unwrap_or(i64::MAX),
-                now_ms,
-            ],
-        )
-        .map_err(|error| format!("Record Pi reporter failure: {error}"))?;
-        tx.commit()
-            .map_err(|error| format!("Commit Pi reporter failure: {error}"))
-    }
-
-    pub(crate) fn record_pi_reporter_recovery(
-        &self,
-        subject: &PiReporterHealthSubject,
-        dimension: PiReporterHealthDimension,
-        now_ms: i64,
-    ) -> Result<(), String> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|error| format!("Begin Pi reporter recovery: {error}"))?;
-        if !ensure_pi_reporter_health_row(&tx, subject, now_ms)? {
-            tx.commit()
-                .map_err(|error| format!("Commit Pi reporter recovery saturation: {error}"))?;
-            return Ok(());
-        }
-        let (column, state) = match dimension {
-            PiReporterHealthDimension::Compatibility => ("compatibility_state", "compatible"),
-            PiReporterHealthDimension::Lifecycle => ("lifecycle_state", "created"),
-            PiReporterHealthDimension::ChildAck => ("child_ack_state", "acknowledged"),
-            PiReporterHealthDimension::Source => ("source_state", "healthy"),
-            PiReporterHealthDimension::Transport => ("transport_state", "healthy"),
-        };
-        tx.execute(
-            &format!(
-                "UPDATE pi_reporter_health
-                 SET {column}=?4, latest_code=NULL, recovered_at_ms=?5,
-                     last_heartbeat_ms=?5, resolved_at_ms=NULL
-                 WHERE normalized_hostname=?1 AND process_instance_id=?2
-                   AND install_channel=?3"
-            ),
-            params![
-                subject.normalized_hostname,
-                subject.process_instance_id,
-                subject.install_channel,
-                state,
-                now_ms,
-            ],
-        )
-        .map_err(|error| format!("Record Pi reporter recovery: {error}"))?;
-        tx.commit()
-            .map_err(|error| format!("Commit Pi reporter recovery: {error}"))
-    }
-
-    pub(crate) fn record_pi_source_reconciliation_failure(
-        &self,
-        source_key: &str,
-        now_ms: i64,
-    ) -> Result<bool, String> {
-        let conn = self.conn.lock().unwrap();
-        let updated = conn
-            .execute(
-                "UPDATE pi_reporter_health
-                 SET source_state='reconciliation_failed',
-                     latest_code='reconciliation_failed',
-                     affected_sessions=MAX(affected_sessions, 1),
-                     last_heartbeat_ms=?2, resolved_at_ms=NULL
-                 WHERE (normalized_hostname, process_instance_id) IN (
-                     SELECT normalized_hostname, process_instance_id
-                     FROM pi_session_lifecycle
-                     WHERE provider='pi' AND source_key=?1
-                 )",
-                params![source_key, now_ms],
-            )
-            .map_err(|error| format!("Record Pi source reconciliation failure: {error}"))?;
-        Ok(updated > 0)
-    }
-
-    pub(crate) fn pi_reporter_health_summary_at(
-        &self,
-        now_ms: i64,
-    ) -> Result<Option<PiReporterHealthSummary>, String> {
-        self.maintain_pi_reporter_health_at(now_ms)?;
-        let conn = self.conn.lock().unwrap();
-        let rows = {
-            let mut statement = conn
-                .prepare(
-                    "SELECT normalized_hostname, process_instance_id, install_channel,
-                            reporter_protocol, reporter_version, quill_build,
-                            capability_digest, last_acceptance_ms,
-                            last_heartbeat_ms, compatibility_state, lifecycle_state,
-                            child_ack_state, source_state, transport_state,
-                            latest_code, affected_sessions, recovered_at_ms,
-                            resolved_at_ms
-                     FROM pi_reporter_health",
-                )
-                .map_err(|error| format!("Prepare Pi reporter health summary: {error}"))?;
-            statement
-                .query_map([], |row| {
-                    Ok(PiReporterHealthRow {
-                        subject: PiReporterHealthSubject {
-                            normalized_hostname: row.get(0)?,
-                            process_instance_id: row.get(1)?,
-                            install_channel: row.get(2)?,
-                            protocol: row.get(3)?,
-                            reporter_version: row.get(4)?,
-                            quill_build: row.get(5)?,
-                            capability_digest: row.get(6)?,
-                        },
-                        last_acceptance_ms: row.get(7)?,
-                        last_heartbeat_ms: row.get(8)?,
-                        compatibility_state: row.get(9)?,
-                        lifecycle_state: row.get(10)?,
-                        child_ack_state: row.get(11)?,
-                        source_state: row.get(12)?,
-                        transport_state: row.get(13)?,
-                        latest_code: row.get(14)?,
-                        affected_sessions: row.get(15)?,
-                        recovered_at_ms: row.get(16)?,
-                        resolved_at_ms: row.get(17)?,
-                    })
-                })
-                .map_err(|error| format!("Query Pi reporter health summary: {error}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("Read Pi reporter health summary: {error}"))?
-        };
-        let saturation_cutoff = now_ms.saturating_sub(PI_REPORTER_ACTIVE_TTL_MS);
-        let saturated_reporters = {
-            let mut statement = conn
-                .prepare(
-                    "SELECT value FROM settings
-                     WHERE key LIKE 'pi_reporter_health.saturation:%'",
-                )
-                .map_err(|error| format!("Prepare Pi reporter saturation summary: {error}"))?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|error| format!("Query Pi reporter saturation summary: {error}"))?
-                .filter_map(Result::ok)
-                .filter_map(|value| {
-                    let (count, at) = value.split_once(':')?;
-                    (at.parse::<i64>().ok()? >= saturation_cutoff)
-                        .then(|| count.parse::<usize>().ok())
-                        .flatten()
-                })
-                .sum()
-        };
-        Ok(summarize_reporter_health(
-            &rows,
-            saturated_reporters,
-            now_ms,
-        ))
-    }
-
     /// Commit protocol-v2 lifecycle ordering before any in-memory projection.
+    /// These rows remain for remote-host ordering, idempotency, and lineage;
+    /// local transcript folding cannot reconstruct those guarantees.
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Transactional Lifecycle Disposition]]
     pub(crate) fn apply_pi_protocol_v2_envelope(
         &self,
         envelope: &PiProtocolV2Envelope,
-        reporter_subject: Option<&PiReporterHealthSubject>,
     ) -> Result<Vec<PiProtocolV2Outcome>, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
@@ -6137,82 +5734,6 @@ impl Storage {
                             )
                             .map_err(|error| format!("Close replaced Pi live row: {error}"))?;
                         }
-
-                        if event.delivery_source == PiProtocolV2DeliverySource::Live {
-                            let source_persisted = tx
-                                .query_row(
-                                    "SELECT processing_status='ok'
-                                     FROM transcript_analytics_sources
-                                     WHERE provider='pi' AND source_key=?1",
-                                    params![source_key],
-                                    |row| row.get::<_, bool>(0),
-                                )
-                                .optional()
-                                .map_err(|error| format!("Read Pi source state: {error}"))?
-                                .unwrap_or(false);
-                            let subject =
-                                pi_reporter_subject_for_event(envelope, event, reporter_subject)?;
-                            if ensure_pi_reporter_health_row(&tx, &subject, accepted_at_ms)? {
-                                let child_ack_state = match lineage {
-                                    PiProtocolV2Lineage::Agent { .. } => "acknowledged",
-                                    PiProtocolV2Lineage::Unresolved { reason }
-                                        if reason == "subagent_parent_unavailable" =>
-                                    {
-                                        "missing"
-                                    }
-                                    PiProtocolV2Lineage::Root
-                                    | PiProtocolV2Lineage::Linked { .. } => "not_applicable",
-                                    PiProtocolV2Lineage::Unresolved { .. } => "unknown",
-                                };
-                                let source_state = if source_persisted {
-                                    "healthy"
-                                } else {
-                                    "source_not_persisted"
-                                };
-                                let latest_code = if child_ack_state == "missing" {
-                                    Some("child_reporter_missing")
-                                } else if !source_persisted {
-                                    Some("source_not_persisted")
-                                } else {
-                                    None
-                                };
-                                tx.execute(
-                                    "UPDATE pi_reporter_health
-                                     SET last_handshake_ms=?4, last_acceptance_ms=?4,
-                                         last_heartbeat_ms=?4, connection_state='connected',
-                                         compatibility_state='compatible',
-                                         lifecycle_state='created', child_ack_state=?5,
-                                         source_state=?6, transport_state='healthy',
-                                         latest_code=?7, affected_sessions=?8,
-                                         recovered_at_ms=CASE
-                                             WHEN compatibility_state!='compatible'
-                                               OR lifecycle_state!='created'
-                                               OR child_ack_state IN ('missing', 'unknown')
-                                               OR source_state!='healthy'
-                                               OR transport_state!='healthy'
-                                             THEN ?4 ELSE recovered_at_ms END,
-                                         resolved_at_ms=NULL
-                                     WHERE normalized_hostname=?1
-                                       AND process_instance_id=?2
-                                       AND install_channel=?3",
-                                    params![
-                                        subject.normalized_hostname,
-                                        subject.process_instance_id,
-                                        subject.install_channel,
-                                        accepted_at_ms,
-                                        child_ack_state,
-                                        source_state,
-                                        latest_code,
-                                        i64::from(
-                                            child_ack_state == "missing" || !source_persisted
-                                        ),
-                                    ],
-                                )
-                                .map_err(|error| {
-                                    format!("Record Pi reporter lifecycle: {error}")
-                                })?;
-                            }
-                        }
                     }
                     PiProtocolV2EventKind::SessionEnd { .. } => {
                         tx.execute(
@@ -6311,7 +5832,7 @@ impl Storage {
 
     /// Resolve a session message against the current durable process without letting
     /// an older process revive or mutate its replacement.
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Lifecycle Recovery And Source Diagnostic]]
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Lifecycle Recovery]]
     pub(crate) fn pi_session_message_disposition(
         &self,
         normalized_host: &str,
@@ -6351,21 +5872,6 @@ impl Storage {
                     params![normalized_host, session_id, observed_at_ms],
                 )
                 .map_err(|error| format!("Prove Pi lifecycle live: {error}"))?;
-                tx.execute(
-                    "UPDATE pi_reporter_health
-                     SET lifecycle_state='created', last_acceptance_ms=?3,
-                         last_heartbeat_ms=?3, recovered_at_ms=CASE
-                             WHEN lifecycle_state!='created' THEN ?3
-                             ELSE recovered_at_ms END,
-                         latest_code=CASE
-                             WHEN source_state='healthy' AND child_ack_state!='missing'
-                               AND transport_state='healthy'
-                             THEN NULL ELSE latest_code END,
-                         resolved_at_ms=NULL
-                     WHERE normalized_hostname=?1 AND process_instance_id=?2",
-                    params![normalized_host, current_process, observed_at_ms],
-                )
-                .map_err(|error| format!("Recover Pi reporter lifecycle: {error}"))?;
                 PiProtocolV2Outcome::Applied
             }
             Some(_) => PiProtocolV2Outcome::Applied,
@@ -6390,18 +5896,6 @@ impl Storage {
             params![now],
         )
         .map_err(|error| format!("Mark Pi sessions recovering: {error}"))?;
-        tx.execute(
-            "UPDATE pi_reporter_health
-             SET lifecycle_state='recovering', latest_code='source_recovering',
-                 affected_sessions=MAX(affected_sessions, 1)
-             WHERE (normalized_hostname, process_instance_id) IN (
-                 SELECT normalized_hostname, process_instance_id
-                 FROM pi_session_lifecycle
-                 WHERE provider='pi' AND lifecycle_state='recovering'
-             )",
-            [],
-        )
-        .map_err(|error| format!("Mark Pi reporter health recovering: {error}"))?;
         let rows = {
             let mut statement = tx
                 .prepare(
@@ -6443,42 +5937,6 @@ impl Storage {
         tx.commit()
             .map_err(|error| format!("Commit Pi recovery load: {error}"))?;
         Ok(rows)
-    }
-
-    pub(crate) fn clear_pi_source_not_persisted(
-        &self,
-        normalized_host: &str,
-        session_id: &str,
-    ) -> Result<bool, String> {
-        let conn = self.conn.lock().unwrap();
-        let updated = conn
-            .execute(
-                "UPDATE pi_reporter_health
-                 SET source_state='healthy',
-                     latest_code=CASE
-                         WHEN compatibility_state='compatible'
-                           AND lifecycle_state NOT IN ('unknown_session', 'recovering')
-                           AND child_ack_state!='missing'
-                           AND transport_state='healthy'
-                         THEN NULL ELSE latest_code END,
-                     affected_sessions=CASE
-                         WHEN compatibility_state='compatible'
-                           AND lifecycle_state NOT IN ('unknown_session', 'recovering')
-                           AND child_ack_state!='missing'
-                           AND transport_state='healthy'
-                         THEN 0 ELSE MAX(affected_sessions, 1) END,
-                     recovered_at_ms=?3
-                 WHERE normalized_hostname=?1
-                   AND process_instance_id=(
-                       SELECT process_instance_id FROM pi_session_lifecycle
-                       WHERE provider='pi' AND normalized_hostname=?1
-                         AND session_id=?2
-                   )
-                   AND source_state IN ('source_not_persisted', 'reconciliation_failed')",
-                params![normalized_host, session_id, Utc::now().timestamp_millis()],
-            )
-            .map_err(|error| format!("Clear Pi source diagnostic: {error}"))?;
-        Ok(updated > 0)
     }
 
     /// Enumerate last-good transcript analytics identities for one exact root.
@@ -7268,32 +6726,6 @@ impl Storage {
                     ],
                 )
                 .map_err(|e| format!("Rehydrate Pi persisted lifecycle: {e}"))?;
-                tx.execute(
-                    "UPDATE pi_reporter_health
-                     SET source_state='healthy',
-                         latest_code=CASE
-                             WHEN compatibility_state='compatible'
-                               AND lifecycle_state NOT IN ('unknown_session', 'recovering')
-                               AND child_ack_state!='missing'
-                               AND transport_state='healthy'
-                             THEN NULL ELSE latest_code END,
-                         affected_sessions=CASE
-                             WHEN compatibility_state='compatible'
-                               AND lifecycle_state NOT IN ('unknown_session', 'recovering')
-                               AND child_ack_state!='missing'
-                               AND transport_state='healthy'
-                             THEN 0 ELSE MAX(affected_sessions, 1) END,
-                         recovered_at_ms=?3
-                     WHERE normalized_hostname=?1
-                       AND process_instance_id=?2
-                       AND source_state IN ('source_not_persisted', 'reconciliation_failed')",
-                    params![
-                        lifecycle.normalized_hostname,
-                        lifecycle.process_instance_id,
-                        accepted_at_ms,
-                    ],
-                )
-                .map_err(|e| format!("Clear reconciled Pi source diagnostic: {e}"))?;
             }
 
             let watermark_ms = watermark
@@ -10378,41 +9810,7 @@ impl Storage {
                  CREATE INDEX IF NOT EXISTS idx_pi_receipts_source
                      ON pi_event_receipts(provider, source_key);
 
-                 CREATE TABLE IF NOT EXISTS pi_reporter_health (
-                     normalized_hostname TEXT NOT NULL,
-                     process_instance_id TEXT NOT NULL,
-                     install_channel     TEXT NOT NULL,
-                     reporter_protocol   INTEGER NOT NULL,
-                     reporter_version    TEXT NOT NULL,
-                     quill_build         TEXT NOT NULL,
-                     capability_digest   TEXT NOT NULL,
-                     last_handshake_ms   INTEGER,
-                     last_acceptance_ms  INTEGER,
-                     last_heartbeat_ms   INTEGER,
-                     connection_state    TEXT NOT NULL,
-                     compatibility_state TEXT NOT NULL,
-                     lifecycle_state     TEXT NOT NULL,
-                     child_ack_state     TEXT NOT NULL,
-                     source_state        TEXT NOT NULL,
-                     transport_state     TEXT NOT NULL,
-                     latest_code         TEXT,
-                     affected_sessions   INTEGER NOT NULL DEFAULT 0,
-                     recovered_at_ms     INTEGER,
-                     resolved_at_ms      INTEGER,
-                     PRIMARY KEY(
-                         normalized_hostname, process_instance_id,
-                         install_channel
-                     ),
-                     CHECK(reporter_protocol >= 0),
-                     CHECK(affected_sessions >= 0),
-                     CHECK(last_handshake_ms IS NULL OR last_handshake_ms >= 0),
-                     CHECK(last_acceptance_ms IS NULL OR last_acceptance_ms >= 0),
-                     CHECK(last_heartbeat_ms IS NULL OR last_heartbeat_ms >= 0),
-                     CHECK(recovered_at_ms IS NULL OR recovered_at_ms >= 0),
-                     CHECK(resolved_at_ms IS NULL OR resolved_at_ms >= 0)
-                 );
-                 CREATE INDEX IF NOT EXISTS idx_pi_reporter_health_active
-                     ON pi_reporter_health(normalized_hostname, last_heartbeat_ms);",
+",
             )
             .map_err(|e| format!("Migration 46 (Pi ownership tables): {e}"))?;
 
@@ -10612,6 +10010,23 @@ impl Storage {
                 .map_err(|e| format!("Migration 46 commit: {e}"))?;
         }
 
+        if current_version < 47 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 47 begin: {e}"))?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS pi_reporter_health;
+                 DELETE FROM settings
+                 WHERE key LIKE 'pi_reporter_health.saturation:%'
+                    OR key IN ('pi_reporter.reload_required', 'pi_reporter.exact_seen');",
+            )
+            .map_err(|e| format!("Migration 47 (retire Pi reporter health): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (47)", [])
+                .map_err(|e| format!("Failed to record migration 47: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 47 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -10619,8 +10034,6 @@ impl Storage {
             db_path: path,
             model_usage_overview_cache: Mutex::new(HashMap::new()),
             context_savings_analytics_cache: Mutex::new(HashMap::new()),
-            #[cfg(test)]
-            pi_extension_health_written: Mutex::new(None),
         };
 
         if production_startup {
@@ -16816,39 +16229,6 @@ impl Storage {
             .map_err(|e| format!("Commit Pi transcript tool replacement: {e}"))
     }
 
-    #[cfg(test)]
-    pub(crate) fn store_pi_extension_health(
-        &self,
-        protocol: u32,
-        extension_version: &str,
-        min_quill_version: &str,
-        last_error: Option<&str>,
-    ) -> Result<(), String> {
-        let protocol = protocol.to_string();
-        let handshake = (
-            protocol.clone(),
-            extension_version.to_owned(),
-            min_quill_version.to_owned(),
-            last_error.unwrap_or("").to_owned(),
-        );
-        let mut written = self.pi_extension_health_written.lock().unwrap();
-        if written.as_ref().is_some_and(|(previous, at)| {
-            *previous == handshake && at.elapsed() < PI_EXTENSION_HEALTH_REFRESH
-        }) {
-            return Ok(());
-        }
-        *written = Some((handshake, Instant::now()));
-        drop(written);
-        let last_seen = Utc::now().to_rfc3339();
-        self.set_settings_atomically(&[
-            ("pi_extension.last_seen", &last_seen),
-            ("pi_extension.protocol", &protocol),
-            ("pi_extension.extension_version", extension_version),
-            ("pi_extension.min_quill_version", min_quill_version),
-            ("pi_extension.last_error", last_error.unwrap_or("")),
-        ])
-    }
-
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -22203,7 +21583,7 @@ mod tests {
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Transactional Lifecycle Disposition]]
     #[test]
     #[serial]
-    fn pi_lifecycle_disposition_orders_processes_and_recovers_source_health() {
+    fn pi_lifecycle_disposition_preserves_remote_ordering_and_idempotency() {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
@@ -22219,13 +21599,13 @@ mod tests {
         );
         assert_eq!(
             storage
-                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(first.clone()), None)
+                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(first.clone()))
                 .unwrap(),
             vec![PiProtocolV2Outcome::Applied]
         );
         assert_eq!(
             storage
-                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(first), None)
+                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(first))
                 .unwrap(),
             vec![PiProtocolV2Outcome::Duplicate]
         );
@@ -22242,7 +21622,7 @@ mod tests {
         );
         assert_eq!(
             storage
-                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(unknown), None)
+                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(unknown))
                 .unwrap(),
             vec![PiProtocolV2Outcome::UnknownSession]
         );
@@ -22264,7 +21644,7 @@ mod tests {
         );
         assert_eq!(
             storage
-                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(newer), None)
+                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(newer))
                 .unwrap(),
             vec![PiProtocolV2Outcome::Applied]
         );
@@ -22279,7 +21659,7 @@ mod tests {
         );
         assert_eq!(
             storage
-                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(stale_reconciliation), None)
+                .apply_pi_protocol_v2_envelope(&pi_v2_envelope(stale_reconciliation))
                 .unwrap(),
             vec![PiProtocolV2Outcome::Stale]
         );
@@ -22299,12 +21679,6 @@ mod tests {
                 .unwrap(),
             PiProtocolV2Outcome::Applied
         );
-        assert!(
-            storage
-                .clear_pi_source_not_persisted("host", "session")
-                .unwrap()
-        );
-
         let child_gap = pi_v2_event(
             "event-child-gap",
             "child",
@@ -22320,7 +21694,7 @@ mod tests {
             ),
         );
         storage
-            .apply_pi_protocol_v2_envelope(&pi_v2_envelope(child_gap), None)
+            .apply_pi_protocol_v2_envelope(&pi_v2_envelope(child_gap))
             .unwrap();
         let child_recovered = pi_v2_event(
             "event-child-recovered",
@@ -22337,7 +21711,7 @@ mod tests {
             ),
         );
         storage
-            .apply_pi_protocol_v2_envelope(&pi_v2_envelope(child_recovered), None)
+            .apply_pi_protocol_v2_envelope(&pi_v2_envelope(child_recovered))
             .unwrap();
 
         let conn = storage.conn.lock().unwrap();
@@ -22352,250 +21726,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lifecycle, ("process-new".to_owned(), "open".to_owned()));
-        let source_state = conn
+        let child = conn
             .query_row(
-                "SELECT source_state, latest_code, affected_sessions
-                 FROM pi_reporter_health
-                 WHERE normalized_hostname='host'
-                   AND process_instance_id='process-new'",
+                "SELECT direct_parent_session_id, lineage_state, agent_role
+                 FROM pi_session_lifecycle
+                 WHERE provider='pi' AND normalized_hostname='host'
+                   AND session_id='child'",
                 [],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
                     ))
                 },
             )
             .unwrap();
-        assert_eq!(source_state, ("healthy".to_owned(), None, 0));
         assert_eq!(
-            conn.query_row(
-                "SELECT child_ack_state FROM pi_reporter_health
-                 WHERE normalized_hostname='host'
-                   AND process_instance_id='process-child'",
+            child,
+            (
+                Some("session".to_owned()),
+                "agent".to_owned(),
+                Some("reviewer".to_owned())
+            )
+        );
+        drop(conn);
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn migration_47_removes_pi_reporter_health_storage() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let conn = storage.conn.lock().unwrap();
+        let table = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='pi_reporter_health'",
                 [],
                 |row| row.get::<_, String>(0),
             )
-            .unwrap(),
-            "acknowledged",
-        );
-        drop(conn);
-        clear_env();
-    }
-
-    // @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Extension health state machine]]
-    #[test]
-    #[serial]
-    fn pi_reporter_health_is_subject_scoped_bounded_and_worst_first() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        let now = Utc::now().timestamp_millis();
-        let first = crate::pi_tracking::PiReporterHealthSubject::new(
-            "host",
-            "process-a",
-            "managed",
-            1,
-            "0.1.0",
-            "old-build",
-            "old-capability",
-        )
-        .unwrap();
-        let second = crate::pi_tracking::PiReporterHealthSubject::new(
-            "host",
-            "process-b",
-            "npm",
-            2,
-            crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION,
-            crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD,
-            crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST,
-        )
-        .unwrap();
-
-        storage
-            .record_pi_reporter_failure(
-                &first,
-                crate::pi_tracking::PiReporterHealthCode::ProtocolMismatch,
-                2,
-                now,
-            )
+            .optional()
             .unwrap();
-        storage
-            .record_pi_reporter_failure(
-                &second,
-                crate::pi_tracking::PiReporterHealthCode::UnknownSession,
-                1,
-                now + 1,
-            )
-            .unwrap();
-        let summary = storage
-            .pi_reporter_health_summary_at(now + 2)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            summary.worst_code,
-            Some(crate::pi_tracking::PiReporterHealthCode::ProtocolMismatch)
-        );
-        assert_eq!(summary.affected_reporters, 2);
-        assert_eq!(summary.affected_sessions, 3);
-
-        storage
-            .record_pi_reporter_recovery(
-                &first,
-                crate::pi_tracking::PiReporterHealthDimension::Compatibility,
-                now + 3,
-            )
-            .unwrap();
-        let summary = storage
-            .pi_reporter_health_summary_at(now + 4)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            summary.worst_code,
-            Some(crate::pi_tracking::PiReporterHealthCode::UnknownSession)
-        );
-        assert_eq!(summary.affected_reporters, 1);
-        assert_eq!(summary.affected_sessions, 1);
-        assert_eq!(summary.recovered_at_ms, Some(now + 3));
-
-        storage
-            .record_pi_reporter_recovery(
-                &first,
-                crate::pi_tracking::PiReporterHealthDimension::Lifecycle,
-                now + 5,
-            )
-            .unwrap();
-        assert_eq!(
-            storage
-                .pi_reporter_health_summary_at(now + 6)
-                .unwrap()
-                .unwrap()
-                .worst_code,
-            Some(crate::pi_tracking::PiReporterHealthCode::UnknownSession),
-            "a different reporter cannot clear the failing subject",
-        );
-
-        {
-            let conn = storage.conn.lock().unwrap();
-            conn.execute(
-                "UPDATE pi_reporter_health SET last_heartbeat_ms=?1",
-                params![now - crate::pi_tracking::PI_REPORTER_ACTIVE_TTL_MS - 1],
-            )
-            .unwrap();
-        }
-        storage.maintain_pi_reporter_health_at(now).unwrap();
-        let conn = storage.conn.lock().unwrap();
+        assert_eq!(table, None);
         assert_eq!(
             conn.query_row(
-                "SELECT COUNT(*) FROM pi_reporter_health WHERE resolved_at_ms IS NULL",
+                "SELECT COUNT(*) FROM settings WHERE key LIKE 'pi_reporter_health.saturation:%'",
                 [],
                 |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            0,
-        );
-        drop(conn);
-        clear_env();
-    }
-
-    #[test]
-    #[serial]
-    fn pi_reporter_health_caps_active_and_terminal_rows_per_host() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        let now = Utc::now().timestamp_millis();
-        for index in 0..=crate::pi_tracking::PI_REPORTER_ROWS_PER_HOST {
-            let subject = crate::pi_tracking::PiReporterHealthSubject::new(
-                "host",
-                &format!("process-{index}"),
-                "managed",
-                2,
-                crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION,
-                crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD,
-                crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST,
-            )
-            .unwrap();
-            storage
-                .record_pi_reporter_failure(
-                    &subject,
-                    crate::pi_tracking::PiReporterHealthCode::UnknownSession,
-                    1,
-                    now + i64::try_from(index).unwrap(),
-                )
-                .unwrap();
-        }
-        let summary = storage
-            .pi_reporter_health_summary_at(
-                now + i64::try_from(crate::pi_tracking::PI_REPORTER_ROWS_PER_HOST).unwrap(),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            summary.active_reporters,
-            crate::pi_tracking::PI_REPORTER_ROWS_PER_HOST
-        );
-        assert_eq!(summary.saturated_reporters, 1);
-        {
-            let conn = storage.conn.lock().unwrap();
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COUNT(*) FROM pi_reporter_health WHERE normalized_hostname='host' AND resolved_at_ms IS NULL",
-                    [],
-                    |row| row.get::<_, usize>(0),
-                )
-                .unwrap(),
-                crate::pi_tracking::PI_REPORTER_ROWS_PER_HOST,
-            );
-            conn.execute(
-                "UPDATE pi_reporter_health SET resolved_at_ms=?1",
-                params![now],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO pi_reporter_health (
-                     normalized_hostname, process_instance_id, install_channel,
-                     reporter_protocol, reporter_version, quill_build,
-                     capability_digest, last_heartbeat_ms, connection_state,
-                     compatibility_state, lifecycle_state, child_ack_state,
-                     source_state, transport_state, affected_sessions,
-                     resolved_at_ms
-                 ) VALUES (
-                     'host', 'terminal-overflow', 'managed', 2, '0.2.0',
-                     'build', 'capability', ?1, 'connected', 'compatible',
-                     'created', 'not_applicable', 'healthy', 'healthy', 0, ?1
-                 )",
-                params![now + 1],
-            )
-            .unwrap();
-        }
-        storage.maintain_pi_reporter_health_at(now + 1).unwrap();
-        let conn = storage.conn.lock().unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM pi_reporter_health WHERE normalized_hostname='host' AND resolved_at_ms IS NOT NULL",
-                [],
-                |row| row.get::<_, usize>(0),
-            )
-            .unwrap(),
-            crate::pi_tracking::PI_REPORTER_ROWS_PER_HOST,
-        );
-        conn.execute(
-            "UPDATE pi_reporter_health SET resolved_at_ms=?1
-             WHERE process_instance_id='terminal-overflow'",
-            params![now - crate::pi_tracking::PI_REPORTER_TERMINAL_RETENTION_MS - 1],
-        )
-        .unwrap();
-        drop(conn);
-        storage.maintain_pi_reporter_health_at(now).unwrap();
-        let conn = storage.conn.lock().unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM pi_reporter_health
-                 WHERE process_instance_id='terminal-overflow'",
-                [],
-                |row| row.get::<_, usize>(0),
             )
             .unwrap(),
             0,
@@ -22617,12 +21796,11 @@ mod tests {
             conn.execute_batch(
                 "DROP TABLE pi_event_receipts;
                  DROP TABLE pi_session_lifecycle;
-                 DROP TABLE pi_reporter_health;
                  DROP INDEX uidx_model_observations_pi_event_uuid;
                  CREATE UNIQUE INDEX uidx_model_observations_pi_event_uuid
                  ON model_usage_observations(analytics_session_id, event_uuid)
                  WHERE provider = 'pi' AND event_uuid IS NOT NULL;
-                 DELETE FROM schema_version WHERE version = 46;
+                 DELETE FROM schema_version WHERE version IN (46, 47);
                  DELETE FROM settings WHERE key IN (
                      'pi_persisted_source_reconciliation_pending',
                      'pi_spool_cleanup_pending'
@@ -22672,7 +21850,7 @@ mod tests {
                     |row| row.get::<_, i32>(0),
                 )
                 .expect("read migrated schema"),
-            46
+            47
         );
         drop(migrated);
         let reopened = Storage::init_at(db.clone(), false).expect("reopen migrated database");
@@ -22752,7 +21930,7 @@ mod tests {
                     |row| row.get::<_, i32>(0),
                 )
                 .expect("read resumed schema"),
-            46
+            47
         );
         clear_env();
     }
@@ -22835,56 +22013,6 @@ mod tests {
                 )
                 .expect("read resumed Pi lifecycle"),
             (4, None)
-        );
-        drop(storage);
-        clear_env();
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Extension Health Persistence]]
-    #[test]
-    #[serial]
-    fn pi_extension_health_stores_handshake_fields_and_last_error() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        storage
-            .store_pi_extension_health(1, "1.2.3", "0.9.0", Some("spool_corrupt"))
-            .expect("store Pi extension health");
-
-        for (key, expected) in [
-            ("pi_extension.protocol", "1"),
-            ("pi_extension.extension_version", "1.2.3"),
-            ("pi_extension.min_quill_version", "0.9.0"),
-            ("pi_extension.last_error", "spool_corrupt"),
-        ] {
-            assert_eq!(storage.get_setting(key).unwrap().as_deref(), Some(expected));
-        }
-        let first_seen = storage.get_setting("pi_extension.last_seen").unwrap();
-        assert!(first_seen.is_some());
-
-        // An unchanged handshake must not rewrite five settings rows per
-        // envelope; a changed field still writes through immediately.
-        storage
-            .store_pi_extension_health(1, "1.2.3", "0.9.0", Some("spool_corrupt"))
-            .expect("repeat unchanged Pi extension health");
-        assert_eq!(
-            storage.get_setting("pi_extension.last_seen").unwrap(),
-            first_seen
-        );
-
-        storage
-            .store_pi_extension_health(1, "1.2.3", "0.9.0", None)
-            .expect("store cleared Pi extension error");
-        assert_eq!(
-            storage
-                .get_setting("pi_extension.last_error")
-                .unwrap()
-                .as_deref(),
-            Some("")
-        );
-        assert_ne!(
-            storage.get_setting("pi_extension.last_seen").unwrap(),
-            first_seen
         );
         drop(storage);
         clear_env();
@@ -27583,8 +26711,7 @@ mod tests {
                  DROP TABLE runtime_turn_state_v45;
                  DROP TABLE pi_event_receipts;
                  DROP TABLE pi_session_lifecycle;
-                 DROP TABLE pi_reporter_health;
-                 DELETE FROM schema_version WHERE version IN (43, 44, 45, 46);",
+                 DELETE FROM schema_version WHERE version IN (43, 44, 45, 46, 47);",
             )
             .expect("rewind database to schema 42");
         }
@@ -27599,7 +26726,7 @@ mod tests {
                 |row| row.get::<_, i32>(0),
             )
             .expect("read schema version"),
-            46
+            47
         );
         for column in [
             "event_uuid",

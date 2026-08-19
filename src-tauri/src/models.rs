@@ -48,15 +48,14 @@ pub const PI_PROTOCOL_V2: u32 = 2;
 pub const PI_PROTOCOL_V2_REPORTER_VERSION: &str = "0.2.0";
 pub const PI_PROTOCOL_V2_QUILL_BUILD: &str = env!("CARGO_PKG_VERSION");
 pub const PI_PROTOCOL_V2_TRACKING_SCHEMA: u32 = 2;
-pub const PI_PROTOCOL_V2_CAPABILITIES: [&str; 5] = [
+pub const PI_PROTOCOL_V2_CAPABILITIES: [&str; 4] = [
     "direct-lineage",
     "lifecycle-occurrence",
     "persisted-session-entry",
     "typed-outcomes",
-    "candidate-broker",
 ];
 pub const PI_PROTOCOL_V2_CAPABILITY_DIGEST: &str =
-    "dc8239abf9b38e3755ee43d91f092e667d3b128d27a5ed5d66899f9b10670860";
+    "5cdd47afab5b26bf604c15338a43944373f40da3dec2543cef662e9988a2f3e7";
 
 /// Shallow compatibility metadata decoded before closed event variants.
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -205,9 +204,6 @@ pub enum PiProtocolV2ErrorCode {
     InvalidEntry,
     TrackingSchemaMismatch,
     ProtocolMismatch,
-    ReporterVersionMismatch,
-    QuillBuildMismatch,
-    CapabilityMismatch,
     Unauthorized,
     UnknownSession,
     ReannounceRequired,

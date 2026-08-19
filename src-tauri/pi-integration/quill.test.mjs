@@ -21,8 +21,6 @@ import quill, {
   PI_PROTOCOL_V2_QUILL_BUILD,
   PI_PROTOCOL_V2_REPORTER_VERSION,
   buildProtocolV2Envelope,
-  electReporterCandidate,
-  reporterCandidateForPath,
   buildProtocolV2Event,
   buildQuillTrackingEntry,
   protocolV2FixtureJsonl,
@@ -143,26 +141,15 @@ function httpResponse(status, body = {}) {
 }
 
 const SOURCE_PATH = fileURLToPath(new URL("./quill.ts", import.meta.url));
-const REPORTER_CONTRACT = {
-  enabled: true,
-  protocol: PI_PROTOCOL_V2,
-  reporter_version: PI_PROTOCOL_V2_REPORTER_VERSION,
-  quill_build: PI_PROTOCOL_V2_QUILL_BUILD,
-  capability_digest: PI_PROTOCOL_V2_CAPABILITY_DIGEST,
-};
 
 async function withHome(config, run) {
-  const configured =
-    config && typeof config === "object"
-      ? { pi_reporter: REPORTER_CONTRACT, ...config }
-      : config;
-  const root = configRoot(configured);
+  const root = configRoot(config);
   const oldHome = process.env.HOME;
   const oldChild = process.env.PI_SUBAGENT_CHILD;
   const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
-  const oldReporterPath = process.env.QUILL_PI_REPORTER_PATH;
+  const oldDebug = process.env.QUILL_DEBUG;
   process.env.HOME = root;
-  process.env.QUILL_PI_REPORTER_PATH = SOURCE_PATH;
+  delete process.env.QUILL_DEBUG;
   delete process.env.PI_SUBAGENT_CHILD;
   delete process.env.PI_SUBAGENT_PARENT_SESSION;
   try {
@@ -174,8 +161,8 @@ async function withHome(config, run) {
     else process.env.PI_SUBAGENT_CHILD = oldChild;
     if (oldParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
     else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
-    if (oldReporterPath === undefined) delete process.env.QUILL_PI_REPORTER_PATH;
-    else process.env.QUILL_PI_REPORTER_PATH = oldReporterPath;
+    if (oldDebug === undefined) delete process.env.QUILL_DEBUG;
+    else process.env.QUILL_DEBUG = oldDebug;
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -213,15 +200,12 @@ test("protocol v2 fixture is deterministic and privacy-safe", () => {
     "option:agent_role:omitted",
     "option:agent_role:present",
     "option:required:omitted",
-    "option:required:present",
     "option:retry_after_ms:omitted",
     "option:retry_after_ms:present",
     "invalid:field",
     "mismatch:protocol:older",
     "mismatch:protocol:newer",
-    "mismatch:reporter_version",
-    "mismatch:quill_build",
-    "mismatch:capability_digest",
+    "generation:legacy-compatible",
     "outcome:applied",
     "outcome:duplicate",
     "outcome:stale",
@@ -238,7 +222,7 @@ test("protocol v2 fixture is deterministic and privacy-safe", () => {
   }
 });
 
-test("protocol v2 builders share exact generation and omit absent options", () => {
+test("protocol v2 builders preserve metadata and omit absent options", () => {
   const event = buildProtocolV2Event({
     event_uuid: "00000000-0000-4000-8000-000000000001",
     event: "session_start",
@@ -324,74 +308,7 @@ test("persistent lifecycle appends the same protocol v2 event before live delive
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Typed bounded delivery]]
-test("persistent live sessions reannounce every 30 seconds without overlapping", async (t) => {
-  t.mock.timers.enable({ apis: ["setInterval"] });
-  await withHome(
-    { url: "http://127.0.0.1:19876", secret: "secret" },
-    async () => {
-      const pi = fakePi();
-      quill(pi.api);
-      const calls = [];
-      let finishReplay;
-      const oldFetch = globalThis.fetch;
-      globalThis.fetch = async (url, options) => {
-        if (!String(url).endsWith("/api/v1/pi/track")) {
-          return httpResponse(202);
-        }
-        calls.push(JSON.parse(options.body));
-        if (calls.length === 2) {
-          return new Promise((resolve) => {
-            finishReplay = () => resolve(httpResponse(202));
-          });
-        }
-        return httpResponse(202);
-      };
-      const ctx = context("periodic-recovery");
-      try {
-        pi.handlers.get("session_start")[0](
-          { type: "session_start", reason: "startup" },
-          ctx,
-        );
-        await flushRequests();
-        assert.equal(calls.length, 1);
-        assert.equal(pi.entries.length, 1);
-
-        t.mock.timers.tick(30_000);
-        await flushRequests();
-        assert.equal(calls.length, 2);
-        assert.deepEqual(calls[1], calls[0]);
-        assert.equal(pi.entries.length, 1);
-
-        t.mock.timers.tick(30_000);
-        await flushRequests();
-        assert.equal(calls.length, 2);
-
-        finishReplay();
-        await flushRequests();
-        t.mock.timers.tick(30_000);
-        await flushRequests();
-        assert.equal(calls.length, 3);
-        assert.deepEqual(calls[2], calls[0]);
-        assert.equal(pi.entries.length, 1);
-
-        await pi.handlers.get("session_shutdown")[0](
-          { type: "session_shutdown", reason: "quit" },
-          ctx,
-        );
-        assert.equal(calls.length, 4);
-        assert.equal(calls[3].events[0].event, "session_end");
-        t.mock.timers.tick(60_000);
-        await flushRequests();
-        assert.equal(calls.length, 4);
-      } finally {
-        globalThis.fetch = oldFetch;
-      }
-    },
-  );
-});
-
-// @lat: [[pi-extension-tests#Pi Extension Test Specs#Typed bounded delivery]]
-test("reporter replacement releases the prior live reannouncement", async (t) => {
+test("persistent live sessions do not reannounce on a timer", async (t) => {
   t.mock.timers.enable({ apis: ["setInterval"] });
   await withHome(
     { url: "http://127.0.0.1:19876", secret: "secret" },
@@ -404,24 +321,16 @@ test("reporter replacement releases the prior live reannouncement", async (t) =>
         if (String(url).endsWith("/api/v1/pi/track")) requests += 1;
         return httpResponse(202);
       };
-      const ctx = context("released-recovery");
       try {
         pi.handlers.get("session_start")[0](
           { type: "session_start", reason: "startup" },
-          ctx,
+          context("no-periodic-recovery"),
         );
         await flushRequests();
         assert.equal(requests, 1);
-
-        quill(pi.api);
         t.mock.timers.tick(60_000);
         await flushRequests();
         assert.equal(requests, 1);
-
-        await pi.handlers.get("session_shutdown")[0](
-          { type: "session_shutdown", reason: "quit" },
-          ctx,
-        );
       } finally {
         globalThis.fetch = oldFetch;
       }
@@ -515,8 +424,7 @@ test("transient tracking failures retry once and auth reloads once", async () =>
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Typed bounded delivery]]
-test("unknown session reannounces once and protocol mismatch makes live push inert", async (t) => {
-  t.mock.timers.enable({ apis: ["setInterval"] });
+test("unknown session reannounces once", async () => {
   await withHome(
     { url: "http://127.0.0.1:19876", secret: "secret" },
     async () => {
@@ -563,60 +471,17 @@ test("unknown session reannounces once and protocol mismatch makes live push ine
       }
     },
   );
-
-  await withHome(
-    { url: "http://127.0.0.1:19876", secret: "secret" },
-    async () => {
-      const pi = fakePi();
-      quill(pi.api);
-      let requests = 0;
-      const oldFetch = globalThis.fetch;
-      globalThis.fetch = async (url) => {
-        if (!String(url).endsWith("/api/v1/pi/track")) {
-          return httpResponse(202);
-        }
-        requests += 1;
-        return httpResponse(426, {
-          code: "protocol_mismatch",
-          message: "exact pair required",
-        });
-      };
-      const ctx = context("inert-session");
-      try {
-        pi.handlers.get("session_start")[0](
-          { type: "session_start", reason: "startup" },
-          ctx,
-        );
-        await flushRequests();
-        t.mock.timers.tick(60_000);
-        await flushRequests();
-        assert.equal(requests, 1);
-        await pi.handlers.get("session_shutdown")[0](
-          { type: "session_shutdown", reason: "quit" },
-          ctx,
-        );
-        assert.equal(requests, 1);
-        assert.equal(pi.entries.length, 2);
-      } finally {
-        globalThis.fetch = oldFetch;
-      }
-    },
-  );
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Typed bounded delivery]]
-test("event-level lifecycle rejection drops one delivery without silencing reporter", async (t) => {
-  t.mock.timers.enable({ apis: ["setInterval"] });
+test("event-level lifecycle rejection drops one delivery without silencing later lifecycle", async () => {
   await withHome(
     { url: "http://127.0.0.1:19876", secret: "secret" },
     async () => {
       const pi = fakePi();
       quill(pi.api);
       const calls = [];
-      const logs = [];
-      const oldError = console.error;
       const oldFetch = globalThis.fetch;
-      console.error = (...parts) => logs.push(parts.join(" "));
       globalThis.fetch = async (url, options) => {
         if (!String(url).endsWith("/api/v1/pi/track")) {
           return httpResponse(202);
@@ -624,7 +489,7 @@ test("event-level lifecycle rejection drops one delivery without silencing repor
         const body = JSON.parse(options.body);
         calls.push(body);
         return calls.length === 2
-          ? httpResponse(426, {
+          ? httpResponse(400, {
               code: "invalid_event",
               message: "Invalid protocol-v2 event",
             })
@@ -637,33 +502,21 @@ test("event-level lifecycle rejection drops one delivery without silencing repor
           ctx,
         );
         await flushRequests();
-        assert.equal(calls.length, 1);
-        assert.equal(calls[0].protocol, PI_PROTOCOL_V2);
-
-        t.mock.timers.tick(30_000);
-        await flushRequests();
-        assert.equal(calls.length, 2);
-        assert.deepEqual(calls[1], calls[0]);
-
-        t.mock.timers.tick(30_000);
-        await flushRequests();
-        assert.equal(calls.length, 3);
-        assert.deepEqual(calls[2], calls[0]);
-
         await pi.handlers.get("session_shutdown")[0](
           { type: "session_shutdown", reason: "quit" },
           ctx,
         );
-        assert.equal(calls.length, 4);
-        assert.equal(calls[3].protocol, PI_PROTOCOL_V2);
-        assert.equal(calls[3].events[0].event, "session_end");
-        assert.equal(pi.entries.length, 2);
-        assert.deepEqual(logs, [
-          "Quill Pi extension TransportError: invalid_event: Invalid protocol-v2 event",
-        ]);
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "reload" },
+          ctx,
+        );
+        await flushRequests();
+        assert.deepEqual(
+          calls.map((call) => call.events[0].event),
+          ["session_start", "session_end", "session_start"],
+        );
       } finally {
         globalThis.fetch = oldFetch;
-        console.error = oldError;
       }
     },
   );
@@ -748,205 +601,39 @@ test("registers every production tracking handler", async () => {
   });
 });
 
-// @lat: [[pi-extension-tests#Pi Extension Test Specs#Reporter coexistence]]
-test("reporter candidates classify channels and require exact unofficial opt-in", () => {
-  const home = "/home/test";
-  const agentDir = `${home}/.pi/agent`;
-  const cwd = `${home}/work/project`;
-  const paths = {
-    managed: `${agentDir}/extensions/quill.ts`,
-    npm: `${agentDir}/npm/node_modules/@sharaf-nassar/quill-pi/quill.ts`,
-    project: `${cwd}/.pi/extensions/quill.ts`,
-    development: `${home}/work/quill/src-tauri/pi-integration/quill.ts`,
-  };
-
-  for (const [installChannel, extensionPath] of Object.entries(paths)) {
-    const candidate = reporterCandidateForPath(extensionPath, {
-      home,
-      agentDir,
-      cwd,
-      selectedPath:
-        installChannel === "project" || installChannel === "development"
-          ? extensionPath
-          : undefined,
-    });
-    assert.equal(candidate.install_channel, installChannel);
-    assert.equal(candidate.extension_path, resolve(extensionPath));
-    assert.equal(candidate.eligible, true);
-  }
-
-  for (const installChannel of ["project", "development"]) {
-    assert.equal(
-      reporterCandidateForPath(paths[installChannel], {
-        home,
-        agentDir,
-        cwd,
-      }).eligible,
-      false,
-    );
-  }
-});
-
-// @lat: [[pi-extension-tests#Pi Extension Test Specs#Reporter coexistence]]
-test("reporter election rejects both skew directions and follows channel precedence", () => {
-  const candidate = (install_channel, overrides = {}) => ({
-    install_channel,
-    extension_path: `/${install_channel}/quill.ts`,
-    eligible: true,
-    protocol: PI_PROTOCOL_V2,
-    reporter_version: PI_PROTOCOL_V2_REPORTER_VERSION,
-    quill_build: PI_PROTOCOL_V2_QUILL_BUILD,
-    capability_digest: PI_PROTOCOL_V2_CAPABILITY_DIGEST,
-    capabilities: PI_PROTOCOL_V2_CAPABILITIES,
-    ...overrides,
-  });
-  const project = candidate("project");
-  const npm = candidate("npm");
-  const managed = candidate("managed");
-
-  assert.equal(
-    electReporterCandidate([project, npm, managed], REPORTER_CONTRACT),
-    managed,
-  );
-  assert.equal(electReporterCandidate([project, npm], REPORTER_CONTRACT), npm);
-  assert.equal(electReporterCandidate([project], REPORTER_CONTRACT), project);
-  assert.equal(
-    electReporterCandidate(
-      [candidate("managed", { protocol: PI_PROTOCOL_V2 - 1 })],
-      REPORTER_CONTRACT,
-    ),
-    undefined,
-  );
-  assert.equal(
-    electReporterCandidate(
-      [candidate("managed", { protocol: PI_PROTOCOL_V2 + 1 })],
-      REPORTER_CONTRACT,
-    ),
-    undefined,
-  );
-  assert.equal(
-    electReporterCandidate(
-      [candidate("managed", { eligible: false }), project],
-      REPORTER_CONTRACT,
-    ),
-    project,
-  );
-});
-
-// @lat: [[pi-extension-tests#Pi Extension Test Specs#Reporter coexistence]]
-test("coexisting copies register and emit each stable event once", async () => {
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Feature gates]]
+test("disabled reporter contract registers nothing while stale generation metadata is ignored", async () => {
   await withHome(
-    { url: "http://127.0.0.1:19876", secret: "secret", hostname: "pi-host" },
-    async () => {
+    {
+      url: "http://127.0.0.1:19876",
+      secret: "secret",
+      pi_reporter: { enabled: false },
+    },
+    () => {
       const pi = fakePi();
-      const laterCopy = fakePi();
       quill(pi.api);
-      quill(laterCopy.api);
-      assert.equal(laterCopy.handlers.size, 0);
-      assert.equal(laterCopy.tools.size, 0);
-
-      for (const event of [
-        "session_start",
-        "session_shutdown",
-        "agent_start",
-        "agent_settled",
-        "turn_end",
-        "tool_execution_start",
-        "tool_execution_end",
-        "input",
-      ]) {
-        assert.equal(pi.handlers.get(event)?.length, 1, event);
-      }
-
-      const calls = [];
-      const oldFetch = globalThis.fetch;
-      globalThis.fetch = async (url, options) => {
-        calls.push({ url: String(url), body: JSON.parse(options.body) });
-        return {
-          ok: true,
-          status: 202,
-          json: async () => ({}),
-          body: { cancel: async () => {} },
-        };
-      };
-      const ctx = context("coexistence-session");
-      try {
-        pi.handlers.get("session_start")[0](
-          { type: "session_start", reason: "startup" },
-          ctx,
-        );
-        await flushRequests();
-        await pi.handlers.get("session_shutdown")[0](
-          { type: "session_shutdown", reason: "quit" },
-          ctx,
-        );
-
-        const events = calls
-          .filter((call) => call.url.endsWith("/api/v1/pi/track"))
-          .flatMap((call) => call.body.events);
-        for (const type of ["session_start", "session_end"]) {
-          assert.equal(
-            events.filter((event) => (event.event || event.type) === type)
-              .length,
-            1,
-            type,
-          );
-        }
-        assert.equal(
-          new Set(events.map((event) => event.event_uuid)).size,
-          events.length,
-        );
-      } finally {
-        globalThis.fetch = oldFetch;
-      }
+      assert.equal(pi.tools.size, 0);
+      assert.equal(pi.handlers.size, 0);
     },
   );
-});
 
-// @lat: [[pi-extension-tests#Pi Extension Test Specs#Feature gates]]
-test("disabled and mismatched reporter contracts register nothing", async () => {
-  for (const pi_reporter of [
-    { ...REPORTER_CONTRACT, enabled: false },
-    { ...REPORTER_CONTRACT, reporter_version: "99.0.0" },
-    { ...REPORTER_CONTRACT, quill_build: "99.0.0" },
-  ]) {
-    await withHome(
-      { url: "http://127.0.0.1:19876", secret: "secret", pi_reporter },
-      () => {
-        const pi = fakePi();
-        quill(pi.api);
-        assert.equal(pi.tools.size, 0);
-        assert.equal(pi.handlers.size, 0);
-      },
-    );
-  }
-});
-
-// @lat: [[pi-extension-tests#Pi Extension Test Specs#Reporter coexistence]]
-test("a pre-broker claim stays active and emits one reload remediation", async () => {
   await withHome(
-    { url: "http://127.0.0.1:19876", secret: "secret" },
-    (root) => {
-      const claimsKey = Symbol.for("quill.pi.reporter.claims");
-      const quillRoot = join(root, ".config", "quill");
-      const claims = globalThis[claimsKey] || new Set();
-      globalThis[claimsKey] = claims;
-      claims.add(quillRoot);
-      const warnings = [];
-      const oldWarn = console.warn;
-      console.warn = (...parts) => warnings.push(parts.join(" "));
-      try {
-        const pi = fakePi();
-        quill(pi.api);
-        quill(pi.api);
-        assert.equal(pi.handlers.size, 0);
-        assert.equal(warnings.length, 1);
-        assert.match(warnings[0], /ReporterReloadRequired/);
-        assert.match(warnings[0], /reload/i);
-      } finally {
-        console.warn = oldWarn;
-        claims.delete(quillRoot);
-      }
+    {
+      url: "http://127.0.0.1:19876",
+      secret: "secret",
+      pi_reporter: {
+        enabled: true,
+        protocol: 1,
+        reporter_version: "0.1.0",
+        quill_build: "old",
+        capability_digest: "old",
+      },
+    },
+    () => {
+      const pi = fakePi();
+      quill(pi.api);
+      assert.deepEqual([...pi.tools.keys()], TOOL_NAMES);
+      assert.equal(pi.handlers.get("session_start")?.length, 1);
     },
   );
 });
@@ -1418,7 +1105,7 @@ test("rendered feature flags independently gate tools and telemetry", async () =
               context_telemetry: false,
             },
             8,
-            ["tool_call", "session_shutdown"],
+            ["tool_call"],
           ],
         ]) {
           const path = join(
@@ -1427,7 +1114,6 @@ test("rendered feature flags independently gate tools and telemetry", async () =
           );
           writeFileSync(path, renderFeatures(source, flags));
           const rendered = (await import(pathToFileURL(path).href)).default;
-          process.env.QUILL_PI_REPORTER_PATH = path;
           const pi = fakePi();
           rendered(pi.api);
           assert.equal(pi.tools.size, expectedTools);
@@ -1441,10 +1127,12 @@ test("rendered feature flags independently gate tools and telemetry", async () =
             pi.handlers.has("session_start"),
             flags.activity_tracking,
           );
-          await pi.handlers.get("session_shutdown")[0](
-            { type: "session_shutdown", reason: "reload" },
-            context(),
-          );
+          if (pi.handlers.has("session_shutdown")) {
+            await pi.handlers.get("session_shutdown")[0](
+              { type: "session_shutdown", reason: "reload" },
+              context(),
+            );
+          }
         }
       } finally {
         globalThis.fetch = oldFetch;
@@ -1723,7 +1411,6 @@ test("telemetry has one canonical tool pair and settled Stop semantics", async (
         assert.ok(payloads.every((payload) => payload.session_id === "pi-session"));
         assert.ok(payloads.every((payload) => payload.hostname === "pi-host"));
         assert.ok(headers.every((value) => value["X-Quill-Pi-Process"]));
-        assert.ok(headers.every((value) => value["X-Quill-Pi-Channel"]));
 
         const lib = readFileSync(
           join(
@@ -1779,7 +1466,7 @@ test("configured child lineage exclusively owns subagent hook semantics", async 
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Typed bounded delivery]]
-test("hook and routing telemetry surface typed non-2xx responses", async () => {
+test("unavailable hook and routing telemetry stay silent and contained", async () => {
   await withHome(
     { url: "http://127.0.0.1:19876", secret: "secret" },
     async () => {
@@ -1809,8 +1496,65 @@ test("hook and routing telemetry surface typed non-2xx responses", async () => {
         );
         assert.equal(denied.block, true);
         await flushRequests();
-        assert.ok(errors.some((error) => /rate_limited|slow down/.test(error)));
-        assert.ok(errors.some((error) => /unavailable/.test(error)));
+        assert.deepEqual(errors, []);
+      } finally {
+        globalThis.fetch = oldFetch;
+        console.error = oldError;
+      }
+    },
+  );
+});
+
+test("hook telemetry stays silent and contained when Quill is unavailable", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const output = [];
+      const oldFetch = globalThis.fetch;
+      const oldError = console.error;
+      const oldWarn = console.warn;
+      globalThis.fetch = () => Promise.reject(new Error("connection refused"));
+      console.error = (...parts) => output.push(parts.join(" "));
+      console.warn = (...parts) => output.push(parts.join(" "));
+      try {
+        assert.doesNotThrow(() =>
+          pi.handlers.get("tool_execution_start")[0](
+            { type: "tool_execution_start", toolName: "read", toolCallId: "call" },
+            context("quill-unavailable"),
+          ),
+        );
+        await flushRequests();
+        assert.deepEqual(output, []);
+      } finally {
+        globalThis.fetch = oldFetch;
+        console.error = oldError;
+        console.warn = oldWarn;
+      }
+    },
+  );
+});
+
+test("QUILL_DEBUG enables contained telemetry diagnostics", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      process.env.QUILL_DEBUG = "1";
+      const pi = fakePi();
+      quill(pi.api);
+      const output = [];
+      const oldFetch = globalThis.fetch;
+      const oldError = console.error;
+      globalThis.fetch = () => Promise.reject(new Error("connection refused"));
+      console.error = (...parts) => output.push(parts.join(" "));
+      try {
+        pi.handlers.get("tool_execution_start")[0](
+          { type: "tool_execution_start", toolName: "read", toolCallId: "call" },
+          context("quill-debug"),
+        );
+        await flushRequests();
+        assert.ok(output.some((line) => /Hook telemetry failed/.test(line)));
       } finally {
         globalThis.fetch = oldFetch;
         console.error = oldError;
@@ -2144,7 +1888,6 @@ test("context preservation off registers no router or routing telemetry", async 
         }),
       );
       const rendered = (await import(pathToFileURL(path).href)).default;
-      process.env.QUILL_PI_REPORTER_PATH = path;
       const pi = fakePi();
       let requests = 0;
       const oldFetch = globalThis.fetch;
@@ -2155,7 +1898,7 @@ test("context preservation off registers no router or routing telemetry", async 
       try {
         rendered(pi.api);
         assert.equal(pi.tools.size, 0);
-        assert.deepEqual([...pi.handlers.keys()], ["session_shutdown"]);
+        assert.deepEqual([...pi.handlers.keys()], []);
         assert.equal(requests, 0);
       } finally {
         globalThis.fetch = oldFetch;
@@ -2260,7 +2003,6 @@ test("context telemetry off preserves routing without posting", async () => {
         }),
       );
       const rendered = (await import(pathToFileURL(path).href)).default;
-      process.env.QUILL_PI_REPORTER_PATH = path;
       const pi = fakePi();
       let requests = 0;
       const oldFetch = globalThis.fetch;
@@ -2452,7 +2194,7 @@ test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", a
       context_url: baseUrl,
       secret: "real-pi-secret",
       hostname: "pi-test",
-      pi_reporter: REPORTER_CONTRACT,
+      pi_reporter: { enabled: true },
     }),
   );
 
@@ -2488,7 +2230,6 @@ test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", a
         PI_CODING_AGENT_DIR: configDir,
         PI_CODING_AGENT_SESSION_DIR: sessionDir,
         PI_SUBAGENT_CHILD: "0",
-        QUILL_PI_REPORTER_PATH: SOURCE_PATH,
       },
     },
   );
@@ -2557,6 +2298,7 @@ test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", a
       `REAL_PI_RESULT version=${piVersion} context_calls=1 session_ms=${sessionMs}`,
     );
   } finally {
+    server.closeAllConnections();
     server.close();
     await once(server, "close");
     rmSync(root, { recursive: true, force: true });

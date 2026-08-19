@@ -34,7 +34,6 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { reporterCandidateForPath } from "../src-tauri/pi-integration/quill.ts";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PROD_ID = "com.quilltoolkit.app";
@@ -305,33 +304,6 @@ async function main() {
 	if (process.platform !== "linux") {
 		throw new Error("this regression needs Xvfb and a session bus; run it on Linux");
 	}
-	const candidateHome = join(tmpdir(), "quill-reporter-policy");
-	const candidateCwd = join(candidateHome, "project");
-	for (const path of [
-		join(candidateCwd, ".pi/extensions/quill.ts"),
-		join(REPO, "src-tauri/pi-integration/quill.ts"),
-	]) {
-		assert.equal(
-			reporterCandidateForPath(path, {
-				home: candidateHome,
-				cwd: candidateCwd,
-				agentDir: join(candidateHome, ".pi/agent"),
-			}).eligible,
-			false,
-			"project/development reporters stay inert without exact path selection",
-		);
-		assert.equal(
-			reporterCandidateForPath(path, {
-				home: candidateHome,
-				cwd: candidateCwd,
-				agentDir: join(candidateHome, ".pi/agent"),
-				selectedPath: path,
-			}).eligible,
-			true,
-			"exact path selection opts one unofficial reporter in",
-		);
-	}
-
 	const binaries = buildBinaries();
 	const ports = {
 		prod: { main: await assignPort(), context: await assignPort() },

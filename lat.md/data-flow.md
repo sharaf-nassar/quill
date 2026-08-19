@@ -150,11 +150,9 @@ Every lifecycle `hooks/list` call uses a process-only local-provider override, s
 
 `POST /api/v1/pi/track` accepts only bearer-authenticated protocol-2 lifecycle envelopes. Lifecycle commits before live mutation and answers typed dispositions; model, tokens, activity, and agent rails arrive from the persisted Pi session file. Validation finishes before mutation. Hostnames reject control characters and normalize once to the lowercase short storage key. Only session start may create state; later lineage updates require its current process, shutdown removes it, and stale shutdown cannot close a newer startup/reload continuation. Replacement starts remove their prior id first. Demo mode mutates nothing.
 
-Authenticated Pi tracking, hook, and context telemetry carry one canonical reporter subject: normalized host, process instance, install channel, protocol, reporter version, Quill build, and capability digest. [[src-tauri/src/storage.rs#Storage#record_pi_reporter_failure]] records compatibility, lifecycle, configured-child, source, transport, and typed saturation failures for that subject; only evidence from the same subject and dimension recovers them. Bad authentication records nothing.
+Protocol-2 lifecycle metadata carries normalized host, process instance, reporter version, Quill build, and capability digest, but only the protocol version gates decoding. Migration 47 drops the obsolete `pi_reporter_health` table and saturation settings; Integrations derives no reporter-generation status or remediation from transport heartbeats.
 
-[[src-tauri/src/storage.rs#Storage#pi_reporter_health_summary_at]] expires inactive subjects after 15 minutes, retains terminal rows for 24 hours, and caps active and terminal rows independently at 4,096 per host. Admission beyond the active cap produces bounded typed saturation instead of an unbounded row. Provider-status IPC presents the worst active state plus affected reporter/session counts, exact mismatch requirements, remediation, and latest verified recovery while preserving legacy never-connected/alive/idle/stale semantics when canonical evidence is absent.
-
-Migration 46 sets `pi_spool_cleanup_pending`, and [[src-tauri/src/server.rs#start_server]] does not spawn the legacy drain while that durable marker exists. No spool lifecycle, lineage, runtime, or usage record is imported into the new owner; persisted Pi sessions are the reconciliation source. Legacy drain code and its direct safety tests remain temporarily available for the later deployment-cutover task, which owns exact reporter reload and artifact deletion.
+Migration 46 sets `pi_spool_cleanup_pending`, and [[src-tauri/src/server.rs#start_server]] does not spawn the legacy drain while that durable marker exists. No spool lifecycle, lineage, runtime, or usage record is imported into the new owner; persisted Pi sessions are the reconciliation source. Spool retirement waits only for persisted-source reconciliation, not reporter reload or exact-generation acknowledgement.
 
 [[src-tauri/src/live_tracker.rs#LiveTracker#apply_paths]] folds the Claude, Codex, and Pi transcripts the filesystem watcher reports. Each file carries the byte offset already consumed, so steady state parses only appended bytes; a trailing line without its newline is left for the next fold.
 
@@ -200,7 +198,9 @@ A rewritten file is shorter than the offset already consumed, which clears the a
 
 ### Pi Lifecycle Rules
 
-Protocol-2 lifecycle preserves remote identities and lineage where disk-folding cannot reach. Local session files own live activity, models, tokens, agents, tools, skills, search, and response times.
+Protocol-2 lifecycle preserves remote identities and lineage where disk-folding cannot reach.
+
+Local session files own live activity, models, tokens, agents, tools, skills, search, and response times. Durable `pi_session_lifecycle` and `pi_event_receipts` remain because remote-host lifecycle, process ordering, event idempotency, and transactional lineage have no local file sweep to reconstruct them from.
 
 [[src-tauri/src/transcript_analytics.rs#source_local_response_times]] derives each Pi turn from persisted user and assistant records under the canonical source key; no runtime-message push is needed. The extension calls Session Search notify only when Pi supplies a transcript path already on disk. Startup inventory, the filesystem watcher, and the 120-second rescan recover the same persisted source without notify. Validation uses [[src-tauri/src/pi_session.rs#read_pi_session_header]] as a bounded v2/v3 probe, then shared parsing indexes messages and schedules authoritative reconciliation. A missing path provides no persisted evidence to invent.
 

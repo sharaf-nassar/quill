@@ -15,293 +15,6 @@ pub use crate::models::{
 
 const MAX_EVENTS: usize = 200;
 const MAX_NAME_BYTES: usize = 256;
-pub(crate) const PI_REPORTER_ACTIVE_TTL_MS: i64 = 15 * 60 * 1_000;
-pub(crate) const PI_REPORTER_TERMINAL_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
-pub(crate) const PI_REPORTER_ROWS_PER_HOST: usize = 4_096;
-
-pub(crate) const PI_REPORTER_HOST_HEADER: &str = "x-quill-pi-host";
-pub(crate) const PI_REPORTER_PROCESS_HEADER: &str = "x-quill-pi-process";
-pub(crate) const PI_REPORTER_CHANNEL_HEADER: &str = "x-quill-pi-channel";
-pub(crate) const PI_REPORTER_PROTOCOL_HEADER: &str = "x-quill-pi-protocol";
-pub(crate) const PI_REPORTER_VERSION_HEADER: &str = "x-quill-pi-reporter";
-pub(crate) const PI_REPORTER_BUILD_HEADER: &str = "x-quill-pi-build";
-pub(crate) const PI_REPORTER_CAPABILITY_HEADER: &str = "x-quill-pi-capability";
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PiReporterHealthSubject {
-    pub(crate) normalized_hostname: String,
-    pub(crate) process_instance_id: String,
-    pub(crate) install_channel: String,
-    pub(crate) protocol: u32,
-    pub(crate) reporter_version: String,
-    pub(crate) quill_build: String,
-    pub(crate) capability_digest: String,
-}
-
-impl PiReporterHealthSubject {
-    pub(crate) fn new(
-        normalized_hostname: &str,
-        process_instance_id: &str,
-        install_channel: &str,
-        protocol: u32,
-        reporter_version: &str,
-        quill_build: &str,
-        capability_digest: &str,
-    ) -> Result<Self, String> {
-        validate_health_name(process_instance_id, "process instance")?;
-        validate_health_name(reporter_version, "reporter version")?;
-        validate_health_name(quill_build, "Quill build")?;
-        validate_health_name(capability_digest, "capability digest")?;
-        if !matches!(
-            install_channel,
-            "managed" | "npm" | "project" | "development" | "unknown" | "live"
-        ) {
-            return Err("Invalid reporter install channel".to_owned());
-        }
-        validate_host(normalized_hostname).map_err(|error| error.message)?;
-        Ok(Self {
-            normalized_hostname: normalized_hostname.to_owned(),
-            process_instance_id: process_instance_id.to_owned(),
-            install_channel: install_channel.to_owned(),
-            protocol,
-            reporter_version: reporter_version.to_owned(),
-            quill_build: quill_build.to_owned(),
-            capability_digest: capability_digest.to_owned(),
-        })
-    }
-
-    pub(crate) fn from_envelope(
-        envelope: &PiProtocolV2Envelope,
-        install_channel: &str,
-    ) -> Result<Self, String> {
-        let first = envelope
-            .events
-            .first()
-            .ok_or_else(|| "Reporter envelope has no events".to_owned())?;
-        if envelope.events.iter().any(|event| {
-            event.normalized_host != first.normalized_host
-                || event.process_instance_id != first.process_instance_id
-        }) {
-            return Err("Reporter envelope mixes host or process identities".to_owned());
-        }
-        Self::new(
-            &first.normalized_host,
-            &first.process_instance_id,
-            install_channel,
-            envelope.protocol,
-            &envelope.reporter_version,
-            &envelope.quill_build,
-            &envelope.capability_digest,
-        )
-    }
-}
-
-fn validate_health_name(value: &str, label: &str) -> Result<(), String> {
-    if value.is_empty()
-        || value.trim() != value
-        || value.len() > MAX_NAME_BYTES
-        || value.chars().any(char::is_control)
-    {
-        return Err(format!("Invalid {label}"));
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PiReporterHealthDimension {
-    Compatibility,
-    Lifecycle,
-    ChildAck,
-    Source,
-    Transport,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PiReporterHealthCode {
-    ProtocolMismatch,
-    UnknownSession,
-    ChildReporterMissing,
-    SourceRecovering,
-    ReconciliationFailed,
-    TelemetryRejected,
-    Saturated,
-}
-
-impl PiReporterHealthCode {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::ProtocolMismatch => "protocol_mismatch",
-            Self::UnknownSession => "unknown_session",
-            Self::ChildReporterMissing => "child_reporter_missing",
-            Self::SourceRecovering => "source_recovering",
-            Self::ReconciliationFailed => "reconciliation_failed",
-            Self::TelemetryRejected => "telemetry_rejected",
-            Self::Saturated => "saturated",
-        }
-    }
-
-    pub(crate) fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "protocol_mismatch"
-            | "reporter_version_mismatch"
-            | "quill_build_mismatch"
-            | "capability_mismatch"
-            | "tracking_schema_mismatch" => Some(Self::ProtocolMismatch),
-            "unknown_session" | "reannounce_required" => Some(Self::UnknownSession),
-            "child_reporter_missing" => Some(Self::ChildReporterMissing),
-            "source_not_persisted" | "source_recovering" => Some(Self::SourceRecovering),
-            "reconciliation_failed" => Some(Self::ReconciliationFailed),
-            "saturated" => Some(Self::Saturated),
-            "rate_limited" | "unavailable" | "telemetry_rejected" | "invalid_telemetry" => {
-                Some(Self::TelemetryRejected)
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn dimension(self) -> PiReporterHealthDimension {
-        match self {
-            Self::ProtocolMismatch => PiReporterHealthDimension::Compatibility,
-            Self::UnknownSession => PiReporterHealthDimension::Lifecycle,
-            Self::ChildReporterMissing => PiReporterHealthDimension::ChildAck,
-            Self::SourceRecovering | Self::ReconciliationFailed => {
-                PiReporterHealthDimension::Source
-            }
-            Self::TelemetryRejected | Self::Saturated => PiReporterHealthDimension::Transport,
-        }
-    }
-
-    fn severity(self) -> u8 {
-        match self {
-            Self::ProtocolMismatch => 7,
-            Self::ReconciliationFailed => 6,
-            Self::ChildReporterMissing => 5,
-            Self::UnknownSession => 4,
-            Self::Saturated => 3,
-            Self::TelemetryRejected => 2,
-            Self::SourceRecovering => 1,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PiReporterHealthRow {
-    pub(crate) subject: PiReporterHealthSubject,
-    pub(crate) last_acceptance_ms: Option<i64>,
-    pub(crate) last_heartbeat_ms: Option<i64>,
-    pub(crate) compatibility_state: String,
-    pub(crate) lifecycle_state: String,
-    pub(crate) child_ack_state: String,
-    pub(crate) source_state: String,
-    pub(crate) transport_state: String,
-    pub(crate) latest_code: Option<String>,
-    pub(crate) affected_sessions: usize,
-    pub(crate) recovered_at_ms: Option<i64>,
-    pub(crate) resolved_at_ms: Option<i64>,
-}
-
-impl PiReporterHealthRow {
-    fn active_code(&self) -> Option<PiReporterHealthCode> {
-        if self.compatibility_state != "compatible" {
-            return Some(PiReporterHealthCode::ProtocolMismatch);
-        }
-        if self.source_state == "reconciliation_failed" {
-            return Some(PiReporterHealthCode::ReconciliationFailed);
-        }
-        if self.child_ack_state == "missing" {
-            return Some(PiReporterHealthCode::ChildReporterMissing);
-        }
-        if self.lifecycle_state == "unknown_session" {
-            return Some(PiReporterHealthCode::UnknownSession);
-        }
-        if self.transport_state == "failed" {
-            return self
-                .latest_code
-                .as_deref()
-                .and_then(PiReporterHealthCode::from_str)
-                .or(Some(PiReporterHealthCode::TelemetryRejected));
-        }
-        if matches!(
-            self.source_state.as_str(),
-            "source_not_persisted" | "recovering"
-        ) || self.lifecycle_state == "recovering"
-        {
-            return Some(PiReporterHealthCode::SourceRecovering);
-        }
-        None
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PiReporterHealthSummary {
-    pub(crate) worst_code: Option<PiReporterHealthCode>,
-    pub(crate) worst_subject: Option<PiReporterHealthSubject>,
-    pub(crate) affected_reporters: usize,
-    pub(crate) affected_sessions: usize,
-    pub(crate) active_reporters: usize,
-    pub(crate) saturated_reporters: usize,
-    pub(crate) last_acceptance_ms: Option<i64>,
-    pub(crate) last_heartbeat_ms: Option<i64>,
-    pub(crate) recovered_at_ms: Option<i64>,
-}
-
-pub(crate) fn summarize_reporter_health(
-    rows: &[PiReporterHealthRow],
-    saturated_reporters: usize,
-    now_ms: i64,
-) -> Option<PiReporterHealthSummary> {
-    if rows.is_empty() && saturated_reporters == 0 {
-        return None;
-    }
-    let active_cutoff = now_ms.saturating_sub(PI_REPORTER_ACTIVE_TTL_MS);
-    let active = rows
-        .iter()
-        .filter(|row| {
-            row.resolved_at_ms.is_none()
-                && row
-                    .last_heartbeat_ms
-                    .is_some_and(|heartbeat| heartbeat >= active_cutoff)
-        })
-        .collect::<Vec<_>>();
-    let mut affected = active
-        .iter()
-        .filter_map(|row| row.active_code().map(|code| (*row, code)))
-        .collect::<Vec<_>>();
-    affected.sort_by(|(left_row, left_code), (right_row, right_code)| {
-        right_code
-            .severity()
-            .cmp(&left_code.severity())
-            .then_with(|| right_row.last_heartbeat_ms.cmp(&left_row.last_heartbeat_ms))
-            .then_with(|| {
-                left_row
-                    .subject
-                    .process_instance_id
-                    .cmp(&right_row.subject.process_instance_id)
-            })
-    });
-    let worst = affected.first().copied();
-    let saturation_wins = saturated_reporters > 0
-        && worst
-            .is_none_or(|(_, code)| PiReporterHealthCode::Saturated.severity() > code.severity());
-    Some(PiReporterHealthSummary {
-        worst_code: saturation_wins
-            .then_some(PiReporterHealthCode::Saturated)
-            .or_else(|| worst.map(|(_, code)| code)),
-        worst_subject: (!saturation_wins)
-            .then(|| worst.map(|(row, _)| row.subject.clone()))
-            .flatten(),
-        affected_reporters: affected
-            .len()
-            .saturating_add(usize::from(saturated_reporters > 0)),
-        affected_sessions: affected.iter().map(|(row, _)| row.affected_sessions).sum(),
-        active_reporters: active.len(),
-        saturated_reporters,
-        last_acceptance_ms: rows.iter().filter_map(|row| row.last_acceptance_ms).max(),
-        last_heartbeat_ms: rows.iter().filter_map(|row| row.last_heartbeat_ms).max(),
-        recovered_at_ms: rows.iter().filter_map(|row| row.recovered_at_ms).max(),
-    })
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PiProtocolV2DecodeError {
     pub code: PiProtocolV2ErrorCode,
@@ -366,7 +79,7 @@ pub fn decode_protocol_v2_envelope(
                 format!("Invalid protocol-v2 envelope: {error}"),
             )
         })?;
-    validate_generation(&PiProtocolV2Generation {
+    validate_generation_metadata(&PiProtocolV2Generation {
         protocol: open.protocol,
         reporter_version: open.reporter_version.clone(),
         quill_build: open.quill_build.clone(),
@@ -486,7 +199,7 @@ pub fn decode_protocol_v2_response(
             capability_digest,
             outcomes,
         } => {
-            validate_generation(&PiProtocolV2Generation {
+            validate_generation_metadata(&PiProtocolV2Generation {
                 protocol: *protocol,
                 reporter_version: reporter_version.clone(),
                 quill_build: quill_build.clone(),
@@ -503,21 +216,9 @@ pub fn decode_protocol_v2_response(
                 ));
             }
         }
-        PiProtocolV2Response::Error { code, required, .. } => {
-            if matches!(
-                code,
-                PiProtocolV2ErrorCode::ProtocolMismatch
-                    | PiProtocolV2ErrorCode::ReporterVersionMismatch
-                    | PiProtocolV2ErrorCode::QuillBuildMismatch
-                    | PiProtocolV2ErrorCode::CapabilityMismatch
-            ) {
-                let required = required.as_ref().ok_or_else(|| {
-                    PiProtocolV2DecodeError::new(
-                        PiProtocolV2ErrorCode::InvalidEnvelope,
-                        "Compatibility errors require exact generation metadata",
-                    )
-                })?;
-                validate_generation(required)?;
+        PiProtocolV2Response::Error { required, .. } => {
+            if let Some(required) = required {
+                validate_generation_metadata(required)?;
             }
         }
     }
@@ -558,7 +259,9 @@ fn exact_keys(
     Ok(())
 }
 
-fn validate_generation(generation: &PiProtocolV2Generation) -> Result<(), PiProtocolV2DecodeError> {
+fn validate_generation_metadata(
+    generation: &PiProtocolV2Generation,
+) -> Result<(), PiProtocolV2DecodeError> {
     if generation.protocol != PI_PROTOCOL_V2 {
         return Err(PiProtocolV2DecodeError::new(
             PiProtocolV2ErrorCode::ProtocolMismatch,
@@ -568,31 +271,9 @@ fn validate_generation(generation: &PiProtocolV2Generation) -> Result<(), PiProt
             ),
         ));
     }
-    if generation.reporter_version != PI_PROTOCOL_V2_REPORTER_VERSION {
-        return Err(PiProtocolV2DecodeError::new(
-            PiProtocolV2ErrorCode::ReporterVersionMismatch,
-            format!(
-                "Unsupported reporter {}; expected {PI_PROTOCOL_V2_REPORTER_VERSION}",
-                generation.reporter_version
-            ),
-        ));
-    }
-    if generation.quill_build != PI_PROTOCOL_V2_QUILL_BUILD {
-        return Err(PiProtocolV2DecodeError::new(
-            PiProtocolV2ErrorCode::QuillBuildMismatch,
-            format!(
-                "Unsupported Quill build {}; expected {PI_PROTOCOL_V2_QUILL_BUILD}",
-                generation.quill_build
-            ),
-        ));
-    }
-    if generation.capability_digest != PI_PROTOCOL_V2_CAPABILITY_DIGEST {
-        return Err(PiProtocolV2DecodeError::new(
-            PiProtocolV2ErrorCode::CapabilityMismatch,
-            "Unsupported capability digest",
-        ));
-    }
-    Ok(())
+    validate_name(&generation.reporter_version, "reporter_version")?;
+    validate_name(&generation.quill_build, "quill_build")?;
+    validate_name(&generation.capability_digest, "capability_digest")
 }
 
 fn validate_reporter_value(value: &Value) -> Result<(), PiProtocolV2DecodeError> {
@@ -633,7 +314,7 @@ fn validate_reporter_value(value: &Value) -> Result<(), PiProtocolV2DecodeError>
             .unwrap_or_default()
             .to_owned(),
     };
-    validate_generation(&generation)
+    validate_generation_metadata(&generation)
 }
 
 fn validate_event_value(value: &Value) -> Result<(), PiProtocolV2DecodeError> {
@@ -908,7 +589,7 @@ mod tests {
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Protocol v2 decoder contract]]
     #[test]
-    fn fixture_accepts_only_the_exact_generation() {
+    fn fixture_accepts_protocol_2_across_reporter_generations() {
         for case in cases() {
             let result = match case.kind {
                 FixtureKind::Envelope => {
@@ -931,8 +612,8 @@ mod tests {
                     assert!(
                         case.headers
                             .keys()
-                            .any(|key| key.eq_ignore_ascii_case(PI_REPORTER_HOST_HEADER)),
-                        "{} carries the reporter headers the extension sends",
+                            .any(|key| key.eq_ignore_ascii_case("x-quill-pi-host")),
+                        "{} carries the lifecycle identity headers the extension sends",
                         case.name
                     );
                     continue;
@@ -978,15 +659,12 @@ mod tests {
             "option:agent_role:omitted",
             "option:agent_role:present",
             "option:required:omitted",
-            "option:required:present",
             "option:retry_after_ms:omitted",
             "option:retry_after_ms:present",
             "invalid:field",
             "mismatch:protocol:older",
             "mismatch:protocol:newer",
-            "mismatch:reporter_version",
-            "mismatch:quill_build",
-            "mismatch:capability_digest",
+            "generation:legacy-compatible",
             "mismatch:schema:older",
             "mismatch:schema:newer",
             "outcome:applied",

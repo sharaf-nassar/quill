@@ -378,87 +378,6 @@ function providerActionCopy(action: PendingProviderAction) {
   };
 }
 
-const PI_HEALTH_LABELS = {
-  never_connected: "Never connected",
-  alive: "Alive",
-  idle: "Idle",
-  stale: "Stale",
-} as const;
-
-const PI_ERROR_LABELS = {
-  config: "Configuration error",
-  transport: "Transport unavailable",
-  protocol_mismatch: "Exact reporter mismatch",
-  unknown_session: "Unknown session",
-  child_reporter_missing: "Configured child reporter missing",
-  source_recovering: "Recovering persisted source",
-  reconciliation_failed: "Reconciliation failed",
-  telemetry_rejected: "Telemetry rejected",
-  saturated: "Reporter health saturated",
-  reporter_reload_required: "Reporter reload required",
-  disabled: "Reporter disabled",
-  registration: "Registration error",
-  spool: "Spool error",
-  unknown: "Unknown extension error",
-} as const;
-
-function PiExtensionDetail({ status }: { status: ProviderStatus }) {
-  const health = status.piExtensionHealth;
-  if (status.provider !== "pi" || !status.enabled) return null;
-  if (!health) {
-    return (
-      <span
-        className="pi-extension-health"
-        data-state="unavailable"
-        role="status"
-        aria-live="polite"
-      >
-        Extension: Status unavailable · No-session runs are intentionally absent
-      </span>
-    );
-  }
-  const affectedReporters = health.affectedReporters ?? 0;
-  const affectedSessions = health.affectedSessions ?? 0;
-  const required = health.lastError === "protocol_mismatch"
-    ? [
-        health.requiredProtocol ? `required protocol ${health.requiredProtocol}` : null,
-        health.requiredExtensionVersion
-          ? `required extension ${health.requiredExtensionVersion}`
-          : null,
-        health.requiredQuillVersion
-          ? `required Quill ${health.requiredQuillVersion}`
-          : null,
-      ].filter(Boolean).join(", ")
-    : null;
-  const detail = [
-    `Extension: ${PI_HEALTH_LABELS[health.state]}`,
-    health.lastError ? PI_ERROR_LABELS[health.lastError] : null,
-    affectedReporters > 0
-      ? `${affectedReporters} ${affectedReporters === 1 ? "reporter" : "reporters"} affected`
-      : null,
-    affectedSessions > 0
-      ? `${affectedSessions} ${affectedSessions === 1 ? "session" : "sessions"} affected`
-      : null,
-    required,
-    health.protocol ? `protocol ${health.protocol}` : null,
-    health.extensionVersion ? `extension ${health.extensionVersion}` : null,
-    health.remediation,
-    health.lastRecoveredAt ? `Recovery verified ${health.lastRecoveredAt}` : null,
-    health.lastSeen ? `last report ${health.lastSeen}` : null,
-    "No-session runs are intentionally absent",
-  ].filter(Boolean).join(" · ");
-  return (
-    <span
-      className="pi-extension-health"
-      data-state={health.state}
-      role="status"
-      aria-live="polite"
-    >
-      {detail}
-    </span>
-  );
-}
-
 function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
   const { toast } = useToast();
   const {
@@ -642,7 +561,6 @@ function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
               description={
                 <>
                   {description}
-                  <PiExtensionDetail status={status} />
                 </>
               }
               control={

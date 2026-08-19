@@ -311,51 +311,12 @@ export interface ProviderStatus {
   userHasMadeChoice: boolean;
   lastError: string | null;
   lastVerifiedAt: string | null;
-  piExtensionHealth?: PiExtensionHealth | null;
   /**
    * Filesystem locations Quill checked when trying to find this provider's
    * CLI. Populated only when `detectedCli` is false so the integrations menu
    * can explain why the provider shows N/A despite being installed.
    */
   lastDetectionAttempts?: string[];
-}
-
-export type PiExtensionHealthState =
-  | "never_connected"
-  | "alive"
-  | "idle"
-  | "stale";
-
-export type PiExtensionErrorKind =
-  | "config"
-  | "transport"
-  | "protocol_mismatch"
-  | "unknown_session"
-  | "child_reporter_missing"
-  | "source_recovering"
-  | "reconciliation_failed"
-  | "telemetry_rejected"
-  | "saturated"
-  | "reporter_reload_required"
-  | "disabled"
-  | "registration"
-  | "spool"
-  | "unknown";
-
-export interface PiExtensionHealth {
-  state: PiExtensionHealthState;
-  lastSeen: string | null;
-  protocol: string | null;
-  extensionVersion: string | null;
-  minQuillVersion: string | null;
-  lastError: PiExtensionErrorKind | null;
-  affectedReporters: number;
-  affectedSessions: number;
-  remediation?: string | null;
-  lastRecoveredAt?: string | null;
-  requiredProtocol?: string | null;
-  requiredExtensionVersion?: string | null;
-  requiredQuillVersion?: string | null;
 }
 
 export type PiLineage =

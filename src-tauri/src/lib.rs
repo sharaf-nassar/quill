@@ -6649,7 +6649,6 @@ mod tests {
             user_has_made_choice: true,
             last_error: None,
             last_verified_at: None,
-            pi_extension_health: None,
             last_detection_attempts: Vec::new(),
         });
 

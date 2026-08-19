@@ -254,11 +254,11 @@ Promotion preconditions `lifecycle='awaiting_review'` and an inactive tombstone 
 
 ## Transactional Pi Lifecycle
 
-[[src-tauri/src/server.rs#post_pi_track]] authenticates and bounds raw `/api/v1/pi/track` bytes before [[src-tauri/src/pi_tracking.rs#decode_protocol_v2_envelope]] inspects open exact-generation metadata and closed lifecycle variants.
+[[src-tauri/src/server.rs#post_pi_track]] authenticates and bounds raw `/api/v1/pi/track` bytes before [[src-tauri/src/pi_tracking.rs#decode_protocol_v2_envelope]] validates protocol-2 metadata and closed lifecycle variants. Reporter, build, and capability values remain descriptive so older protocol-2 providers survive desktop upgrades.
 
-The route returns typed compatibility, validation, rate, recovery, and availability responses; accepted handshakes name the exact build, protocol, reporter, capability digest, and ordered lifecycle dispositions.
+The route returns typed validation, rate, recovery, and availability responses; accepted handshakes name the current build, protocol, reporter, capability digest, and ordered lifecycle dispositions.
 
-[[src-tauri/src/storage.rs#Storage#apply_pi_protocol_v2_envelope]] commits receipt dedupe, process/sequence ordering, durable lifecycle, replacement close, and source diagnostics in one transaction. [[src-tauri/src/live_tracker.rs#LiveTracker#apply_pi_protocol_v2_event]] receives only committed `applied` events. Restart and tracking re-enable load durable open rows as recovering, while same-process reannouncement proves them live. Missing source evidence stays `source_not_persisted` until validated notify or persisted-source reconciliation clears that process's diagnostic.
+[[src-tauri/src/storage.rs#Storage#apply_pi_protocol_v2_envelope]] commits receipt dedupe, process/sequence ordering, durable lifecycle, and replacement close in one transaction. [[src-tauri/src/live_tracker.rs#LiveTracker#apply_pi_protocol_v2_event]] receives only committed `applied` events. Restart and tracking re-enable load durable open rows as recovering, while same-process reannouncement proves them live. These durable rows remain for remote-host ordering, idempotency, and lineage that the local fold cannot reconstruct.
 
 The Sessions projection resolves explicit Pi agents through direct lineage with memoized roots, a visited set, and depth 64. Nested descendants flatten into the visible root; missing, cyclic, over-depth, and cross-host parents remain independent unresolved live rows; completion removes them. Descendants contribute family activity/runtime plus explicit agent count/runtime, while root tokens and turns stay root-only. Storage overfetches observed identities so child suppression cannot shorten a requested page.
 

@@ -9,7 +9,7 @@ Quill's Pi extension reports local session activity and exposes Quill's local wo
 - Node.js: `>=22.19.0`
 - Entry point: `quill.ts`, exported as the package root
 
-Package releases use independent SemVer. Protocol 2 requires the exact reporter and Quill build pair; an incompatible server makes live push inert while persisted Pi evidence remains available for later reconciliation.
+Package releases use independent SemVer. Protocol 2 is the lifecycle compatibility boundary; reporter and Quill build metadata is descriptive, so an older protocol-2 provider remains usable after a desktop upgrade.
 
 ## Install and reload
 
@@ -27,27 +27,15 @@ Pi packages run with user permissions. Review `quill.ts` and npm provenance befo
 
 For persistent sessions, lifecycle and direct-lineage evidence is appended as compact `quill-tracking` custom entries before the matching protocol-v2 live request. Pi buffers early entries and flushes them with its first assistant entry. Native Pi entries remain the only owner of prompts, messages, tool output, model, and usage content.
 
-`--no-session` is intentionally untracked: no custom entry, live request, health subject, spool, or log is created. Transient delivery retries once, authentication reloads once, an unknown session reannounces once, and exact-pair mismatch stops later live pushes without removing persisted evidence.
+`--no-session` is intentionally untracked: no custom entry, live request, spool, or log is created. Transient delivery retries once, authentication reloads once, and an unknown session reannounces once. Expected unavailable-server and contained delivery failures are silent unless `QUILL_DEBUG` is set.
 
 When `PI_SUBAGENT_CHILD=1`, the extension registers tracking only. Root processes, including `--no-session`, retain the eight `quill_` tools and context router; children expose neither.
 
-Child launchers such as pi-subagents may load Quill through their generic explicit `extensions` or `subagentOnlyExtensions` configuration and may report a generic runtime acknowledgement. Quill does not edit launcher settings, auto-inject the broker-selected reporter path, or pin a Quill-specific pi-subagents release. An ambient-disabled child without an explicitly configured Quill extension remains outside the supported tracking guarantee.
+Child launchers such as pi-subagents may load Quill through their generic explicit `extensions` or `subagentOnlyExtensions` configuration. Quill does not edit launcher settings or pin a Quill-specific pi-subagents release. An ambient-disabled child without an explicitly configured Quill extension remains outside the supported tracking guarantee.
 
-## Ownership and coexistence
+## Ownership
 
-Pi 0.84 resolves project and user extensions before package extensions. The first compatible Quill copy claims the reporter for that load. Later copies register no tools or handlers. Session shutdown releases the claim so `/reload`, `/new`, `/resume`, and `/fork` can elect again.
-
-| Installed copies          | Active copy                   | Owner and result                                                                                                    |
-| ------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| Quill-managed only        | Managed `extensions/quill.ts` | Quill installs, repairs, updates, disables, and removes it.                                                         |
-| npm only                  | npm package                   | Pi and the user own package state; Quill owns local config and ingestion.                                           |
-| Managed and npm           | Managed copy                  | npm copy stays inert. Quill repair never edits Pi's npm store or settings.                                          |
-| User `quill.ts` and npm   | User file first               | A compatible Quill file claims once. An unrelated file owns its own behavior; npm supplies the sole Quill reporter. |
-| Project, managed, and npm | Project file first            | Project trust and Pi's native precedence apply, then the singleton claim prevents a second compatible reporter.     |
-
-A user-owned global `extensions/quill.ts` blocks Quill's managed installation because both need the same path. Quill does not rename or delete it. Remove or rename that file before enabling the managed copy.
-
-Copies older than `0.1.0` lack singleton election. Disable or remove them before mixing install channels.
+Quill installs, repairs, updates, disables, and removes only its managed `extensions/quill.ts`. Pi and the user own npm package state, project extensions, and load order. A user-owned global `extensions/quill.ts` blocks Quill's managed installation because both need the same path; Quill does not rename or delete it.
 
 ## Lifecycle commands
 
