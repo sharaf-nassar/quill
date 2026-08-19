@@ -74,6 +74,11 @@ struct LiveSession {
     model: Option<String>,
     /// Cumulative tokens reported by Pi's extension for the current session.
     live_tokens: Option<i64>,
+    /// The same total as the fold reads it out of Pi's own session file. It is
+    /// kept apart from `live_tokens` so a fold and a concurrent push counting
+    /// the same assistant messages converge on one number rather than adding
+    /// up to twice it. `None` means no assistant usage has been folded yet.
+    folded_tokens: Option<i64>,
     /// Root, generic link, explicit subagent, or unresolved proof from Pi.
     lineage: Option<PiLineage>,
     /// Spawn tool-use ids seen in a `tool_result` and workflow agent ids seen
@@ -285,6 +290,9 @@ enum FileRole {
     /// A Codex rollout, folding into the root of its spawn chain. A spawned
     /// rollout is the sub-agent it names; a root one carries no agent.
     Codex { agent_id: Option<String> },
+    /// A Pi session file: origin, project, activity, model, and cumulative
+    /// usage, all stated by the file the running agent flushes as it goes.
+    Pi,
 }
 
 /// How far one transcript has been folded.
@@ -412,6 +420,21 @@ impl TrackerState {
                     });
                 }
             }
+            FileRole::Pi => {
+                let session = sessions.entry(key.clone()).or_default();
+                // A rewritten session file replaces its own history, so the
+                // activity and the cumulative usage it had contributed go with
+                // it and the refold from zero in the same pass answers instead.
+                if cold && offset > 0 {
+                    session.last_activity = session.started_at.unwrap_or(DateTime::UNIX_EPOCH);
+                    session.folded_tokens = None;
+                    session.live_tokens = None;
+                    changed = true;
+                }
+                read_appended(path, &mut offset, |line| {
+                    changed |= fold_pi_line(line, session);
+                });
+            }
             _ => read_appended(path, &mut offset, |line| {
                 let Ok(record) = serde_json::from_str::<ScanRecord>(line) else {
                     return;
@@ -515,6 +538,7 @@ impl TrackerState {
         let (session_id, role) = match provider {
             IntegrationProvider::Claude => claude_session_file(path)?,
             IntegrationProvider::Codex => return self.codex_file(path, host, now),
+            IntegrationProvider::Pi => return self.pi_file(path, host),
             _ => return None,
         };
         Some((
@@ -590,6 +614,40 @@ impl TrackerState {
                 agent_id: Some(head.session_id),
             },
         ))
+    }
+
+    /// The session a Pi session file folds into.
+    ///
+    /// A Pi path names its session only by convention, so identity comes from
+    /// the header record the file opens with, read through the same bounded
+    /// probe notify validation uses. That header also carries the session's
+    /// origin and project, and is the floor its activity falls back to before
+    /// the first prompt is typed. The answer is remembered on the file's own
+    /// tail entry, so a warm sweep re-reads no headers.
+    fn pi_file(&mut self, path: &Path, host: &str) -> Option<(SessionKey, FileRole)> {
+        if let Some(tail) = self.files.get(path) {
+            return Some((tail.session.clone(), FileRole::Pi));
+        }
+        let header = crate::pi_session::read_pi_session_header(path)?;
+        let key = SessionKey {
+            provider: IntegrationProvider::Pi.as_str().to_owned(),
+            host: host.to_owned(),
+            session_id: observed_name(&header.id)?,
+        };
+        let started_at = utc(&header.timestamp);
+        let session = self.sessions.entry(key.clone()).or_default();
+        // A pushed session already established both, and the push is the only
+        // producer that can carry a cwd the file does not state.
+        if session.started_at.is_none() {
+            session.started_at = started_at;
+        }
+        if session.cwd.is_none() {
+            session.cwd = observed_root_cwd(Some(&header.cwd));
+        }
+        if let Some(started_at) = started_at {
+            advance(&mut session.last_activity, started_at);
+        }
+        Some((key, FileRole::Pi))
     }
 
     /// Release sessions that stopped producing evidence, along with the file
@@ -987,6 +1045,12 @@ impl LiveTracker {
             return false;
         };
         self.mutate_pi_session(session_id, host, |session| {
+            // The push and the fold read the same assistant messages, so once
+            // the session's own file has answered for this session the push
+            // may only accelerate it, never add to the total again.
+            if session.folded_tokens.is_some() {
+                return false;
+            }
             let Some(total) = session.live_tokens.unwrap_or(0).checked_add(delta) else {
                 return false;
             };
@@ -1084,7 +1148,7 @@ impl LiveTracker {
     /// the idle window whose length has moved past its consumed offset is
     /// folded, and idle sessions are released.
     pub(crate) fn sweep(&self, now: DateTime<Utc>) {
-        let roots = vec![
+        let mut roots = vec![
             (
                 IntegrationProvider::Claude,
                 crate::data_paths::resolve_claude_projects_dir(),
@@ -1094,6 +1158,10 @@ impl LiveTracker {
                 crate::data_paths::resolve_codex_sessions_dir(),
             ),
         ];
+        match crate::data_paths::resolve_pi_sessions_dir() {
+            Ok(path) => roots.push((IntegrationProvider::Pi, path)),
+            Err(error) => log::warn!("Pi transcript root is unavailable: {error}"),
+        }
         self.sweep_in(&roots, now);
     }
 
@@ -1113,6 +1181,15 @@ impl LiveTracker {
                     crate::sessions::discover_codex_transcripts_in(root)
                         .into_iter()
                         .map(|path| (path, *provider)),
+                ),
+                // Pi states identity in each file's own header rather than in
+                // a chain across files, so a quiet one answers nothing and is
+                // gated the way a quiet Claude transcript is.
+                IntegrationProvider::Pi => paths.extend(
+                    crate::sessions::discover_pi_transcripts_in(root)
+                        .into_iter()
+                        .map(|path| (path, *provider))
+                        .filter(|(path, _)| modified_within_idle_window(path, now)),
                 ),
                 _ => {}
             }
@@ -1604,6 +1681,92 @@ fn fold_codex_line(line: &str, session: &mut LiveSession, agent_id: Option<&str>
     changed
 }
 
+/// Fold one Pi session-file line into its session.
+///
+/// A Pi file states everything the pushed feed reports: substantive turn
+/// content advances activity, an assistant message names the model answering
+/// and the tokens it cost, and a `model_change` names a switch no message has
+/// answered under yet. Bookkeeping entries — custom extension records, the
+/// reporter's own `quill-tracking` entry, thinking-level and compaction
+/// markers — carry no role this reads, so writing one cannot reopen a finished
+/// session.
+fn fold_pi_line(line: &str, session: &mut LiveSession) -> bool {
+    let Ok(record) = serde_json::from_str::<PiRecord>(line) else {
+        return false;
+    };
+    let mut changed = false;
+    match record.kind.as_str() {
+        PI_MESSAGE_RECORD => {
+            let Some(message) = record.message else {
+                return false;
+            };
+            if message
+                .role
+                .as_deref()
+                .is_some_and(|role| PI_ACTIVITY_ROLES.contains(&role))
+                && let Some(timestamp) = record.timestamp.as_deref().and_then(utc)
+            {
+                changed |= advance(&mut session.last_activity, timestamp);
+            }
+            if message.role.as_deref() != Some(PI_ASSISTANT_ROLE) {
+                return changed;
+            }
+            changed |= pi_model(
+                session,
+                message.provider.as_deref(),
+                message.model.as_deref(),
+            );
+            // Pi states the same total the extension's usage push sums, so the
+            // two producers reach the same cumulative number.
+            if let Some(total) = message
+                .usage
+                .and_then(|usage| usage.total_tokens)
+                .filter(|total| *total >= 0)
+                && let Some(folded) = session.folded_tokens.unwrap_or(0).checked_add(total)
+            {
+                session.folded_tokens = Some(folded);
+                changed |= session.live_tokens != Some(folded);
+                session.live_tokens = Some(folded);
+            }
+        }
+        PI_MODEL_CHANGE_RECORD => {
+            changed |= pi_model(
+                session,
+                record.provider.as_deref(),
+                record.model_id.as_deref(),
+            );
+        }
+        _ => {}
+    }
+    changed
+}
+
+/// Record the model a Pi entry names, through the same validation the pushed
+/// model event passes, and never clobber a known model with an absent one.
+fn pi_model(session: &mut LiveSession, provider: Option<&str>, model: Option<&str>) -> bool {
+    // `pi_model_id` also rejects a padded provider and validates the combined
+    // identifier after its individual dimensions. Keep file-derived models on
+    // that same boundary as pushed models.
+    let provider = provider
+        .filter(|value| value.trim() == *value)
+        .and_then(|value| crate::model_usage::validate_model_id(value).ok());
+    let model = model.and_then(|value| crate::model_usage::validate_model_id(value).ok());
+    let (Some(provider), Some(model)) = (provider, model) else {
+        return false;
+    };
+    if crate::model_usage::validate_model_id(&format!("{provider}/{model}")).is_err() {
+        return false;
+    }
+    if session.model_provider.as_deref() == Some(provider.as_str())
+        && session.model.as_deref() == Some(model.as_str())
+    {
+        return false;
+    }
+    session.model_provider = Some(provider);
+    session.model = Some(model);
+    true
+}
+
 /// Claude's tree states a file's role in its own layout: a sub-agent transcript
 /// at any depth folds into the root session that owns its `subagents/` tree,
 /// and a workflow directory holds both the agents it drives and their journal.
@@ -1760,6 +1923,43 @@ struct CodexHead {
     model: Option<String>,
     cwd: Option<String>,
     started_at: Option<DateTime<Utc>>,
+}
+
+const PI_MESSAGE_RECORD: &str = "message";
+const PI_MODEL_CHANGE_RECORD: &str = "model_change";
+const PI_ASSISTANT_ROLE: &str = "assistant";
+/// The roles Pi gives an entry that carries turn content. Everything else it
+/// writes is bookkeeping appended around a turn rather than inside one.
+const PI_ACTIVITY_ROLES: [&str; 3] = ["user", PI_ASSISTANT_ROLE, "toolResult"];
+
+/// The fields of a Pi session entry the fold reads. `message.content` is left
+/// undeclared because the fold answers nothing from it and a tool result can
+/// carry megabytes.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    timestamp: Option<String>,
+    message: Option<PiMessage>,
+    /// Upstream provider of a `model_change` entry.
+    provider: Option<String>,
+    model_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PiMessage {
+    role: Option<String>,
+    /// Present on assistant messages, absent on every other role.
+    provider: Option<String>,
+    model: Option<String>,
+    usage: Option<PiUsage>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiUsage {
+    total_tokens: Option<i64>,
 }
 
 const CODEX_EVENT_RECORD: &str = "event_msg";
@@ -2188,6 +2388,19 @@ mod tests {
             }
         }
 
+        /// A Pi sessions root holding one per-cwd directory, the way Pi names
+        /// the tree it flushes each session's JSONL into.
+        fn pi(session_id: &str) -> Self {
+            let root = tempfile::tempdir().expect("create pi fixture root");
+            fs::create_dir_all(root.path().join("--home-user-project--"))
+                .expect("create pi cwd directory");
+            Self {
+                root,
+                provider: IntegrationProvider::Pi,
+                session_id: session_id.to_owned(),
+            }
+        }
+
         /// Where one transcript of this fixture's provider lives.
         fn path(&self, session_id: &str) -> PathBuf {
             match self.provider {
@@ -2196,6 +2409,11 @@ mod tests {
                     .path()
                     .join("2026/08/08")
                     .join(format!("rollout-2026-08-08T00-00-00-{session_id}.jsonl")),
+                IntegrationProvider::Pi => self
+                    .root
+                    .path()
+                    .join("--home-user-project--")
+                    .join(format!("2026-08-08T00-00-00-000Z_{session_id}.jsonl")),
                 _ => self
                     .root
                     .path()
@@ -2293,20 +2511,24 @@ mod tests {
             self.append_to(&self.path(thread_id), body);
         }
 
-        /// Sweep this fixture's root, pointing the other provider's walk at a
+        /// Sweep this fixture's root, pointing the other providers' walks at a
         /// directory that does not exist.
         fn sweep(&self, tracker: &LiveTracker, now: DateTime<Utc>) {
             let absent = self.root.path().join("absent-root");
-            let roots = match self.provider {
-                IntegrationProvider::Codex => vec![
-                    (IntegrationProvider::Claude, absent),
-                    (IntegrationProvider::Codex, self.root.path().to_path_buf()),
-                ],
-                _ => vec![
-                    (IntegrationProvider::Claude, self.root.path().to_path_buf()),
-                    (IntegrationProvider::Codex, absent),
-                ],
-            };
+            let mine = self.root.path().to_path_buf();
+            let roots = [
+                IntegrationProvider::Claude,
+                IntegrationProvider::Codex,
+                IntegrationProvider::Pi,
+            ]
+            .map(|provider| {
+                let root = if provider == self.provider {
+                    mine.clone()
+                } else {
+                    absent.clone()
+                };
+                (provider, root)
+            });
             tracker.sweep_in(&roots, now);
         }
 
@@ -3868,6 +4090,334 @@ mod tests {
         let state = tracker.state.lock().unwrap();
         assert!(state.sessions.is_empty());
         assert!(state.files.is_empty());
+    }
+
+    /// The header record every Pi session file opens with.
+    fn pi_header(session_id: &str, timestamp: &str) -> String {
+        format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"{session_id}\",\
+             \"timestamp\":\"{timestamp}\",\"cwd\":\"/home/user/project\"}}"
+        )
+    }
+
+    fn pi_user(timestamp: &str) -> String {
+        format!(
+            "{{\"type\":\"message\",\"id\":\"u-{timestamp}\",\"parentId\":null,\
+             \"timestamp\":\"{timestamp}\",\"message\":{{\"role\":\"user\",\
+             \"content\":[{{\"type\":\"text\",\"text\":\"go\"}}]}}}}"
+        )
+    }
+
+    /// One assistant answer, carrying the model that produced it and the same
+    /// usage totals the extension pushes for it.
+    fn pi_assistant(timestamp: &str, model: &str, total: i64) -> String {
+        format!(
+            "{{\"type\":\"message\",\"id\":\"a-{timestamp}\",\"parentId\":null,\
+             \"timestamp\":\"{timestamp}\",\"message\":{{\"role\":\"assistant\",\
+             \"provider\":\"cliproxyapi\",\"model\":\"{model}\",\
+             \"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\
+             \"usage\":{{\"input\":{total},\"output\":0,\"cacheRead\":0,\
+             \"cacheWrite\":0,\"totalTokens\":{total}}}}}}}"
+        )
+    }
+
+    const PI_SESSION: &str = "01a01745-ab70-7905-b6ef-0c047dbb6ab9";
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Session Fold]]
+    #[test]
+    fn a_pi_session_folds_its_origin_model_and_usage_from_its_own_file() {
+        let fixture = Fixture::pi(PI_SESSION);
+        fixture.write(&format!(
+            "{}\n{}\n",
+            pi_header(PI_SESSION, "2026-08-08T00:00:00Z"),
+            pi_user("2026-08-08T00:00:10Z")
+        ));
+        let tracker = LiveTracker::new(None);
+
+        // Cold start with no watcher event at all: the sweep is what finds it.
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:15Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.started_at, Some(parse("2026-08-08T00:00:00Z")));
+            assert_eq!(session.cwd.as_deref(), Some("/home/user/project"));
+            assert_eq!(session.last_activity, parse("2026-08-08T00:00:10Z"));
+            assert_eq!(session.model, None);
+            assert_eq!(session.live_tokens, None);
+            // Neither field has a source on disk, so a folded session claims
+            // neither rather than inventing one.
+            assert!(!session.recovering);
+            assert_eq!(session.process_instance_id, None);
+        });
+
+        // A model switch and the answers under it: the newest name wins and
+        // usage accumulates across every assistant message.
+        fixture.append(&format!(
+            "{}\n{}\n",
+            "{\"type\":\"model_change\",\"id\":\"m1\",\
+             \"timestamp\":\"2026-08-08T00:00:11Z\",\"provider\":\"llm-router\",\
+             \"modelId\":\"auto\"}",
+            pi_assistant("2026-08-08T00:00:20Z", "gpt-5.6-sol", 1_200)
+        ));
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:25Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.model_provider.as_deref(), Some("cliproxyapi"));
+            assert_eq!(session.model.as_deref(), Some("gpt-5.6-sol"));
+            assert_eq!(session.live_tokens, Some(1_200));
+            assert_eq!(session.last_activity, parse("2026-08-08T00:00:20Z"));
+        });
+
+        fixture.append(&format!(
+            "{}\n",
+            pi_assistant("2026-08-08T00:00:30Z", "gpt-5.6-terra", 800)
+        ));
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:35Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.model.as_deref(), Some("gpt-5.6-terra"));
+            assert_eq!(session.live_tokens, Some(2_000));
+        });
+
+        // The pushed model boundary also rejects a provider/model pair whose
+        // combined identifier is too long; a file must not bypass it.
+        let oversized_model = "a".repeat(130);
+        fixture.append(&format!(
+            "{{\"type\":\"model_change\",\"id\":\"m2\",\
+             \"timestamp\":\"2026-08-08T00:00:31Z\",\"provider\":\"{oversized_model}\",\
+             \"modelId\":\"{oversized_model}\"}}\n"
+        ));
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:35Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.model.as_deref(), Some("gpt-5.6-terra"));
+        });
+
+        // Silence past the shared cutoff releases the session and the offset
+        // it owned, the same way it releases a Claude or Codex one.
+        fixture.sweep(&tracker, parse("2026-08-08T00:20:00Z"));
+        let state = tracker.state.lock().unwrap();
+        assert!(state.sessions.is_empty());
+        assert!(state.files.is_empty());
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Tail Mechanics]]
+    #[test]
+    fn a_pi_fold_reads_only_appended_bytes_and_a_rewrite_restarts_its_totals() {
+        let fixture = Fixture::pi(PI_SESSION);
+        fixture.write(&format!(
+            "{}\n{}\n",
+            pi_header(PI_SESSION, "2026-08-08T00:00:00Z"),
+            pi_assistant("2026-08-08T00:00:10Z", "gpt-5.6-sol", 500)
+        ));
+        let tracker = LiveTracker::new(None);
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:15Z"));
+        let consumed = fixture.consumed(&tracker).expect("first fold");
+        assert_eq!(
+            consumed,
+            fs::metadata(fixture.root_transcript())
+                .expect("stat session file")
+                .len()
+        );
+
+        // A record still mid-write is left unconsumed rather than counted in
+        // half, so neither its tokens nor its timestamp land early.
+        let appended = pi_assistant("2026-08-08T00:00:20Z", "gpt-5.6-sol", 300);
+        let (head, tail) = appended.split_at(appended.len() - 12);
+        fixture.append(head);
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:22Z"));
+        assert_eq!(fixture.consumed(&tracker), Some(consumed));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.live_tokens, Some(500));
+        });
+
+        fixture.append(&format!("{tail}\n"));
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:25Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.live_tokens, Some(800));
+            assert_eq!(session.last_activity, parse("2026-08-08T00:00:20Z"));
+        });
+
+        // A shorter file was rewritten rather than appended to, so the totals
+        // it had contributed go with it instead of being counted twice.
+        fixture.write(&format!(
+            "{}\n{}\n",
+            pi_header(PI_SESSION, "2026-08-08T00:00:00Z"),
+            pi_assistant("2026-08-08T00:00:05Z", "gpt-5.6-sol", 100)
+        ));
+        let rewritten = fs::metadata(fixture.root_transcript())
+            .expect("stat session file")
+            .len();
+        assert!(rewritten < fixture.consumed(&tracker).expect("second fold"));
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:30Z"));
+        assert_eq!(fixture.consumed(&tracker), Some(rewritten));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.live_tokens, Some(100));
+            assert_eq!(session.last_activity, parse("2026-08-08T00:00:05Z"));
+        });
+
+        // Replacing it with no assistant usage clears the replaced total
+        // rather than keeping the old file's value visible.
+        fixture.write(&format!(
+            "{}\n",
+            pi_header(PI_SESSION, "2026-08-08T00:00:00Z")
+        ));
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:35Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.live_tokens, None);
+            assert_eq!(session.last_activity, parse("2026-08-08T00:00:00Z"));
+        });
+
+        // Zero is still a folded usage total, so a concurrent push may not
+        // resume adding tokens merely because the cumulative total is zero.
+        fixture.append(&format!(
+            "{}\n",
+            pi_assistant("2026-08-08T00:00:06Z", "gpt-5.6-sol", 0)
+        ));
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:40Z"));
+        assert!(!tracker.add_pi_live_tokens(
+            PI_SESSION,
+            local_observed_host().expect("local host"),
+            1,
+            0,
+            0,
+            0,
+        ));
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Session Activity]]
+    #[test]
+    fn pi_activity_ignores_entries_written_around_a_turn() {
+        let fixture = Fixture::pi(PI_SESSION);
+        fixture.write(&format!(
+            "{}\n{}\n",
+            pi_header(PI_SESSION, "2026-08-08T00:00:00Z"),
+            pi_user("2026-08-08T00:01:00Z")
+        ));
+        let tracker = LiveTracker::new(None);
+        fixture.sweep(&tracker, parse("2026-08-08T00:01:05Z"));
+        assert_eq!(
+            fixture.last_activity(&tracker),
+            Some(parse("2026-08-08T00:01:00Z"))
+        );
+
+        // Extension records, the reporter's own tracking entry, and Pi's
+        // thinking-level and compaction markers are all written around a turn
+        // rather than inside one, so none of them may reopen a finished
+        // session.
+        fixture.append(concat!(
+            "{\"type\":\"custom_message\",\"customType\":\"lat-reminder\",\"id\":\"c1\",",
+            "\"timestamp\":\"2026-08-08T00:02:00Z\",\"content\":\"remember\"}\n",
+            "{\"type\":\"custom\",\"customType\":\"quill-tracking\",\"id\":\"c2\",",
+            "\"timestamp\":\"2026-08-08T00:03:00Z\",\"data\":{}}\n",
+            "{\"type\":\"thinking_level_change\",\"id\":\"c3\",",
+            "\"timestamp\":\"2026-08-08T00:04:00Z\",\"thinkingLevel\":\"off\"}\n",
+            "{\"type\":\"compaction\",\"id\":\"c4\",",
+            "\"timestamp\":\"2026-08-08T00:05:00Z\",\"summary\":\"...\"}\n",
+        ));
+        fixture.sweep(&tracker, parse("2026-08-08T00:05:05Z"));
+        assert_eq!(
+            fixture.last_activity(&tracker),
+            Some(parse("2026-08-08T00:01:00Z"))
+        );
+
+        // A tool result is turn content and does advance it.
+        fixture.append(concat!(
+            "{\"type\":\"message\",\"id\":\"t1\",\"timestamp\":\"2026-08-08T00:06:00Z\",",
+            "\"message\":{\"role\":\"toolResult\",\"toolName\":\"Read\",\"content\":[]}}\n",
+        ));
+        fixture.sweep(&tracker, parse("2026-08-08T00:06:05Z"));
+        assert_eq!(
+            fixture.last_activity(&tracker),
+            Some(parse("2026-08-08T00:06:00Z"))
+        );
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Push Parity]]
+    #[test]
+    fn a_folded_pi_session_and_its_push_agree_on_one_row() {
+        let host = local_observed_host().expect("local host");
+        let now = Utc::now();
+        let at = |ago: i64| (now - TimeDelta::seconds(ago)).to_rfc3339();
+        let fixture = Fixture::pi(PI_SESSION);
+        fixture.write(&format!(
+            "{}\n{}\n{}\n{}\n",
+            pi_header(PI_SESSION, &at(300)),
+            pi_user(&at(240)),
+            pi_assistant(&at(180), "gpt-5.6-sol", 1_200),
+            pi_assistant(&at(120), "gpt-5.6-sol", 800)
+        ));
+
+        // What the extension pushes for the very same file.
+        let push = |tracker: &LiveTracker| {
+            tracker.start_pi_session(
+                PI_SESSION,
+                host,
+                Some("/home/user/project"),
+                false,
+                parse(&at(300)),
+                None,
+            );
+            for (seconds_ago, tokens) in [(180, 1_200), (120, 800)] {
+                tracker.record_pi_activity(PI_SESSION, host, parse(&at(seconds_ago)));
+                tracker.set_pi_model(PI_SESSION, host, "cliproxyapi", "gpt-5.6-sol");
+                tracker.add_pi_live_tokens(PI_SESSION, host, tokens, 0, 0, 0);
+            }
+        };
+        let row = |tracker: &LiveTracker| {
+            let mut rows = tracker.overlay(
+                Vec::new(),
+                &(now - TimeDelta::hours(1)).to_rfc3339(),
+                None,
+                Some(IntegrationProvider::Pi),
+                Some(10),
+            );
+            assert_eq!(rows.len(), 1, "exactly one visible Pi row");
+            rows.pop().expect("the single Pi row")
+        };
+
+        let folded = LiveTracker::new(None);
+        fixture.sweep(&folded, now);
+        let pushed = LiveTracker::new(None);
+        push(&pushed);
+
+        // The file states everything the push reports, so the two producers
+        // present the same row down to the serialized field.
+        let visible = |tracker: &LiveTracker| {
+            serde_json::to_value(row(tracker)).expect("serialize the visible row")
+        };
+        assert_eq!(visible(&folded), visible(&pushed));
+        assert_eq!(row(&folded).total_tokens, 2_000);
+        assert_eq!(row(&folded).project.as_deref(), Some("/home/user/project"));
+        for tracker in [&folded, &pushed] {
+            fixture.with_session(tracker, |session| {
+                assert_eq!(session.model_provider.as_deref(), Some("cliproxyapi"));
+                assert_eq!(session.model.as_deref(), Some("gpt-5.6-sol"));
+            });
+        }
+
+        // Both producers running at once converge on that one row rather than
+        // opening a second identity, and the fold leaves the lineage only the
+        // push can prove alone.
+        let both = LiveTracker::new(None);
+        push(&both);
+        both.set_pi_lineage(PI_SESSION, host, PiLineage::Root);
+        fixture.sweep(&both, now);
+        let converged = row(&both);
+        assert_eq!(converged.total_tokens, row(&folded).total_tokens);
+        assert_eq!(converged.project, row(&folded).project);
+        assert_eq!(converged.last_active, row(&folded).last_active);
+        assert_eq!(converged.first_seen, row(&folded).first_seen);
+        assert_eq!(converged.pi_lineage, Some(PiLineage::Root));
+
+        // A message neither has seen yet reaches the row exactly once, in
+        // whichever order the two producers happen to observe it.
+        fixture.append(&format!("{}\n", pi_assistant(&at(60), "gpt-5.6-sol", 500)));
+        both.record_pi_activity(PI_SESSION, host, parse(&at(60)));
+        both.add_pi_live_tokens(PI_SESSION, host, 500, 0, 0, 0);
+        fixture.sweep(&both, now);
+        assert_eq!(row(&both).total_tokens, 2_500);
+
+        let fold_first = LiveTracker::new(None);
+        fixture.sweep(&fold_first, now);
+        push(&fold_first);
+        fold_first.add_pi_live_tokens(PI_SESSION, host, 500, 0, 0, 0);
+        assert_eq!(row(&fold_first).total_tokens, 2_500);
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Read Overlay]]

@@ -834,6 +834,23 @@ pub(crate) fn discover_codex_transcripts_in(sessions_dir: &Path) -> Vec<PathBuf>
         .collect()
 }
 
+/// Enumerate every Pi session file under `sessions_dir`.
+///
+/// Live snapshot scanning shares this walker with retained inventory so the
+/// per-cwd tree and the nested child runs under it are only ever traversed one
+/// way.
+pub(crate) fn discover_pi_transcripts_in(sessions_dir: &Path) -> Vec<PathBuf> {
+    if !sessions_dir.exists() {
+        return Vec::new();
+    }
+    let mut diagnostic = None;
+    collect_pi_jsonl_candidates(sessions_dir, IntegrationProvider::Pi, &mut diagnostic)
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.path)
+        .collect()
+}
+
 /// A Codex rollout filename ends with the 36-character thread uuid.
 const CODEX_THREAD_ID_LEN: usize = 36;
 

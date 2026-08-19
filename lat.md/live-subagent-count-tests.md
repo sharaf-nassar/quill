@@ -178,6 +178,28 @@ A turn's own records can push its `task_started` out of the bounded window, and 
 
 A rollout that died mid-turn leaves an unmatched `task_started` forever, so silence past the cutoff is the only thing that stops it counting, and once its root goes quiet too the whole tree leaves the fold and releases its offsets.
 
+## Live Tracker Pi Session Fold
+
+A Pi session found by a cold sweep alone takes its start and project from the header record its file opens with, then advances activity from the turn content that follows.
+
+It accumulates every assistant message's usage into one cumulative total and answers to the newest model any message or `model_change` names. It claims neither a process instance nor a recovering flag, because the file states neither, and silence past the shared cutoff releases it and its offsets the way it releases a Claude or Codex session.
+
+## Live Tracker Pi Tail Mechanics
+
+A Pi fold parses only appended bytes and leaves a record still mid-write unconsumed, so neither its tokens nor its timestamp land in half.
+
+A rewritten file is shorter than the offset already consumed, which clears the activity and the cumulative usage it had contributed before the replacement is folded whole, rather than counting the same messages twice.
+
+## Live Tracker Pi Session Activity
+
+Pi activity advances from `user`, `assistant`, and `toolResult` entries only, so custom extension records, the reporter's own `quill-tracking` entry, and thinking-level and compaction markers written after a turn cannot reopen a finished session.
+
+## Live Tracker Pi Push Parity
+
+A Pi session folded from its own file and the same session reported by the extension present the identical Sessions row, down to the serialized field, because the file states everything the push reports.
+
+Both producers running at once converge on that one row rather than a second identity: the fold leaves pushed lineage alone, and a message neither has seen yet reaches the total exactly once in whichever order the two observe it.
+
 ## Live Tracker Read Overlay
 
 A folded session storage has no row for becomes an observed-only row carrying its open agents in a stable order, and only a validated root cwd earns it: without one it names no project and stays out of the result.
