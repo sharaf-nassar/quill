@@ -646,10 +646,6 @@ fn pi_v2_error(
         .into_response()
 }
 
-fn pi_decode_status(_code: PiProtocolV2ErrorCode) -> StatusCode {
-    StatusCode::BAD_REQUEST
-}
-
 // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Authenticated Protocol v2 Router]]
 async fn post_pi_track(
     State(state): State<Arc<PiTrackRouteState>>,
@@ -693,12 +689,7 @@ async fn post_pi_track(
     let payload = match crate::pi_tracking::decode_protocol_v2_envelope(&bytes) {
         Ok(payload) => payload,
         Err(error) => {
-            return pi_v2_error(
-                pi_decode_status(error.code),
-                error.code,
-                error.message,
-                None,
-            );
+            return pi_v2_error(StatusCode::BAD_REQUEST, error.code, error.message, None);
         }
     };
     if state.demo_mode || crate::ingest_is_quiesced() {

@@ -315,19 +315,22 @@ fn uninstall_with_paths(
     }
 }
 
+fn is_local_config(value: &serde_json::Value) -> bool {
+    value
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|url| reqwest::Url::parse(url).ok())
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+}
+
 fn write_reporter_enabled(config_path: &Path, enabled: bool) -> Result<(), String> {
     let mut value: serde_json::Value = serde_json::from_slice(
         &fs::read(config_path)
             .map_err(|error| format!("Failed to read {}: {error}", config_path.display()))?,
     )
     .map_err(|error| format!("Failed to parse {}: {error}", config_path.display()))?;
-    let local = value
-        .get("url")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|url| reqwest::Url::parse(url).ok())
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"));
-    if !local {
+    if !is_local_config(&value) {
         return Ok(());
     }
     value
@@ -351,13 +354,7 @@ fn verify_reporter_enabled(config_path: &Path, enabled: bool) -> Result<(), Stri
             .map_err(|error| format!("Failed to read {}: {error}", config_path.display()))?,
     )
     .map_err(|error| format!("Failed to parse {}: {error}", config_path.display()))?;
-    let local = value
-        .get("url")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|url| reqwest::Url::parse(url).ok())
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"));
-    if local && value["pi_reporter"]["enabled"] != enabled {
+    if is_local_config(&value) && value["pi_reporter"]["enabled"] != enabled {
         return Err("Pi reporter enablement does not match integration state".to_string());
     }
     Ok(())
