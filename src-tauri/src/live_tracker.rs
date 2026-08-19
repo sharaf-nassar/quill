@@ -69,6 +69,15 @@ struct LiveSession {
     process_instance_id: Option<String>,
     /// Validated launcher role/name carried onto the active-agent rail.
     agent_role: Option<String>,
+    /// A direct Pi tree edge stated by the runtime-owned session layout.
+    structural_lineage: Option<PiLineage>,
+    /// A flat Pi session file can anchor structural child edges without making
+    /// every push-only Pi session an unproven resolver root.
+    structural_root: bool,
+    /// Role stated by a nested session's own `session_info` entry. It remains
+    /// separate from the reporter role so either source can corroborate it
+    /// without overwriting the other.
+    structural_agent_role: Option<String>,
     /// Upstream provider and model from Pi's newest assistant message.
     model_provider: Option<String>,
     model: Option<String>,
@@ -127,6 +136,35 @@ impl LiveAgent {
 }
 
 impl LiveSession {
+    /// The lineage the resolver follows. A nested runtime tree is primary over
+    /// a reporter edge, while flat files retain their explicit proof or act as
+    /// an implicit resolver root without manufacturing a visible proof.
+    fn resolver_lineage(&self) -> Option<PiLineage> {
+        match self.structural_lineage.as_ref() {
+            Some(PiLineage::Agent { .. }) => self.structural_lineage.clone(),
+            _ => self
+                .lineage
+                .clone()
+                .or_else(|| self.structural_root.then_some(PiLineage::Root)),
+        }
+    }
+
+    /// Lineage suitable for the Sessions response. An implicit root only
+    /// exists so the shared resolver can walk a tree; it is not reporter proof.
+    fn projected_lineage(&self) -> Option<PiLineage> {
+        match self.structural_lineage.as_ref() {
+            Some(PiLineage::Agent { .. }) => self.structural_lineage.clone(),
+            _ => self.lineage.clone(),
+        }
+    }
+
+    /// A nested session's own role wins over the reporter's corroborating role.
+    fn projected_agent_role(&self) -> Option<String> {
+        self.structural_agent_role
+            .clone()
+            .or_else(|| self.agent_role.clone())
+    }
+
     /// Whether a sub-agent is still working.
     ///
     /// A Codex agent answers to its own rollout's newest turn boundary, a
@@ -292,7 +330,9 @@ enum FileRole {
     Codex { agent_id: Option<String> },
     /// A Pi session file: origin, project, activity, model, and cumulative
     /// usage, all stated by the file the running agent flushes as it goes.
-    Pi,
+    /// Nested children additionally carry their runtime-assigned run id so
+    /// their own `session_info` can state a role without filename guessing.
+    Pi { run_id: Option<String> },
 }
 
 /// How far one transcript has been folded.
@@ -302,6 +342,8 @@ struct FileTail {
     offset: u64,
     /// Session this file's records fold into.
     session: SessionKey,
+    /// Nested Pi run id captured with the structural path on the first fold.
+    pi_run_id: Option<String>,
 }
 
 /// Live session and agent state, folded from transcripts as they are written.
@@ -420,7 +462,7 @@ impl TrackerState {
                     });
                 }
             }
-            FileRole::Pi => {
+            FileRole::Pi { run_id } => {
                 let session = sessions.entry(key.clone()).or_default();
                 // A rewritten session file replaces its own history, so the
                 // activity and the cumulative usage it had contributed go with
@@ -432,7 +474,7 @@ impl TrackerState {
                     changed = true;
                 }
                 read_appended(path, &mut offset, |line| {
-                    changed |= fold_pi_line(line, session);
+                    changed |= fold_pi_line(line, session, run_id.as_deref());
                 });
             }
             _ => read_appended(path, &mut offset, |line| {
@@ -486,6 +528,10 @@ impl TrackerState {
             FileTail {
                 offset,
                 session: key,
+                pi_run_id: match role {
+                    FileRole::Pi { run_id } => run_id.clone(),
+                    _ => None,
+                },
             },
         );
         changed
@@ -618,15 +664,19 @@ impl TrackerState {
 
     /// The session a Pi session file folds into.
     ///
-    /// A Pi path names its session only by convention, so identity comes from
-    /// the header record the file opens with, read through the same bounded
-    /// probe notify validation uses. That header also carries the session's
-    /// origin and project, and is the floor its activity falls back to before
-    /// the first prompt is typed. The answer is remembered on the file's own
-    /// tail entry, so a warm sweep re-reads no headers.
+    /// Identity comes from the header record the file opens with. A nested
+    /// `run-N/session.jsonl` additionally states its parent in the enclosing
+    /// runtime directory, so that direct agent edge joins the shared resolver
+    /// without needing a reporter. Both answers are remembered on the file's
+    /// tail entry, so a warm sweep re-reads neither headers nor path facts.
     fn pi_file(&mut self, path: &Path, host: &str) -> Option<(SessionKey, FileRole)> {
         if let Some(tail) = self.files.get(path) {
-            return Some((tail.session.clone(), FileRole::Pi));
+            return Some((
+                tail.session.clone(),
+                FileRole::Pi {
+                    run_id: tail.pi_run_id.clone(),
+                },
+            ));
         }
         let header = crate::pi_session::read_pi_session_header(path)?;
         let key = SessionKey {
@@ -635,6 +685,8 @@ impl TrackerState {
             session_id: observed_name(&header.id)?,
         };
         let started_at = utc(&header.timestamp);
+        let structural_lineage = pi_path_lineage(path);
+        let run_id = pi_path_run_id(path);
         let session = self.sessions.entry(key.clone()).or_default();
         // A pushed session already established both, and the push is the only
         // producer that can carry a cwd the file does not state.
@@ -647,7 +699,13 @@ impl TrackerState {
         if let Some(started_at) = started_at {
             advance(&mut session.last_activity, started_at);
         }
-        Some((key, FileRole::Pi))
+        if structural_lineage.is_some() {
+            session.structural_lineage = structural_lineage;
+            session.structural_root = false;
+        } else if session.structural_lineage.is_none() {
+            session.structural_root = true;
+        }
+        Some((key, FileRole::Pi { run_id }))
     }
 
     /// Release sessions that stopped producing evidence, along with the file
@@ -661,16 +719,17 @@ impl TrackerState {
         for (child_key, _child) in sessions
             .iter()
             .filter(|(_, child)| now.signed_duration_since(child.last_activity) <= IDLE_AFTER)
-            .filter(|(_, child)| matches!(child.lineage, Some(PiLineage::Agent { .. })))
+            .filter(|(_, child)| matches!(child.resolver_lineage(), Some(PiLineage::Agent { .. })))
         {
             let mut current_key = child_key.clone();
             for _ in 0..MAX_PI_LINEAGE_DEPTH {
+                let lineage = sessions
+                    .get(&current_key)
+                    .and_then(LiveSession::resolver_lineage);
                 let Some(
                     PiLineage::Agent { parent_session_id }
                     | PiLineage::Linked { parent_session_id },
-                ) = sessions
-                    .get(&current_key)
-                    .and_then(|session| session.lineage.as_ref())
+                ) = lineage
                 else {
                     break;
                 };
@@ -1211,8 +1270,7 @@ impl LiveTracker {
             .filter(|(_, session)| !session.recovering)
             .filter_map(|(key, session)| {
                 session
-                    .lineage
-                    .clone()
+                    .resolver_lineage()
                     .map(|lineage| (key.clone(), lineage))
             })
             .collect::<HashMap<_, _>>();
@@ -1222,7 +1280,7 @@ impl LiveTracker {
             .iter()
             .map(|(key, session)| {
                 let visible = if !session.recovering
-                    && matches!(session.lineage, Some(PiLineage::Agent { .. }))
+                    && matches!(session.resolver_lineage(), Some(PiLineage::Agent { .. }))
                 {
                     match resolve_pi_root(key, &lineages, &keys, &mut memo, &mut HashSet::new()) {
                         PiRootResolution::Root(root, _) if root != *key => root,
@@ -1267,8 +1325,7 @@ impl LiveTracker {
             })
             .filter_map(|(key, session)| {
                 session
-                    .lineage
-                    .clone()
+                    .resolver_lineage()
                     .map(|lineage| (key.clone(), lineage))
             })
             .collect::<HashMap<_, _>>();
@@ -1288,7 +1345,7 @@ impl LiveTracker {
                 );
                 continue;
             }
-            match child.lineage.as_ref() {
+            match child.resolver_lineage() {
                 Some(PiLineage::Agent { .. }) => {
                     let resolution = resolve_pi_root(
                         child_key,
@@ -1318,7 +1375,7 @@ impl LiveTracker {
                                 ObservedSessionAgent {
                                     agent_id: child_key.session_id.clone(),
                                     model_id: child.model.clone(),
-                                    agent_type: child.agent_role.clone(),
+                                    agent_type: child.projected_agent_role(),
                                     runtime_secs: child.started_at.map(|started_at| {
                                         now.signed_duration_since(started_at)
                                             .num_milliseconds()
@@ -1365,13 +1422,13 @@ impl LiveTracker {
                             },
                         );
                     }
-                    projected_lineage.insert(
-                        child_key.clone(),
-                        child.lineage.clone().expect("matched linked lineage"),
-                    );
+                    projected_lineage
+                        .insert(child_key.clone(), PiLineage::Linked { parent_session_id });
                 }
-                Some(lineage) => {
-                    projected_lineage.insert(child_key.clone(), lineage.clone());
+                Some(_) => {
+                    if let Some(lineage) = child.projected_lineage() {
+                        projected_lineage.insert(child_key.clone(), lineage);
+                    }
                 }
                 None => {}
             }
@@ -1411,7 +1468,7 @@ impl LiveTracker {
             row.pi_lineage = projected_lineage
                 .get(&key)
                 .cloned()
-                .or_else(|| session.lineage.clone());
+                .or_else(|| session.projected_lineage());
             row.parent_session_id = match &row.pi_lineage {
                 Some(PiLineage::Linked { parent_session_id }) => Some(parent_session_id.clone()),
                 _ => None,
@@ -1464,17 +1521,18 @@ impl LiveTracker {
                 rows.push(SessionBreakdown {
                     provider: key.provider.clone(),
                     session_id: key.session_id.clone(),
-                    parent_session_id: match projected_lineage.get(key).or(session.lineage.as_ref())
+                    parent_session_id: match projected_lineage
+                        .get(key)
+                        .cloned()
+                        .or_else(|| session.projected_lineage())
                     {
-                        Some(PiLineage::Linked { parent_session_id }) => {
-                            Some(parent_session_id.clone())
-                        }
+                        Some(PiLineage::Linked { parent_session_id }) => Some(parent_session_id),
                         _ => None,
                     },
                     pi_lineage: projected_lineage
                         .get(key)
                         .cloned()
-                        .or_else(|| session.lineage.clone()),
+                        .or_else(|| session.projected_lineage()),
                     ephemeral: session.ephemeral,
                     hostname: key.host.clone(),
                     total_tokens: session.live_tokens.unwrap_or(0),
@@ -1686,11 +1744,11 @@ fn fold_codex_line(line: &str, session: &mut LiveSession, agent_id: Option<&str>
 /// A Pi file states everything the pushed feed reports: substantive turn
 /// content advances activity, an assistant message names the model answering
 /// and the tokens it cost, and a `model_change` names a switch no message has
-/// answered under yet. Bookkeeping entries — custom extension records, the
-/// reporter's own `quill-tracking` entry, thinking-level and compaction
-/// markers — carry no role this reads, so writing one cannot reopen a finished
-/// session.
-fn fold_pi_line(line: &str, session: &mut LiveSession) -> bool {
+/// answered under yet. A nested child also names its role in its own
+/// `session_info`, keyed to the run id its runtime tree assigned. Bookkeeping
+/// entries — including the reporter's `quill-tracking` entry — cannot reopen a
+/// finished session.
+fn fold_pi_line(line: &str, session: &mut LiveSession, run_id: Option<&str>) -> bool {
     let Ok(record) = serde_json::from_str::<PiRecord>(line) else {
         return false;
     };
@@ -1735,6 +1793,15 @@ fn fold_pi_line(line: &str, session: &mut LiveSession) -> bool {
                 record.provider.as_deref(),
                 record.model_id.as_deref(),
             );
+        }
+        PI_SESSION_INFO_RECORD => {
+            if let Some(role) =
+                run_id.and_then(|run_id| pi_agent_role(record.name.as_deref(), run_id))
+                && session.structural_agent_role.as_deref() != Some(role.as_str())
+            {
+                session.structural_agent_role = Some(role);
+                changed = true;
+            }
         }
         _ => {}
     }
@@ -1795,6 +1862,81 @@ fn claude_session_file(path: &Path) -> Option<(String, FileRole)> {
             workflow,
         },
     ))
+}
+
+/// Runtime-owned Pi tree evidence, not a relationship inferred by Quill.
+///
+/// Pi writes nested child sessions as
+/// `<timestamp>_<parent>/<run-id>/run-N/session.jsonl`. The parent directory,
+/// not timing, cwd, filenames, or models, is the direct edge. Everything
+/// outside that exact runtime shape stays an independent flat session.
+fn pi_path_lineage(path: &Path) -> Option<PiLineage> {
+    let run_dir = path.parent()?;
+    let run_index = run_dir.file_name()?.to_str()?.strip_prefix("run-")?;
+    if run_index.is_empty()
+        || !run_index.bytes().all(|byte| byte.is_ascii_digit())
+        || path.file_name().is_none_or(|name| name != "session.jsonl")
+    {
+        return None;
+    }
+    observed_name(run_dir.parent()?.file_name()?.to_str()?)?;
+    let parent_dir = run_dir.parent()?.parent()?.file_name()?.to_str()?;
+    let (timestamp, parent_session_id) = parent_dir.rsplit_once('_')?;
+    pi_runtime_timestamp(timestamp)?;
+    pi_session_uuid(parent_session_id)?;
+    Some(PiLineage::Agent {
+        parent_session_id: parent_session_id.to_owned(),
+    })
+}
+
+/// The run id in the same structural child path as [`pi_path_lineage`].
+fn pi_path_run_id(path: &Path) -> Option<String> {
+    pi_path_lineage(path)?;
+    observed_name(path.parent()?.parent()?.file_name()?.to_str()?)
+}
+
+/// Pi's runtime directory timestamp is fixed-width UTC with millisecond
+/// precision, distinct from arbitrary directory names.
+fn pi_runtime_timestamp(value: &str) -> Option<()> {
+    (value.len() == 24
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && value.as_bytes()[10] == b'T'
+        && value.as_bytes()[13] == b'-'
+        && value.as_bytes()[16] == b'-'
+        && value.as_bytes()[19] == b'-'
+        && value.as_bytes()[23] == b'Z'
+        && value
+            .bytes()
+            .enumerate()
+            .filter(|(index, _)| ![4, 7, 10, 13, 16, 19, 23].contains(index))
+            .all(|(_, byte)| byte.is_ascii_digit()))
+    .then_some(())
+}
+
+/// Pi session ids in tree parent directories are UUIDs, not arbitrary names.
+fn pi_session_uuid(value: &str) -> Option<()> {
+    (value.len() == 36
+        && [8, 13, 18, 23]
+            .iter()
+            .all(|index| value.as_bytes()[*index] == b'-')
+        && value
+            .bytes()
+            .enumerate()
+            .filter(|(index, _)| ![8, 13, 18, 23].contains(index))
+            .all(|(_, byte)| byte.is_ascii_hexdigit()))
+    .then_some(())
+}
+
+/// The role Pi's nested child writes into its own session info. Binding its
+/// run id prevents a free-form session label from becoming an agent role.
+fn pi_agent_role(name: Option<&str>, run_id: &str) -> Option<String> {
+    let name = name?.strip_prefix("subagent-")?;
+    let (role, child_index) = name.rsplit_once(&format!("-{run_id}-"))?;
+    child_index
+        .parse::<u64>()
+        .ok()
+        .and_then(|_| observed_agent_type(Some(role)))
 }
 
 /// The local host every transcript-derived session belongs to.
@@ -1927,6 +2069,7 @@ struct CodexHead {
 
 const PI_MESSAGE_RECORD: &str = "message";
 const PI_MODEL_CHANGE_RECORD: &str = "model_change";
+const PI_SESSION_INFO_RECORD: &str = "session_info";
 const PI_ASSISTANT_ROLE: &str = "assistant";
 /// The roles Pi gives an entry that carries turn content. Everything else it
 /// writes is bookkeeping appended around a turn rather than inside one.
@@ -1945,6 +2088,8 @@ struct PiRecord {
     /// Upstream provider of a `model_change` entry.
     provider: Option<String>,
     model_id: Option<String>,
+    /// Pi's own session label, which a nested child keys to its runtime run id.
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2424,6 +2569,25 @@ mod tests {
 
         fn root_transcript(&self) -> PathBuf {
             self.path(&self.session_id)
+        }
+
+        /// Pi's runtime-owned child layout: the enclosing directory names the
+        /// parent session and this child's run id; the child header names self.
+        fn pi_child_path(&self, parent_id: &str, run_id: &str) -> PathBuf {
+            self.root
+                .path()
+                .join("--home-user-project--")
+                .join(format!("2026-08-08T00-00-00-000Z_{parent_id}"))
+                .join(run_id)
+                .join("run-0")
+                .join("session.jsonl")
+        }
+
+        fn write_pi_child(&self, parent_id: &str, run_id: &str, body: &str) {
+            let path = self.pi_child_path(parent_id, run_id);
+            fs::create_dir_all(path.parent().expect("child directory"))
+                .expect("create Pi child directory");
+            fs::write(path, body).expect("write Pi child transcript");
         }
 
         fn subagents(&self) -> PathBuf {
@@ -4121,6 +4285,13 @@ mod tests {
         )
     }
 
+    fn pi_session_info(role: &str, run_id: &str) -> String {
+        format!(
+            "{{\"type\":\"session_info\",\"id\":\"info-{run_id}\",\"parentId\":null,\
+             \"timestamp\":\"2026-08-08T00:00:01Z\",\"name\":\"subagent-{role}-{run_id}-0\"}}"
+        )
+    }
+
     const PI_SESSION: &str = "01a01745-ab70-7905-b6ef-0c047dbb6ab9";
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Session Fold]]
@@ -4194,6 +4365,226 @@ mod tests {
         let state = tracker.state.lock().unwrap();
         assert!(state.sessions.is_empty());
         assert!(state.files.is_empty());
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Tree Lineage]]
+    #[test]
+    fn a_nested_pi_session_tree_rebuilds_the_agent_rail_without_a_reporter() {
+        let now = Utc::now();
+        let at = |ago: i64| (now - TimeDelta::seconds(ago)).to_rfc3339();
+        let fixture = Fixture::pi(PI_SESSION);
+        let child = "01a01746-ab70-7905-b6ef-0c047dbb6ab9";
+        let run_id = "b663b5ad";
+        fixture.write(&format!(
+            "{}\n{}\n",
+            pi_header(PI_SESSION, &at(120)),
+            pi_user(&at(100))
+        ));
+        fixture.write_pi_child(
+            PI_SESSION,
+            run_id,
+            &format!(
+                "{}\n{}\n{}\n{}\n",
+                pi_header(child, &at(30)),
+                pi_session_info("reviewer", run_id),
+                pi_user(&at(20)),
+                pi_assistant(&at(10), "gpt-5.6-sol", 100)
+            ),
+        );
+        let tracker = LiveTracker::new(None);
+
+        // The file tree alone carries this direct edge: no lifecycle, lineage,
+        // or model push has entered the tracker.
+        fixture.sweep(&tracker, now);
+        let host = local_observed_host().expect("local host");
+        {
+            let state = tracker.state.lock().unwrap();
+            let child = state
+                .sessions
+                .get(&SessionKey {
+                    provider: IntegrationProvider::Pi.as_str().to_owned(),
+                    host: host.to_owned(),
+                    session_id: child.to_owned(),
+                })
+                .expect("folded child");
+            assert_eq!(
+                child.structural_lineage,
+                Some(PiLineage::Agent {
+                    parent_session_id: PI_SESSION.to_owned(),
+                })
+            );
+            assert_eq!(child.structural_agent_role.as_deref(), Some("reviewer"));
+        }
+        let (keys, rows) = read_path(&tracker, Vec::new(), now);
+        assert!(keys.iter().all(|(_, session_id, _)| session_id != child));
+        assert_eq!(rows.len(), 1);
+        let parent = &rows[0];
+        assert_eq!(parent.session_id, PI_SESSION);
+        assert_eq!(parent.agent_count, Some(1));
+        assert_eq!(agent_ids(parent), vec![child]);
+        let agent = &parent.observed_agents.as_ref().unwrap()[0];
+        assert_eq!(agent.agent_type.as_deref(), Some("reviewer"));
+        assert_eq!(agent.model_id.as_deref(), Some("gpt-5.6-sol"));
+        assert!(agent.runtime_active);
+        assert!(agent.runtime_secs.is_some_and(|runtime| runtime >= 30.0));
+        assert!(utc(&parent.last_active).is_some_and(|active| active >= parse(&at(10))));
+
+        // A matching push corroborates the same edge rather than creating a
+        // second child projection or overwriting the structural role.
+        assert!(tracker.set_pi_lineage(
+            child,
+            host,
+            PiLineage::Agent {
+                parent_session_id: PI_SESSION.to_owned(),
+            },
+        ));
+        let (_, rows) = read_path(&tracker, Vec::new(), now);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(agent_ids(&rows[0]), vec![child]);
+        assert_eq!(
+            rows[0].observed_agents.as_ref().unwrap()[0]
+                .agent_type
+                .as_deref(),
+            Some("reviewer")
+        );
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Tree Lineage]]
+    #[test]
+    fn a_flat_pi_session_stays_independent_without_explicit_lineage() {
+        let now = Utc::now();
+        let at = |ago: i64| (now - TimeDelta::seconds(ago)).to_rfc3339();
+        let fixture = Fixture::pi(PI_SESSION);
+        let flat = "01a01747-ab70-7905-b6ef-0c047dbb6ab9";
+        fixture.write(&format!(
+            "{}\n{}\n",
+            pi_header(PI_SESSION, &at(30)),
+            pi_user(&at(20))
+        ));
+        fs::write(
+            fixture.path(flat),
+            format!(
+                "{}\n{}\n{}\n",
+                pi_header(flat, &at(15)),
+                pi_session_info("reviewer", "b663b5ad"),
+                pi_user(&at(10))
+            ),
+        )
+        .expect("write flat Pi session");
+        let tracker = LiveTracker::new(None);
+
+        fixture.sweep(&tracker, now);
+        let (_, rows) = read_path(&tracker, Vec::new(), now);
+        assert_eq!(rows.len(), 2);
+        let flat = rows.iter().find(|row| row.session_id == flat).unwrap();
+        assert_eq!(flat.pi_lineage, None);
+        assert_eq!(flat.agent_count, None);
+        assert!(rows.iter().all(|row| {
+            row.observed_agents
+                .as_ref()
+                .is_none_or(|agents| agents.iter().all(|agent| agent.agent_id != flat.session_id))
+        }));
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Tree Bounds]]
+    #[test]
+    fn pi_tree_edges_use_the_shared_depth_cycle_and_missing_parent_rules() {
+        let now = Utc::now();
+        let at = now.to_rfc3339();
+        let session_id = |number| format!("00000000-0000-4000-8000-{number:012}");
+
+        let fixture = Fixture::pi(PI_SESSION);
+        fixture.write(&format!(
+            "{}\n{}\n",
+            pi_header(PI_SESSION, &at),
+            pi_user(&at)
+        ));
+        let mut parent = PI_SESSION.to_owned();
+        for depth in 1..=65 {
+            let child = session_id(depth);
+            let run_id = format!("depth-{depth}");
+            fixture.write_pi_child(
+                &parent,
+                &run_id,
+                &format!("{}\n{}\n", pi_header(&child, &at), pi_user(&at)),
+            );
+            parent = child;
+        }
+        let tracker = LiveTracker::new(None);
+        fixture.sweep(&tracker, now);
+        let (_, rows) = read_path(&tracker, Vec::new(), now);
+        let root = rows
+            .iter()
+            .find(|row| row.session_id == PI_SESSION)
+            .unwrap();
+        assert_eq!(root.agent_count, Some(64));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == session_id(65))
+                .unwrap()
+                .pi_lineage,
+            Some(PiLineage::Unresolved {
+                reason: "lineage_depth_exceeded".to_owned(),
+            })
+        );
+
+        let missing = Fixture::pi(PI_SESSION);
+        let missing_child = session_id(80);
+        missing.write_pi_child(
+            &session_id(81),
+            "missing",
+            &format!("{}\n{}\n", pi_header(&missing_child, &at), pi_user(&at)),
+        );
+        let missing_tracker = LiveTracker::new(None);
+        missing.sweep(&missing_tracker, now);
+        let (_, rows) = read_path(&missing_tracker, Vec::new(), now);
+        assert_eq!(
+            rows[0].pi_lineage,
+            Some(PiLineage::Unresolved {
+                reason: "missing_parent".to_owned(),
+            })
+        );
+        let remote_parent = session_id(81);
+        missing_tracker.start_pi_session(
+            &remote_parent,
+            "other-host",
+            Some("/work/quill"),
+            false,
+            now,
+            None,
+        );
+        missing_tracker.set_pi_lineage(&remote_parent, "other-host", PiLineage::Root);
+        let (_, rows) = read_path(&missing_tracker, Vec::new(), now);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == missing_child)
+                .unwrap()
+                .pi_lineage,
+            Some(PiLineage::Unresolved {
+                reason: "cross_host_parent".to_owned(),
+            })
+        );
+
+        let cycle = Fixture::pi(PI_SESSION);
+        let cycle_a = session_id(90);
+        let cycle_b = session_id(91);
+        for (child, parent, run_id) in [
+            (cycle_a.as_str(), cycle_b.as_str(), "cycle-a"),
+            (cycle_b.as_str(), cycle_a.as_str(), "cycle-b"),
+        ] {
+            cycle.write_pi_child(
+                parent,
+                run_id,
+                &format!("{}\n{}\n", pi_header(child, &at), pi_user(&at)),
+            );
+        }
+        let cycle_tracker = LiveTracker::new(None);
+        cycle.sweep(&cycle_tracker, now);
+        let (_, rows) = read_path(&cycle_tracker, Vec::new(), now);
+        assert!(rows.iter().all(|row| matches!(
+            row.pi_lineage,
+            Some(PiLineage::Unresolved { ref reason }) if reason == "lineage_cycle"
+        )));
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Tail Mechanics]]

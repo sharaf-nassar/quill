@@ -184,6 +184,18 @@ A Pi session found by a cold sweep alone takes its start and project from the he
 
 It accumulates every assistant message's usage into one cumulative total and answers to the newest model any message or `model_change` names. It claims neither a process instance nor a recovering flag, because the file states neither, and silence past the shared cutoff releases it and its offsets the way it releases a Claude or Codex session.
 
+## Live Tracker Pi Tree Lineage
+
+A Pi child at `<timestamp>_<parent-uuid>/<run-id>/run-N/session.jsonl` rebuilds its direct agent edge from the runtime tree alone.
+
+It joins the existing root rail with its own model, activity, runtime, and `session_info` role while its independent row is omitted; a matching push corroborates rather than duplicates that projection.
+
+A flat Pi session with no explicit launcher proof remains an independent row even when its contents resemble a child. pi-subagents `subagent-artifacts` transcripts are not Pi session files and never feed this rail.
+
+## Live Tracker Pi Tree Bounds
+
+Structural Pi tree edges use the existing lineage resolver unchanged: 64 direct descendants flatten to the root, while a 65th, a cycle, a missing parent, or a parent found only on another host remains an unresolved independent row.
+
 ## Live Tracker Pi Tail Mechanics
 
 A Pi fold parses only appended bytes and leaves a record still mid-write unconsumed, so neither its tokens nor its timestamp land in half.
