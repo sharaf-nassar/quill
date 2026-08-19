@@ -64,3 +64,45 @@ test("chart dimensions preserve every model-evidence token", () => {
     ["cliproxyapi", "PI / unattributed"],
   );
 });
+
+// @lat: [[widget-usage-tests#Widget Usage Tests#Chart group preservation]]
+test("Model dimension merges one model across CLIs by normalized id", () => {
+  const activity = {
+    bucketSeconds: 300,
+    bucketStarts: ["2026-08-01T12:00:00Z", "2026-08-01T12:05:00Z"],
+    series: [
+      {
+        identity: { provider: "pi", modelId: "cliproxyapi/gpt-5.6-sol" },
+        sessionsPerBucket: [0, 1],
+        tokensPerBucket: [0, 20],
+      },
+      {
+        identity: { provider: "codex", modelId: "gpt-5.6-sol" },
+        sessionsPerBucket: [1, 0],
+        tokensPerBucket: [130, 0],
+      },
+      {
+        identity: { provider: "claude", modelId: "gpt-5.6-sol" },
+        sessionsPerBucket: [0, 1],
+        tokensPerBucket: [0, 50],
+      },
+    ],
+    unattributedSeries: [],
+  };
+
+  for (const dimension of ["cli", "llm", "models"]) {
+    const { series } = chartSeriesFor(activity, dimension, providerLabel, providerHue);
+    assert.equal(
+      series.flatMap(({ values }) => values).reduce((sum, value) => sum + value, 0),
+      200,
+    );
+  }
+
+  const models = chartSeriesFor(activity, "models", providerLabel, providerHue).series;
+  assert.equal(models.length, 1);
+  assert.equal(models[0].id, "model:gpt-5.6-sol");
+  assert.equal(models[0].label, "gpt-5.6-sol");
+
+  const cli = chartSeriesFor(activity, "cli", providerLabel, providerHue).series;
+  assert.equal(cli.length, 3);
+});

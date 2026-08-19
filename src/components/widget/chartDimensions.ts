@@ -26,6 +26,17 @@ function upstreamLabel(provider: string, modelId: string): string {
   return provider === "pi" && separator > 0 ? modelId.slice(0, separator) : provider;
 }
 
+/**
+ * Merges a model's evidence across CLIs: Pi ids embed the upstream gateway
+ * prefix (`cliproxyapi/gpt-5.6-sol`) while other CLIs report the bare model
+ * id, so stripping that prefix is a pure string derivation with no catalog
+ * or vendor inference. See docs/solutions/conventions/model-id-normalization-boundary.md.
+ */
+export function normalizeModelId(provider: string, modelId: string): string {
+  const separator = modelId.indexOf("/");
+  return provider === "pi" && separator > 0 ? modelId.slice(separator + 1) : modelId;
+}
+
 export function chartSeriesFor(
   activity: ModelActivity | undefined,
   dimension: WidgetChartDimension,
@@ -46,12 +57,8 @@ export function chartSeriesFor(
       const label = upstreamLabel(provider, modelId);
       add(`llm:${label}`, label, provider, entry.tokensPerBucket);
     } else {
-      add(
-        `${provider}/${modelId}`,
-        `${providerLabel(provider)} / ${modelId}`,
-        provider,
-        entry.tokensPerBucket,
-      );
+      const normalized = normalizeModelId(provider, modelId);
+      add(`model:${normalized}`, normalized, provider, entry.tokensPerBucket);
     }
   }
   for (const entry of activity.unattributedSeries) {

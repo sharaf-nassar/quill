@@ -13,3 +13,5 @@ The chart starts in Model mode, rejects invalid saved values, and persists a val
 ## Chart group preservation
 
 CLI, Provider, and Model group the same model-evidence buckets without dropping unattributed tokens.
+
+Model further merges one model's evidence across CLIs by normalized id, stripping Pi's `{upstream}/` prefix before grouping, so `cliproxyapi/gpt-5.6-sol` and a directly-routed `gpt-5.6-sol` render as one series.
