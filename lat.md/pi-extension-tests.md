@@ -47,7 +47,7 @@ A session without a persistent Pi file appends and sends no tracking or health e
 
 Lifecycle delivery has bounded retry, reload, periodic recovery, reannouncement, and inert-mismatch behavior.
 
-A persistent live session replays its exact start envelope every 30 seconds without appending another durable entry. Replay ticks skip an overlapping send and stop at shutdown, reporter release, or protocol mismatch; no-session and disabled reporters schedule nothing. Timeout, `429`, and `503` retry once; `401` reloads config once; `409 unknown_session` reannounces the persisted start once before one mutation replay; `426` makes later live pushes inert while durable entries continue. Hook and routing telemetry inspect non-2xx bodies and surface typed server codes without changing routing decisions or escaping handlers.
+A persistent live session replays its exact start envelope every 30 seconds without appending another durable entry. Replay ticks skip an overlapping send and stop at shutdown, reporter release, or generation mismatch; no-session and disabled reporters schedule nothing. Timeout, `429`, and `503` retry once; `401` reloads config once; `409 unknown_session` reannounces the persisted start once before one mutation replay; a `426` rejecting the generation the sent envelope declared makes later live pushes inert while durable entries continue. A rejection naming an event-level failure, including the protocol-1 acceleration hint the protocol-2 route refuses, logs one bounded typed error and drops only that event, leaving the replay, later lifecycle pushes, and runtime messages alive. Hook and routing telemetry inspect non-2xx bodies and surface typed server codes without changing routing decisions or escaping handlers.
 
 ## Handshake and lineage
 

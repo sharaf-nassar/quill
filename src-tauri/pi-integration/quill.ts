@@ -609,6 +609,16 @@ function reporterProcess(config) {
   return state;
 }
 
+// Codes that reject the reporter generation itself rather than one event.
+// Mirrors the `426` set in `pi_decode_status` (src-tauri/src/server.rs).
+const GENERATION_MISMATCH_CODES = new Set([
+  "protocol_mismatch",
+  "reporter_version_mismatch",
+  "quill_build_mismatch",
+  "capability_mismatch",
+  "tracking_schema_mismatch",
+]);
+
 async function responseError(response) {
   let body;
   try {
@@ -622,7 +632,7 @@ async function responseError(response) {
   if (response.status === 409 && code === "unknown_session") {
     return new UnknownSessionError(typedMessage);
   }
-  if (response.status === 426 || code === "protocol_mismatch") {
+  if (GENERATION_MISMATCH_CODES.has(code)) {
     return new ProtocolMismatchError(typedMessage);
   }
   const error = new TransportError(typedMessage);
@@ -743,7 +753,14 @@ async function sendTracked(config, state, endpoint, payload) {
         error = recoveryError;
       }
     }
-    if (error instanceof ProtocolMismatchError) {
+    // Only a rejection of the generation this payload declared makes the whole
+    // reporter inert. An event-level rejection - including a protocol-1
+    // acceleration hint the protocol-2 route refuses - drops that one event and
+    // leaves lifecycle, the cached start replay, and runtime messages alive.
+    if (
+      error instanceof ProtocolMismatchError &&
+      payload?.protocol === PI_PROTOCOL_V2
+    ) {
       state.inert = true;
       stopLiveReannounce(state);
     }

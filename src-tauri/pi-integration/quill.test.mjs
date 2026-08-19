@@ -612,6 +612,78 @@ test("unknown session reannounces once and protocol mismatch makes live push ine
   );
 });
 
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Typed bounded delivery]]
+test("event-level rejection drops one event without silencing the reporter", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const calls = [];
+      const rejections = new Map([
+        // The protocol-1 acceleration hint the protocol-2 route refuses.
+        [2, { code: "protocol_mismatch", message: "Unsupported protocol 1" }],
+        // An event-level code on a protocol-2 lifecycle replay.
+        [3, { code: "invalid_event", message: "Invalid protocol-v2 event" }],
+      ]);
+      const logs = [];
+      const oldError = console.error;
+      const oldFetch = globalThis.fetch;
+      console.error = (...parts) => logs.push(parts.join(" "));
+      globalThis.fetch = async (url, options) => {
+        if (!String(url).endsWith("/api/v1/pi/track")) {
+          return httpResponse(202);
+        }
+        calls.push(JSON.parse(options.body));
+        const rejection = rejections.get(calls.length);
+        return rejection ? httpResponse(426, rejection) : httpResponse(202);
+      };
+      const ctx = context("event-rejection-session");
+      try {
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "startup" },
+          ctx,
+        );
+        await flushRequests();
+        assert.equal(calls.length, 1);
+
+        pi.handlers.get("turn_start")[0]({ type: "turn_start" }, ctx);
+        await flushRequests();
+        assert.equal(calls.length, 2);
+        assert.equal(calls[1].protocol, 1);
+
+        t.mock.timers.tick(30_000);
+        await flushRequests();
+        assert.equal(calls.length, 3);
+        assert.deepEqual(calls[2], calls[0]);
+
+        t.mock.timers.tick(30_000);
+        await flushRequests();
+        assert.equal(calls.length, 4);
+        assert.deepEqual(calls[3], calls[0]);
+
+        await pi.handlers.get("session_shutdown")[0](
+          { type: "session_shutdown", reason: "quit" },
+          ctx,
+        );
+        assert.equal(calls.length, 5);
+        assert.equal(calls[4].protocol, PI_PROTOCOL_V2);
+        assert.equal(calls[4].events[0].event, "session_end");
+        assert.equal(pi.entries.length, 2);
+
+        assert.deepEqual(logs, [
+          "Quill Pi extension ProtocolMismatchError: protocol_mismatch: Unsupported protocol 1",
+          "Quill Pi extension TransportError: invalid_event: Invalid protocol-v2 event",
+        ]);
+      } finally {
+        globalThis.fetch = oldFetch;
+        console.error = oldError;
+      }
+    },
+  );
+});
+
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Tracking capability boundary]]
 test("child mode exposes tracking without root tools or router", async () => {
   await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, () => {
