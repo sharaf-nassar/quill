@@ -50,7 +50,7 @@ Every payload builder in the extension that posts to `/api/v1/pi/track` has a ge
 
 The builders are enumerated from the extension source rather than from the endpoint string, so a new event kind on the tracking wire fails the suite until it carries a fixture.
 
-The protocol-2 lifecycle shapes are accepted. The protocol-1 activity, model, and usage shapes must be accepted too; the router answers them `426` today, so this test fails on those shapes by design until native ingestion is restored.
+The protocol-2 lifecycle shapes and the protocol-1 activity, model, and usage shapes are all accepted, because the route dispatches on the protocol each envelope declares. A protocol-1 hint envelope answers `202` with `{"status": "accepted"}` and folds its events into `LiveTracker`; only a protocol neither shape claims answers `426`.
 
 ## Transactional Lifecycle Disposition
 

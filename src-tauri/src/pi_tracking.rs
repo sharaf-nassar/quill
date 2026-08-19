@@ -317,21 +317,31 @@ impl PiProtocolV2DecodeError {
     }
 }
 
+fn protocol_field(object: &Map<String, Value>) -> Option<u32> {
+    object
+        .get("protocol")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+/// The protocol a tracking envelope declares, read before any generation
+/// validation so the route can dispatch the shape it actually received.
+/// `None` leaves the typed rejection to the decoder for that shape.
+pub fn envelope_protocol(bytes: &[u8]) -> Option<u32> {
+    protocol_field(parse_json(bytes).ok()?.as_object()?)
+}
+
 pub fn decode_protocol_v2_envelope(
     bytes: &[u8],
 ) -> Result<PiProtocolV2Envelope, PiProtocolV2DecodeError> {
     let value = parse_json(bytes)?;
     let object = object(&value, PiProtocolV2ErrorCode::InvalidEnvelope, "envelope")?;
-    let protocol = object
-        .get("protocol")
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| {
-            PiProtocolV2DecodeError::new(
-                PiProtocolV2ErrorCode::InvalidEnvelope,
-                "Envelope protocol must be an integer",
-            )
-        })?;
+    let protocol = protocol_field(object).ok_or_else(|| {
+        PiProtocolV2DecodeError::new(
+            PiProtocolV2ErrorCode::InvalidEnvelope,
+            "Envelope protocol must be an integer",
+        )
+    })?;
     if protocol != PI_PROTOCOL_V2 {
         return Err(PiProtocolV2DecodeError::new(
             PiProtocolV2ErrorCode::ProtocolMismatch,

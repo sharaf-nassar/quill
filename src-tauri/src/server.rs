@@ -393,7 +393,6 @@ fn session_messages_rate_limit<'a>(
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct PiTrackError {
     status: StatusCode,
@@ -416,6 +415,17 @@ impl PiTrackError {
             code: "internal_error",
             message: message.into(),
         }
+    }
+
+    fn response(self) -> Response {
+        (
+            self.status,
+            Json(serde_json::json!({
+                "error": self.code,
+                "message": self.message,
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -620,7 +630,6 @@ fn validate_pi_track_envelope(payload: &PiTrackEnvelope) -> Result<(), PiTrackEr
     Ok(())
 }
 
-#[allow(dead_code)]
 fn ingest_pi_track(
     storage: &Storage,
     live_tracker: &crate::live_tracker::LiveTracker,
@@ -1139,7 +1148,7 @@ fn pi_v2_error(
     code: PiProtocolV2ErrorCode,
     message: impl Into<String>,
     retry_after_ms: Option<u64>,
-) -> (StatusCode, Json<PiProtocolV2Response>) {
+) -> Response {
     let required = matches!(
         code,
         PiProtocolV2ErrorCode::ProtocolMismatch
@@ -1157,6 +1166,7 @@ fn pi_v2_error(
             retry_after_ms,
         }),
     )
+        .into_response()
 }
 
 fn pi_decode_status(code: PiProtocolV2ErrorCode) -> StatusCode {
@@ -1170,12 +1180,77 @@ fn pi_decode_status(code: PiProtocolV2ErrorCode) -> StatusCode {
     }
 }
 
+/// The protocol-1 half of `/api/v1/pi/track`: activity, model, lineage,
+/// live-token, and per-message usage hints that accelerate live state ahead of
+/// reconciliation. It shares auth, the body bound, the rate limiter, and
+/// demo-mode gating with the lifecycle path but none of its guarantees - no
+/// generation acknowledgement, no durable receipt, no reporter-subject match -
+/// because the persisted snapshot overwrites whatever a hint reports.
+// @lat: [[data-flow#Data Flow#Live Session Tracker]]
+async fn ingest_pi_track_v1(state: &PiTrackRouteState, bytes: &[u8]) -> Response {
+    let payload = match serde_json::from_slice::<PiTrackEnvelope>(bytes) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return PiTrackError::bad_request(
+                "invalid_envelope",
+                format!("Invalid Pi tracking envelope: {error}"),
+            )
+            .response();
+        }
+    };
+    if crate::ingest_is_quiesced() {
+        return PiTrackError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "quiesced",
+            message: "Database maintenance in progress; retry shortly".to_owned(),
+        }
+        .response();
+    }
+    if !check_rate_limit_with_cost(
+        &state.rate_limiter,
+        MAX_PI_TRACK_REQUESTS,
+        payload.events.len().max(1),
+    ) {
+        return PiTrackError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "rate_limited",
+            message: "Rate limit exceeded".to_owned(),
+        }
+        .response();
+    }
+
+    let storage = state.storage;
+    let tracker = Arc::clone(&state.live_tracker);
+    let demo_mode = state.demo_mode;
+    match tokio::task::spawn_blocking(move || {
+        crate::with_ingest_write_permit(|| ingest_pi_track(storage, &tracker, &payload, demo_mode))
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            if let Some(app_handle) = &state.app_handle {
+                let _ = app_handle.emit(crate::SESSIONS_LIVE_UPDATED_EVENT, ());
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({"status": "accepted"})),
+            )
+                .into_response()
+        }
+        Ok(Err(error)) => error.response(),
+        Err(error) => {
+            log::error!("Pi tracking worker failed: {error}");
+            PiTrackError::internal("Pi tracking worker failed").response()
+        }
+    }
+}
+
 // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Authenticated Protocol v2 Router]]
 async fn post_pi_track(
     State(state): State<Arc<PiTrackRouteState>>,
     headers: HeaderMap,
     request: Request,
-) -> (StatusCode, Json<PiProtocolV2Response>) {
+) -> Response {
     if !check_auth(&headers, &state.secret) {
         return pi_v2_error(
             StatusCode::UNAUTHORIZED,
@@ -1221,6 +1296,13 @@ async fn post_pi_track(
             );
         }
     };
+    // Only lifecycle moved to protocol 2; activity, model, lineage, live
+    // tokens, and usage still arrive as protocol-1 hints. Anything else -
+    // including a body that declares no readable protocol - stays with the
+    // lifecycle decoder and its typed generation rejection.
+    if crate::pi_tracking::envelope_protocol(&bytes) == Some(PI_TRACK_PROTOCOL) {
+        return ingest_pi_track_v1(&state, &bytes).await;
+    }
     let payload = match crate::pi_tracking::decode_protocol_v2_envelope(&bytes) {
         Ok(payload) => payload,
         Err(error) => {
@@ -1397,6 +1479,7 @@ async fn post_pi_track(
             outcomes,
         }),
     )
+        .into_response()
 }
 
 fn store_observation_in_background(storage: &'static Storage, payload: ObservationPayload) {
@@ -2821,8 +2904,7 @@ async fn post_session_messages(
                     PiProtocolV2ErrorCode::Unavailable,
                     "Pi lifecycle lookup failed",
                     Some(1500),
-                )
-                .into_response();
+                );
             }
         };
         if disposition == PiProtocolV2Outcome::UnknownSession {
@@ -2831,8 +2913,7 @@ async fn post_session_messages(
                 PiProtocolV2ErrorCode::UnknownSession,
                 "Session lifecycle must be reannounced",
                 None,
-            )
-            .into_response();
+            );
         }
         if disposition == PiProtocolV2Outcome::Stale {
             return pi_v2_error(
@@ -2840,8 +2921,7 @@ async fn post_session_messages(
                 PiProtocolV2ErrorCode::ReannounceRequired,
                 "A newer Pi process owns this session",
                 None,
-            )
-            .into_response();
+            );
         }
         if let Some(process_instance_id) = payload.process_instance_id.as_deref()
             && let Some(at) = DateTime::<Utc>::from_timestamp_millis(observed_at)
@@ -3532,10 +3612,6 @@ mod observed_subagent_tests {
         ));
     }
 
-    // EXPECTED TO FAIL until bead quill-oyie.21 restores native ingestion: the
-    // router answers the protocol-1 activity, model, and usage shapes with 426
-    // today. These assertions are the intended contract and .21's target — do
-    // not relax them to the current behavior.
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Extension Track Wire Contract]]
     #[tokio::test]
     async fn real_pi_router_answers_every_extension_track_shape() {
@@ -3589,6 +3665,80 @@ mod observed_subagent_tests {
             "the real router drops extension shapes it must ingest: {}",
             broken.join("; ")
         );
+    }
+
+    // @lat: [[data-flow#Data Flow#Live Session Tracker]]
+    #[tokio::test]
+    async fn real_pi_router_folds_protocol_v1_hints_into_live_state() {
+        let client = reqwest::Client::new();
+        let state = pi_route_state(false);
+        let url = spawn_pi_route(Arc::clone(&state)).await;
+
+        let response = client
+            .post(&url)
+            .bearer_auth("route-secret")
+            .body(
+                serde_json::json!({
+                    "protocol": PI_TRACK_PROTOCOL,
+                    "extension_version": "0.2.0",
+                    "min_quill_version": "0.9.0",
+                    "events": [
+                        {
+                            "type": "session_start",
+                            "event_uuid": "hint-start",
+                            "session_id": "hint-session",
+                            "hostname": "pi-host",
+                            "timestamp": "2026-08-18T02:00:00Z",
+                            "cwd": "/work/pi",
+                            "reason": "startup",
+                            "lineage": { "kind": "root" }
+                        },
+                        {
+                            "type": "usage",
+                            "event_uuid": "hint-usage",
+                            "session_id": "hint-session",
+                            "hostname": "pi-host",
+                            "timestamp": "2026-08-18T02:00:01Z",
+                            "model_provider": "openai",
+                            "model": "gpt-5",
+                            "input_tokens": 5,
+                            "output_tokens": 4,
+                            "cache_read_tokens": 1,
+                            "cache_write_tokens": 6,
+                            "cost": {
+                                "input": 0.05,
+                                "output": 0.08,
+                                "cache_read": 0.01,
+                                "cache_write": 0.06,
+                                "total": 0.2
+                            }
+                        }
+                    ]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("protocol-1 hint request");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"status": "accepted"})
+        );
+
+        assert_eq!(
+            state.live_tracker.session_ranking_keys(),
+            vec![("pi".into(), "hint-session".into(), "pi-host".into())]
+        );
+        let rows = state.live_tracker.overlay(
+            Vec::new(),
+            "2026-08-18T00:00:00Z",
+            Some("pi-host"),
+            Some(IntegrationProvider::Pi),
+            Some(10),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].total_tokens, 16);
     }
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Agent Lineage Protocol]]
