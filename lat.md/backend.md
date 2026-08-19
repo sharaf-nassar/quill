@@ -1045,7 +1045,7 @@ Replacing one `(provider, source_key)` row with a new nickname updates that labe
 
 ##### Usage Graph Dimensions
 
-The Usage graph must preserve every model-evidence token while it groups by CLI, upstream LLM, or exact model.
+The Usage graph must preserve every model-evidence token while it groups by CLI, upstream provider, or exact model.
 
 A Pi fixture with two `cliproxyapi/*` models, a direct Codex model, and model-less Pi activity verifies dimensions, buckets, footer fields, and the invariant that plotted plus unattributed token buckets equal the overview total.
 
@@ -2104,7 +2104,7 @@ One handshake means one process. [[src-tauri/src/server.rs#start_server]] binds 
 
 Data still relocates. [[src-tauri/src/data_paths.rs#quill_dir_name]] namespaces the `quill` leaf (`quill` → `quill-dev`) and [[src-tauri/src/data_paths.rs#quill_config_dir]] is the one root `claude_setup`, `codex`, `pi`, `retirement`, the context store, and the Pi spool all derive from. `learning.rs` uses the same leaf name under `dirs::config_dir()`, which differs from `~/.config` on macOS and must keep doing so. Tauri's app cache and `usage.db` already hang under the identity-specific app-data root, so the installed app's `context/context.db`, `~/.cache/quill/`, database, and app cache stay untouched.
 
-Provider roots stay production's. `~/.claude/`, `~/.codex/`, and `~/.pi/` belong to the agents, and startup repair rewrites assets there to point at the running Quill — under a dev identity that still redirects the installed app's providers at dev's namespaced hook scripts and context store, even though the listener and contract no longer move. [[src-tauri/src/integrations/manager.rs#provider_writes_allowed]] therefore drops `startup_refresh` and `force_rescan` to the same read-only path demo mode uses, skipping repair, deployment, and continuity retirement. `QUILL_DEV_INTEGRATIONS=1` opts a dev run back in when the integration flows themselves are what is under test.
+Provider roots stay production's. `~/.claude/`, `~/.codex/`, and `~/.pi/` belong to the agents, and startup repair rewrites assets there to point at the running Quill — under a dev identity that still redirects the installed app's providers at dev's namespaced hook scripts and context store, even though the listener and contract no longer move. [[src-tauri/src/integrations/manager.rs#development_integration_writes_enabled]] enables current integrations, including the Pi reporter, for every dev launch; `QUILL_DEV_INTEGRATIONS=0` is the explicit read-only opt-out.
 
 `scripts/dev-runtime-isolation.mjs` (`npm run test:dev-isolation`) is the live regression: it builds both identities and runs them together under one throwaway `HOME`, one Xvfb display, and one session bus. Holding both up at once now requires the public port overrides rather than being the default, and it asserts both stay alive on their overridden listeners, share exactly one credential, and keep separate context stores and app cache roots while every production-owned hash and mtime — contract, context store, `~/.cache/quill/`, and provider assets — is unchanged. Focused Rust tests separately pin the published pair, the identity-independent contract roots, and override precedence. It is not in `npm test` because it builds two binaries.
 

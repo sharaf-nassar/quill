@@ -812,6 +812,9 @@ function UsageView({ range }: UsageViewProps) {
     ],
   );
 
+  const chartDimensionLabel =
+    chartDimension === "llm" ? "Provider" : chartDimension === "cli" ? "CLI" : "Model";
+
   return (
     <>
       <div className="wg-usage-band">
@@ -819,8 +822,8 @@ function UsageView({ range }: UsageViewProps) {
           <div className="wg-chart-dimensions" role="group" aria-label="Graph grouping">
             {([
               ["cli", "CLI"],
-              ["llm", "LLM"],
-              ["models", "Models"],
+              ["llm", "Provider"],
+              ["models", "Model"],
             ] as const).map(([dimension, label]) => (
               <button
                 key={dimension}
@@ -848,7 +851,7 @@ function UsageView({ range }: UsageViewProps) {
               series={chart?.series ?? []}
               xLabels={chart?.labels}
               height={CHART_HEIGHT}
-              ariaLabel={`${chartDimension} token usage for the selected range: ${formatTokenCount(
+              ariaLabel={`${chartDimensionLabel} token usage for the selected range: ${formatTokenCount(
                 chart?.totalTokens ?? 0,
               )} total${chart?.summary ? ` — ${chart.summary}` : ""}`}
               emptyLabel="No tokens recorded in this range"

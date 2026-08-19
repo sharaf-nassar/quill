@@ -273,10 +273,9 @@ and single-instance lock separate from an installed Quill. Invoking the Tauri
 CLI directly (`cargo tauri dev`) skips that and writes to production state.
 
 A dev run keeps its own database, context store, learned rules, and app caches
-(`~/.config/quill-dev/` and its identity-specific data root), and skips startup
-provider repair that would otherwise re-point `~/.claude/`, `~/.codex/`, and
-`~/.pi/` at the dev build. `QUILL_DEV_INTEGRATIONS=1` opts a dev run back into
-provider installs.
+(`~/.config/quill-dev/` and its identity-specific data root). Startup repairs
+current provider integrations—including Pi—for live validation. Set
+`QUILL_DEV_INTEGRATIONS=0` to keep a dev run read-only.
 
 What it does *not* move is the provider handshake: every build listens on
 19876/19877 and publishes the same `~/.config/quill/config.json` with the same
