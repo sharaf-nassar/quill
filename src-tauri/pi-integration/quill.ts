@@ -1806,6 +1806,109 @@ export function protocolV2FixtureJsonl() {
     },
   );
 
+  // Exact `/api/v1/pi/track` request bytes for every payload builder in this
+  // file, so the real router is asserted against what the extension emits
+  // rather than against shapes it already accepts. The records replay in order
+  // as one session: the start opens it, the native events land on it, and the
+  // end closes it.
+  const wireHeaders = headers(
+    {
+      secret: "fixture-secret",
+      hostname: "pi-host",
+      installChannel: "managed",
+      quillRoot: "protocol-v2-fixture",
+    },
+    true,
+  );
+  delete wireHeaders.Authorization;
+  wireHeaders["X-Quill-Pi-Process"] = "10000000-0000-4000-8000-000000000001";
+  const addWire = (events, status, value) => {
+    cases.push({
+      name: `wire.${events.join("+")}`,
+      kind: "wire",
+      expectation: "accept",
+      coverage: events.map((event) => `track:event:${event}`),
+      status,
+      headers: wireHeaders,
+      wire: JSON.stringify(value),
+    });
+  };
+  // Mirrors `trackEvent`: native events carry the unnormalized reporter
+  // hostname and a stable identity, never a normalized host or a sequence.
+  const nativeEvent = (type, identity, fields = {}) => ({
+    type,
+    event_uuid: stableId("pi", "session-root", type, identity),
+    session_id: "session-root",
+    hostname: "pi-host",
+    timestamp: "2026-08-18T02:00:30.000Z",
+    ...fields,
+  });
+  const usageCommon = {
+    session_id: "session-root",
+    hostname: "pi-host",
+    timestamp: "2026-08-18T02:00:32.000Z",
+  };
+
+  addWire(["session_start"], 202, buildProtocolV2Envelope([fixtureEvent(21)]));
+  addWire(
+    ["activity"],
+    202,
+    trackEnvelope([nativeEvent("activity", "turn:0")]),
+  );
+  addWire(
+    ["model"],
+    202,
+    trackEnvelope([
+      nativeEvent("model", "model:openai:gpt-5", {
+        model_provider: "openai",
+        model: "gpt-5",
+      }),
+    ]),
+  );
+  addWire(
+    ["model", "usage"],
+    202,
+    trackEnvelope([
+      {
+        ...usageCommon,
+        type: "model",
+        event_uuid: stableId(
+          "pi",
+          "session-root",
+          "message-model",
+          "response-1",
+        ),
+        model_provider: "openai",
+        model: "gpt-5",
+      },
+      {
+        ...usageCommon,
+        type: "usage",
+        event_uuid: stableId("pi", "session-root", "usage", "response-1"),
+        model_provider: "openai",
+        model: "gpt-5",
+        input_tokens: 5,
+        output_tokens: 4,
+        cache_read_tokens: 1,
+        cache_write_tokens: 6,
+        cost: {
+          input: 0.05,
+          output: 0.08,
+          cache_read: 0.01,
+          cache_write: 0.06,
+          total: 0.2,
+        },
+      },
+    ]),
+  );
+  addWire(
+    ["session_end"],
+    202,
+    buildProtocolV2Envelope([
+      fixtureEvent(22, { event: "session_end", reason: "quit" }),
+    ]),
+  );
+
   return `${cases.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
 }
 

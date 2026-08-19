@@ -44,6 +44,14 @@ It bounds the body at 1 MiB, matches identity/generation headers to the envelope
 
 Accepted responses include exact Quill build, protocol, reporter version, capability digest, and ordered dispositions. Authenticated mismatch, unknown-session, rate, and availability outcomes write typed reporter health; successful evidence recovers only the matching subject and dimension.
 
+## Extension Track Wire Contract
+
+Every payload builder in the extension that posts to `/api/v1/pi/track` has a generated wire fixture, and the real router answers each one's exact request bytes and reporter headers.
+
+The builders are enumerated from the extension source rather than from the endpoint string, so a new event kind on the tracking wire fails the suite until it carries a fixture.
+
+The protocol-2 lifecycle shapes are accepted. The protocol-1 activity, model, and usage shapes must be accepted too; the router answers them `426` today, so this test fails on those shapes by design until native ingestion is restored.
+
 ## Transactional Lifecycle Disposition
 
 One SQLite transaction returns `applied`, `duplicate`, `stale`, or `unknown_session` for each validated event.

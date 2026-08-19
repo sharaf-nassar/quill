@@ -863,6 +863,7 @@ mod tests {
         Envelope,
         Entry,
         Response,
+        Wire,
     }
 
     #[derive(Deserialize, PartialEq, Eq)]
@@ -881,6 +882,10 @@ mod tests {
         coverage: Vec<String>,
         #[serde(default)]
         error_code: Option<PiProtocolV2ErrorCode>,
+        #[serde(default)]
+        status: Option<u16>,
+        #[serde(default)]
+        headers: std::collections::BTreeMap<String, String>,
         wire: String,
     }
 
@@ -904,6 +909,24 @@ mod tests {
                 }
                 FixtureKind::Response => {
                     decode_protocol_v2_response(case.wire.as_bytes()).map(|_| ())
+                }
+                // Wire records are replayed against the real router in
+                // server.rs, including the protocol-1 shapes this decoder is
+                // not meant to read. Pin only the request they describe.
+                FixtureKind::Wire => {
+                    assert!(
+                        case.status.is_some(),
+                        "{} declares its intended status",
+                        case.name
+                    );
+                    assert!(
+                        case.headers
+                            .keys()
+                            .any(|key| key.eq_ignore_ascii_case(PI_REPORTER_HOST_HEADER)),
+                        "{} carries the reporter headers the extension sends",
+                        case.name
+                    );
+                    continue;
                 }
             };
             match case.expectation {

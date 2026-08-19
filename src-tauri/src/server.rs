@@ -3223,6 +3223,46 @@ mod observed_subagent_tests {
             .expect("named protocol-v2 fixture")
     }
 
+    /// Ordered `/api/v1/pi/track` request fixtures: exact extension bytes plus
+    /// the reporter headers the extension sends with them.
+    fn pi_track_wire_fixtures() -> Vec<serde_json::Value> {
+        include_str!("../pi-integration/fixtures/protocol-v2.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("fixture record"))
+            .filter(|record| record["kind"] == "wire")
+            .collect()
+    }
+
+    /// Event kinds `quill.ts` posts to `/api/v1/pi/track`. Every body reaching
+    /// that endpoint is built by `trackEvent` (one event) or `trackEvents` (a
+    /// batch), and both name the kind as a literal, so scanning those two call
+    /// shapes enumerates the wire without depending on the endpoint string.
+    fn pi_track_event_kinds_in_extension() -> std::collections::BTreeSet<String> {
+        const SOURCE: &str = include_str!("../pi-integration/quill.ts");
+        let single = regex::Regex::new(r#"trackEvent\(\s*config,\s*state,\s*info,\s*"(\w+)""#)
+            .expect("single-event pattern");
+        let batch =
+            regex::Regex::new(r#"(?s)trackEvents\(\s*config,\s*state,\s*info,\s*\[(.*?)\]\s*\)"#)
+                .expect("batch pattern");
+        let batch_kind = regex::Regex::new(r#"type:\s*"(\w+)""#).expect("batch kind pattern");
+        let mut kinds = single
+            .captures_iter(SOURCE)
+            .map(|captures| captures[1].to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!kinds.is_empty(), "quill.ts still posts single events");
+        let mut batches = 0;
+        for events in batch.captures_iter(SOURCE) {
+            batches += 1;
+            kinds.extend(
+                batch_kind
+                    .captures_iter(&events[1])
+                    .map(|captures| captures[1].to_owned()),
+            );
+        }
+        assert!(batches > 0, "quill.ts still posts batched events");
+        kinds
+    }
+
     fn pi_route_state(demo_mode: bool) -> Arc<PiTrackRouteState> {
         let storage = Box::leak(Box::new(
             Storage::init_at(
@@ -3490,6 +3530,65 @@ mod observed_subagent_tests {
                 ..
             }
         ));
+    }
+
+    // EXPECTED TO FAIL until bead quill-oyie.21 restores native ingestion: the
+    // router answers the protocol-1 activity, model, and usage shapes with 426
+    // today. These assertions are the intended contract and .21's target — do
+    // not relax them to the current behavior.
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Extension Track Wire Contract]]
+    #[tokio::test]
+    async fn real_pi_router_answers_every_extension_track_shape() {
+        let fixtures = pi_track_wire_fixtures();
+        let covered = fixtures
+            .iter()
+            .flat_map(|record| {
+                record["coverage"]
+                    .as_array()
+                    .expect("fixture coverage")
+                    .iter()
+                    .filter_map(|tag| {
+                        tag.as_str()?
+                            .strip_prefix("track:event:")
+                            .map(str::to_owned)
+                    })
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            covered,
+            pi_track_event_kinds_in_extension(),
+            "every /api/v1/pi/track builder in quill.ts needs a wire fixture"
+        );
+
+        let client = reqwest::Client::new();
+        let url = spawn_pi_route(pi_route_state(false)).await;
+        let mut broken = Vec::new();
+        for record in fixtures {
+            let name = record["name"].as_str().expect("fixture name");
+            let expected = StatusCode::from_u16(
+                u16::try_from(record["status"].as_u64().expect("intended status"))
+                    .expect("status fits"),
+            )
+            .expect("valid status");
+            let wire = record["wire"].as_str().expect("fixture wire").to_owned();
+            let mut request = client.post(&url).bearer_auth("route-secret").body(wire);
+            for (header, value) in record["headers"].as_object().expect("fixture headers") {
+                request = request.header(header, value.as_str().expect("header value"));
+            }
+            let status = request
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .status();
+            if status != expected {
+                broken.push(format!("{name}: answered {status}, must answer {expected}"));
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "the real router drops extension shapes it must ingest: {}",
+            broken.join("; ")
+        );
     }
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Agent Lineage Protocol]]

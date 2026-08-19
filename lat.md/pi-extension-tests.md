@@ -35,6 +35,8 @@ Deterministic TypeScript builders freeze the exact protocol-v2 generation and pe
 
 The checked-in JSONL covers canonical identity, lifecycle occurrence fields, every start/end reason, delivery source, lineage state, optional field, exact-generation mismatch, and typed outcome. Valid `quill-tracking` entries contain no prompt, message, or tool output. Lifecycle live emission and persisted entries use protocol 2; native-derived model, usage, activity, and runtime acceleration remains protocol 1.
 
+The same file also freezes each `/api/v1/pi/track` request the extension sends: the exact envelope bytes, the reporter headers accompanying them, and the status the router owes them. The records replay in order as one session, so the start opens it, the native events land on it, and the end closes it.
+
 ## Persisted lifecycle evidence
 
 A persistent session appends `quill-tracking` lifecycle/direct-lineage data through Pi before sending the same event UUID in its protocol-v2 live envelope. Pi buffers pre-assistant entries and flushes them with the native session file.
