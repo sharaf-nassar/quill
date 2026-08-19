@@ -20,19 +20,19 @@
 //
 // See specs/018-widget-ui-redesign/plan.md#Affected Components.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useMemo, useState } from "react";
 import { AreaChart, bucketTotals, Sparkline, type VizSeries } from "../viz";
+import { chartSeriesFor } from "../chartDimensions";
 import { selectInsightLine } from "./insightLine";
-import { useActivitySeries, useProviderTokenSeries } from "../../../hooks/useWidgetSeries";
+import { useActivitySeries } from "../../../hooks/useWidgetSeries";
 import { useBreakdownData } from "../../../hooks/useBreakdownData";
-import { useCachedInvoke } from "../../../hooks/useCachedInvoke";
 import { queryRangeMs, shouldLoadSecondaryProjects } from "../../../hooks/widgetQueryPlan";
 import { useCodeInsights } from "../../../hooks/useCodeInsights";
 import { useCodeStats } from "../../../hooks/useCodeStats";
 import { useContextSavingsStats } from "../../../hooks/useContextSavingsStats";
 import { useLlmRuntimeStats } from "../../../hooks/useLlmRuntimeStats";
 import { useRetentionCutoff } from "../../../hooks/useRetentionCutoff";
+import { useModelAnalytics } from "../../../hooks/useModelAnalytics";
 import { openManageWindow } from "../../../lib/manageWindow";
 import { IS_MACOS } from "../../../lib/windowChrome";
 import {
@@ -48,6 +48,11 @@ import {
   resolveSessionMetrics,
 } from "../../../utils/format";
 import { providerHue, providerLabel, providerTag } from "../../../utils/providers";
+import {
+  readStoredWidgetChartDimension,
+  storeWidgetChartDimension,
+  type WidgetChartDimension,
+} from "../rangePreference";
 import { formatRetentionCutoff } from "../../../utils/retention";
 import { formatTokenCount } from "../../../utils/tokens";
 import type {
@@ -58,14 +63,13 @@ import type {
   IntegrationProvider,
   InsightTrend,
   ProjectBreakdown,
+  ModelUsageOverviewTotals,
   RangeType,
   SessionBreakdown,
   SkillBreakdown,
-  TokenStats,
 } from "../../../types";
 
 const CHART_HEIGHT = 118;
-const REFRESH_INTERVAL_MS = 60_000;
 /** Rows the breakdown shows before it would start dominating the widget. */
 const BREAKDOWN_LIMIT = 5;
 
@@ -177,12 +181,12 @@ function trendDelta(trend: InsightTrend | null): Delta | null {
 }
 
 /** Cache hit rate over the range, on the same denominator analytics uses. */
-function cacheHitRate(stats: TokenStats | null): number | null {
+function cacheHitRate(stats: ModelUsageOverviewTotals | null): number | null {
   if (!stats) return null;
   const denominator =
-    stats.total_input + stats.total_cache_creation + stats.total_cache_read;
+    stats.inputTokens + stats.cacheCreationTokens + stats.cacheReadTokens;
   if (denominator <= 0) return null;
-  return Math.round((stats.total_cache_read / denominator) * 100);
+  return Math.round((stats.cacheReadTokens / denominator) * 100);
 }
 
 /** Per-bucket `lines_added − lines_removed` over the selected range. */
@@ -202,48 +206,6 @@ function netLineBuckets(
     values[index] += point.lines_added - point.lines_removed;
   }
   return values;
-}
-
-/**
- * Range-scoped token totals for the footer.
- *
- * Deliberately narrow: it asks for `get_token_stats` and nothing else. The
- * legacy analytics hook this replaces also pulled the full point history and
- * the hostname list, neither of which the widget draws, and a background
- * instrument should not pay for reads it never renders.
- */
-function useWidgetTokenStats(range: RangeType) {
-  const request = useCallback(
-    () =>
-      invoke<TokenStats>("get_token_stats", {
-        range,
-        provider: null,
-        hostname: null,
-        sessionId: null,
-        cwd: null,
-      }),
-    [range],
-  );
-  const { state, refresh } = useCachedInvoke({
-    command: "get_token_stats",
-    args: {
-      range,
-      provider: null,
-      hostname: null,
-      sessionId: null,
-      cwd: null,
-    },
-    request,
-    normalizeError: String,
-    invalidationEvents: ["tokens-updated"],
-  });
-
-  useEffect(() => {
-    const interval = setInterval(refresh, REFRESH_INTERVAL_MS);
-    return () => clearInterval(interval);
-  }, [refresh]);
-
-  return { stats: state.data, loading: state.initialLoading };
 }
 
 interface ReadoutProps {
@@ -733,10 +695,12 @@ export interface UsageViewProps {
 function UsageView({ range }: UsageViewProps) {
   const [mode, setMode] = useState<BreakdownMode>("sessions");
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [chartDimension, setChartDimension] = useState<WidgetChartDimension>(
+    () => readStoredWidgetChartDimension(),
+  );
 
-  const tokenSeries = useProviderTokenSeries(range);
+  const { overview } = useModelAnalytics(range, null, true);
   const activity = useActivitySeries(range);
-  const tokens = useWidgetTokenStats(range);
   const runtime = useLlmRuntimeStats(range);
   const insights = useCodeInsights(range, runtime);
   const code = useCodeStats(range);
@@ -752,6 +716,8 @@ function UsageView({ range }: UsageViewProps) {
   });
   const projects = mode === "projects" ? breakdown : secondaryProjects;
 
+  useEffect(() => storeWidgetChartDimension(chartDimension), [chartDimension]);
+
   // Recency and live runtime labels advance without polling the backend.
   useEffect(() => {
     const interval = setInterval(() => setNowMs(Date.now()), 1_000);
@@ -759,26 +725,28 @@ function UsageView({ range }: UsageViewProps) {
   }, []);
 
   const chart = useMemo(() => {
-    const response = tokenSeries.data;
-    if (!response) return null;
-    const series: VizSeries[] = response.series.map((entry) => ({
-      id: entry.provider,
-      label: providerTag(entry.provider),
-      color: providerHue(entry.provider),
-      values: entry.values,
-      fillOpacity: entry.provider === "claude" ? 0.09 : 0.16,
+    const source = chartSeriesFor(
+      overview.data?.activity,
+      chartDimension,
+      providerTag,
+      providerHue,
+    );
+    if (source.series.length === 0) return null;
+    const series: VizSeries[] = source.series.map((entry) => ({
+      ...entry,
+      fillOpacity: 0.12,
     }));
-    const totals = bucketTotals(response.series);
+    const totals = bucketTotals(series);
     return {
       series,
-      totals: response.total_tokens,
+      totalTokens: totals.reduce((sum, value) => sum + value, 0),
       delta: rangeMomentum(totals),
-      labels: axisLabels(response.timestamps, range),
-      summary: response.series
-        .map((entry) => `${providerTag(entry.provider)} ${formatTokenCount(entry.total_tokens)}`)
+      labels: axisLabels(source.labels, range),
+      summary: series
+        .map((entry) => `${entry.label} ${formatTokenCount(entry.values.reduce((sum, value) => sum + value, 0))}`)
         .join(", "),
     };
-  }, [tokenSeries.data, range]);
+  }, [chartDimension, overview.data, range]);
 
   const netLines = useMemo(
     () => netLineBuckets(code.history, range, 8),
@@ -801,7 +769,8 @@ function UsageView({ range }: UsageViewProps) {
     [mode, breakdown.data, nowMs],
   );
 
-  const cachePercent = cacheHitRate(tokens.stats);
+  const modelTotals = overview.data?.totals ?? null;
+  const cachePercent = cacheHitRate(modelTotals);
   const savingsSummary = savings.data?.summary ?? null;
   const reusePercent =
     savingsSummary && (savingsSummary.sourcesPreserved ?? 0) > 0
@@ -819,75 +788,92 @@ function UsageView({ range }: UsageViewProps) {
           loading: savings.loading,
         },
         cache: {
-          tokensFromCache: tokens.stats?.total_cache_read ?? null,
+          tokensFromCache: modelTotals?.cacheReadTokens ?? null,
           percentOfInput: cachePercent,
-          loading: tokens.loading,
+          loading: overview.initialLoading,
         },
         providers: {
           totals:
-            tokenSeries.data?.series.map((entry) => ({
-              label: providerTag(entry.provider),
-              tokens: entry.total_tokens,
+            chart?.series.map((entry) => ({
+              label: entry.label,
+              tokens: entry.values.reduce((sum, value) => sum + value, 0),
             })) ?? null,
-          loading: tokenSeries.loading,
+          loading: overview.initialLoading,
         },
       }),
     [
       savingsSummary,
       reusePercent,
       savings.loading,
-      tokens.stats,
-      tokens.loading,
+      modelTotals,
+      overview.initialLoading,
       cachePercent,
-      tokenSeries.data,
-      tokenSeries.loading,
+      chart,
     ],
   );
 
   return (
     <>
       <div className="wg-usage-band">
-        {tokenSeries.loading && !chart ? (
-          <div
-            className="wg-skeleton wg-skeleton-block"
-            style={{ height: `${CHART_HEIGHT}px` }}
-            aria-hidden="true"
-          />
-        ) : tokenSeries.error && !chart ? (
-          <div className="wg-state wg-state-error">
-            <span className="wg-state-lamp" aria-hidden="true" />
-            Token series unavailable
+        <div className="wg-usage-chart">
+          <div className="wg-chart-dimensions" role="group" aria-label="Graph grouping">
+            {([
+              ["cli", "CLI"],
+              ["llm", "LLM"],
+              ["models", "Models"],
+            ] as const).map(([dimension, label]) => (
+              <button
+                key={dimension}
+                type="button"
+                aria-pressed={dimension === chartDimension}
+                onClick={() => setChartDimension(dimension)}
+              >
+                {label}
+              </button>
+            ))}
           </div>
-        ) : (
-          <AreaChart
-            series={chart?.series ?? []}
-            xLabels={chart?.labels}
-            height={CHART_HEIGHT}
-            ariaLabel={`Token usage for the selected range: ${formatTokenCount(
-              chart?.totals ?? 0,
-            )} total${chart?.summary ? ` — ${chart.summary}` : ""}`}
-            emptyLabel="No tokens recorded in this range"
-            overlay={
-              <>
-                {chart?.delta && (
-                  <span
-                    className="wg-usage-delta"
-                    data-tone={chart.delta.tone}
-                    title={chart.delta.title}
-                  >
-                    {chart.delta.text}
+          {overview.initialLoading && !chart ? (
+            <div
+              className="wg-skeleton wg-skeleton-block"
+              style={{ height: `${CHART_HEIGHT}px` }}
+              aria-hidden="true"
+            />
+          ) : overview.error && !chart ? (
+            <div className="wg-state wg-state-error">
+              <span className="wg-state-lamp" aria-hidden="true" />
+              Model usage unavailable
+            </div>
+          ) : (
+            <AreaChart
+              series={chart?.series ?? []}
+              xLabels={chart?.labels}
+              height={CHART_HEIGHT}
+              ariaLabel={`${chartDimension} token usage for the selected range: ${formatTokenCount(
+                chart?.totalTokens ?? 0,
+              )} total${chart?.summary ? ` — ${chart.summary}` : ""}`}
+              emptyLabel="No tokens recorded in this range"
+              overlay={
+                <>
+                  {chart?.delta && (
+                    <span
+                      className="wg-usage-delta"
+                      data-tone={chart.delta.tone}
+                      title={chart.delta.title}
+                    >
+                      {chart.delta.text}
+                    </span>
+                  )}
+                  <span className="wg-usage-headline">
+                    <span className="wg-usage-big">
+                      {formatTokenCount(chart?.totalTokens ?? 0)}
+                    </span>
+                    <span className="wg-usage-unit">tokens</span>
                   </span>
-                )}
-                <span className="wg-usage-headline">
-                  <span className="wg-usage-big">
-                    {formatTokenCount(chart?.totals ?? 0)}
-                  </span>
-                  <span className="wg-usage-unit">tokens</span>
-                </span>
-              </>
-            }
-          />
-        )}
+                </>
+              }
+            />
+          )}
+        </div>
 
         {/* One insight for this window, chosen by the rotation rule and absent
             rather than zeroed when no candidate has anything true to say. */}
@@ -1104,10 +1090,10 @@ function UsageView({ range }: UsageViewProps) {
 
       <footer className="wg-footer wg-num">
         <span className="wg-footer-kv">
-          In <b>{tokens.stats ? formatTokenCount(tokens.stats.total_input) : "—"}</b>
+          In <b>{modelTotals ? formatTokenCount(modelTotals.inputTokens) : "—"}</b>
         </span>
         <span className="wg-footer-kv">
-          Out <b>{tokens.stats ? formatTokenCount(tokens.stats.total_output) : "—"}</b>
+          Out <b>{modelTotals ? formatTokenCount(modelTotals.outputTokens) : "—"}</b>
         </span>
         <span className="wg-footer-kv">
           Cache <b>{cachePercent === null ? "—" : `${cachePercent}%`}</b>

@@ -975,7 +975,7 @@ Tables for recording per-session token consumption and hourly host-level aggrega
 - **token_hourly** — Hourly aggregates per provider/host (total tokens, turn_count). Unique on (hour, hostname, provider).
 - Analytics session history, compact token stats, and delete-session cleanup all treat sessions as `(provider, session_id)` pairs so Claude and Codex ids cannot collide.
 
-Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (14)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
+Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (13)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
 
 Pushed Pi usage reuses `token_snapshots` only for lifecycle origins marked ephemeral. The model-observation event UUID admits the snapshot once, preserving tokens after live teardown without changing non-ephemeral rows.
 
@@ -985,7 +985,7 @@ Migration 28 stores replayable transcript evidence and source ownership for prov
 
 The source lifecycle and graph-resolution path is documented in [[data-flow#Model Observation Reconciliation]].
 
-- **model_usage_observations** — Normalized turn and token facts with exact raw model identity, a nullable indexed `derived_model_id` attribution column, nullable token dimensions, resolved session/chain ownership, and source-local ordering. Migration 43 adds nullable Pi event UUID and native input/output/cache-read/cache-write/total cost fields plus a Pi-only partial unique event index.
+- **model_usage_observations** — Normalized turn and token facts with exact raw model identity, a nullable indexed `derived_model_id` attribution column, nullable token dimensions, resolved session/chain ownership, and source-local ordering. Pi stores its upstream provider and model as one validated `provider/model` identity, preserving the only evidence the Usage graph may use for its LLM grouping. Migration 43 adds nullable Pi event UUID and native input/output/cache-read/cache-write/total cost fields plus a Pi-only partial unique event index.
 - **model_observation_sources** — Retained source inventory, fingerprints, activity bounds, display-only agent nickname, reconciliation status, and durable deletion suppression.
 - **model_backfill_state** — Singleton progress and completeness state used to distinguish final empty claims from provisional recovered data.
 
@@ -1011,7 +1011,7 @@ The in-process analytics cache shares typed results only while every source tabl
 
 [[src-tauri/src/storage.rs#CacheKey]] identifies command-specific request dimensions and a 30-second wall-clock bucket so sliding windows naturally expire at a bucket boundary. [[src-tauri/src/storage.rs#get_or_compute]] checks the 45-second TTL and a [[src-tauri/src/storage.rs#TableVersions]] fingerprint made from indexed high-water markers. Model overview also fingerprints `rollup_meta.rollup_generation`; bucket and context commands keep their own probes. A failed probe bypasses the cache and computes fresh. Each [[src-tauri/src/storage.rs#Storage]] owns its three typed caches.
 
-[[src-tauri/src/storage.rs#Storage#get_model_usage_overview]] serves the Models-page overview from one read-only deferred-transaction snapshot as a [[src-tauri/src/models.rs#ModelUsageOverviewResponse]]. During rollup build it preserves the established raw temp-table path. After completion, `scoped_overview` contains aggregate-grain closed UTC hours plus raw leading/current-hour rows, so it never rematerializes the full closed observation range; provider filtering remains sargable. The response carries: range totals (sessions, projects, turns, tokens, coverage); per-model reach rows (sessions, projects, turns, primary-in count, days active, tokens and share); a running-now entry per provider pairing the latest contiguous model run with its predecessor; fixed-bucket per-model distinct-session activity; a top-8 project × model session matrix; per-session model-count combinations with top co-occurrence pairs; and a parent-versus-subagent token split. Exact facet routing and non-decomposable exceptions are inventoried in [[backend#Backend#Database#Schema#Hourly Analytics Rollups]].
+[[src-tauri/src/storage.rs#Storage#get_model_usage_overview]] serves the Models-page and Usage-chart overview from one read-only deferred-transaction snapshot as a [[src-tauri/src/models.rs#ModelUsageOverviewResponse]]. During rollup build it preserves the established raw temp-table path. After completion, `scoped_overview` contains aggregate-grain closed UTC hours plus raw leading/current-hour rows, so it never rematerializes the full closed observation range; provider filtering remains sargable. The response carries range totals with input/output/cache dimensions, per-model reach rows, a running-now entry per provider, fixed-bucket per-model session and token activity, model-less token activity by CLI provider, project × model session data, model combinations, and parent-versus-subagent token totals. The Usage view re-groups those token buckets by recorded CLI, Pi upstream prefix, or exact provider-qualified model without changing the total. Exact facet routing and non-decomposable exceptions are inventoried in [[backend#Backend#Database#Schema#Hourly Analytics Rollups]].
 
 [[src-tauri/src/storage.rs#Storage#get_model_sessions]] pages sessions for one exact provider-qualified raw model without a catalog. Its checksummed opaque cursor fixes the half-open range, records the persisted model-data revision, and seeks by last activity descending, then binary provider/session identity ascending. Observation replacement, source pruning/failure visibility, deletion suppression, and model cwd changes advance that revision in their own commit; a later page rejects a stale cursor instead of mixing totals with unreachable rows. Each page derives selected-model usage, latest project/host context, range-scoped primary model, distinct models, independent chains, and turn-only within-chain switches from unsuppressed evidence.
 
@@ -1042,6 +1042,12 @@ Asserts exact input and cache-read decomposition across three monotonic turns, a
 Codex agent nicknames persist as nullable source display metadata without changing source identity.
 
 Replacing one `(provider, source_key)` row with a new nickname updates that label in place and leaves exactly one source row; nickname never joins any observation or source key.
+
+##### Usage Graph Dimensions
+
+The Usage graph must preserve every model-evidence token while it groups by CLI, upstream LLM, or exact model.
+
+A Pi fixture with two `cliproxyapi/*` models, a direct Codex model, and model-less Pi activity verifies dimensions, buckets, footer fields, and the invariant that plotted plus unattributed token buckets equal the overview total.
 
 ##### Model Sessions Cursor Codec
 
@@ -1493,17 +1499,13 @@ Key-value configuration and schema migration version tracking.
 
 The Tauri commands registered in [[src-tauri/src/lib.rs]] are grouped by feature.
 
-### Usage and Token Commands (14)
+### Usage and Token Commands (13)
 
 Live usage and token analytics commands back provider quota, history, breakdown, and context-savings views.
 
-`fetch_usage_data`, `get_usage_history`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_provider_token_series`, `get_activity_series`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`, `get_skill_breakdown`, `get_skill_project_breakdown`, `get_hook_breakdown`, `get_context_savings_analytics`.
+`fetch_usage_data`, `get_usage_history`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_activity_series`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`, `get_skill_breakdown`, `get_skill_project_breakdown`, `get_hook_breakdown`, `get_context_savings_analytics`.
 
 The live-usage commands now treat utilization history as `(provider, bucket_key)` data instead of assuming a single global Claude bucket label.
-
-`get_provider_token_series(range, buckets)` and `get_activity_series(range, buckets)` are the widget's series reads: the first returns one aligned token series per provider for the hero chart, the second the per-bucket distinct session and project counts behind the sessions and projects sparklines. Both lay their answer on the grid built by [[src-tauri/src/storage.rs#token_series_window]] — `buckets` defaults to [[src-tauri/src/storage.rs#DEFAULT_SERIES_BUCKETS]] (8) and is capped by [[src-tauri/src/storage.rs#MAX_SERIES_BUCKETS]] — so a chart and a sparkline drawn for the same range always share an x-axis. The grid ends at "now" and starts at the same [[src-tauri/src/storage.rs#range_from_timestamp]] lower bound every other range-scoped read uses; `all`, having no fixed width, starts instead at the oldest matching snapshot rather than at the epoch.
-
-[[src-tauri/src/storage.rs#Storage#get_provider_token_series]] sums the same `token_snapshots` columns over the same `WHERE` clause as [[src-tauri/src/storage.rs#Storage#get_token_stats]] and files every matching row into exactly one bucket, so its `total_tokens` equals the headline the widget overlays on the chart — debug builds assert that identity against the headline query on the same connection and window. Two cases that would otherwise drop tokens are handled instead of discarded (constitution #1): a row whose bucket index falls outside the grid (written after the grid was computed, or with an offset that makes the string lower bound and `strftime` disagree) is clamped into the nearest bucket, and a timestamp SQLite cannot parse collapses into the first bucket rather than to `NULL`. Providers are returned as their raw snapshot strings, not parsed enums, so an unrecognized producer is still charted; series are ordered busiest first.
 
 [[src-tauri/src/storage.rs#Storage#get_activity_series]] counts distinct `session_id` and distinct `cwd` per bucket. Those counts are distinct *within* a bucket and deliberately do not sum to a range total — a session spanning three buckets is counted in each — and snapshots with no `cwd` are left out of the project count instead of being folded into an invented "unknown" project.
 

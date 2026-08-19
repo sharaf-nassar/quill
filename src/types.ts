@@ -114,38 +114,7 @@ export interface TokenStats {
 }
 
 /**
- * One provider's token totals from `get_provider_token_series`, aligned to the
- * response's shared `timestamps` grid.
- *
- * `provider` is the raw snapshot value rather than an {@link IntegrationProvider}:
- * a producer the app does not recognize still has to be charted, because the
- * summed series must equal the headline total (constitution #1).
- */
-export interface ProviderTokenSeries {
-  provider: string;
-  values: number[];
-  total_tokens: number;
-}
-
-/**
- * Bucketed per-provider token series behind the widget's hero chart.
- *
- * `total_tokens` equals `get_token_stats(range).total_tokens` for the same
- * range by construction, so the headline overlaid on the chart always agrees
- * with the areas beneath it.
- */
-export interface ProviderTokenSeriesResponse {
-  range: string;
-  bucket_secs: number;
-  /** Bucket starts shared by every series, oldest first. */
-  timestamps: string[];
-  series: ProviderTokenSeries[];
-  total_tokens: number;
-}
-
-/**
- * Per-bucket distinct session and project counts from `get_activity_series`,
- * on the same grid as {@link ProviderTokenSeriesResponse}.
+ * Per-bucket distinct session and project counts from `get_activity_series`.
  *
  * Counts are distinct within a bucket and therefore do not sum to a range
  * total — a session spanning three buckets appears in each. Snapshots with no
@@ -757,6 +726,10 @@ export interface ModelUsageOverviewTotals {
   turns: number;
   attributedTokens: number;
   totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
   coveragePercent: number | null;
   distinctModels: number;
   multiModelSessions: number;
@@ -787,12 +760,19 @@ export interface ModelUsageOverviewRow {
 export interface ModelActivitySeries {
   identity: ModelIdentity;
   sessionsPerBucket: number[];
+  tokensPerBucket: number[];
+}
+
+export interface ModelUnattributedActivitySeries {
+  provider: string;
+  tokensPerBucket: number[];
 }
 
 export interface ModelActivity {
   bucketSeconds: number;
   bucketStarts: string[];
   series: ModelActivitySeries[];
+  unattributedSeries: ModelUnattributedActivitySeries[];
 }
 
 export interface ModelProjectMatrixCell {

@@ -14,6 +14,7 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[widget-range-tests]] — Exact comparison windows and unique breakdown query test specs
 - [[widget-viz-tests]] — Pointer-to-bucket interaction test specs for widget charts
 - [[widget-view-tests]] — Availability and persistence test specs for widget view controls
+- [[widget-usage-tests]] — Usage graph dimension preference and token-preservation test specs
 - [[widget-limits-tests]] — Collapsed CPA provider-state cue test specs
 - [[indicator-tests]] — CPA pool precedence and direct-fallback indicator test specs
 - [[view-reader-tests]] — Slow-reader contention and concurrent-ingest test specs

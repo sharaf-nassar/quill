@@ -86,15 +86,15 @@ use crate::models::{
     ModelOverviewActivity, ModelOverviewActivitySeries, ModelOverviewCombinations,
     ModelOverviewDelegation, ModelOverviewDelegationTop, ModelOverviewPair,
     ModelOverviewProjectCell, ModelOverviewProjectRow, ModelOverviewRow, ModelOverviewTotals,
-    ModelRange, ModelRunningNow, ModelSessionRow, ModelSessionsResponse, ModelTokenScope,
-    ModelUsageOverviewResponse, ObservationPayload, ObservationSummary, PiLineage,
-    PiProtocolV2DeliverySource, PiProtocolV2Envelope, PiProtocolV2EventKind, PiProtocolV2Lineage,
-    PiProtocolV2Outcome, PiRecoveringSession, ProjectBreakdown, ProjectTokens, ProviderTokenSeries,
-    ProviderTokenSeriesResponse, RunInferenceCall, RunInferenceConfinement, RunInferenceSummary,
-    SessionBreakdown, SessionCodeStats, SessionModelChain, SessionModelChainKind,
-    SessionModelHistoryResponse, SessionModelSegment, SessionRef, SessionStats, SkillBreakdown,
-    SkillProjectBreakdown, TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, UsageBucket,
-    UsageSource,
+    ModelOverviewUnattributedActivitySeries, ModelRange, ModelRunningNow, ModelSessionRow,
+    ModelSessionsResponse, ModelTokenScope, ModelUsageOverviewResponse, ObservationPayload,
+    ObservationSummary, PiLineage, PiProtocolV2DeliverySource, PiProtocolV2Envelope,
+    PiProtocolV2EventKind, PiProtocolV2Lineage, PiProtocolV2Outcome, PiRecoveringSession,
+    ProjectBreakdown, ProjectTokens, RunInferenceCall, RunInferenceConfinement,
+    RunInferenceSummary, SessionBreakdown, SessionCodeStats, SessionModelChain,
+    SessionModelChainKind, SessionModelHistoryResponse, SessionModelSegment, SessionRef,
+    SessionStats, SkillBreakdown, SkillProjectBreakdown, TokenDataPoint, TokenReportPayload,
+    TokenStats, ToolCount, UsageBucket, UsageSource,
 };
 
 /// Highest migration this build knows how to apply. Every migration gate is a
@@ -11063,6 +11063,10 @@ impl Storage {
                      + COALESCE(observation.output_tokens, 0)
                      + COALESCE(observation.cache_creation_tokens, 0)
                      + COALESCE(observation.cache_read_tokens, 0)) AS token_amount,
+                    COALESCE(observation.input_tokens, 0) AS input_amount,
+                    COALESCE(observation.output_tokens, 0) AS output_amount,
+                    COALESCE(observation.cache_creation_tokens, 0) AS cache_creation_amount,
+                    COALESCE(observation.cache_read_tokens, 0) AS cache_read_amount,
                     (observation.observed_at_ms - ?1) / ?3 AS bucket_index,
                     date(observation.observed_at_ms / 1000, 'unixepoch') AS day_string,
                     1 AS obs_count,
@@ -11099,6 +11103,10 @@ impl Storage {
                         rollup.input_tokens + rollup.output_tokens
                             + rollup.cache_creation_tokens + rollup.cache_read_tokens
                             AS token_amount,
+                        rollup.input_tokens AS input_amount,
+                        rollup.output_tokens AS output_amount,
+                        rollup.cache_creation_tokens AS cache_creation_amount,
+                        rollup.cache_read_tokens AS cache_read_amount,
                         (rollup.hour_utc - ?1) / ?3 AS bucket_index,
                         date(rollup.hour_utc / 1000, 'unixepoch') AS day_string,
                         rollup.obs_count AS obs_count,
@@ -11127,6 +11135,10 @@ impl Storage {
                             + COALESCE(observation.output_tokens, 0)
                             + COALESCE(observation.cache_creation_tokens, 0)
                             + COALESCE(observation.cache_read_tokens, 0),
+                        COALESCE(observation.input_tokens, 0),
+                        COALESCE(observation.output_tokens, 0),
+                        COALESCE(observation.cache_creation_tokens, 0),
+                        COALESCE(observation.cache_read_tokens, 0),
                         (observation.observed_at_ms - ?1) / ?3,
                         date(observation.observed_at_ms / 1000, 'unixepoch'),
                         1,
@@ -11156,6 +11168,10 @@ impl Storage {
                             + COALESCE(observation.output_tokens, 0)
                             + COALESCE(observation.cache_creation_tokens, 0)
                             + COALESCE(observation.cache_read_tokens, 0),
+                        COALESCE(observation.input_tokens, 0),
+                        COALESCE(observation.output_tokens, 0),
+                        COALESCE(observation.cache_creation_tokens, 0),
+                        COALESCE(observation.cache_read_tokens, 0),
                         (observation.observed_at_ms - ?1) / ?3,
                         date(observation.observed_at_ms / 1000, 'unixepoch'),
                         1,
@@ -11199,6 +11215,10 @@ impl Storage {
             sessions: i64,
             turns: i64,
             total_tokens: i64,
+            input_tokens: i64,
+            output_tokens: i64,
+            cache_creation_tokens: i64,
+            cache_read_tokens: i64,
             attributed_tokens: i64,
             distinct_models: i64,
             evidence_count: i64,
@@ -11221,6 +11241,18 @@ impl Storage {
                      ),
                      COALESCE((
                          SELECT SUM(token_amount) FROM scoped_overview
+                     ), 0),
+                     COALESCE((
+                         SELECT SUM(input_amount) FROM scoped_overview
+                     ), 0),
+                     COALESCE((
+                         SELECT SUM(output_amount) FROM scoped_overview
+                     ), 0),
+                     COALESCE((
+                         SELECT SUM(cache_creation_amount) FROM scoped_overview
+                     ), 0),
+                     COALESCE((
+                         SELECT SUM(cache_read_amount) FROM scoped_overview
                      ), 0),
                      COALESCE((
                          SELECT SUM(token_amount)
@@ -11248,9 +11280,13 @@ impl Storage {
                         sessions: row.get(0)?,
                         turns: row.get(1)?,
                         total_tokens: row.get(2)?,
-                        attributed_tokens: row.get(3)?,
-                        distinct_models: row.get(4)?,
-                        evidence_count: row.get(5)?,
+                        input_tokens: row.get(3)?,
+                        output_tokens: row.get(4)?,
+                        cache_creation_tokens: row.get(5)?,
+                        cache_read_tokens: row.get(6)?,
+                        attributed_tokens: row.get(7)?,
+                        distinct_models: row.get(8)?,
+                        evidence_count: row.get(9)?,
                     })
                 },
             )
@@ -11712,6 +11748,112 @@ impl Storage {
             }
         }
 
+        // Token series carry every evidence row, including the ones that lack
+        // a model id. A closed UTC hour participates only when it fits one
+        // response bucket. Otherwise raw residual rows keep its split exact.
+        let mut activity_tokens = BTreeMap::<(String, String), Vec<i64>>::new();
+        let mut unattributed_tokens = BTreeMap::<String, Vec<i64>>::new();
+        {
+            let mut token_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+                Box::new(range_start_ms),
+                Box::new(range_end_ms),
+                Box::new(bucket_millis),
+                Box::new(rollup_start_ms),
+                Box::new(rollup_end_ms),
+                Box::new(provider.map(str::to_owned)),
+            ];
+            let token_sql = if building_index {
+                "SELECT bucket_index, provider, derived_model_id, SUM(token_amount)
+                 FROM scoped_overview
+                 GROUP BY bucket_index, provider COLLATE BINARY,
+                          derived_model_id COLLATE BINARY
+                 HAVING ?1 = ?1 AND ?2 = ?2 AND ?3 = ?3
+                    AND ?4 = ?4 AND ?5 = ?5 AND ?6 IS ?6"
+                    .to_string()
+            } else {
+                let mut sql = format!(
+                    "SELECT bucket_index, provider, derived_model_id, SUM(token_amount)
+                     FROM (
+                         SELECT (rollup.hour_utc - ?1) / ?3 AS bucket_index,
+                                rollup.provider AS provider,
+                                NULLIF(rollup.derived_model_id, '') AS derived_model_id,
+                                rollup.input_tokens + rollup.output_tokens
+                                    + rollup.cache_creation_tokens
+                                    + rollup.cache_read_tokens AS token_amount
+                         FROM model_usage_hourly AS rollup
+                         JOIN active_model_read_sources AS source
+                           ON source.provider = rollup.provider
+                          AND source.source_key = rollup.source_key
+                         WHERE rollup.hour_utc >= ?4
+                           AND rollup.hour_utc < ?5
+                           AND (?6 IS NULL OR rollup.provider = ?6)
+                           AND (
+                               rollup.raw_pruned = 1
+                               OR (rollup.hour_utc - ?1) / ?3
+                                  = (rollup.hour_utc + {MODEL_ROLLUP_HOUR_MS} - 1 - ?1) / ?3
+                           )"
+                );
+                for &(raw_start_ms, raw_end_ms) in &residual_ranges {
+                    let start_parameter = token_params.len() + 1;
+                    let end_parameter = start_parameter + 1;
+                    token_params.push(Box::new(raw_start_ms));
+                    token_params.push(Box::new(raw_end_ms));
+                    sql.push_str(" UNION ALL ");
+                    sql.push_str(&model_raw_residual_branch_sql(
+                        "(observation.observed_at_ms - ?1) / ?3,
+                         observation.provider,
+                         observation.derived_model_id,
+                         COALESCE(observation.input_tokens, 0)
+                           + COALESCE(observation.output_tokens, 0)
+                           + COALESCE(observation.cache_creation_tokens, 0)
+                           + COALESCE(observation.cache_read_tokens, 0)",
+                        start_parameter,
+                        end_parameter,
+                        6,
+                        has_pruned_authority,
+                    ));
+                }
+                sql.push_str(
+                    "
+                     ) AS bucket_tokens
+                     GROUP BY bucket_index, provider COLLATE BINARY,
+                              derived_model_id COLLATE BINARY",
+                );
+                sql
+            };
+            let mut statement = tx
+                .prepare_cached(&token_sql)
+                .map_err(|error| format!("Prepare model overview token series: {error}"))?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(token_params.iter()), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(|error| format!("Query model overview token series: {error}"))?;
+            for row in rows {
+                let (bucket_index, provider, model_id, tokens) =
+                    row.map_err(|error| format!("Read model overview token series: {error}"))?;
+                let bucket_index = usize::try_from(bucket_index)
+                    .map_err(|_| format!("Invalid model overview token bucket: {bucket_index}"))?;
+                if bucket_index >= bucket_capacity || tokens < 0 {
+                    return Err("Model overview token series is invalid".to_string());
+                }
+                let values = match model_id {
+                    Some(model_id) => activity_tokens
+                        .entry((provider, model_id))
+                        .or_insert_with(|| vec![0; bucket_capacity]),
+                    None => unattributed_tokens
+                        .entry(provider)
+                        .or_insert_with(|| vec![0; bucket_capacity]),
+                };
+                values[bucket_index] = tokens;
+            }
+        }
+
         // Attributed tokens split by owning-source sidechain flag.
         let mut parent_tokens = 0_i64;
         let mut subagent_tokens = 0_i64;
@@ -12041,8 +12183,21 @@ impl Storage {
                     .get(*identity_key)
                     .cloned()
                     .unwrap_or_else(|| vec![0; bucket_capacity]),
+                tokens_per_bucket: activity_tokens
+                    .get(*identity_key)
+                    .cloned()
+                    .unwrap_or_else(|| vec![0; bucket_capacity]),
             });
         }
+        let unattributed_series = unattributed_tokens
+            .into_iter()
+            .map(
+                |(provider, tokens_per_bucket)| ModelOverviewUnattributedActivitySeries {
+                    provider,
+                    tokens_per_bucket,
+                },
+            )
+            .collect::<Vec<_>>();
 
         // Top projects by total in-range sessions, then binary project name.
         let mut project_totals = HashMap::<String, i64>::new();
@@ -12156,6 +12311,10 @@ impl Storage {
                 turns: totals_row.turns,
                 attributed_tokens: totals_row.attributed_tokens,
                 total_tokens: totals_row.total_tokens,
+                input_tokens: totals_row.input_tokens,
+                output_tokens: totals_row.output_tokens,
+                cache_creation_tokens: totals_row.cache_creation_tokens,
+                cache_read_tokens: totals_row.cache_read_tokens,
                 coverage_percent: model_percentage(
                     totals_row.attributed_tokens,
                     totals_row.total_tokens,
@@ -12169,6 +12328,7 @@ impl Storage {
                 bucket_seconds,
                 bucket_starts,
                 series,
+                unattributed_series,
             },
             project_matrix,
             combinations: ModelOverviewCombinations {
@@ -14267,104 +14427,9 @@ impl Storage {
         .map_err(|e| format!("Query error: {e}"))
     }
 
-    /// Per-provider token totals on the shared bucket grid for `range`.
-    ///
-    /// Reads `token_snapshots` through the same lower bound as
-    /// [`Storage::get_token_stats`] and buckets every matching row exactly
-    /// once, so the summed series equals the headline total the widget prints
-    /// over the chart. Debug builds assert that identity against the headline
-    /// query on the same connection and window.
-    pub fn get_provider_token_series(
-        &self,
-        range: &str,
-        buckets: Option<u32>,
-    ) -> Result<ProviderTokenSeriesResponse, String> {
-        let conn = self.conn.lock().unwrap();
-        let window = token_series_window(&conn, range, buckets)?;
-
-        // Keep the provider-leading grouping index in both planner states.
-        // Bounded ANALYZE otherwise substitutes a timestamp skip-scan whose
-        // cost was not proven across this aggregation's supported windows.
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT provider,
-                        {SERIES_BUCKET_EXPR},
-                        COALESCE(SUM(input_tokens + output_tokens
-                                     + cache_creation_input_tokens
-                                     + cache_read_input_tokens), 0)
-                 FROM token_snapshots INDEXED BY idx_token_snap_provider_session_sidechain
-                 WHERE timestamp >= ?1
-                 GROUP BY 1, 2"
-            ))
-            .map_err(|e| format!("Prepare error: {e}"))?;
-
-        let rows = stmt
-            .query_map(
-                params![&window.from, window.start_epoch, window.bucket_secs],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .map_err(|e| format!("Query error: {e}"))?;
-
-        let mut by_provider: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-        for row in rows {
-            let (provider, bucket, tokens) = row.map_err(|e| format!("Row error: {e}"))?;
-            let values = by_provider
-                .entry(provider)
-                .or_insert_with(|| vec![0; window.bucket_count]);
-            values[window.bucket_index(bucket)] += tokens;
-        }
-
-        let mut series: Vec<ProviderTokenSeries> = by_provider
-            .into_iter()
-            .map(|(provider, values)| ProviderTokenSeries {
-                total_tokens: values.iter().sum(),
-                provider,
-                values,
-            })
-            .collect();
-        // Busiest provider first; the map already ties by name for stability.
-        series.sort_by_key(|entry| std::cmp::Reverse(entry.total_tokens));
-
-        let total_tokens = series.iter().map(|entry| entry.total_tokens).sum();
-
-        #[cfg(debug_assertions)]
-        {
-            let headline: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(input_tokens + output_tokens
-                                         + cache_creation_input_tokens
-                                         + cache_read_input_tokens), 0)
-                     FROM token_snapshots
-                     WHERE timestamp >= ?1",
-                    [&window.from],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("Series invariant query error: {e}"))?;
-            debug_assert_eq!(
-                total_tokens, headline,
-                "provider token series must sum to the get_token_stats total for range {range}"
-            );
-        }
-
-        Ok(ProviderTokenSeriesResponse {
-            range: range.to_string(),
-            bucket_secs: window.bucket_secs,
-            timestamps: window.timestamps,
-            series,
-            total_tokens,
-        })
-    }
-
     /// Distinct session and project counts per bucket for `range`.
     ///
-    /// Shares [`Storage::get_provider_token_series`]'s grid so the sessions and
-    /// projects sparklines align with the hero chart. Counts are distinct
+    /// Counts are distinct
     /// within a bucket, never across the range, and snapshots without a `cwd`
     /// are left out of the project count instead of being folded into an
     /// invented "unknown" project.
@@ -28442,6 +28507,142 @@ mod tests {
         )
     }
 
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Usage Graph Dimensions]]
+    #[test]
+    #[serial]
+    fn model_overview_activity_keeps_cli_llm_model_dimensions() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let range_end = DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z")
+            .expect("range end")
+            .with_timezone(&Utc);
+        let at = |minutes| range_end - TimeDelta::minutes(minutes);
+        let source_sql = "INSERT INTO model_observation_sources (
+                provider, source_key, source_root_key, source_path,
+                source_session_id, analytics_session_id, chain_id,
+                is_sidechain, seen_generation, processing_status, observation_count
+            ) VALUES (?1, ?2, ?2, ?2, ?3, ?3, ?3, 0, 1, 'ok', ?4)";
+        let observation_sql = "INSERT INTO model_usage_observations (
+                provider, source_key, source_record_key, source_ordinal,
+                observation_kind, source_session_id, analytics_session_id, chain_id,
+                raw_model_id, derived_model_id, is_sidechain, observed_at_ms,
+                input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+                model_evidence, token_evidence
+            ) VALUES (?1, ?2, ?3, ?4, 'turn', ?5, ?5, ?5, ?6, ?6, 0, ?7,
+                      ?8, ?9, ?10, ?11, 'explicit', 'direct')";
+        {
+            let conn = storage.conn.lock().expect("storage lock");
+            conn.execute(source_sql, params!["pi", "pi-source", "pi-session", 3])
+                .expect("insert Pi source");
+            conn.execute(
+                source_sql,
+                params!["codex", "codex-source", "codex-session", 1],
+            )
+            .expect("insert Codex source");
+            for (ordinal, model_id, timestamp, input, output, cache_write, cache_read) in [
+                (0, Some("cliproxyapi/claude-opus-5"), at(10), 100, 10, 5, 20),
+                (1, Some("cliproxyapi/gpt-5.6-sol"), at(20), 200, 0, 0, 30),
+                (2, None, at(30), 7, 0, 0, 0),
+            ] {
+                conn.execute(
+                    observation_sql,
+                    params![
+                        "pi",
+                        "pi-source",
+                        format!("pi-{ordinal}"),
+                        ordinal,
+                        "pi-session",
+                        model_id,
+                        timestamp.timestamp_millis(),
+                        input,
+                        output,
+                        cache_write,
+                        cache_read,
+                    ],
+                )
+                .expect("insert Pi observation");
+            }
+            conn.execute(
+                observation_sql,
+                params![
+                    "codex",
+                    "codex-source",
+                    "codex-0",
+                    0,
+                    "codex-session",
+                    Some("gpt-5.6-sol"),
+                    at(40).timestamp_millis(),
+                    50,
+                    1,
+                    0,
+                    0,
+                ],
+            )
+            .expect("insert Codex observation");
+        }
+
+        let overview = storage
+            .get_model_usage_overview_uncached(ModelRange::OneHour, None, range_end)
+            .expect("overview");
+        assert_eq!(overview.totals.total_tokens, 423);
+        assert_eq!(overview.totals.input_tokens, 357);
+        assert_eq!(overview.totals.output_tokens, 11);
+        assert_eq!(overview.totals.cache_creation_tokens, 5);
+        assert_eq!(overview.totals.cache_read_tokens, 50);
+        let tokens_by_model = overview
+            .activity
+            .series
+            .iter()
+            .map(|series| {
+                (
+                    (
+                        series.identity.provider.as_str(),
+                        series.identity.model_id.as_str(),
+                    ),
+                    series.tokens_per_bucket.iter().sum::<i64>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            tokens_by_model,
+            BTreeMap::from([
+                (("codex", "gpt-5.6-sol"), 51),
+                (("pi", "cliproxyapi/claude-opus-5"), 135),
+                (("pi", "cliproxyapi/gpt-5.6-sol"), 230),
+            ])
+        );
+        assert_eq!(
+            overview
+                .activity
+                .unattributed_series
+                .iter()
+                .map(|series| (
+                    series.provider.as_str(),
+                    series.tokens_per_bucket.iter().sum::<i64>()
+                ))
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([("pi", 7)])
+        );
+        assert_eq!(
+            overview
+                .activity
+                .series
+                .iter()
+                .flat_map(|series| series.tokens_per_bucket.iter())
+                .sum::<i64>()
+                + overview
+                    .activity
+                    .unattributed_series
+                    .iter()
+                    .flat_map(|series| series.tokens_per_bucket.iter())
+                    .sum::<i64>(),
+            overview.totals.total_tokens,
+            "every chart dimension must preserve the model-evidence total"
+        );
+        clear_env();
+    }
+
     #[test]
     #[serial]
     fn get_model_usage_overview_aggregates_reach_primary_and_combinations() {
@@ -28490,6 +28691,10 @@ mod tests {
                 "turns": 7,
                 "attributedTokens": 300,
                 "totalTokens": 300,
+                "inputTokens": 300,
+                "outputTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
                 "coveragePercent": 100.0,
                 "distinctModels": 3,
                 "multiModelSessions": 2
@@ -28539,7 +28744,9 @@ mod tests {
         assert_eq!(overview.activity.series.len(), 3);
         for series in &overview.activity.series {
             assert_eq!(series.sessions_per_bucket.len(), 12);
+            assert_eq!(series.tokens_per_bucket.len(), 12);
         }
+        assert!(overview.activity.unattributed_series.is_empty());
         let bucket_sums = overview
             .activity
             .series

@@ -25,8 +25,6 @@ import type {
   ModelUsageOverviewResponse,
   ProjectBreakdown,
   ProviderStatus,
-  ProviderTokenSeries,
-  ProviderTokenSeriesResponse,
   RetentionAuditRecord,
   RetentionMaintenanceProgress,
   RetentionMaintenanceResult,
@@ -1303,6 +1301,10 @@ function createModelUsageOverviewFixture(
   const projectSessions = new Map<string, Set<string>>();
   let attributedTokens = 0;
   let totalTokens = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheCreationTokens = 0;
+  let cacheReadTokens = 0;
   let totalTurns = 0;
   let scopedEvidenceCount = 0;
   let parentTokens = 0;
@@ -1313,6 +1315,10 @@ function createModelUsageOverviewFixture(
   for (const observation of scoped) {
     const tokens = modelObservationTokens(observation);
     totalTokens += tokens;
+    inputTokens += observation.inputTokens ?? 0;
+    outputTokens += observation.outputTokens ?? 0;
+    cacheCreationTokens += observation.cacheCreationTokens ?? 0;
+    cacheReadTokens += observation.cacheReadTokens ?? 0;
     totalTurns += observation.kind === "turn" ? 1 : 0;
     const isSubagent =
       observation.parentChainId !== undefined &&
@@ -1479,12 +1485,22 @@ function createModelUsageOverviewFixture(
     new Date(rangeStart + index * bucketMillis).toISOString(),
   );
   const activitySessions = new Map<string, Set<string>[]>();
+  const activityTokens = new Map<string, number[]>();
+  const unattributedTokens = new Map<string, number[]>();
   for (const observation of scoped) {
-    if (observation.modelId === null) continue;
     const bucketIndex = Math.floor(
       (observation.observedAt - rangeStart) / bucketMillis,
     );
     if (bucketIndex < 0 || bucketIndex >= bucketCount) continue;
+    const tokens = modelObservationTokens(observation);
+    if (observation.modelId === null) {
+      const buckets =
+        unattributedTokens.get(observation.provider) ??
+        Array.from({ length: bucketCount }, () => 0);
+      buckets[bucketIndex] += tokens;
+      unattributedTokens.set(observation.provider, buckets);
+      continue;
+    }
     const identityKey = modelIdentityFixtureKey({
       provider: observation.provider,
       modelId: observation.modelId,
@@ -1494,6 +1510,11 @@ function createModelUsageOverviewFixture(
       Array.from({ length: bucketCount }, () => new Set<string>());
     buckets[bucketIndex].add(modelSessionFixtureKey(observation));
     activitySessions.set(identityKey, buckets);
+    const tokenBuckets =
+      activityTokens.get(identityKey) ??
+      Array.from({ length: bucketCount }, () => 0);
+    tokenBuckets[bucketIndex] += tokens;
+    activityTokens.set(identityKey, tokenBuckets);
   }
   const activitySeries = models
     .map(({ identity }) => {
@@ -1505,6 +1526,9 @@ function createModelUsageOverviewFixture(
           buckets === undefined
             ? Array.from({ length: bucketCount }, () => 0)
             : buckets.map((bucket) => bucket.size),
+        tokensPerBucket:
+          activityTokens.get(identityKey) ??
+          Array.from({ length: bucketCount }, () => 0),
       };
     })
     .filter((entry) =>
@@ -1627,6 +1651,10 @@ function createModelUsageOverviewFixture(
       turns: totalTurns,
       attributedTokens,
       totalTokens,
+      inputTokens,
+      outputTokens,
+      cacheCreationTokens,
+      cacheReadTokens,
       coveragePercent:
         totalTokens === 0 ? null : (100 * attributedTokens) / totalTokens,
       distinctModels: modelAggregates.size,
@@ -1638,6 +1666,10 @@ function createModelUsageOverviewFixture(
       bucketSeconds,
       bucketStarts,
       series: activitySeries,
+      unattributedSeries: Array.from(unattributedTokens, ([provider, tokensPerBucket]) => ({
+        provider,
+        tokensPerBucket,
+      })),
     },
     projectMatrix,
     combinations: { single, dual, threePlus, topPairs },
@@ -2018,57 +2050,10 @@ function setRetentionPolicyFixture(
 }
 
 // --- Widget aggregates (feature 018) ------------------------------------------
-// Sample answers for `get_provider_token_series` and `get_activity_series`,
-// typed by the same contract the Rust commands serialize, so a drift between
-// the mock and the backend shape fails typecheck instead of only showing up in
-// the browser.
 
-/** Curves lifted from the mockup so browser mode matches the design intent. */
-const CODEX_CURVE = [9, 12, 15, 14, 19, 23, 26, 25, 31, 36, 40, 45, 52] as const;
-const CLAUDE_CURVE = [4, 5, 7, 9, 8, 11, 13, 15, 14, 17, 19, 20, 21] as const;
 const SESSION_CURVE = [2, 3, 3, 5, 4, 6, 7, 8, 7, 9, 10, 12, 13] as const;
 const PROJECT_CURVE = [1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 9] as const;
-
-/** Tokens per curve unit, so a wider range reads as a bigger number. */
-const RANGE_TOKEN_SCALE: Record<string, number> = {
-  "1h": 3_200,
-  "6h": 24_000,
-  "24h": 78_000,
-  "7d": 410_000,
-  "30d": 1_450_000,
-};
-
-const PROVIDER_SERIES_BUCKETS = 13;
 const ACTIVITY_SERIES_BUCKETS = 8;
-
-function providerSeries(
-  provider: string,
-  curve: readonly number[],
-  scale: number,
-  count: number,
-): ProviderTokenSeries {
-  const values = resample(curve, count).map((unit) => unit * scale);
-  return {
-    provider,
-    values,
-    total_tokens: values.reduce((sum, value) => sum + value, 0),
-  };
-}
-
-function providerTokenSeries(range: string, buckets: number): ProviderTokenSeriesResponse {
-  const scale = RANGE_TOKEN_SCALE[range] ?? RANGE_TOKEN_SCALE["24h"];
-  const series = [
-    providerSeries("codex", CODEX_CURVE, scale, buckets),
-    providerSeries("claude", CLAUDE_CURVE, scale, buckets),
-  ];
-  return {
-    range,
-    bucket_secs: bucketSecs(range, buckets),
-    timestamps: bucketTimestamps(range, buckets),
-    series,
-    total_tokens: series.reduce((sum, entry) => sum + entry.total_tokens, 0),
-  };
-}
 
 function activitySeries(range: string, buckets: number): ActivitySeriesResponse {
   return {
@@ -2120,8 +2105,6 @@ const fixtures: Record<string, FixtureHandler> = {
   // tokens
   get_token_history: (args) => tokenHistory(rangeArg(args)),
   get_token_stats: () => tokenStats,
-  get_provider_token_series: (args) =>
-    providerTokenSeries(rangeArg(args), bucketsArg(args, PROVIDER_SERIES_BUCKETS)),
   get_activity_series: (args) =>
     activitySeries(rangeArg(args), bucketsArg(args, ACTIVITY_SERIES_BUCKETS)),
   // code

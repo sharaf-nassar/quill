@@ -278,37 +278,6 @@ pub struct TokenStats {
     pub avg_output_per_turn: f64,
 }
 
-/// One provider's token totals over the shared bucket grid.
-///
-/// `values` always has one entry per timestamp in the enclosing
-/// [`ProviderTokenSeriesResponse`], so every provider is aligned on the same
-/// x-axis and the widget chart can stack them without re-bucketing.
-#[derive(Serialize, Clone, Debug)]
-pub struct ProviderTokenSeries {
-    /// Raw `token_snapshots.provider` value, not a parsed enum: an unknown
-    /// producer must still be charted, never silently dropped from the sum.
-    pub provider: String,
-    pub values: Vec<i64>,
-    pub total_tokens: i64,
-}
-
-/// Bucketed per-provider token series backing the widget's hero chart.
-///
-/// `total_tokens` equals `get_token_stats(range).total_tokens` for the same
-/// range by construction — both read `token_snapshots` through the same
-/// lower-bound filter, and every matching row lands in exactly one bucket.
-#[derive(Serialize, Clone, Debug)]
-pub struct ProviderTokenSeriesResponse {
-    /// Echo of the requested range, so a late response can be matched to the
-    /// toggle that asked for it.
-    pub range: String,
-    pub bucket_secs: i64,
-    /// Bucket start instants, oldest first.
-    pub timestamps: Vec<String>,
-    pub series: Vec<ProviderTokenSeries>,
-    pub total_tokens: i64,
-}
-
 /// Per-bucket distinct session and project counts over the same bucket grid.
 ///
 /// Counts are distinct *within* a bucket, so they do not sum to a range total:
@@ -1731,6 +1700,10 @@ pub struct ModelOverviewTotals {
     pub turns: i64,
     pub attributed_tokens: i64,
     pub total_tokens: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
     pub coverage_percent: Option<f64>,
     pub distinct_models: i64,
     pub multi_model_sessions: i64,
@@ -1770,15 +1743,26 @@ pub struct ModelOverviewRow {
 pub struct ModelOverviewActivitySeries {
     pub identity: ModelIdentity,
     pub sessions_per_bucket: Vec<i64>,
+    pub tokens_per_bucket: Vec<i64>,
 }
 
-/// Fixed zero-filled UTC bucket axis plus per-model session series.
+/// Token activity that has no model evidence stays visible rather than being
+/// silently excluded from a CLI, LLM, or model chart.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewUnattributedActivitySeries {
+    pub provider: String,
+    pub tokens_per_bucket: Vec<i64>,
+}
+
+/// Fixed zero-filled UTC bucket axis plus per-model session and token series.
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelOverviewActivity {
     pub bucket_seconds: i64,
     pub bucket_starts: Vec<String>,
     pub series: Vec<ModelOverviewActivitySeries>,
+    pub unattributed_series: Vec<ModelOverviewUnattributedActivitySeries>,
 }
 
 /// Sessions a model reached inside one project.

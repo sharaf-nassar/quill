@@ -313,10 +313,8 @@ def populate_token_snapshots(conn: sqlite3.Connection) -> list[tuple[str, str, d
 	rolling 6h window — so we seed BOTH a 30-day historical spread AND a
 	dedicated recent cluster (0.5-5.5h old) across distinct projects.
 
-	Every row carries a `provider`: get_provider_token_series groups by it and
-	emits one chart series per distinct value, so a claude-only corpus draws a
-	single line no matter how many providers are enabled. Claude leads the mix
-	because it also owns the sub-agent rows below.
+	Every row carries a `provider` so session and host breakdowns keep producer
+	identity. Claude leads the mix because it also owns the sub-agent rows below.
 
 	A slice of the recent Claude sessions is written as sub-agent rows
 	(`is_sidechain = 1` with an `agent_id`), which is what makes the Usage

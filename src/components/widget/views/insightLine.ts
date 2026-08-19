@@ -18,7 +18,7 @@
 //   3. **First eligible in a fixed order wins.** The order is by how much of
 //      the story the rest of the widget does not already tell: context savings
 //      appears nowhere else on the surface; the cached-token volume is only
-//      implied by the footer's percentage; the provider split is already drawn
+//      implied by the footer's percentage; the selected chart grouping is already drawn
 //      by the chart directly above, so it speaks last.
 //   4. **A pending source holds the line.** While a higher-priority candidate's
 //      source has not answered for this window, the line stays empty rather
@@ -44,7 +44,7 @@ export interface InsightLine {
   readonly detail: string | null;
 }
 
-/** One provider's token total for the window, already labelled by the caller. */
+/** One selected chart group's token total, already labelled by the caller. */
 export interface ProviderTotal {
   readonly label: string;
   readonly tokens: number;
@@ -71,7 +71,7 @@ export interface InsightInputs {
     readonly percentOfInput: number | null;
     readonly loading: boolean;
   };
-  /** Per-provider totals behind the hero chart, one entry per plotted series. */
+  /** Selected chart-group totals, one entry per plotted series. */
   readonly providers: {
     readonly totals: readonly ProviderTotal[] | null;
     readonly loading: boolean;
@@ -139,7 +139,7 @@ const CANDIDATES: readonly Candidate[] = [
       const totals = providers.totals;
       if (!totals) return null;
       const active = totals.filter((entry) => entry.tokens > 0);
-      // A lone provider's share is always 100% — a sentence that states the
+      // A lone group's share is always 100% — a sentence that states the
       // obvious is worse than no sentence at all.
       if (active.length < 2) return null;
       const sum = active.reduce((running, entry) => running + entry.tokens, 0);
@@ -150,7 +150,7 @@ const CANDIDATES: readonly Candidate[] = [
       return {
         id: "provider-mix",
         headline: `${leader.label} drove ${Math.round((leader.tokens / sum) * 100)}% of tokens`,
-        detail: `${formatNumber(active.length)} providers active`,
+        detail: `${formatNumber(active.length)} groups active`,
       };
     },
   },

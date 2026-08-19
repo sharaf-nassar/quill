@@ -11,6 +11,11 @@ export const WIDGET_RANGES = [
 export const DEFAULT_WIDGET_RANGE: RangeType = "1h";
 const STORAGE_KEY = "quill-widget-range";
 
+export const WIDGET_CHART_DIMENSIONS = ["cli", "llm", "models"] as const;
+export type WidgetChartDimension = (typeof WIDGET_CHART_DIMENSIONS)[number];
+export const DEFAULT_WIDGET_CHART_DIMENSION: WidgetChartDimension = "models";
+const CHART_DIMENSION_STORAGE_KEY = "quill-widget-chart-dimension";
+
 export function resolveStoredWidgetRange(value: string | null): RangeType {
   return WIDGET_RANGES.some((range) => range.id === value)
     ? (value as RangeType)
@@ -33,6 +38,37 @@ export function storeWidgetRange(
 ): void {
   try {
     (storage ?? localStorage).setItem(STORAGE_KEY, range);
+  } catch {
+    /* Keep the current-session selection when storage is unavailable. */
+  }
+}
+
+export function resolveStoredWidgetChartDimension(
+  value: string | null,
+): WidgetChartDimension {
+  return WIDGET_CHART_DIMENSIONS.includes(value as WidgetChartDimension)
+    ? (value as WidgetChartDimension)
+    : DEFAULT_WIDGET_CHART_DIMENSION;
+}
+
+export function readStoredWidgetChartDimension(
+  storage?: Pick<Storage, "getItem">,
+): WidgetChartDimension {
+  try {
+    return resolveStoredWidgetChartDimension(
+      (storage ?? localStorage).getItem(CHART_DIMENSION_STORAGE_KEY),
+    );
+  } catch {
+    return DEFAULT_WIDGET_CHART_DIMENSION;
+  }
+}
+
+export function storeWidgetChartDimension(
+  dimension: WidgetChartDimension,
+  storage?: Pick<Storage, "setItem">,
+): void {
+  try {
+    (storage ?? localStorage).setItem(CHART_DIMENSION_STORAGE_KEY, dimension);
   } catch {
     /* Keep the current-session selection when storage is unavailable. */
   }

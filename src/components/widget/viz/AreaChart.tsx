@@ -281,19 +281,25 @@ function AreaChart({
             strokeWidth={1}
           />
         ))}
-        {xLabels?.map((label, index) => (
-          <text
-            key={`${label}-${index}`}
-            x={((index + 1) * width) / (xLabels.length + 1)}
-            y={height - 4}
-            textAnchor="middle"
-            fill={index === active ? "var(--text)" : "var(--faint)"}
-            fontSize={7.5}
-            fontWeight={index === active ? 700 : 500}
-          >
-            {label}
-          </text>
-        ))}
+        {xLabels?.map((label, index) => {
+          const step = Math.max(1, Math.ceil(xLabels.length / 8));
+          if (index % step !== 0 && index !== xLabels.length - 1) return null;
+          return (
+            <text
+              key={`${label}-${index}`}
+              x={xLabels.length <= 1 ? width / 2 : (index * width) / (xLabels.length - 1)}
+              y={height - 4}
+              textAnchor={
+                index === 0 ? "start" : index === xLabels.length - 1 ? "end" : "middle"
+              }
+              fill={index === active ? "var(--text)" : "var(--faint)"}
+              fontSize={7.5}
+              fontWeight={index === active ? 700 : 500}
+            >
+              {label}
+            </text>
+          );
+        })}
         {plotted.map(({ entry, points }) => (
           <path
             key={`${entry.id}-fill`}

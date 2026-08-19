@@ -1,6 +1,7 @@
 ---
 title: Usage graph collapses model dimensions into Pi
 date: 2026-08-19
+last_updated: 2026-08-19
 component: widget usage graph
 tags: [widget, usage, pi, model-analytics]
 problem_type: bug
@@ -12,33 +13,32 @@ The widget graph can show one large `PI` area although Pi ran several models.
 
 ## Root cause
 
-`UsageView` requests `useProviderTokenSeries` at
-`src/components/widget/views/UsageView.tsx:737`. Its storage query groups
-`token_snapshots` by the CLI `provider` alone at
-`src-tauri/src/storage.rs:14875-14907`.
+Before `quill-zddt`, per this investigation, the graph grouped only
+`token_snapshots.provider`. That turned all Pi-routed work into one `PI` area.
 
-Pi reconciliation records the upstream provider and model as one validated
-`provider/model` identity at `src-tauri/src/transcript_analytics.rs:1885-1896`.
-The graph does not read that identity, so it cannot separate Pi traffic by
-upstream LLM provider or model.
+Current code groups model-evidence buckets in
+`src/components/widget/views/UsageView.tsx:233-272` and reads them from the
+shared model overview at `src/components/widget/views/UsageView.tsx:766-808`.
+Pi reconciliation records upstream provider and model as one validated
+`provider/model` identity in `src-tauri/src/transcript_analytics.rs:1885-1896`.
 
-Per this investigation, the production 24-hour snapshot had one Pi graph
-series while its model observations contained separate
-`cliproxyapi/claude-opus-5`, `cliproxyapi/gpt-5.6-sol`,
-`cliproxyapi/gpt-5.6-terra`, and `cliproxyapi/claude-sonnet-5` rows.
+The original production 24-hour snapshot had one Pi graph series while model
+evidence contained separate `cliproxyapi/claude-opus-5`,
+`cliproxyapi/gpt-5.6-sol`, `cliproxyapi/gpt-5.6-terra`, and
+`cliproxyapi/claude-sonnet-5` rows.
 
 ## What didn't work
 
-Changing labels or splitting the existing `token_snapshots` result cannot add
-LLM or model dimensions. That table stores only the CLI provider for this
+Changing labels or splitting the old `token_snapshots` result could not add
+LLM or model dimensions. That table stored only the CLI provider for that
 query.
 
 ## Fix
 
-Fix filed as `quill-zddt`, unlanded as of this writing. It will provide one
-bucketed model-evidence aggregate with CLI, recorded upstream LLM, and exact
-model groupings. `Models` will be the persisted default. The graph headline,
-delta, legend, insight split, and footer must use the same selected aggregate.
+`quill-zddt` replaced the CLI-only aggregate with model-evidence buckets.
+The widget defaults to persisted `Models` grouping and can switch to CLI or
+recorded upstream LLM grouping. Model-less rows remain unattributed. The graph
+headline, delta, legend, insight split, and footer read the same aggregate.
 
 ## Prevention
 
