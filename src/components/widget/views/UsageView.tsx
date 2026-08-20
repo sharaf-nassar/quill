@@ -44,6 +44,7 @@ import {
   formatObservedSessionAgents,
   formatPiLineageStatus,
   formatRecency,
+  formatSessionModel,
   isSessionLive,
   resolveSessionMetrics,
 } from "../../../utils/format";
@@ -267,6 +268,8 @@ interface RowModel {
   };
   nameLabel?: string;
   chipLabel?: string;
+  /** Short family label plus the raw id it was derived from, for its tooltip. */
+  model?: { label: string; id: string };
   parentSessionId?: string;
   lineageStatus?: ReturnType<typeof formatPiLineageStatus>;
   agentSummary?: {
@@ -446,6 +449,15 @@ function SessionIdentity({ row }: { row: RowModel }) {
           {row.chip.text}
         </span>
       )}
+      {row.model && (
+        <span
+          className="wg-row-session-model wg-row-datum"
+          data-tooltip={row.model.id}
+          aria-label={`Model ${row.model.id}`}
+        >
+          {row.model.label}
+        </span>
+      )}
       {row.parentSessionId && (
         <span
           className="wg-row-session-parent wg-row-datum"
@@ -560,6 +572,9 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
     activeAgentRuntimeRate,
     nowMs,
   );
+  const model = row.model_id !== null
+    ? { label: formatSessionModel(row.provider, row.model_id), id: row.model_id }
+    : undefined;
   return {
     key: `${row.provider}:${row.hostname}:${row.session_id}`,
     live,
@@ -574,6 +589,7 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
     },
     chip: { text: providerTag(row.provider), tone: row.provider },
     chipLabel: `Provider ${providerTag(row.provider)}`,
+    model,
     parentSessionId: row.provider === "pi" ? row.parent_session_id ?? undefined : undefined,
     lineageStatus:
       row.provider === "pi" && row.pi_lineage?.kind === "unresolved"

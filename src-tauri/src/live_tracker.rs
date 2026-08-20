@@ -78,8 +78,12 @@ struct LiveSession {
     /// separate from the reporter role so either source can corroborate it
     /// without overwriting the other.
     structural_agent_role: Option<String>,
-    /// Upstream provider and model from Pi's newest assistant message.
+    /// Upstream provider from Pi's newest assistant message. Claude and
+    /// Codex have no separate upstream-provider dimension, so only Pi ever
+    /// sets this.
     model_provider: Option<String>,
+    /// The session's own current model: Pi's newest assistant message, a
+    /// Claude root's newest assistant record, or a Codex root's rollout head.
     model: Option<String>,
     /// Cumulative tokens reported by Pi's extension for the current session.
     live_tokens: Option<i64>,
@@ -511,13 +515,19 @@ impl TrackerState {
                 }
                 // A sub-agent transcript's own assistant records name the model
                 // that agent is running, so its label needs no retained
-                // evidence.
-                if let Some(agent) = session.agent_mut(agent_id)
-                    && let Some(model) = claude_record_model(&record)
-                    && agent.model.as_deref() != Some(model.as_str())
-                {
-                    agent.model = Some(model);
-                    changed = true;
+                // evidence. A root transcript's own assistant records name the
+                // session's model the same way.
+                if let Some(model) = claude_record_model(&record) {
+                    if let Some(agent) = session.agent_mut(agent_id) {
+                        if agent.model.as_deref() != Some(model.as_str()) {
+                            agent.model = Some(model);
+                            changed = true;
+                        }
+                    } else if agent_id.is_none() && session.model.as_deref() != Some(model.as_str())
+                    {
+                        session.model = Some(model);
+                        changed = true;
+                    }
                 }
                 // A depth>=2 spawn's result lands in its parent agent's
                 // transcript rather than the root, so every file in the tree
@@ -649,6 +659,11 @@ impl TrackerState {
             }
             if let Some(started_at) = head.started_at {
                 advance(&mut session.last_activity, started_at);
+            }
+            // The head is memoised, so this never overwrites a known model
+            // with a later absent one; it only ever fills a still-unknown one.
+            if let Some(model) = &head.model {
+                session.model.get_or_insert_with(|| model.clone());
             }
             return Some((key, FileRole::Codex { agent_id: None }));
         }
@@ -1443,6 +1458,7 @@ impl LiveTracker {
                 continue;
             };
             row.ephemeral = session.ephemeral;
+            row.model_id = session.model.clone();
             let mut observed_agents = session.open_agents(now);
             if let Some(agents) = agents_by_parent.get(&key) {
                 observed_agents.extend(agents.iter().cloned());
@@ -1540,6 +1556,7 @@ impl LiveTracker {
                         .to_rfc3339(),
                     ended_at: None,
                     project: Some(cwd.clone()),
+                    model_id: session.model.clone(),
                     active_runtime_secs: agent_runtime_secs,
                     agent_count: i64::try_from(pi_agents.len())
                         .ok()
@@ -3686,6 +3703,37 @@ mod tests {
         });
     }
 
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Root Model]]
+    #[test]
+    fn a_claude_root_takes_the_model_its_own_assistant_records_name() {
+        let fixture = Fixture::new();
+        fixture.write(&format!(
+            "{}\n{}\n",
+            record("2026-08-08T00:00:00Z"),
+            assistant("2026-08-08T00:00:01Z", "claude-opus-4-5-20251101"),
+        ));
+
+        let tracker = LiveTracker::new(None);
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:05Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.model.as_deref(), Some("claude-opus-4-5-20251101"));
+        });
+
+        // A later record naming no model never clears the one already known.
+        fixture.append(&record("2026-08-08T00:00:02Z"));
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:06Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.model.as_deref(), Some("claude-opus-4-5-20251101"));
+        });
+
+        let (_, rows) = read_path(&tracker, Vec::new(), parse("2026-08-08T00:00:10Z"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].model_id.as_deref(),
+            Some("claude-opus-4-5-20251101")
+        );
+    }
+
     /// The modern flat spawn marker: `thread_source` plus `parent_thread_id`.
     fn spawned_by(parent: &str, role: &str) -> String {
         format!(
@@ -3925,6 +3973,31 @@ mod tests {
             // same gate retained evidence passes through.
             assert_eq!(session.agents[malformed].model, None);
         });
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Codex Root Model]]
+    #[test]
+    fn a_codex_root_takes_its_rollout_heads_model() {
+        let root = "019fe372-6824-70e3-8fcd-0000000000e0";
+        let fixture = Fixture::codex(root);
+        fixture.write_rollout(
+            root,
+            ",\"thread_source\":\"user\"",
+            &[
+                &turn_context("gpt-5.6-sol"),
+                &turn("task_started", "2026-08-08T00:00:01Z"),
+            ],
+        );
+
+        let tracker = LiveTracker::new(None);
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:05Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.model.as_deref(), Some("gpt-5.6-sol"));
+        });
+
+        let (_, rows) = read_path(&tracker, Vec::new(), parse("2026-08-08T00:00:10Z"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model_id.as_deref(), Some("gpt-5.6-sol"));
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Codex Agent Name]]
@@ -4817,6 +4890,7 @@ mod tests {
             last_active: (now - TimeDelta::minutes(1)).to_rfc3339(),
             ended_at: None,
             project: Some("/stored/project".to_owned()),
+            model_id: None,
             active_runtime_secs: None,
             agent_count: None,
             agent_runtime_secs: None,
@@ -4870,6 +4944,7 @@ mod tests {
             last_active: (now - TimeDelta::minutes(2)).to_rfc3339(),
             ended_at: None,
             project: Some("/remote/project".to_owned()),
+            model_id: None,
             active_runtime_secs: None,
             agent_count: None,
             agent_runtime_secs: None,

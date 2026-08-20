@@ -2477,6 +2477,18 @@ body {
   color: var(--signal-cyan);
 }
 
+.wg-row-session-model {
+  flex: 0 0 auto;
+  max-width: 70px;
+  overflow: hidden;
+  color: var(--label);
+  font-size: 9.5px;
+  font-weight: 500;
+  line-height: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .wg-row-session-ephemeral {
   flex: 0 0 auto;
   padding: 1px 3px;

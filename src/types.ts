@@ -151,6 +151,8 @@ export interface SessionBreakdown {
   /** Newest observed graceful end; newer activity reopens the session. */
   ended_at: string | null;
   project: string | null;
+  /** The session's own model, from the live fold; null when unobserved. */
+  model_id: string | null;
   /** Lifetime active runtime across every native chain; null is unknown. */
   active_runtime_secs: number | null;
   /** Retained sidechains plus current explicitly marked Pi subagent processes. */

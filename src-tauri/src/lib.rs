@@ -6362,6 +6362,7 @@ mod tests {
             first_seen: "2030-01-01T00:00:00Z".to_string(),
             last_active: "2030-01-01T00:00:02Z".to_string(),
             ended_at: None,
+            model_id: None,
             project: None,
             active_runtime_secs: None,
             agent_count: None,

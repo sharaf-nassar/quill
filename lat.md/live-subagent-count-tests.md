@@ -76,6 +76,8 @@ Session rows add one active root turn only from open-root evidence and apply the
 
 Session identity keeps the full reduced-scale provider name directly after the session name and centered against the row height; stable columns prevent optional agent totals and variable-width values from shifting later fields.
 
+A known model's short family label sits right after the provider name, carrying its raw id in the tooltip and accessible label the same way the agent rail does; an unknown model renders neither label nor placeholder.
+
 ## Shared Root Session Id
 
 Retained inventory and the live fold derive a transcript's root session id through one helper per provider, so the two consumers cannot drift apart on layout rules.
@@ -134,6 +136,10 @@ A `.meta.json` that lost the race to the transcript beside it is picked up by a 
 
 An agent's model comes from its own assistant records and passes the same validation retained evidence does, so a malformed id leaves the agent unlabelled instead of mislabelled.
 
+## Live Tracker Root Model
+
+A root's own model comes from its newest root assistant record the same way an agent's does, landing on `SessionBreakdown.model_id` through the overlay; a later record naming none never clears one already known.
+
 ## Live Tracker Codex Turn Resolution
 
 A Codex sub-agent counts only while its own rollout's newest turn boundary is a `task_started`, so a thread that completed or aborted its turn stops counting while still being listed with the name its head declared.
@@ -165,6 +171,10 @@ Current Codex stopped writing `agent_role` after 2026-07-07 and names threads by
 A `turn_context` written after the head read is picked up by a later event rather than never, because a head with no model yet is left uncached the way a `.meta.json` that lost the same race is retried.
 
 The retry ends once the rollout outgrows the bounded scan window, since from there a re-read would only cover bytes the first scan already rejected.
+
+## Live Tracker Codex Root Model
+
+A Codex root's own model comes from its rollout head the same way a spawned agent's does, landing on `SessionBreakdown.model_id` through the overlay.
 
 ## Live Tracker Codex Spawn Chain
 

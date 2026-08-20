@@ -45,6 +45,11 @@ function agentModelFamily(provider: IntegrationProvider, modelId: string) {
 	return family ? { label: family[0], rank: family[1] } : { label: modelId, rank: 100 };
 }
 
+/** The same short family label the agent rail renders, for any other session datum. */
+export function formatSessionModel(provider: IntegrationProvider, modelId: string): string {
+	return agentModelFamily(provider, modelId).label;
+}
+
 export function formatExtrapolatedRuntime(
 	runtimeSecs: number | null,
 	runtimeAsOfMs: number | null,

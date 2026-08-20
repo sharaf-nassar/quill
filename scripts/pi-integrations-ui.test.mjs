@@ -146,6 +146,7 @@ test("Sessions names recovering and configured-child gaps without a new row", ()
     last_active: "2026-08-14T08:00:00Z",
     ended_at: null,
     project: "quill",
+    model_id: null,
     active_runtime_secs: null,
     agent_count: null,
     agent_runtime_secs: null,

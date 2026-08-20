@@ -15,6 +15,7 @@ const baseRow = {
 	last_active: "2099-01-01T00:00:00Z",
 	ended_at: null,
 	project: "active-retained",
+	model_id: null,
 	active_runtime_secs: 60,
 	agent_count: 0,
 	agent_runtime_secs: 0,
@@ -116,6 +117,37 @@ test("session identity places the full provider name directly after the session 
 	assert.match(markup("codex"), /aria-label="Provider CODEX">CODEX<\/span>/);
 	assert.match(markup("mini_max"), /aria-label="Provider MINIMAX">MINIMAX<\/span>/);
 	assert.doesNotMatch(claude, /wg-row-chip/);
+
+	// A row with no known model renders nothing extra: no placeholder element.
+	assert.doesNotMatch(claude, /wg-row-session-model/);
+
+	// The short model family label renders right after the provider chip, with
+	// the raw id retained in its tooltip and accessible label — the same
+	// labels `formatObservedSessionAgents` produces for the agent rail.
+	const modelMarkup = (provider, model_id) => renderToStaticMarkup(createElement(SessionIdentity, {
+		row: sessionRow({ ...baseRow, provider, model_id }, NOW),
+	}));
+
+	// Pi row carrying a Claude-family id.
+	assert.match(
+		modelMarkup("pi", "claude-opus-5"),
+		/<span class="wg-row-session-provider wg-row-datum"[^>]*>PI<\/span><span class="wg-row-session-model wg-row-datum" data-tooltip="claude-opus-5" aria-label="Model claude-opus-5">Opus<\/span>/,
+	);
+
+	// Pi row carrying a Codex-family id.
+	assert.match(
+		modelMarkup("pi", "gpt-5.6-sol"),
+		/<span class="wg-row-session-provider wg-row-datum"[^>]*>PI<\/span><span class="wg-row-session-model wg-row-datum" data-tooltip="gpt-5\.6-sol" aria-label="Model gpt-5\.6-sol">Sol<\/span>/,
+	);
+
+	// Native Claude row.
+	assert.match(
+		modelMarkup("claude", "claude-sonnet-4-6"),
+		/<span class="wg-row-session-provider wg-row-datum"[^>]*>CLAUDE<\/span><span class="wg-row-session-model wg-row-datum" data-tooltip="claude-sonnet-4-6" aria-label="Model claude-sonnet-4-6">Sonnet<\/span>/,
+	);
+
+	// A null model_id renders no model element and no placeholder.
+	assert.doesNotMatch(modelMarkup("claude", null), /wg-row-session-model/);
 });
 
 // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Persisted Source Presentation]]
