@@ -26,6 +26,10 @@ const ALLOWED_CONTEXT_KEYS = new Set([
 let initialized = false;
 
 export function setCrashReportingEnabled(enabled: boolean): void {
+  // A dev server never opens a transport. `tauri dev` events carry the
+  // CI-placeholder release with no matching source maps, so they reach the
+  // production project as unactionable noise that still pages someone.
+  if (import.meta.env.DEV) return;
   if (enabled === initialized) return;
   if (enabled) {
     Sentry.init({

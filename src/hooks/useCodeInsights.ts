@@ -1,4 +1,4 @@
-import { useEffect, useCallback } from "react";
+import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useCachedInvoke } from "./useCachedInvoke";
 import {
@@ -231,7 +231,7 @@ export function useCodeInsights(
 			};
 	}, [range, runtimeSparkline, totalRuntimeSecs]);
 
-	const { state, refresh } = useCachedInvoke({
+	const { state } = useCachedInvoke({
 		command: "widget_code_insights",
 		args: {
 			range,
@@ -247,12 +247,8 @@ export function useCodeInsights(
 			"sessions-index-updated",
 			"transcript-analytics-updated",
 		],
+		pollMs: 60_000,
 	});
-
-	useEffect(() => {
-		const interval = setInterval(refresh, 60_000);
-		return () => clearInterval(interval);
-	}, [refresh]);
 
 	return state.data ?? { ...EMPTY_RESULT, loading: state.initialLoading };
 }

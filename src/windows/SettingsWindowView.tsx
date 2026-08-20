@@ -1,4 +1,4 @@
-import { useIntegrations } from "../hooks/useIntegrations";
+import type { UseIntegrationsResult } from "../hooks/useIntegrations";
 import { useIntegrationFeatures } from "../hooks/useIntegrationFeatures";
 import { useRuntimeSettings } from "../hooks/useRuntimeSettings";
 import { useLearningSettings } from "../hooks/useLearningSettings";
@@ -17,13 +17,14 @@ interface SettingsWindowViewProps {
   // retarget an already-open workspace.
   tab: SettingsTabId;
   onTabChange: (id: SettingsTabId) => void;
+  integrations: UseIntegrationsResult;
 }
 
 function SettingsWindowView({
   tab: active,
   onTabChange,
+  integrations,
 }: SettingsWindowViewProps) {
-  const integrations = useIntegrations();
   const features = useIntegrationFeatures();
   const runtime = useRuntimeSettings();
   const learning = useLearningSettings();

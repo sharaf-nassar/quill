@@ -308,11 +308,13 @@ The retired EPHEMERAL badge is never rendered. Persisted Pi sessions use native 
 
 ## Custom Hooks
 
-Widget data hooks use Tauri `invoke()` through a process-lifetime cache. One widget-level listener set invalidates entries on push events and batches mounted refresh work on a fixed five-second floor; most hooks retain a 60-second fallback poll.
+Widget data hooks share a process-lifetime Tauri IPC cache with bounded event refresh and optional fallback polling.
 
 ### Integration Hook
 
-`useIntegrations` in [[src/hooks/useIntegrations.ts]] loads provider statuses plus the persisted indicator primary provider, listens for `integrations-updated` and `indicator-updated`, and tracks per-provider in-flight actions and mutation errors.
+`useIntegrations` owns provider status, indicator preference, mutations, and their push listeners.
+
+The Manage shell mounts one [[src/hooks/useIntegrations.ts#useIntegrations]] instance and passes it into Settings, so gating and configuration do not duplicate reads, listeners, or polling.
 
 It drives the [[features#Settings Window]]'s Integrations tab and blocked-window gating. Enable and disable failures stay on the affected provider row, whose existing toggle becomes an accessible retry; a successful retry clears only that provider's error. The `enableProvider` function accepts an optional `apiKey` argument used by service-only providers like MiniMax, while `saveIndicatorPrimaryProvider` persists the status-indicator preference without introducing a separate frontend polling path. `rescan` invokes the `rescan_integrations` IPC and tracks `rescanInFlight` so the "Rescan PATH" row can spin while the backend re-derives the login-shell PATH and re-runs detection.
 
@@ -373,7 +375,9 @@ The hooks the deleted analytics pane owned — `useAnalyticsData`, `useTokenData
 [[src/hooks/useCachedInvoke.ts#useCachedInvoke]] is the shared cache primitive
 for `useModelAnalytics`, `useWidgetSeries`, `useCodeStats`,
 `useCodeInsights`, `useLlmRuntimeStats`, `useContextSavingsStats`, and
-`useBreakdownData`. [[src/hooks/cachedInvokeStore.ts#CachedInvokeStore]] keys
+`useBreakdownData`. Its optional `pollMs` owns the common fallback interval, so
+callers declare cadence without each implementing timer lifecycle.
+[[src/hooks/cachedInvokeStore.ts#CachedInvokeStore]] keys
 entries by logical command plus stable serialized arguments, retains accepted
 data for 45 seconds, shares identical in-flight requests, and never promotes a
 rejection to cached data. Fresh remounts read the module entry with zero IPC;
@@ -406,7 +410,7 @@ same fan-out, already coalesced by the watcher's admission window upstream.
 
 ### State Pattern
 
-Hooks follow a consistent async state pattern: `useState` for data/loading/error, `useRef` for initial load tracking, `useEffect` for fetching, periodic interval refresh, and Tauri event listener cleanup.
+Hooks follow a consistent async state pattern: `useState` for data/loading/error, `useRef` for initial load tracking, `useEffect` for fetching and event cleanup, and shared fallback polling where time-window data needs it.
 
 ### Model Analytics Hook
 

@@ -2546,9 +2546,7 @@ pub struct SkillAccess {
 
 /// Event-kind classification used by the runtime-event pipeline. Five
 /// variants matching specs/008-runtime-redesign/contracts/session-events.md
-/// (EVT-CL-2..EVT-CL-5 and EVT-CX-1). Used by both extractor and storage
-/// ingest paths so the conversion between [`ExtractedEvent`] and
-/// [`crate::storage::SessionEventInput`] is a plain field map.
+/// (EVT-CL-2..EVT-CL-5 and EVT-CX-1).
 // @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionEventKind {
@@ -2582,10 +2580,6 @@ pub struct ExtractedEvent {
     pub event_ordinal: usize,
     pub timestamp: String,
     pub kind: SessionEventKind,
-    #[allow(dead_code)] // Native source identity supplies sidechain attribution.
-    pub is_sidechain: bool,
-    #[allow(dead_code)] // Native source identity supplies analytics attribution.
-    pub agent_id: Option<String>,
     pub uuid: Option<String>,
     pub parent_uuid: Option<String>,
 }
@@ -2607,10 +2601,6 @@ pub struct ExtractedMessage {
     // Tool actions for SQLite storage
     #[allow(dead_code)]
     pub tool_actions: Vec<ToolAction>,
-    /// Provider-native sub-agent attribution. False for top-level messages.
-    pub is_sidechain: bool,
-    #[allow(dead_code)] // Native source identity supplies analytics attribution.
-    pub agent_id: Option<String>,
     pub parent_uuid: Option<String>,
     /// Working directory at the time of the message. Claude reads it from the
     /// top-level `cwd` field on each JSONL row; Codex reads it once from
@@ -2645,12 +2635,6 @@ pub struct ExtractedSession {
 // @lat: [[backend#Database#Schema#Hook Invocations]]
 #[derive(Clone, Debug)]
 pub struct HookInvocation {
-    #[allow(dead_code)] // Native source identity supplies root and sidechain attribution.
-    pub session_id: String,
-    #[allow(dead_code)]
-    pub agent_id: Option<String>,
-    #[allow(dead_code)]
-    pub is_sidechain: bool,
     pub timestamp: String,
     pub hook_event: String,
     pub hook_matcher: Option<String>,
@@ -3318,21 +3302,6 @@ fn extract_hook_invocation_from_attachment(record: &serde_json::Value) -> Option
         .filter(|s| !s.is_empty())?
         .to_string();
 
-    let session_id = record
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let is_sidechain = record
-        .get("isSidechain")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let agent_id = record
-        .get("agentId")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
     let cwd = record
         .get("cwd")
         .and_then(|v| v.as_str())
@@ -3385,9 +3354,6 @@ fn extract_hook_invocation_from_attachment(record: &serde_json::Value) -> Option
     });
 
     Some(HookInvocation {
-        session_id,
-        agent_id,
-        is_sidechain,
         timestamp,
         hook_event: hook_event.to_string(),
         hook_matcher,
@@ -3778,8 +3744,6 @@ fn make_tool_message(
         tool_details,
         tool_actions: vec![action],
         // Synthetic Codex tool message — no sub-agent attribution applies.
-        is_sidechain: false,
-        agent_id: None,
         parent_uuid: None,
         cwd,
     }
@@ -3925,8 +3889,6 @@ pub(crate) fn extract_pi_session(
                 event_ordinal,
                 timestamp: entry.base.timestamp.clone(),
                 kind,
-                is_sidechain: false,
-                agent_id: None,
                 uuid: Some(entry.base.id.clone()),
                 parent_uuid: entry.base.parent_id.clone(),
             });
@@ -4073,8 +4035,6 @@ pub(crate) fn extract_pi_session(
             commands_run,
             tool_details,
             tool_actions,
-            is_sidechain: false,
-            agent_id: None,
             parent_uuid: entry.base.parent_id,
             cwd: Some(cwd.clone()),
         });
@@ -4586,8 +4546,6 @@ fn extract_claude_messages_from_jsonl_records(
                     event_ordinal,
                     timestamp: timestamp.clone(),
                     kind,
-                    is_sidechain,
-                    agent_id: agent_id.clone(),
                     uuid: if uuid.is_empty() {
                         None
                     } else {
@@ -4617,8 +4575,6 @@ fn extract_claude_messages_from_jsonl_records(
             commands_run,
             tool_details: tool_details_vec,
             tool_actions,
-            is_sidechain,
-            agent_id,
             parent_uuid,
             cwd: cwd.clone(),
         });
@@ -4772,8 +4728,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                         event_ordinal: 0,
                         timestamp: timestamp.clone(),
                         kind,
-                        is_sidechain: native_identity.is_sidechain,
-                        agent_id: None,
                         uuid: payload
                             .get("id")
                             .and_then(|value| value.as_str())
@@ -4799,8 +4753,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                     commands_run: Vec::new(),
                     tool_details: Vec::new(),
                     tool_actions: Vec::new(),
-                    is_sidechain: native_identity.is_sidechain,
-                    agent_id: None,
                     parent_uuid: None,
                     cwd: cwd.clone(),
                 });
@@ -4833,8 +4785,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                                 } else {
                                     SessionEventKind::AsstText
                                 },
-                                is_sidechain: native_identity.is_sidechain,
-                                agent_id: None,
                                 uuid: uuid.clone(),
                                 parent_uuid: None,
                             });
@@ -4853,8 +4803,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             commands_run: Vec::new(),
                             tool_details: Vec::new(),
                             tool_actions: Vec::new(),
-                            is_sidechain: native_identity.is_sidechain,
-                            agent_id: None,
                             parent_uuid: None,
                             cwd: cwd.clone(),
                         });
@@ -4896,8 +4844,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             commands_run: Vec::new(),
                             tool_details: Vec::new(),
                             tool_actions: Vec::new(),
-                            is_sidechain: native_identity.is_sidechain,
-                            agent_id: None,
                             parent_uuid: None,
                             cwd: cwd.clone(),
                         });
@@ -4961,8 +4907,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                                 event_ordinal: 0,
                                 timestamp: timestamp.clone(),
                                 kind: SessionEventKind::AsstToolUse,
-                                is_sidechain: native_identity.is_sidechain,
-                                agent_id: None,
                                 uuid: (!call_id.is_empty()).then(|| format!("call:{call_id}")),
                                 parent_uuid: None,
                             });
@@ -5041,8 +4985,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                                 event_ordinal: 0,
                                 timestamp: timestamp.clone(),
                                 kind: SessionEventKind::AsstToolUse,
-                                is_sidechain: native_identity.is_sidechain,
-                                agent_id: None,
                                 uuid: (!call_id.is_empty()).then(|| format!("call:{call_id}")),
                                 parent_uuid: None,
                             });
@@ -5074,8 +5016,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                                 event_ordinal: 0,
                                 timestamp: timestamp.clone(),
                                 kind: SessionEventKind::UserToolResult,
-                                is_sidechain: native_identity.is_sidechain,
-                                agent_id: None,
                                 uuid: (!call_id.is_empty()).then(|| format!("output:{call_id}")),
                                 parent_uuid: None,
                             });
@@ -5111,8 +5051,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             event_ordinal: 0,
                             timestamp,
                             kind: SessionEventKind::AsstThinking,
-                            is_sidechain: native_identity.is_sidechain,
-                            agent_id: None,
                             uuid: payload
                                 .get("id")
                                 .and_then(|value| value.as_str())
@@ -5135,11 +5073,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
 
     for message in &mut messages {
         message.session_id.clone_from(&native_identity.chain_id);
-        message.is_sidechain = native_identity.is_sidechain;
-        message.agent_id.clone_from(&native_identity.agent_id);
-    }
-    for event in &mut events {
-        event.agent_id.clone_from(&native_identity.agent_id);
     }
 
     ExtractedSession {
@@ -5581,7 +5514,7 @@ mod tests {
     }
 
     #[test]
-    fn extraction_tags_subagent_records_with_attribution() {
+    fn extraction_uses_native_subagent_session_identity() {
         let fixture = make_fixture();
         let files =
             SessionIndex::discover_claude_session_files_in(fixture.path()).expect("discover ok");
@@ -5597,15 +5530,6 @@ mod tests {
             "expected at least one extracted sub-agent message"
         );
         for msg in &extracted.messages {
-            assert!(
-                msg.is_sidechain,
-                "every record in a subagents/ transcript carries isSidechain=true"
-            );
-            assert_eq!(
-                msg.agent_id.as_deref(),
-                Some("aaaabbbbccccdddd"),
-                "agent_id must round-trip through extraction"
-            );
             assert_eq!(
                 msg.session_id, "aaaabbbbccccdddd",
                 "sub-agent session_id must use its native agent chain identity"
@@ -5624,11 +5548,7 @@ mod tests {
         let parent_file = files.iter().find(|f| !f.is_subagent).expect("parent file");
         let parent_extracted = extract_messages_from_jsonl(parent_file.provider, &parent_file.path);
         for msg in &parent_extracted.messages {
-            assert!(
-                !msg.is_sidechain,
-                "parent transcript records must not be tagged sidechain"
-            );
-            assert!(msg.agent_id.is_none());
+            assert_eq!(msg.session_id, parent_extracted.session_id);
         }
     }
 
@@ -5995,8 +5915,6 @@ mod tests {
             commands_run: Vec::new(),
             tool_details: Vec::new(),
             tool_actions: Vec::new(),
-            is_sidechain: false,
-            agent_id: None,
             parent_uuid: None,
             cwd: None,
         };
@@ -6084,8 +6002,6 @@ mod tests {
                 commands_run: Vec::new(),
                 tool_details: Vec::new(),
                 tool_actions: Vec::new(),
-                is_sidechain: false,
-                agent_id: None,
                 parent_uuid: None,
                 cwd: None,
             };
@@ -6257,8 +6173,6 @@ mod tests {
             commands_run: Vec::new(),
             tool_details: Vec::new(),
             tool_actions: Vec::new(),
-            is_sidechain: false,
-            agent_id: None,
             parent_uuid: None,
             cwd: None,
         };
@@ -6302,7 +6216,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_spawn_identity_reaches_messages_and_events() {
+    fn codex_spawn_identity_reaches_messages() {
         let records = parse_jsonl_records(concat!(
             r#"{"type":"session_meta","payload":{"id":"child-1","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-1"}}}}}"#,
             "\n",
@@ -6312,10 +6226,7 @@ mod tests {
 
         assert_eq!(extracted.session_id, "child-1");
         assert_eq!(extracted.messages.len(), 1);
-        assert!(extracted.messages[0].is_sidechain);
-        assert_eq!(extracted.messages[0].agent_id.as_deref(), Some("child-1"));
+        assert_eq!(extracted.messages[0].session_id, "child-1");
         assert_eq!(extracted.events.len(), 1);
-        assert!(extracted.events[0].is_sidechain);
-        assert_eq!(extracted.events[0].agent_id.as_deref(), Some("child-1"));
     }
 }

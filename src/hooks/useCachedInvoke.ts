@@ -31,6 +31,7 @@ export interface UseCachedInvokeOptions<T, E> {
 	onError?: (error: unknown) => void;
 	enabled?: boolean;
 	invalidationEvents?: readonly string[];
+	pollMs?: number;
 }
 
 function localState<T, E>(
@@ -62,6 +63,7 @@ export function useCachedInvoke<T, E>({
 	onError,
 	enabled = true,
 	invalidationEvents = [],
+	pollMs,
 }: UseCachedInvokeOptions<T, E>): {
 	state: CachedInvokeState<T, E>;
 	refresh: () => void;
@@ -124,6 +126,12 @@ export function useCachedInvoke<T, E>({
 		if (!enabled) return;
 		cachedInvokeStore.retry<T>(cacheKey, () => requestRef.current());
 	}, [cacheKey, enabled]);
+
+	useEffect(() => {
+		if (!enabled || pollMs === undefined) return;
+		const interval = setInterval(refresh, pollMs);
+		return () => clearInterval(interval);
+	}, [enabled, pollMs, refresh]);
 
 	const state =
 		requestState.cacheKey === cacheKey

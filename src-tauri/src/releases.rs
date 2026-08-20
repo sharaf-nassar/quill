@@ -10,8 +10,6 @@ const MAX_LIMIT: u32 = 100;
 struct GithubRelease {
     tag_name: String,
     #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
     body: Option<String>,
     html_url: String,
     #[serde(default)]
@@ -25,7 +23,6 @@ struct GithubRelease {
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseNote {
     pub tag_name: String,
-    pub name: Option<String>,
     pub body: Option<String>,
     pub html_url: String,
     pub published_at: Option<String>,
@@ -41,7 +38,6 @@ fn normalize_release(raw: GithubRelease) -> Option<ReleaseNote> {
     }
     Some(ReleaseNote {
         tag_name: raw.tag_name,
-        name: raw.name.filter(|s| !s.is_empty()),
         body: raw.body.filter(|s| !s.is_empty()),
         html_url: raw.html_url,
         published_at: raw.published_at,
@@ -93,7 +89,6 @@ mod tests {
     fn make(tag: &str, draft: bool, prerelease: bool) -> GithubRelease {
         GithubRelease {
             tag_name: tag.to_string(),
-            name: Some(format!("Quill {tag}")),
             body: Some("notes".to_string()),
             html_url: format!("https://github.com/sharaf-nassar/quill/releases/tag/{tag}"),
             published_at: Some("2026-04-01T00:00:00Z".to_string()),
@@ -116,10 +111,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_strings_become_none() {
+    fn empty_body_becomes_none() {
         let raw = vec![GithubRelease {
             tag_name: "v0.3.25".to_string(),
-            name: Some(String::new()),
             body: Some(String::new()),
             html_url: "https://example.invalid".to_string(),
             published_at: None,
@@ -128,7 +122,6 @@ mod tests {
         }];
         let notes = normalize_releases(raw);
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].name.is_none());
         assert!(notes[0].body.is_none());
     }
 

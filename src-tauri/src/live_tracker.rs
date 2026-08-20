@@ -34,7 +34,7 @@ use crate::server::{MAX_CWD_LEN, MAX_STRING_LEN};
 /// merely quiet: measured inter-record gaps reach p99.9 ≈ 309s, an order of
 /// magnitude below it. It evicts whole idle sessions and serves as the
 /// per-agent crash backstop for a spawn whose result never arrived.
-const IDLE_AFTER: TimeDelta = TimeDelta::minutes(15);
+pub(crate) const IDLE_AFTER: TimeDelta = TimeDelta::minutes(15);
 
 /// One live session, addressed the way a Sessions row is.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -356,6 +356,14 @@ pub(crate) struct LiveTracker {
 struct TrackerState {
     sessions: HashMap<SessionKey, LiveSession>,
     files: HashMap<PathBuf, FileTail>,
+    /// Pi sessions whose reporter announced their end. A finished session's
+    /// transcript stays inside the idle window for a while, and the fold
+    /// takes a recent file as liveness; this is the memory that stops such a
+    /// file from resurrecting an ended session as an open agent. A new
+    /// `session_start` for the same identity clears its entry, and entries
+    /// older than the idle window are pruned because a file that old cannot
+    /// fold anyway.
+    ended: HashMap<SessionKey, DateTime<Utc>>,
     /// Rollout path per Codex thread id, the only way a spawned rollout's
     /// parent chain can be located. It covers the whole corpus rather than the
     /// live window — an ancestor named by a live spawn is often long quiet —
@@ -374,6 +382,7 @@ impl Default for TrackerState {
         Self {
             sessions: HashMap::new(),
             files: HashMap::new(),
+            ended: HashMap::new(),
             threads: HashMap::new(),
             heads: HashMap::new(),
             activity_tracking_enabled: true,
@@ -671,6 +680,11 @@ impl TrackerState {
     /// tail entry, so a warm sweep re-reads neither headers nor path facts.
     fn pi_file(&mut self, path: &Path, host: &str) -> Option<(SessionKey, FileRole)> {
         if let Some(tail) = self.files.get(path) {
+            // A reporter-announced end outranks the file's recency: the
+            // session is over even though its transcript is still fresh.
+            if self.ended.contains_key(&tail.session) {
+                return None;
+            }
             return Some((
                 tail.session.clone(),
                 FileRole::Pi {
@@ -684,6 +698,9 @@ impl TrackerState {
             host: host.to_owned(),
             session_id: observed_name(&header.id)?,
         };
+        if self.ended.contains_key(&key) {
+            return None;
+        }
         let started_at = utc(&header.timestamp);
         let structural_lineage = pi_path_lineage(path);
         let run_id = pi_path_run_id(path);
@@ -713,8 +730,14 @@ impl TrackerState {
     /// revival re-reads from zero.
     fn evict_idle(&mut self, now: DateTime<Utc>) -> bool {
         let Self {
-            sessions, files, ..
+            sessions,
+            files,
+            ended,
+            ..
         } = self;
+        // A tombstone older than the idle window is spent: a file that quiet
+        // cannot fold, so nothing is left for it to block.
+        ended.retain(|_, ended_at| now.signed_duration_since(*ended_at) <= IDLE_AFTER);
         let mut active_agent_ancestors = HashSet::new();
         for (child_key, _child) in sessions
             .iter()
@@ -836,6 +859,9 @@ impl LiveTracker {
                 agent_role,
                 ..
             } => {
+                // A new occurrence of this identity reopens it: the transcript
+                // may fold again.
+                state.ended.remove(&key);
                 let mut changed = previous_session_id.as_ref().is_some_and(|previous| {
                     state
                         .sessions
@@ -873,10 +899,23 @@ impl LiveTracker {
                 changed
             }
             PiProtocolV2EventKind::SessionEnd { .. } => {
-                state.sessions.get(&key).is_some_and(|session| {
-                    session.process_instance_id.as_deref()
-                        == Some(event.process_instance_id.as_str())
-                }) && state.sessions.remove(&key).is_some()
+                // An end from a superseded occurrence cannot touch the session
+                // another process now owns; a fold-created session claims no
+                // process, so a durably applied end still closes it.
+                if state.sessions.get(&key).is_some_and(|session| {
+                    session
+                        .process_instance_id
+                        .as_deref()
+                        .is_some_and(|process| process != event.process_instance_id)
+                }) {
+                    false
+                } else {
+                    // Remember the end even when the session is already gone:
+                    // its transcript stays inside the idle window for a while
+                    // and must not fold it back into a live agent.
+                    state.ended.insert(key.clone(), occurred_at);
+                    state.sessions.remove(&key).is_some()
+                }
             }
             PiProtocolV2EventKind::Lineage {
                 lineage,
@@ -903,6 +942,46 @@ impl LiveTracker {
             self.notify();
         }
         changed
+    }
+
+    /// Remember reporter-announced ends restored from durable lifecycle, so a
+    /// restart cannot re-fold a recently ended session's still-recent
+    /// transcript back into a live agent.
+    ///
+    /// The startup sweep races this seeding, so a session the sweep already
+    /// folded back is dropped here as long as it claims no process; one a new
+    /// process has re-announced stays.
+    pub(crate) fn seed_pi_ended_sessions(
+        &self,
+        sessions: impl IntoIterator<Item = (String, String, i64)>,
+    ) {
+        let mut changed = false;
+        let mut state = self.state.lock().unwrap();
+        for (host, session_id, ended_at_ms) in sessions {
+            let Some(ended_at) = DateTime::<Utc>::from_timestamp_millis(ended_at_ms) else {
+                continue;
+            };
+            let key = SessionKey {
+                provider: IntegrationProvider::Pi.as_str().to_owned(),
+                host,
+                session_id,
+            };
+            if state
+                .sessions
+                .get(&key)
+                .is_some_and(|session| session.process_instance_id.is_none())
+            {
+                state.sessions.remove(&key);
+                changed = true;
+            }
+            if !state.sessions.contains_key(&key) {
+                state.ended.insert(key, ended_at);
+            }
+        }
+        drop(state);
+        if changed {
+            self.notify();
+        }
     }
 
     pub(crate) fn prove_pi_session(
@@ -4266,6 +4345,101 @@ mod tests {
                 .as_deref(),
             Some("reviewer")
         );
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Reporter End Tombstone]]
+    #[test]
+    fn an_ended_pi_child_cannot_be_resurrected_by_its_recent_transcript() {
+        let now = Utc::now();
+        let at = |ago: i64| (now - TimeDelta::seconds(ago)).to_rfc3339();
+        let fixture = Fixture::pi(PI_SESSION);
+        let child = "01a01746-ab70-7905-b6ef-0c047dbb6ab9";
+        let run_id = "b663b5ad";
+        fixture.write(&format!(
+            "{}\n{}\n",
+            pi_header(PI_SESSION, &at(120)),
+            pi_user(&at(100))
+        ));
+        fixture.write_pi_child(
+            PI_SESSION,
+            run_id,
+            &format!(
+                "{}\n{}\n{}\n",
+                pi_header(child, &at(30)),
+                pi_user(&at(20)),
+                pi_assistant(&at(10), "gpt-5.6-sol", 100)
+            ),
+        );
+        let tracker = LiveTracker::new(None);
+        fixture.sweep(&tracker, now);
+        let (_, rows) = read_path(&tracker, Vec::new(), now);
+        assert_eq!(agent_ids(&rows[0]), vec![child]);
+
+        // The reporter announces the child's end while its transcript is
+        // still inside the idle window.
+        let host = local_observed_host().expect("local host");
+        let event = |sequence, kind| PiProtocolV2Event {
+            event_uuid: format!("{child}-{sequence}"),
+            provider: crate::models::PiProtocolV2Provider::Pi,
+            normalized_host: host.to_owned(),
+            session_id: child.to_owned(),
+            process_instance_id: "child-process".to_owned(),
+            sequence,
+            origin_at: at(30),
+            occurred_at: at(5),
+            delivery_source: PiProtocolV2DeliverySource::Live,
+            kind,
+        };
+        assert!(tracker.apply_pi_protocol_v2_event(&event(
+            2,
+            PiProtocolV2EventKind::SessionEnd {
+                reason: crate::models::PiProtocolV2EndReason::Quit,
+            },
+        )));
+
+        // Later sweeps keep seeing the recent file through both the warm tail
+        // and the cold header path, but the remembered end wins.
+        fixture.sweep(&tracker, now);
+        fixture.sweep(&tracker, now);
+        let (_, rows) = read_path(&tracker, Vec::new(), now);
+        assert!(rows.iter().all(|row| agent_ids(row).is_empty()));
+
+        // A restarted tracker never saw the live end. Its startup sweep races
+        // durable seeding, so even a child the sweep already folded back is
+        // dropped when the seeded end arrives, and later sweeps stay blocked.
+        let restarted = LiveTracker::new(None);
+        fixture.sweep(&restarted, now);
+        let (_, rows) = read_path(&restarted, Vec::new(), now);
+        assert_eq!(agent_ids(&rows[0]), vec![child]);
+        restarted.seed_pi_ended_sessions([(
+            host.to_owned(),
+            child.to_owned(),
+            (now - TimeDelta::seconds(5)).timestamp_millis(),
+        )]);
+        let (_, rows) = read_path(&restarted, Vec::new(), now);
+        assert!(rows.iter().all(|row| agent_ids(row).is_empty()));
+        fixture.sweep(&restarted, now);
+        let (_, rows) = read_path(&restarted, Vec::new(), now);
+        assert!(rows.iter().all(|row| agent_ids(row).is_empty()));
+
+        // A new start for the same identity reopens it: the transcript may
+        // fold this session again.
+        assert!(tracker.apply_pi_protocol_v2_event(&event(
+            3,
+            PiProtocolV2EventKind::SessionStart {
+                reason: crate::models::PiProtocolV2StartReason::Resume,
+                previous_session_id: None,
+                lineage: PiProtocolV2Lineage::Agent {
+                    parent_session_id: PI_SESSION.to_owned(),
+                },
+                agent_role: Some("worker".to_owned()),
+            },
+        )));
+        fixture.sweep(&tracker, now);
+        let (_, rows) = read_path(&tracker, Vec::new(), now);
+        assert_eq!(agent_ids(&rows[0]), vec![child]);
+        let agent = &rows[0].observed_agents.as_ref().unwrap()[0];
+        assert_eq!(agent.agent_type.as_deref(), Some("worker"));
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Pi Tree Lineage]]

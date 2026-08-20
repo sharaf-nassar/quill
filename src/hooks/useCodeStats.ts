@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from "react";
+import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { RangeType, CodeStats, CodeStatsHistoryPoint } from "../types";
 import { useCachedInvoke } from "./useCachedInvoke";
@@ -22,7 +22,7 @@ export function useCodeStats(range: RangeType) {
 			"sessions-index-updated",
 			"transcript-analytics-updated",
 		],
+		pollMs: 60_000,
 	});
-	useEffect(() => { const interval = setInterval(refresh, 60_000); return () => clearInterval(interval); }, [refresh]);
 	return { stats: state.data?.stats ?? null, history: state.data?.history ?? [], loading: state.initialLoading, error: state.error, refresh };
 }

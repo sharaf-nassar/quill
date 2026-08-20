@@ -570,9 +570,9 @@ is written exactly as an unfiltered replacement writes it, so the source
 stays registered and reconcilable; a per-source `retained_through` column is
 ruled out because `prune_transcript_analytics_sources_for_root` deletes the
 registry row it would live on. Live rows never reach this path at all: every
-other insert site (`store_live_session_analytics`, `ingest_session_events`,
-and `server.rs::persist_remote_session_analytics` through the first of them)
-hard-codes `source_key NULL`, and live rows are excluded from retention.
+other insert site (`store_live_session_analytics`, including
+`server.rs::persist_remote_session_analytics`) hard-codes `source_key NULL`, and
+live rows are excluded from retention.
 
 [[src-tauri/src/storage.rs#RetentionInsertFilterCounts]] rides back on
 `TranscriptAnalyticsReplacement::Replaced` and keeps the two figures separate,
@@ -642,8 +642,8 @@ rather than being assumed to follow from the changed-source case.
 
 ##### Live Rows Ignore The Watermark
 
-`store_live_session_analytics` and `ingest_session_events` must insert their
-`source_key IS NULL` rows on both sides of the cutoff, and every one must land.
+`store_live_session_analytics` must insert its `source_key IS NULL` rows on both
+sides of the cutoff, and every one must land.
 
 Live rows are outside retention's scope by design, so a watermark leaking into
 either live path would delete data the user was never asked about.
@@ -1271,7 +1271,7 @@ Owned/live identities are respectively: `session_events` `(provider, source_key,
 
 Before migration-46 DDL, every existing schema 1-45 database is advanced to schema 45 and copied to the exact sibling path `<usage.db>.schema-45.backup` through SQLite `VACUUM INTO`, which includes committed WAL state. Quill verifies `PRAGMA quick_check = ok` and schema version 45, fsyncs the temporary file, atomically renames it from `.building`, and verifies it again. Interrupted `.building` files are discarded; an already verified backup is reused, so restore and migration resume are idempotent. Literal restore/verification commands are pinned in [[pi-model-usage-tests#Pi Model Usage Test Specs#Schema 45 Backup And Ownership Migration]].
 
-Migration 46 creates `pi_session_lifecycle` and `pi_event_receipts`. Persisted open sessions enter lifecycle storage and `live_analytics_sessions` as `recovering`; only their own later end closes them. Migration 47 drops the obsolete reporter-health table and saturation settings. The durable `pi_spool_cleanup_pending` marker disables production legacy-spool import while persisted-source reconciliation owns readiness for artifact deletion.
+Migration 46 creates `pi_session_lifecycle` and `pi_event_receipts`. Persisted open sessions enter lifecycle storage and `live_analytics_sessions` as `recovering`; only their own later end closes them. At server startup [[src-tauri/src/storage.rs#Storage#load_pi_recently_closed_sessions]] selects closed Pi rows no older than [[src-tauri/src/live_tracker.rs#IDLE_AFTER]] and seeds tracker tombstones after recovering rows, preventing still-recent files from reopening the completed occurrence. Migration 47 drops the obsolete reporter-health table and saturation settings. The durable `pi_spool_cleanup_pending` marker disables production legacy-spool import while persisted-source reconciliation owns readiness for artifact deletion.
 
 Migration 30 renames the five prior analytics tables to `*_legacy_v30` and rebuilds them around source identity. The archives are **retained**, not dropped: rows with no hostname, and local rows whose transcript Claude has since pruned, are neither provably remote nor guaranteed rebuildable, and retention beats copying a multi-GB database. Nothing queries an archive and no index is kept on one — legacy named indexes are dropped so a retained archive cannot collide with the rebuilt tables' index names. An archive holding no rows at all is dropped immediately, so fresh installs stay clean.
 
@@ -1291,7 +1291,7 @@ Reconciliation compares canonical source key/path and last-good status before re
 
 `replace_transcript_analytics_snapshot` replaces all five owned analytics tables and the source registry in one transaction; Pi snapshots extend that same transaction across lifecycle, receipts, token snapshots, native model observations, unpruned model rollups, and the model source registry. Valid empty snapshots remove only that source, while suppression, identity drift, stale generation, or any final insert failure leaves every prior row intact. Owned inserts use `INSERT OR IGNORE` through prepared statements, and generation guards reject stale plans before rows change. The `session_events`, `tool_actions`, and Pi usage inserts obey the retention watermark so delete-and-reinsert cannot resurrect pruned history. Shared tool/skill helpers keep notify and retained keys identical.
 
-[[src-tauri/src/storage.rs#Storage#store_live_session_analytics]] atomically writes runtime or hook rows with durable project, full-cwd, and host origin. Pi runtime rows use [[src-tauri/src/storage.rs#pi_source_key]] so equal session ids on different hosts never collide; other live rows remain source-less. Origin upserts preserve known fields with `COALESCE`; event rows require unique message UUID identity and use the incoming session as root and chain. Active and closed Pi runtime and response replay obey the retention watermark; accepted closed rows refold without accumulating hourly totals.
+[[src-tauri/src/storage.rs#Storage#store_live_session_analytics]] atomically writes runtime or hook rows with durable project, full-cwd, and host origin. It is the sole source-less runtime-event writer. Pi runtime rows use [[src-tauri/src/storage.rs#pi_source_key]] so equal session ids on different hosts never collide; other live rows remain source-less. Origin upserts preserve known fields with `COALESCE`; event rows require unique message UUID identity and use the incoming session as root and chain. Active and closed Pi runtime and response replay obey the retention watermark; accepted closed rows refold without accumulating hourly totals.
 
 Its response pairing reaches back into storage for Pi alone. Pi pushes one message per request, so a turn's prompt and reply arrive in different batches and a call-local pending slot pairs nothing; the reply instead recovers the newest `user_text` event in its chain that no completed turn has consumed, claimed once per batch so one prompt stays one turn.
 

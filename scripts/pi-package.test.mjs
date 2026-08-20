@@ -50,6 +50,10 @@ test("Pi package publication waits for the matching desktop release", () => {
   assert.ok(buildStage > desktopGate);
   assert.ok(dryRun > buildStage);
   assert.ok(publish > dryRun);
-  assert.match(workflow, /gh release view "v\$\{PI_VERSION\}"/);
+  assert.equal(
+    workflow.match(/gh release view "v\$\{PI_VERSION\}"/g)?.length,
+    1,
+  );
+  assert.match(workflow, /--json isDraft,isPrerelease,assets/);
   assert.match(workflow, /"0\.0\.0-injected-by-ci", process\.env\.PI_VERSION/);
 });

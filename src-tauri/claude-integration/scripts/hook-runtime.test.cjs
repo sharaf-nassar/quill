@@ -1,29 +1,21 @@
 #!/usr/bin/env node
 "use strict";
 
+const assert = require("node:assert/strict");
 const childProcess = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const test = require("node:test");
 
 const observe = require("./observe.cjs");
 const qbuild = require("./qbuild-guard.cjs");
 const tokens = require("./report-tokens.cjs");
 const sync = require("./session-sync.cjs");
 
-let passed = 0;
-let failed = 0;
-const tests = [];
-
-function assert(condition, message) {
-  if (!condition) throw new Error(message || "assertion failed");
-}
-
-function it(name, fn) {
-  tests.push({ name, fn });
-}
+const it = test;
 
 async function withFixture(fn) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "quill-hook-test-"));
@@ -282,20 +274,3 @@ it("syncs past a poisoned first row, retryable failure, and final multi-chunk ta
     }
   })
 ));
-
-async function run() {
-  for (const { name, fn } of tests) {
-    try {
-      await fn();
-      passed += 1;
-      process.stdout.write(`  ok  ${name}\n`);
-    } catch (error) {
-      failed += 1;
-      process.stdout.write(`  FAIL ${name}\n    ${error.message}\n`);
-    }
-  }
-  process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
-  process.exit(failed === 0 ? 0 : 1);
-}
-
-void run();

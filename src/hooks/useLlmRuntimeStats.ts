@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from "react";
+import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { RangeType, LlmRuntimeStats, SparklinePoint } from "../types";
 import { useCachedInvoke } from "./useCachedInvoke";
@@ -11,7 +11,7 @@ export function useLlmRuntimeStats(range: RangeType): LlmRuntimeStatsResult {
 		const stats = await invoke<LlmRuntimeStats>("get_llm_runtime_stats", { range });
 		return stats.turn_count === 0 ? EMPTY : { totalRuntimeSecs: stats.total_runtime_secs, turnCount: stats.turn_count, sessionCount: stats.session_count, avgPerTurnSecs: stats.avg_per_turn_secs, sparkline: stats.sparkline.map((value) => ({ value })) };
 	}, [range]);
-	const { state, refresh } = useCachedInvoke({
+	const { state } = useCachedInvoke({
 		command: "get_llm_runtime_stats",
 		args: { range },
 		request,
@@ -21,7 +21,7 @@ export function useLlmRuntimeStats(range: RangeType): LlmRuntimeStatsResult {
 			"sessions-index-updated",
 			"transcript-analytics-updated",
 		],
+		pollMs: 60_000,
 	});
-	useEffect(() => { const interval = setInterval(refresh, 60_000); return () => clearInterval(interval); }, [refresh]);
 	return { ...(state.data ?? EMPTY), loading: state.initialLoading };
 }

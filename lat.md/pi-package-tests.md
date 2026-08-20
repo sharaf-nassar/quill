@@ -12,4 +12,6 @@ The npm tarball exports one dependency-free extension and contains only its mani
 
 ## Desktop-first publication
 
-`.github/workflows/publish-pi-extension.yml` requires the matching published desktop release and managed assets before injecting that exact build into the reporter, running package/provenance dry runs, and publishing the npm artifact.
+Pi publication requires one verified matching desktop release before npm publication.
+
+`.github/workflows/publish-pi-extension.yml` reads draft, prerelease, and asset metadata in one release lookup, requires managed assets, injects that exact build into the reporter, runs package/provenance dry runs, then publishes.

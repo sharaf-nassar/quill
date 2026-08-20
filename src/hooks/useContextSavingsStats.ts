@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from "react";
+import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useCachedInvoke } from "./useCachedInvoke";
 import type {
@@ -11,8 +11,6 @@ import type {
 	ContextSavingsTimeSeriesPoint,
 	RangeType,
 } from "../types";
-
-const REFRESH_INTERVAL_MS = 60_000;
 
 function isRouterEvent(key: string): boolean {
 	return key.startsWith("router.");
@@ -138,12 +136,8 @@ export function useContextSavingsStats(range: RangeType, limit = 40) {
 		onError: (error) =>
 			console.error("Context savings analytics fetch error:", error),
 		invalidationEvents: ["context-savings-updated"],
+		pollMs: 60_000,
 	});
-
-	useEffect(() => {
-		const interval = setInterval(refresh, REFRESH_INTERVAL_MS);
-		return () => clearInterval(interval);
-	}, [refresh]);
 
 	return {
 		data: state.data,

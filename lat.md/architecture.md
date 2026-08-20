@@ -8,7 +8,7 @@ The application pairs a Rust backend with a React frontend communicating over Ta
 
 - **Frontend**: React 19, TypeScript, an internal SVG viz kit (no charting dependency), pure CSS dark theme
 - **Backend**: Rust (edition 2024), Tauri 2, Axum HTTP server, SQLite (rusqlite), Tantivy full-text search
-- **AI**: Anthropic API via rig-core SDK for pattern extraction and memory optimization
+- **AI**: Claude Code subprocess inference for pattern extraction and memory optimization
 - **Build**: Vite (ES2020), Cargo, GitHub Actions CI/CD across Linux/macOS/Windows
 
 ## Multi-Window Design

@@ -4,8 +4,8 @@
 # Requires: xdotool, ImageMagick (`import` plus `convert` or `magick`), awk.
 #
 # ── Why this script does not click coordinates ────────────────────────────────
-# The main window *is* the widget now: 360px wide, no decorations, and a
-# content-derived height. The old titlebar strip of Live/Analytics/Learning/
+# The main window *is* the widget now: 360px wide by default, freely resizable,
+# and decorationless. The old titlebar strip of Live/Analytics/Learning/
 # Sessions buttons at fixed x-offsets no longer exists, and the two surfaces
 # that replaced it both move under the script's feet:
 #
@@ -35,10 +35,9 @@
 #   * One Quill instance running, widget visible, at least one provider enabled.
 #     Use `scripts/run_quill_demo.sh --clean` so the shots come from the
 #     sandboxed dummy dataset and never from personal state.
-#   * On GNOME/Mutter (X11) the raw `target/{debug,release}` binaries render
-#     through a GL surface `import` cannot read; capture against the packaged
-#     AppImage build. A blank grab is reported per shot rather than saved
-#     silently.
+#   * A plain `cargo build` embeds the frontend and is sufficient on the
+#     maintainer's GNOME/Mutter (X11) host. A blank grab is still reported per
+#     shot rather than saved silently.
 #
 # ── Output ────────────────────────────────────────────────────────────────────
 # Written to OUTDIR (default `marketing-site/assets/screenshots/`):
@@ -63,8 +62,7 @@ OUTDIR="${OUTDIR:-$REPO_ROOT/marketing-site/assets/screenshots}"
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 
-# Logical widget width; mirrors `width`/`maxWidth` in src-tauri/tauri.conf.json
-# and WIDGET_WIDTH in src/App.tsx.
+# Logical widget width; mirrors `width` in src-tauri/tauri.conf.json.
 WIDGET_WIDTH=360
 
 # 2x device-pixel-ratio output for HiDPI rendering on the marketing site. The

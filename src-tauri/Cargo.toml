@@ -6,7 +6,6 @@ edition = "2024"
 
 [lib]
 name = "quill_lib"
-crate-type = ["lib", "cdylib", "staticlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

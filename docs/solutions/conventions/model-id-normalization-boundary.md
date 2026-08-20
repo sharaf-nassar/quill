@@ -1,6 +1,7 @@
 ---
 title: Model chart splits one model across CLIs
 date: 2026-08-22
+last_updated: 2026-08-24
 component: model analytics identity
 tags: [widget, usage, model-analytics, normalization, constitution]
 problem_type: convention
@@ -53,6 +54,30 @@ landed in `844ceaf`: the helper lives at
 from the string, e.g. mapping dated `claude-haiku-4-5-20251001` to a
 family, or vendor-labeling cross-routed traffic) requires a sibling
 derived column with versioned re-stamping — the migration-29 playbook.
+
+## Scope of the no-family-parsing rule
+
+`lat.md/features.md:193` bans "model catalog, family parsing, alias,
+friendly name" — that sentence describes the **Models view** only, not the
+repo. Session rails do the opposite by design: `agentModelFamily`
+(`src/utils/format.ts:35`) parses `Opus`/`Sonnet`/`Haiku`/`Fable` and
+`Sol`/`Terra`/`Luna` out of raw ids for the agent rail, shipped by closed
+bead `quill-pe96` and pinned as a contract in
+`lat.md/live-subagent-count-tests.md:61-65`. A reader who applies :193
+globally will either stall on a rail label change or "fix" the rails by
+removing shipped behavior.
+
+The distinction is what the label is *for*: the Models view attributes
+usage and must not merge distinct identities, so it keys on exact
+provider-qualified strings. A rail is a 100 px status chip whose job is
+recognition, and it keeps the raw id in its tooltip/ARIA — nothing is lost,
+nothing is invented. Same test as the Prevention section below: derived at
+read time from stored evidence, displayed beside the evidence, never
+substituted for it.
+
+Surfaced while triaging `quill-ihbn` (root session rows carry no model
+label; unlanded as of this writing) — its follow-ups `quill-0fhp` and
+`quill-nm0h` extend the same rail vocabulary.
 
 ## Prevention
 

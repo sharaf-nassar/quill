@@ -258,7 +258,7 @@ Promotion preconditions `lifecycle='awaiting_review'` and an inactive tombstone 
 
 The route returns typed validation, rate, recovery, and availability responses; accepted handshakes name the current build, protocol, reporter, capability digest, and ordered lifecycle dispositions.
 
-[[src-tauri/src/storage.rs#Storage#apply_pi_protocol_v2_envelope]] commits receipt dedupe, process/sequence ordering, durable lifecycle, and replacement close in one transaction. [[src-tauri/src/live_tracker.rs#LiveTracker#apply_pi_protocol_v2_event]] receives only committed `applied` events. Restart and tracking re-enable load durable open rows as recovering, while same-process reannouncement proves them live. These durable rows remain for remote-host ordering, idempotency, and lineage that the local fold cannot reconstruct.
+[[src-tauri/src/storage.rs#Storage#apply_pi_protocol_v2_envelope]] commits receipt dedupe, process/sequence ordering, durable lifecycle, and replacement close in one transaction. [[src-tauri/src/live_tracker.rs#LiveTracker#apply_pi_protocol_v2_event]] receives only committed `applied` events. Restart and tracking re-enable load durable open rows as recovering; recently closed rows still inside the live idle window seed end tombstones so their fresh transcripts cannot resurrect that occurrence. Same-process reannouncement proves an open row live, and a later `session_start` clears the matching tombstone. These durable rows remain for remote-host ordering, idempotency, lineage, and closure that the local fold cannot reconstruct.
 
 The Sessions projection resolves explicit Pi agents through direct lineage with memoized roots, a visited set, and depth 64. Nested descendants flatten into the visible root; missing, cyclic, over-depth, and cross-host parents remain independent unresolved live rows; completion removes them. Descendants contribute family activity/runtime plus explicit agent count/runtime, while root tokens and turns stay root-only. Storage overfetches observed identities so child suppression cannot shorten a requested page.
 
@@ -318,7 +318,7 @@ When `curl`/`wget` does pass the network-dump check by writing quietly to a file
 
 `commandReadsTaintedPath` gates on reader verbs in the quote-stripped command only (a `cat` that appears solely inside quoted data does not open the gate), then matches each tainted path against both the quote-stripped command and an unquote-preserving normalization (`unquoteCommand`), keeping the previous word-boundary anchoring, so a read written as `cat '/tmp/x.json'` is caught instead of collapsing to `cat ''` and escaping the guard while `echo 'next: cat /tmp/x.json'` stays allowed.
 
-Per-session marker files under `~/.config/quill/context/markers/` keep guidance from repeating, and the scripts prune marker directories older than 30 days at most once per day. The taint state file lives inside each session's marker directory and is removed by the same 30-day cleanup. A standalone Node test suite next to the router (`src-tauri/claude-integration/scripts/context-router.test.cjs`) exercises the deny paths and the taint round-trip; run it with `node context-router.test.cjs` from its directory.
+Per-session marker files under `~/.config/quill/context/markers/` keep guidance from repeating, and the scripts prune marker directories older than 30 days at most once per day. The taint state file lives inside each session's marker directory and is removed by the same 30-day cleanup. A native Node test suite next to the router (`src-tauri/claude-integration/scripts/context-router.test.cjs`) exercises the deny paths and the taint round-trip; run it with `node --test context-router.test.cjs` from its directory.
 
 ### Context Savings Telemetry
 
@@ -476,6 +476,12 @@ Invalid URL, unreachable, unauthorized, unsupported-version, and unexpected-resp
 
 Default-on, user-opt-out crash reporter that ships scrubbed stack traces to Sentry without exposing any session content. Toggled via the "Help improve Quill" row at the bottom of the General settings tab.
 
+### Production-Only Transport
+
+Development builds never open the transport, whatever the preference says.
+
+`tauri dev` runs a debug binary against a Vite dev server, so both halves would otherwise report under the CI-placeholder release `v0.0.0-injected-by-ci` with no uploaded source maps — unsymbolicated noise in the production project that still pages someone. [[src-tauri/src/crash_reporting.rs#set_enabled]] returns early under `debug_assertions` and [[src/lib/crashReporting.ts#setCrashReportingEnabled]] under `import.meta.env.DEV`, each guarding its own surface's single entry point so every caller — boot, the settings toggle, and its rollback — is covered by one check. Events therefore only ever carry the `production` environment.
+
 ### Deny-by-Default Scrubbing
 
 Both surfaces wire a `before_send` hook that strips every dynamic field — messages, exception values, breadcrumbs, request data, user context, extras, and full file paths — before any event leaves the process.
@@ -486,7 +492,7 @@ The threat model assumes the entire payload domain is sensitive: panic messages 
 
 Frontend [[src/lib/crashReporting.ts]] and Rust [[src-tauri/src/crash_reporting.rs]] share the same DSN and scrubbing policy.
 
-The Rust side stores its `ClientInitGuard` in a `OnceLock<Mutex<Option<ClientInitGuard>>>` so [[src-tauri/src/crash_reporting.rs#set_enabled]] can drop the guard on opt-out (which flushes pending events and closes the transport) and re-init on opt-in. The frontend calls `Sentry.close()` and `Sentry.init()` for the same effect; one-shot initialization is gated on the `crash_reporting.enabled` value returned by the very first `get_runtime_settings` IPC call from [[src/main.tsx]], so the SDK never sends data before the user's preference is read.
+Both are inert in development per [[features#Crash Reporting#Production-Only Transport]]. The Rust side stores its `ClientInitGuard` in a `OnceLock<Mutex<Option<ClientInitGuard>>>` so [[src-tauri/src/crash_reporting.rs#set_enabled]] can drop the guard on opt-out (which flushes pending events and closes the transport) and re-init on opt-in. The frontend calls `Sentry.close()` and `Sentry.init()` for the same effect; one-shot initialization is gated on the `crash_reporting.enabled` value returned by the very first `get_runtime_settings` IPC call from [[src/main.tsx]], so the SDK never sends data before the user's preference is read.
 
 ### Toggle Lifecycle
 

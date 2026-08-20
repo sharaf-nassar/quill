@@ -173,6 +173,9 @@ pub async fn start_server(
     if let Ok(sessions) = storage.load_pi_recovering_sessions() {
         live_tracker.rehydrate_pi_sessions(sessions);
     }
+    if let Ok(sessions) = storage.load_pi_recently_closed_sessions() {
+        live_tracker.seed_pi_ended_sessions(sessions);
+    }
     let pi_track_rate_limiter = Arc::new(Mutex::new(VecDeque::new()));
     let pi_track_state = Arc::new(PiTrackRouteState {
         storage,
@@ -2218,28 +2221,22 @@ async fn post_session_messages(
     let extracted: Vec<sessions::ExtractedMessage> = payload
         .messages
         .iter()
-        .map(|message| {
-            let identity = resolve_remote_message_identity(&payload.session_id, message)
-                .expect("validated remote message identity");
-            sessions::ExtractedMessage {
-                uuid: message.uuid.clone(),
-                session_id: payload.session_id.clone(),
-                parent_session_id: None,
-                role: message.role.clone(),
-                content: message.content.clone(),
-                timestamp: message.timestamp.clone(),
-                git_branch: payload.git_branch.clone().unwrap_or_default(),
-                tools_used: message.tools_used.clone(),
-                files_modified: message.files_modified.clone(),
-                code_changes: Vec::new(),
-                commands_run: Vec::new(),
-                tool_details: Vec::new(),
-                tool_actions: Vec::new(),
-                is_sidechain: identity.is_sidechain,
-                agent_id: identity.agent_id.map(str::to_string),
-                parent_uuid: message.parent_uuid.clone(),
-                cwd: payload.cwd.clone(),
-            }
+        .map(|message| sessions::ExtractedMessage {
+            uuid: message.uuid.clone(),
+            session_id: payload.session_id.clone(),
+            parent_session_id: None,
+            role: message.role.clone(),
+            content: message.content.clone(),
+            timestamp: message.timestamp.clone(),
+            git_branch: payload.git_branch.clone().unwrap_or_default(),
+            tools_used: message.tools_used.clone(),
+            files_modified: message.files_modified.clone(),
+            code_changes: Vec::new(),
+            commands_run: Vec::new(),
+            tool_details: Vec::new(),
+            tool_actions: Vec::new(),
+            parent_uuid: message.parent_uuid.clone(),
+            cwd: payload.cwd.clone(),
         })
         .collect();
 

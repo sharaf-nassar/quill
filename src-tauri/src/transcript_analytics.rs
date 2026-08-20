@@ -3611,8 +3611,6 @@ mod tests {
                 lines_removed: None,
                 timestamp: TEST_TIMESTAMP.to_owned(),
             }],
-            is_sidechain: false,
-            agent_id: None,
             parent_uuid: Some("parent-uuid".to_owned()),
             cwd: Some("/work/quill".to_owned()),
         }

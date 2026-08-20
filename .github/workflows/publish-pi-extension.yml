@@ -47,9 +47,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          DRAFT=$(gh release view "v${PI_VERSION}" --json isDraft --jq .isDraft)
-          PRERELEASE=$(gh release view "v${PI_VERSION}" --json isPrerelease --jq .isPrerelease)
-          ASSETS=$(gh release view "v${PI_VERSION}" --json assets --jq '.assets | length')
+          read -r DRAFT PRERELEASE ASSETS < <(
+            gh release view "v${PI_VERSION}" \
+              --json isDraft,isPrerelease,assets \
+              --jq '[.isDraft, .isPrerelease, (.assets | length)] | @tsv'
+          )
           if [ "$DRAFT" != "false" ] || [ "$PRERELEASE" != "false" ] || [ "$ASSETS" -lt 1 ]; then
             echo "::error::Published desktop release v${PI_VERSION} with managed assets is required first"
             exit 1

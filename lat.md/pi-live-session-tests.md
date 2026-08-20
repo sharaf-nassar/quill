@@ -44,7 +44,7 @@ One SQLite transaction returns `applied`, `duplicate`, `stale`, or `unknown_sess
 
 Only committed `applied` events mutate `LiveTracker`; newer process starts supersede older instances, while stale process ends and reconciliation cannot reopen or remove the replacement.
 
-Durable open rows load as recovering after restart or tracking re-enable. Same-process lifecycle evidence can prove them live; a mismatched process is stale and an absent or closed lifecycle returns `unknown_session`.
+Durable open rows load as recovering after restart or tracking re-enable. Recently closed rows load only inside the shared idle window, preserving their host, session id, and close instant for tombstone seeding. Same-process lifecycle evidence can prove an open row live; a mismatched process is stale and an absent or closed lifecycle returns `unknown_session`.
 
 ## Lifecycle Recovery
 
@@ -98,6 +98,12 @@ While any child stays open, the root's activity reads as the overlay instant its
 Nested explicit agents preserve direct lineage internally but flatten into one visible root rail.
 
 Missing parents remain independent unresolved live rows, late proof attaches the same identity, and completion removes the child projection. Family activity and runtime include descendants; agent count/runtime remain explicit; root tokens and turns stay root-only.
+
+## Reporter End Tombstone
+
+A reporter-announced end closes that Pi child occurrence: later sweeps over its still-recent transcript cannot resurrect it through either the warm tail or the cold header path.
+
+A restarted tracker reaches the same answer from durable closed lifecycle rows — seeding drops a child its startup sweep already re-folded while that child claims no process — and only a new `session_start` for the same identity reopens folding, carrying its role with it.
 
 ## Depth 64 Cycle And Cross-Host Rejection
 

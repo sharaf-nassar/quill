@@ -552,23 +552,6 @@ impl<'a> ResponseTimeInput<'a> {
     }
 }
 
-/// One non-meta `user` or `assistant` JSONL line borrowed for the
-/// `session_events` ingest pipeline (feature 008). Mirrors
-/// [`ResponseTimeInput`] lifetime conventions so callers can build both
-/// vectors in the same loop. See
-/// specs/008-runtime-redesign/contracts/session-events.md.
-// @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
-#[derive(Clone, Copy)]
-#[allow(dead_code)] // Constructed only by legacy ingest tests.
-pub struct SessionEventInput<'a> {
-    pub timestamp: &'a str,
-    pub kind: crate::sessions::SessionEventKind,
-    pub is_sidechain: bool,
-    pub agent_id: Option<&'a str>,
-    pub uuid: Option<&'a str>,
-    pub parent_uuid: Option<&'a str>,
-}
-
 /// Persisted transcript analytics source state used to seed later inventory
 /// and root-resolution passes without reparsing unchanged files.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5936,6 +5919,33 @@ impl Storage {
         };
         tx.commit()
             .map_err(|error| format!("Commit Pi recovery load: {error}"))?;
+        Ok(rows)
+    }
+
+    /// Pi sessions whose reporter announced an end recently enough that their
+    /// transcripts are still inside the live idle window. A restarting tracker
+    /// seeds these as ended so a fold cannot resurrect them as open agents.
+    pub(crate) fn load_pi_recently_closed_sessions(
+        &self,
+    ) -> Result<Vec<(String, String, i64)>, String> {
+        let cutoff = (Utc::now() - crate::live_tracker::IDLE_AFTER).timestamp_millis();
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT normalized_hostname, session_id, closed_at_ms
+                 FROM pi_session_lifecycle
+                 WHERE provider='pi'
+                   AND lifecycle_state='closed'
+                   AND closed_at_ms >= ?1",
+            )
+            .map_err(|error| format!("Prepare Pi closed load: {error}"))?;
+        let rows = statement
+            .query_map(params![cutoff], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| format!("Query Pi closed load: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Read Pi closed row: {error}"))?;
         Ok(rows)
     }
 
@@ -21031,104 +21041,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Bulk-insert source-less per-event rows for the active-interval runtime
-    /// pipeline (feature 008). Idempotent — stable native UUID-local event
-    /// keys feed the migration-30 `(provider, session_id, event_key)` live
-    /// partial unique index. See
-    /// specs/008-runtime-redesign/contracts/session-events.md
-    /// (ING-1..ING-5).
-    // @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
-    #[cfg(test)]
-    pub fn ingest_session_events(
-        &self,
-        provider: IntegrationProvider,
-        session_id: &str,
-        events: &[SessionEventInput<'_>],
-    ) -> Result<(), String> {
-        // ING-1: empty input short-circuits without touching the DB.
-        if events.is_empty() {
-            return Ok(());
-        }
-
-        // ING-2: defend against extractor ordering bugs / clock skew.
-        let mut sorted: Vec<SessionEventInput<'_>> = events.to_vec();
-        sorted.sort_by(|a, b| a.timestamp.cmp(b.timestamp));
-
-        // ING-3: single transaction for one (provider, session_id) batch.
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("session_events transaction: {e}"))?;
-        {
-            let mut native_event_ordinals: HashMap<&str, usize> = HashMap::new();
-            let mut fallback_event_ordinals: HashMap<(&str, &str, &str), usize> = HashMap::new();
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO session_events
-                     (provider, source_key, event_key, session_id, chain_id,
-                      parent_chain_id, agent_id, is_sidechain, timestamp, kind,
-                      uuid, parent_uuid)
-                     VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                )
-                .map_err(|e| format!("session_events prepare: {e}"))?;
-
-            for ev in &sorted {
-                // ING-5: skip rows whose timestamp does not parse as RFC3339.
-                if DateTime::parse_from_rfc3339(ev.timestamp).is_err() {
-                    log::warn!(
-                        "session_events: dropping row with unparseable timestamp {}",
-                        ev.timestamp
-                    );
-                    continue;
-                }
-
-                let chain_id = ev
-                    .agent_id
-                    .filter(|agent_id| ev.is_sidechain && !agent_id.is_empty())
-                    .unwrap_or(session_id);
-                let parent_chain_id = (chain_id != session_id).then_some(session_id);
-                let event_key = match ev.uuid.filter(|uuid| !uuid.is_empty()) {
-                    Some(uuid) => {
-                        let event_ordinal = native_event_ordinals.entry(uuid).or_default();
-                        let event_key = format!("native:{uuid}:{event_ordinal}");
-                        *event_ordinal += 1;
-                        event_key
-                    }
-                    None => {
-                        let fallback_identity = (chain_id, ev.timestamp, ev.kind.as_str());
-                        let event_ordinal = fallback_event_ordinals
-                            .entry(fallback_identity)
-                            .or_default();
-                        let event_key = format!(
-                            "legacy:{chain_id}:{}:{}:{event_ordinal}",
-                            ev.timestamp,
-                            ev.kind.as_str()
-                        );
-                        *event_ordinal += 1;
-                        event_key
-                    }
-                };
-                stmt.execute(params![
-                    provider.as_str(),
-                    event_key,
-                    session_id,
-                    chain_id,
-                    parent_chain_id,
-                    ev.agent_id,
-                    ev.is_sidechain as i64,
-                    ev.timestamp,
-                    ev.kind.as_str(),
-                    ev.uuid,
-                    ev.parent_uuid,
-                ])
-                .map_err(|e| format!("session_events insert: {e}"))?;
-            }
-        }
-        tx.commit()
-            .map_err(|e| format!("session_events commit: {e}"))?;
-        Ok(())
-    }
-
     /// Compute LLM runtime stats. `scope` controls whether sub-agent
     /// (`is_sidechain = 1`) rows are folded in:
     /// * `None` or `Some("all")`: include parent + sub-agent rows (default,
@@ -21815,7 +21727,37 @@ mod tests {
                 Some("reviewer".to_owned())
             )
         );
+        conn.execute(
+            "UPDATE pi_session_lifecycle
+             SET lifecycle_state='closed', closed_at_ms=?1
+             WHERE provider='pi' AND normalized_hostname='host'
+               AND session_id='child'",
+            params![now - crate::live_tracker::IDLE_AFTER.num_milliseconds() - 1],
+        )
+        .unwrap();
         drop(conn);
+        assert!(
+            storage
+                .load_pi_recently_closed_sessions()
+                .unwrap()
+                .is_empty()
+        );
+
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE pi_session_lifecycle SET closed_at_ms=?1
+                 WHERE provider='pi' AND normalized_hostname='host'
+                   AND session_id='child'",
+                params![now],
+            )
+            .unwrap();
+        assert_eq!(
+            storage.load_pi_recently_closed_sessions().unwrap(),
+            vec![("host".to_owned(), "child".to_owned(), now)]
+        );
         clear_env();
     }
 
@@ -26387,146 +26329,6 @@ mod tests {
         clear_env();
     }
 
-    /// Feature 008 / US2: two sub-agent chains sharing the same parent
-    /// session_id but carrying distinct native chain ids must produce two
-    /// independent turns rather than one merged turn. The legacy ingest
-    /// helper derives those chain ids from each sub-agent's agent id.
-    #[test]
-    #[serial]
-    fn session_events_sibling_subagents_form_independent_turns() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        // Fixture times are relative to now: the stats window is anchored
-        // to Utc::now(), so absolute dates age out of "30d" and rot the test.
-        let base = Utc::now() - chrono::Duration::hours(1);
-        let at = |secs: i64| (base + chrono::Duration::seconds(secs)).to_rfc3339();
-        let (a_start, a_end) = (at(0), at(30));
-        let (b_start, b_end) = (at(5), at(40));
-        let events_a = vec![
-            crate::storage::SessionEventInput {
-                timestamp: &a_start,
-                kind: crate::sessions::SessionEventKind::UserText,
-                is_sidechain: true,
-                agent_id: Some("agent-a"),
-                uuid: None,
-                parent_uuid: None,
-            },
-            crate::storage::SessionEventInput {
-                timestamp: &a_end,
-                kind: crate::sessions::SessionEventKind::AsstText,
-                is_sidechain: true,
-                agent_id: Some("agent-a"),
-                uuid: None,
-                parent_uuid: None,
-            },
-        ];
-        let events_b = vec![
-            crate::storage::SessionEventInput {
-                timestamp: &b_start,
-                kind: crate::sessions::SessionEventKind::UserText,
-                is_sidechain: true,
-                agent_id: Some("agent-b"),
-                uuid: None,
-                parent_uuid: None,
-            },
-            crate::storage::SessionEventInput {
-                timestamp: &b_end,
-                kind: crate::sessions::SessionEventKind::AsstText,
-                is_sidechain: true,
-                agent_id: Some("agent-b"),
-                uuid: None,
-                parent_uuid: None,
-            },
-        ];
-        storage
-            .ingest_session_events(IntegrationProvider::Claude, "sess-1", &events_a)
-            .expect("ingest a");
-        storage
-            .ingest_session_events(IntegrationProvider::Claude, "sess-1", &events_b)
-            .expect("ingest b");
-        let stats = storage.get_llm_runtime_stats("30d", None).expect("stats");
-        assert_eq!(
-            stats.turn_count, 2,
-            "two sibling sub-agent chains should produce two turns, got {}",
-            stats.turn_count
-        );
-        clear_env();
-    }
-
-    /// Feature 008 / US2: `scope = parent_only` must select
-    /// `WHERE is_sidechain = 0` so the total excludes sub-agent rows.
-    /// Verifies the STAT-2 bracket clause.
-    #[test]
-    #[serial]
-    fn session_events_parent_only_excludes_sidechain() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        // Relative fixture times, same rationale as the sibling test above.
-        let base = Utc::now() - chrono::Duration::hours(1);
-        let at = |secs: i64| (base + chrono::Duration::seconds(secs)).to_rfc3339();
-        let (p_start, p_end) = (at(0), at(10));
-        let (s_start, s_end) = (at(20), at(50));
-        let mut all_events = vec![
-            crate::storage::SessionEventInput {
-                timestamp: &p_start,
-                kind: crate::sessions::SessionEventKind::UserText,
-                is_sidechain: false,
-                agent_id: None,
-                uuid: None,
-                parent_uuid: None,
-            },
-            crate::storage::SessionEventInput {
-                timestamp: &p_end,
-                kind: crate::sessions::SessionEventKind::AsstText,
-                is_sidechain: false,
-                agent_id: None,
-                uuid: None,
-                parent_uuid: None,
-            },
-        ];
-        let subagent = vec![
-            crate::storage::SessionEventInput {
-                timestamp: &s_start,
-                kind: crate::sessions::SessionEventKind::UserText,
-                is_sidechain: true,
-                agent_id: Some("agent-x"),
-                uuid: None,
-                parent_uuid: None,
-            },
-            crate::storage::SessionEventInput {
-                timestamp: &s_end,
-                kind: crate::sessions::SessionEventKind::AsstText,
-                is_sidechain: true,
-                agent_id: Some("agent-x"),
-                uuid: None,
-                parent_uuid: None,
-            },
-        ];
-        all_events.extend(subagent);
-        storage
-            .ingest_session_events(IntegrationProvider::Claude, "sess-1", &all_events)
-            .expect("ingest");
-        let all = storage
-            .get_llm_runtime_stats("30d", None)
-            .expect("stats all");
-        let parent = storage
-            .get_llm_runtime_stats("30d", Some("parent_only"))
-            .expect("stats parent");
-        assert!(
-            parent.total_runtime_secs < all.total_runtime_secs,
-            "parent_only ({} s) must be strictly less than all ({} s)",
-            parent.total_runtime_secs,
-            all.total_runtime_secs
-        );
-        assert!(
-            parent.total_runtime_secs > 0.0,
-            "parent_only must still register parent activity"
-        );
-        clear_env();
-    }
-
     /// Seed one active Claude model source through the real parse + replace
     /// write path so query tests exercise persisted evidence, not synthetic
     /// rows. The transcript is written to a real file only to derive a fast
@@ -29767,30 +29569,9 @@ mod tests {
             )
             .expect("store live analytics");
 
-        let ingest_session = "ingest-session";
-        let ingest_stamps = ["2026-02-01T00:00:00.000Z", "2026-06-01T00:00:00.000Z"];
-        let ingested: Vec<SessionEventInput<'_>> = ingest_stamps
-            .iter()
-            .enumerate()
-            .map(|(index, timestamp)| SessionEventInput {
-                timestamp,
-                kind: crate::sessions::SessionEventKind::UserText,
-                is_sidechain: false,
-                agent_id: None,
-                uuid: Some(["ingest-uuid-a", "ingest-uuid-b"][index]),
-                parent_uuid: None,
-            })
-            .collect();
-        storage
-            .ingest_session_events(IntegrationProvider::Claude, ingest_session, &ingested)
-            .expect("ingest live session events");
-
-        let mut expected = live_stamps.to_vec();
-        expected.extend_from_slice(&ingest_stamps);
-        expected.sort_unstable();
         assert_eq!(
             live_timestamps(&storage, "session_events"),
-            expected,
+            live_stamps,
             "every source-less event must land regardless of the watermark"
         );
 

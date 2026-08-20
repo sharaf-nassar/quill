@@ -26,6 +26,12 @@ fn slot() -> &'static Mutex<Option<ClientInitGuard>> {
 }
 
 pub fn set_enabled(enabled: bool) {
+    // A debug build never opens a transport. `tauri dev` events carry the
+    // CI-placeholder release with no matching source maps, so they reach the
+    // production project as unactionable noise that still pages someone.
+    if cfg!(debug_assertions) {
+        return;
+    }
     if enabled {
         enable();
     } else {
@@ -38,16 +44,11 @@ fn enable() {
     if g.is_some() {
         return;
     }
-    let environment = if cfg!(debug_assertions) {
-        "development"
-    } else {
-        "production"
-    };
     let guard = sentry::init((
         DSN,
         sentry::ClientOptions {
             release: Some(RELEASE.into()),
-            environment: Some(environment.into()),
+            environment: Some("production".into()),
             attach_stacktrace: true,
             send_default_pii: false,
             auto_session_tracking: false,
@@ -125,6 +126,15 @@ mod tests {
     #[test]
     fn release_matches_tagged_cargo_version() {
         assert_eq!(RELEASE, format!("v{}", env!("CARGO_PKG_VERSION")));
+    }
+
+    // @lat: [[crash-reporting-tests#Crash Reporting Test Specs#Development builds never transmit]]
+    #[test]
+    fn set_enabled_opens_no_transport_in_a_debug_build() {
+        // A test binary is a debug build, which is exactly the profile the
+        // guard refuses to report from.
+        set_enabled(true);
+        assert!(slot().lock().unwrap().is_none());
     }
 
     // @lat: [[crash-reporting-tests#Crash Reporting Test Specs#Rust deny-by-default payload boundary]]

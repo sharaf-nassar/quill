@@ -86,7 +86,6 @@ export type ManageSection =
 interface SectionDef {
   id: ManageSection;
   label: string;
-  desc: string;
   Icon: () => React.ReactElement;
 }
 
@@ -95,19 +94,16 @@ const SECTIONS: SectionDef[] = [
   {
     id: "sessions",
     label: "Sessions",
-    desc: "Full-text search across every past Claude Code and Codex session.",
     Icon: SessionsIcon,
   },
   {
     id: "learning",
     label: "Learning",
-    desc: "Learned rules, memory optimization, and analysis run history.",
     Icon: LearningIcon,
   },
   {
     id: "settings",
     label: "Settings",
-    desc: "Integrations, context, learning, and performance configuration.",
     Icon: SettingsIcon,
   },
 ];
@@ -375,7 +371,11 @@ function ManageWindowView() {
             ) : active === "learning" ? (
               <LearningSection />
             ) : (
-              <SettingsSection tab={settingsTab} onTabChange={setSettingsTab} />
+              <SettingsSection
+                tab={settingsTab}
+                onTabChange={setSettingsTab}
+                integrations={integrations}
+              />
             )}
           </Suspense>
         </main>

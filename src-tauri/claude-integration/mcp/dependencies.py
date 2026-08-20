@@ -2,22 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 
 import httpx
-
-APP_ID = "com.quilltoolkit.app"
-
-
-def get_app_data_dir() -> Path:
-    """Platform-aware Quill app data directory.
-    Mirrors the Rust backend's use of dirs::data_local_dir()."""
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / APP_ID
-    return Path.home() / ".local" / "share" / APP_ID
 
 
 @lru_cache(maxsize=1)

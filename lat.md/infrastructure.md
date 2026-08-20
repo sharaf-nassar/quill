@@ -25,7 +25,7 @@ Production permits outbound frontend connections only to Tauri IPC and the exact
 
 ### Backend Build
 
-Rust edition 2024 uses the pinned `rust-toolchain.toml` compiler version. Crate types: `lib`, `cdylib`, `staticlib`. `build.rs` calls `tauri_build::build()`.
+Rust edition 2024 uses the pinned `rust-toolchain.toml` compiler version. The library uses Cargo's default Rust library output for the desktop binary. `build.rs` calls `tauri_build::build()`.
 
 The `quill` app binary is Cargo's default run target; maintenance spikes under
 `src-tauri/src/bin/` remain explicit `cargo run --bin <name>` targets.
@@ -446,7 +446,7 @@ TypeScript 5.9, Vite 6.0, ESLint 9.39, @vitejs/plugin-react.
 
 Rust crate dependencies grouped by role. Full list in `src-tauri/Cargo.toml`.
 
-**Core runtime**: Tauri 2, Axum 0.8, Tokio 1, rusqlite 0.31 (bundled), Tantivy 0.25, reqwest 0.13, rig-core 0.32.
+**Core runtime**: Tauri 2, Axum 0.8, Tokio 1, rusqlite 0.31 (bundled), Tantivy 0.25, and reqwest 0.13.
 
 **Tauri plugins**: tauri-plugin-dialog 2, tauri-plugin-single-instance 2, tauri-plugin-window-state 2, tauri-plugin-updater 2, tauri-plugin-log 2.
 

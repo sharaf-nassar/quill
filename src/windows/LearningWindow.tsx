@@ -136,7 +136,6 @@ function LearningPanel() {
   const [activeTab, setActiveTab] = useState<"rules" | "memories">("rules");
   const [showRuns, setShowRuns] = useState(false);
   const handleCloseRuns = useCallback(() => setShowRuns(false), []);
-  const contentRef = useRef<HTMLDivElement>(null);
 
   // Per-provider contribution to shared-scope rules (feature 005 M-6 /
   // FR-028), derived from the already-fetched `rules` — no extra fetch. A
@@ -236,7 +235,7 @@ function LearningPanel() {
         </div>
       </div>
       <div className="learning-main">
-      <div className="learning-content" ref={contentRef}>
+      <div className="learning-content">
         {activeTab === "rules" ? (
           <>
             <StatusStrip

@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 "use strict";
 
-// Standalone tests for context-router.cjs. No test runner required:
-//   node context-router.test.cjs
-// Exits 0 on success, 1 with diagnostics on failure.
+// Native Node tests for context-router.cjs:
+//   node --test context-router.test.cjs
 
+const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { after, test } = require("node:test");
 
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "quill-router-test-"));
 process.env.HOME = tmpHome;
@@ -16,25 +17,11 @@ delete process.env.QUILL_PROVIDER;
 
 const router = require("./context-router.cjs");
 
-let passed = 0;
-let failed = 0;
-const failures = [];
+const it = test;
 
-function it(name, fn) {
-  try {
-    fn();
-    passed += 1;
-    process.stdout.write(`  ok  ${name}\n`);
-  } catch (err) {
-    failed += 1;
-    failures.push({ name, err });
-    process.stdout.write(`  FAIL ${name}\n    ${err.message}\n`);
-  }
-}
-
-function assert(cond, msg) {
-  if (!cond) throw new Error(msg || "assertion failed");
-}
+after(() => {
+  fs.rmSync(tmpHome, { recursive: true, force: true });
+});
 
 function assertDeny(result, expectedSubstring) {
   assert(result, "expected deny response, got null");
@@ -388,8 +375,3 @@ it("commandReadsTaintedPath matches whole-token paths only", () => {
   assert(router.commandReadsTaintedPath("rm /tmp/foo.json", set) === null, "rm is not a reader");
   assert(router.commandReadsTaintedPath("cat /tmp/other.json", set) === null, "different path should not match");
 });
-
-// -- Summary ---------------------------------------------------------------
-process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
-try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch (_) {}
-process.exit(failed === 0 ? 0 : 1);
