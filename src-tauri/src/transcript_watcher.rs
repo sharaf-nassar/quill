@@ -585,8 +585,9 @@ mod tests {
             std::env::set_var("QUILL_CODEX_SESSIONS_DIR", temp.path().join("codex"));
             std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
         }
-        let index = crate::sessions::SessionIndex::open_or_create(&temp.path().join("index"))
-            .expect("open watcher search index");
+        let index =
+            crate::sessions::SessionIndex::open_or_create_for_tests(&temp.path().join("index"))
+                .expect("open watcher search index");
 
         assert_eq!(sync_search_index_for_test(&index, None), Ok(3));
         index.reader.reload().expect("reload watcher search index");

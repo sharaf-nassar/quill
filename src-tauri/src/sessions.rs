@@ -1134,9 +1134,26 @@ pub struct SessionIndex {
 
 impl SessionIndex {
     const SCHEMA_VERSION: u32 = 7;
+    const PRODUCTION_WRITER_HEAP_BYTES: usize = 50_000_000;
+    #[cfg(test)]
+    const TEST_WRITER_HEAP_BYTES: usize = 15_000_000;
 
     /// Open an existing index or create a new one at the given directory.
     pub fn open_or_create(index_dir: &Path) -> Result<Self, String> {
+        Self::open_or_create_with_writer_heap(index_dir, Self::PRODUCTION_WRITER_HEAP_BYTES)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_or_create_for_tests(index_dir: &Path) -> Result<Self, String> {
+        // Tantivy selects one worker at its 15 MB minimum, so parallel index
+        // tests do not multiply production's three-worker writer footprint.
+        Self::open_or_create_with_writer_heap(index_dir, Self::TEST_WRITER_HEAP_BYTES)
+    }
+
+    fn open_or_create_with_writer_heap(
+        index_dir: &Path,
+        writer_heap_bytes: usize,
+    ) -> Result<Self, String> {
         std::fs::create_dir_all(index_dir)
             .map_err(|e| format!("Failed to create index dir: {e}"))?;
 
@@ -1167,7 +1184,7 @@ impl SessionIndex {
             .map_err(|e| format!("Failed to open or create index: {e}"))?;
 
         let writer: IndexWriter = index
-            .writer(50_000_000)
+            .writer(writer_heap_bytes)
             .map_err(|e| format!("Failed to create IndexWriter: {e}"))?;
 
         let reader = index
@@ -5374,7 +5391,7 @@ mod tests {
             1
         );
         let index_dir = root.path().join("index");
-        let index = SessionIndex::open_or_create(&index_dir).expect("open index");
+        let index = SessionIndex::open_or_create_for_tests(&index_dir).expect("open index");
         assert_eq!(
             index
                 .startup_scan_without_emit(None)
@@ -5871,11 +5888,18 @@ mod tests {
         );
     }
 
+    // @lat: [[session-search-tests#Session Search Test Specs#Index Test Resource Budget]]
+    #[test]
+    fn production_writer_heap_budget_remains_unchanged() {
+        assert_eq!(SessionIndex::PRODUCTION_WRITER_HEAP_BYTES, 50_000_000);
+        assert_eq!(SessionIndex::TEST_WRITER_HEAP_BYTES, 15_000_000);
+    }
+
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Provider Safe Search]]
     #[test]
     fn pi_search_hits_and_facets_keep_provider_identity_and_metadata() {
         let temp = TempDir::new().expect("tempdir");
-        let index = SessionIndex::open_or_create(temp.path()).expect("open index");
+        let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("open index");
         let messages = extract_messages_from_jsonl_contents(
             IntegrationProvider::Pi,
             Path::new("session.jsonl"),
@@ -5929,7 +5953,7 @@ mod tests {
     #[test]
     fn search_excludes_non_conversation_roles() {
         let temp = TempDir::new().expect("tempdir");
-        let index = SessionIndex::open_or_create(temp.path()).expect("open index");
+        let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("open index");
         let make_message = |uuid: &str, role: &str, content: &str| ExtractedMessage {
             uuid: uuid.to_string(),
             session_id: "roles".to_string(),
@@ -6016,7 +6040,7 @@ mod tests {
     fn opening_index_removes_only_legacy_pi_non_conversation_documents() {
         let temp = TempDir::new().expect("tempdir");
         {
-            let index = SessionIndex::open_or_create(temp.path()).expect("open index");
+            let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("open index");
             let make_message = |uuid: &str, role: &str| ExtractedMessage {
                 uuid: uuid.to_string(),
                 session_id: uuid.to_string(),
@@ -6068,7 +6092,7 @@ mod tests {
         )
         .expect("reset cleanup state");
 
-        let index = SessionIndex::open_or_create(temp.path()).expect("reopen index");
+        let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("reopen index");
         let facets = index.get_facets().expect("facets");
         let count = |provider: &str| {
             facets
@@ -6122,7 +6146,7 @@ mod tests {
     #[test]
     fn absolute_project_filter_distinguishes_same_named_directories() {
         let temp = TempDir::new().expect("tempdir");
-        let index = SessionIndex::open_or_create(temp.path()).expect("open index");
+        let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("open index");
 
         for (session_id, message_id, cwd) in [
             ("session-a", "message-a", "/work/team-a/quill"),
@@ -6174,7 +6198,7 @@ mod tests {
         let obsolete = temp.path().join("obsolete-index-file");
         fs::write(&obsolete, "old schema").expect("write old index marker");
 
-        let _index = SessionIndex::open_or_create(temp.path()).expect("open index");
+        let _index = SessionIndex::open_or_create_for_tests(temp.path()).expect("open index");
 
         assert_eq!(
             fs::read_to_string(temp.path().join("schema_version.txt")).expect("read version"),
@@ -6187,7 +6211,7 @@ mod tests {
     #[test]
     fn pi_cleanup_does_not_delete_same_id_from_other_providers() {
         let temp = TempDir::new().expect("tempdir");
-        let index = SessionIndex::open_or_create(temp.path()).expect("open index");
+        let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("open index");
         let make_message = |uuid: &str, content: &str| ExtractedMessage {
             uuid: uuid.to_string(),
             session_id: "shared".to_string(),
@@ -6332,7 +6356,7 @@ mod tests {
             .expect("seed subagent reingest flag");
 
         let index_dir = root.path().join("index");
-        let index = SessionIndex::open_or_create(&index_dir).expect("open index");
+        let index = SessionIndex::open_or_create_for_tests(&index_dir).expect("open index");
 
         index
             .startup_scan_without_emit(Some(&storage))
@@ -6427,7 +6451,7 @@ mod tests {
             .expect("seed Codex reingest flag");
 
         let index_dir = root.path().join("index");
-        let index = SessionIndex::open_or_create(&index_dir).expect("open index");
+        let index = SessionIndex::open_or_create_for_tests(&index_dir).expect("open index");
         index
             .startup_scan_without_emit(Some(&storage))
             .expect("sweep with an unreadable transcript");

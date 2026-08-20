@@ -2862,8 +2862,8 @@ mod observed_subagent_tests {
             ),
         )
         .expect("write Pi transcript");
-        let index =
-            sessions::SessionIndex::open_or_create(&temp.path().join("index")).expect("open index");
+        let index = sessions::SessionIndex::open_or_create_for_tests(&temp.path().join("index"))
+            .expect("open index");
         let payload = SessionNotifyPayload {
             provider: IntegrationProvider::Pi,
             session_id: "pushed-id".into(),
@@ -2922,8 +2922,8 @@ mod observed_subagent_tests {
             ),
         )
         .expect("write Pi transcript");
-        let index =
-            sessions::SessionIndex::open_or_create(&temp.path().join("index")).expect("open index");
+        let index = sessions::SessionIndex::open_or_create_for_tests(&temp.path().join("index"))
+            .expect("open index");
         let storage = Storage::init_at(temp.path().join("usage.db"), false).unwrap();
         let payload = SessionNotifyPayload {
             provider: IntegrationProvider::Pi,
