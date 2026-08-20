@@ -23990,25 +23990,21 @@ mod tests {
         const SESSIONS: i64 = 2_000;
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
+        let seed_now = Utc::now();
         {
             let conn = storage.conn.lock().unwrap();
-            conn.execute_batch(&format!(
-                "WITH RECURSIVE rows(value) AS (
-                     VALUES(1)
-                     UNION ALL
-                     SELECT value + 1 FROM rows WHERE value < {SESSIONS}
-                 )
-                 INSERT INTO token_snapshots (
-                     provider, session_id, hostname, timestamp, input_tokens,
-                     output_tokens, cache_creation_input_tokens,
-                     cache_read_input_tokens, cwd, is_sidechain
-                 )
-                 SELECT 'claude', printf('sess-%05d', value), 'host-a',
-                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('-%d seconds', value)),
-                        10, 0, 0, 0, NULL, 0
-                 FROM rows;"
-            ))
-            .expect("seed populated session-breakdown corpus (tokens only)");
+            conn.execute_batch("BEGIN;")
+                .expect("begin token snapshot seed transaction");
+        }
+        for value in 1..=SESSIONS {
+            let session_id = format!("sess-{value:05}");
+            let timestamp = (seed_now - TimeDelta::seconds(value)).to_rfc3339();
+            seed_token_snapshot(&storage, "claude", &session_id, "host-a", &timestamp);
+        }
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch("COMMIT;")
+                .expect("commit token snapshot seed transaction");
         }
 
         // Before: no session has recorded model usage yet, so this is the
@@ -24023,46 +24019,23 @@ mod tests {
 
         {
             let conn = storage.conn.lock().unwrap();
-            conn.execute_batch(&format!(
-                "WITH RECURSIVE rows(value) AS (
-                     VALUES(1)
-                     UNION ALL
-                     SELECT value + 1 FROM rows WHERE value < {SESSIONS}
-                 )
-                 INSERT INTO model_observation_sources (
-                     provider, source_key, source_root_key, source_path,
-                     source_session_id, analytics_session_id, chain_id,
-                     is_sidechain, seen_generation, processing_status,
-                     observation_count
-                 )
-                 SELECT 'claude', printf('src-%05d', value), printf('src-%05d', value),
-                        printf('src-%05d', value), printf('sess-%05d', value),
-                        printf('sess-%05d', value), printf('sess-%05d', value),
-                        0, 1, 'ok', 1
-                 FROM rows;
-
-                 WITH RECURSIVE rows(value) AS (
-                     VALUES(1)
-                     UNION ALL
-                     SELECT value + 1 FROM rows WHERE value < {SESSIONS}
-                 )
-                 INSERT INTO model_usage_observations (
-                     provider, source_key, source_record_key, source_ordinal,
-                     observation_kind, source_session_id, analytics_session_id,
-                     chain_id, raw_model_id, derived_model_id, is_sidechain,
-                     observed_at_ms, input_tokens, output_tokens,
-                     cache_creation_tokens, cache_read_tokens,
-                     model_evidence, token_evidence
-                 )
-                 SELECT 'claude', printf('src-%05d', value), printf('src-%05d', value),
-                        0, 'turn', printf('sess-%05d', value), printf('sess-%05d', value),
-                        printf('sess-%05d', value),
-                        CASE WHEN value % 2 = 0 THEN 'claude-opus-4-5' ELSE 'claude-haiku-4-5' END,
-                        CASE WHEN value % 2 = 0 THEN 'claude-opus-4-5' ELSE 'claude-haiku-4-5' END,
-                        0, value, 500, 0, 0, 0, 'explicit', 'direct'
-                 FROM rows;"
-            ))
-            .expect("seed populated session-breakdown corpus (model usage)");
+            conn.execute_batch("BEGIN;")
+                .expect("begin model observation seed transaction");
+        }
+        for value in 1..=SESSIONS {
+            let session_id = format!("sess-{value:05}");
+            let source_key = format!("src-{value:05}");
+            let model_id = if value % 2 == 0 {
+                "claude-opus-4-5"
+            } else {
+                "claude-haiku-4-5"
+            };
+            seed_model_observation(&storage, "claude", &session_id, &source_key, model_id, 500);
+        }
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch("COMMIT;")
+                .expect("commit model observation seed transaction");
         }
 
         let (sql, params_vec) =

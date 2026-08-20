@@ -498,22 +498,20 @@ mod tests {
         ]
     }
 
-    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Recovery]]
-    #[test]
-    #[serial]
-    fn configured_roots_include_persisted_pi() {
-        let prior = std::env::var("QUILL_DEMO_MODE").ok();
-        unsafe { std::env::set_var("QUILL_DEMO_MODE", "1") };
-        assert!(
-            transcript_roots()
-                .iter()
-                .any(|root| root.provider == IntegrationProvider::Pi)
-        );
-        unsafe {
-            if let Some(prior) = prior {
-                std::env::set_var("QUILL_DEMO_MODE", prior);
-            } else {
-                std::env::remove_var("QUILL_DEMO_MODE");
+    /// Save-and-restore guard for `QUILL_*` env vars mutated by a `#[serial]`
+    /// test; each named key is snapshotted on construction and set back to
+    /// its prior value (or removed, if unset) on drop.
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
             }
         }
     }
@@ -521,19 +519,23 @@ mod tests {
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Recovery]]
     #[test]
     #[serial]
-    fn watcher_search_sync_refreshes_all_retained_providers() {
-        struct DemoEnv;
-        impl Drop for DemoEnv {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var("QUILL_DEMO_MODE");
-                    std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
-                    std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
-                    std::env::remove_var("QUILL_PI_SESSIONS_DIR");
-                }
-            }
-        }
+    fn configured_roots_include_persisted_pi() {
+        let _env = EnvGuard(vec![(
+            "QUILL_DEMO_MODE",
+            std::env::var_os("QUILL_DEMO_MODE"),
+        )]);
+        unsafe { std::env::set_var("QUILL_DEMO_MODE", "1") };
+        assert!(
+            transcript_roots()
+                .iter()
+                .any(|root| root.provider == IntegrationProvider::Pi)
+        );
+    }
 
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Recovery]]
+    #[test]
+    #[serial]
+    fn watcher_search_sync_refreshes_all_retained_providers() {
         let temp = tempfile::tempdir().expect("create watcher search fixture");
         let claude = temp.path().join("claude").join("-work-quill");
         let codex = temp.path().join("codex").join("2026/08/14");
@@ -566,13 +568,23 @@ mod tests {
             ),
         )
         .expect("write Pi fixture");
+        let keys = [
+            "QUILL_DEMO_MODE",
+            "QUILL_CLAUDE_PROJECTS_DIR",
+            "QUILL_CODEX_SESSIONS_DIR",
+            "QUILL_PI_SESSIONS_DIR",
+        ];
+        let _env = EnvGuard(
+            keys.into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
         unsafe {
             std::env::set_var("QUILL_DEMO_MODE", "1");
             std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", temp.path().join("claude"));
             std::env::set_var("QUILL_CODEX_SESSIONS_DIR", temp.path().join("codex"));
             std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
         }
-        let _env = DemoEnv;
         let index = crate::sessions::SessionIndex::open_or_create(&temp.path().join("index"))
             .expect("open watcher search index");
 
@@ -815,21 +827,6 @@ mod tests {
     #[test]
     #[serial]
     fn blocking_retained_scan_does_not_starve_live_folds_or_sweeps() {
-        struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                for (key, value) in self.0.drain(..) {
-                    unsafe {
-                        if let Some(value) = value {
-                            std::env::set_var(key, value);
-                        } else {
-                            std::env::remove_var(key);
-                        }
-                    }
-                }
-            }
-        }
-
         let temp = tempfile::tempdir().expect("create watcher worker fixture");
         let claude = temp.path().join("claude");
         let codex = temp.path().join("codex");

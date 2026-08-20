@@ -52,6 +52,28 @@ const hit = {
 	score: 1,
 };
 
+const baseRow = {
+	provider: "pi",
+	session_id: "parent-session",
+	parent_session_id: null,
+	hostname: "host",
+	total_tokens: 10,
+	turn_count: 1,
+	first_seen: "2026-08-14T08:00:00Z",
+	last_active: "2099-01-01T00:00:00Z",
+	ended_at: null,
+	project: "/work/quill",
+	model_id: null,
+	active_runtime_secs: null,
+	agent_count: null,
+	agent_runtime_secs: null,
+	current_turn_runtime_secs: null,
+	current_turn_runtime_active: false,
+	runtime_as_of_ms: null,
+	active_runtime_rate: 0,
+	observed_only: false,
+};
+
 // @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Search Parent Navigation]]
 test("Pi search rows and details render accessible parent navigation", () => {
 	const markup = renderToStaticMarkup(createElement(ParentSessionLink, {
@@ -91,30 +113,12 @@ test("session search reports each input change immediately", (t) => {
 // @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Live Linked Session Copy]]
 test("Pi live lineage uses linked-session copy and never agent-count copy", () => {
 	const row = sessionRow({
-		provider: "pi",
-		session_id: "parent-session",
-		parent_session_id: null,
-		hostname: "host",
-		total_tokens: 10,
-		turn_count: 1,
-		first_seen: "2026-08-14T08:00:00Z",
-		last_active: "2099-01-01T00:00:00Z",
-		ended_at: null,
-		project: "/work/quill",
-		model_id: null,
-		active_runtime_secs: null,
-		agent_count: null,
-		agent_runtime_secs: null,
-		current_turn_runtime_secs: null,
-		current_turn_runtime_active: false,
-		runtime_as_of_ms: null,
-		active_runtime_rate: 0,
+		...baseRow,
 		observed_agents: [],
 		live_linked_sessions: [
 			{ session_id: "child-a", model_id: "claude-sonnet-4-5" },
 			{ session_id: "child-b", model_id: "gpt-5.6" },
 		],
-		observed_only: false,
 	}, Date.now());
 	const identity = renderToStaticMarkup(createElement(SessionIdentity, { row }));
 	const rail = renderToStaticMarkup(createElement(LiveLinkedSessionRail, {
@@ -131,24 +135,7 @@ test("Pi live lineage uses linked-session copy and never agent-count copy", () =
 // @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Linked Session Model Label]]
 test("Pi linked rail shortens model ids the same way the agent rail does", () => {
 	const row = sessionRow({
-		provider: "pi",
-		session_id: "parent-session",
-		parent_session_id: null,
-		hostname: "host",
-		total_tokens: 10,
-		turn_count: 1,
-		first_seen: "2026-08-14T08:00:00Z",
-		last_active: "2099-01-01T00:00:00Z",
-		ended_at: null,
-		project: "/work/quill",
-		model_id: null,
-		active_runtime_secs: null,
-		agent_count: null,
-		agent_runtime_secs: null,
-		current_turn_runtime_secs: null,
-		current_turn_runtime_active: false,
-		runtime_as_of_ms: null,
-		active_runtime_rate: 0,
+		...baseRow,
 		observed_agents: [
 			{
 				agent_id: "agent-1",
@@ -163,7 +150,6 @@ test("Pi linked rail shortens model ids the same way the agent rail does", () =>
 			{ session_id: "child-codex", model_id: "cliproxyapi/gpt-5.6-sol" },
 			{ session_id: "child-unmodeled", model_id: null },
 		],
-		observed_only: false,
 	}, Date.now());
 
 	const agentRail = renderToStaticMarkup(createElement(ActiveAgentRail, { agents: row.agents }));
@@ -197,28 +183,11 @@ test("Pi live lineage uses singular copy for one child", () => {
 // @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Unresolved Lineage Reason]]
 test("Pi unresolved lineage is visibly unlinked and distinct from root", () => {
 	const row = sessionRow({
-		provider: "pi",
+		...baseRow,
 		session_id: "child-session",
-		parent_session_id: null,
 		pi_lineage: { kind: "unresolved", reason: "parent_header_unavailable" },
-		hostname: "host",
-		total_tokens: 10,
-		turn_count: 1,
-		first_seen: "2026-08-14T08:00:00Z",
-		last_active: "2099-01-01T00:00:00Z",
-		ended_at: null,
-		project: "/work/quill",
-		model_id: null,
-		active_runtime_secs: null,
-		agent_count: null,
-		agent_runtime_secs: null,
-		current_turn_runtime_secs: null,
-		current_turn_runtime_active: false,
-		runtime_as_of_ms: null,
-		active_runtime_rate: 0,
 		observed_agents: [],
 		live_linked_sessions: [],
-		observed_only: false,
 	}, Date.now());
 	const markup = renderToStaticMarkup(createElement(SessionIdentity, { row }));
 	assert.match(markup, /Unlinked Pi session: parent header unavailable/);
