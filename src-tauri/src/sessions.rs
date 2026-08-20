@@ -1815,6 +1815,14 @@ impl SessionIndex {
             }
 
             let extracted = extract_messages_from_jsonl(discovered.provider, &discovered.path);
+            // A terminal failure (identity unresolvable, malformed record) is
+            // deterministic for this file's current content -- retrying
+            // cannot succeed, so it must not count toward the re-ingest
+            // tally below or the flag it gates would stay set forever. Its
+            // fingerprint is still cached below like any other attempted
+            // file, so it is skipped on every later sweep unless its content
+            // changes -- counted as permanently skipped, not pending.
+            let terminal_failure = extracted.terminal_failure;
             let mut file_failed = !extracted.extraction_succeeded || fingerprint.is_none();
             let project_name = extracted
                 .project_name
@@ -1865,12 +1873,13 @@ impl SessionIndex {
             if let Some(fingerprint) = fingerprint {
                 state.file_mtimes.insert(file_key, fingerprint);
             }
-            if force_reingest && file_failed {
+            if force_reingest && file_failed && !terminal_failure {
                 reingest_failures += 1;
             }
             if codex_agent_identity_reingest_pending
                 && discovered.provider == IntegrationProvider::Codex
                 && file_failed
+                && !terminal_failure
             {
                 codex_reingest_failures += 1;
             }
@@ -2613,6 +2622,14 @@ pub struct ExtractedSession {
     pub project_name: Option<String>,
     pub messages: Vec<ExtractedMessage>,
     extraction_succeeded: bool,
+    /// Set only when `extraction_succeeded` is false and the failure is
+    /// deterministic for this file's current content -- provider identity
+    /// unresolvable, or a malformed/unsupported record -- rather than
+    /// environmental (I/O error, partial write, locked file). The mtime
+    /// sweep must not let a terminal failure hold re-ingest flags set
+    /// forever; a retryable failure must keep the flag set so the file is
+    /// retried on the next sweep.
+    terminal_failure: bool,
     /// Per-event timeline emitted alongside [`messages`] for the active-
     /// interval runtime pipeline (feature 008). Populated by
     /// [`extract_claude_messages_from_jsonl`] and
@@ -3813,10 +3830,15 @@ fn extract_pi_messages(
 ) -> ExtractedSession {
     match parsed {
         Ok(Some(session)) => extract_pi_session(path, session),
-        Ok(None) => unsupported_extracted_session(path),
+        Ok(None) => unsupported_extracted_session(path, false),
         Err(error) => {
             log::warn!("Failed to parse Pi JSONL {}: {error}", path.display());
-            unsupported_extracted_session(path)
+            // A read failure may resolve on retry; an unsupported version or
+            // a malformed quill-tracking entry is deterministic for this
+            // content and must not hold re-ingest flags set forever.
+            let terminal_failure =
+                !matches!(error, crate::pi_session::PiSessionParseError::Read { .. });
+            unsupported_extracted_session(path, terminal_failure)
         }
     }
 }
@@ -4045,6 +4067,7 @@ pub(crate) fn extract_pi_session(
         project_name,
         messages,
         extraction_succeeded: true,
+        terminal_failure: false,
         events,
         hook_invocations: Vec::new(),
     }
@@ -4160,7 +4183,7 @@ fn pi_message_text(content: &serde_json::Value) -> String {
     }
 }
 
-fn unsupported_extracted_session(path: &Path) -> ExtractedSession {
+fn unsupported_extracted_session(path: &Path, terminal_failure: bool) -> ExtractedSession {
     ExtractedSession {
         session_id: path
             .file_stem()
@@ -4170,6 +4193,7 @@ fn unsupported_extracted_session(path: &Path) -> ExtractedSession {
         project_name: None,
         messages: Vec::new(),
         extraction_succeeded: false,
+        terminal_failure,
         events: Vec::new(),
         hook_invocations: Vec::new(),
     }
@@ -4196,6 +4220,7 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
                     .map(SessionIndex::project_display_name),
                 messages: Vec::new(),
                 extraction_succeeded: false,
+                terminal_failure: false,
                 events: Vec::new(),
                 hook_invocations: Vec::new(),
             };
@@ -4614,6 +4639,7 @@ fn extract_claude_messages_from_jsonl_records(
             .map(SessionIndex::project_display_name),
         messages,
         extraction_succeeded: true,
+        terminal_failure: false,
         events,
         hook_invocations,
     }
@@ -4629,6 +4655,7 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                 project_name: None,
                 messages: Vec::new(),
                 extraction_succeeded: false,
+                terminal_failure: false,
                 events: Vec::new(),
                 hook_invocations: Vec::new(),
             };
@@ -4652,6 +4679,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                 project_name: None,
                 messages,
                 extraction_succeeded: false,
+                terminal_failure: true,
                 events,
                 hook_invocations: Vec::new(),
             };
@@ -5080,6 +5108,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
         project_name: cwd.as_deref().and_then(project_name_from_cwd),
         messages,
         extraction_succeeded: true,
+        terminal_failure: false,
         events,
         hook_invocations: Vec::new(),
     }
@@ -6228,5 +6257,196 @@ mod tests {
         assert_eq!(extracted.messages.len(), 1);
         assert_eq!(extracted.messages[0].session_id, "child-1");
         assert_eq!(extracted.events.len(), 1);
+    }
+
+    /// quill-fqwp regression: a Codex rollout with no `session_meta` record
+    /// can never resolve identity no matter how many times it is retried.
+    /// Before the fix, `reingest_failures` counted this deterministic
+    /// failure the same as a transient one, so
+    /// `codex_agent_identity_reingest_pending` (and the four `force_reingest`
+    /// flags) never reached zero failures and stayed set forever, which in
+    /// turn kept clearing the mtime cache and re-extracting the whole corpus
+    /// every sweep. See docs/solutions/runtime-errors/
+    /// live-rails-degrade-when-retained-ingest-loops.md.
+    // @lat: [[data-flow#Session Indexing Pipeline]]
+    #[test]
+    #[serial]
+    fn terminal_codex_identity_failure_clears_reingest_flags_after_one_sweep() {
+        let root = TempDir::new().expect("tempdir");
+        let claude = root.path().join("claude");
+        let codex = root.path().join("codex");
+        let pi = root.path().join("pi");
+        for directory in [&claude, &codex, &pi] {
+            fs::create_dir(directory).expect("create transcript root");
+        }
+
+        // No `session_meta` record at all -- identity is permanently
+        // unresolvable no matter how many times this file is retried.
+        fs::write(
+            codex.join("rollout-poison.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-08-03T12:00:00Z",
+                    "payload": {"type": "agent_message", "message": "orphaned"}
+                })
+            ),
+        )
+        .expect("write poisoned Codex transcript");
+
+        for index in 0..3 {
+            let lines = [
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"id": format!("healthy-{index}")}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-08-03T12:00:00Z",
+                    "payload": {"type": "agent_message", "message": format!("ok-{index}")}
+                })
+                .to_string(),
+            ]
+            .join("\n")
+                + "\n";
+            fs::write(codex.join(format!("rollout-healthy-{index}.jsonl")), lines)
+                .expect("write healthy Codex transcript");
+        }
+
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_DATA_DIR", root.path());
+            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", &claude);
+            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", &codex);
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
+        }
+
+        let storage = crate::storage::Storage::init().expect("init storage");
+        storage
+            .set_setting("codex_agent_identity_reingest_pending", "1")
+            .expect("seed Codex reingest flag");
+        storage
+            .set_setting("subagent_reingest_pending", "1")
+            .expect("seed subagent reingest flag");
+
+        let index_dir = root.path().join("index");
+        let index = SessionIndex::open_or_create(&index_dir).expect("open index");
+
+        index
+            .startup_scan_without_emit(Some(&storage))
+            .expect("first sweep");
+
+        assert!(
+            storage
+                .get_setting("codex_agent_identity_reingest_pending")
+                .expect("read flag")
+                .is_none(),
+            "a permanently-unresolvable transcript must not hold the Codex identity flag set"
+        );
+        assert!(
+            storage
+                .get_setting("subagent_reingest_pending")
+                .expect("read flag")
+                .is_none(),
+            "a permanently-unresolvable transcript must not hold the subagent reingest flag set"
+        );
+
+        let mtimes_after_first_sweep = index.state.lock().unwrap().file_mtimes.clone();
+        assert_eq!(
+            mtimes_after_first_sweep.len(),
+            4,
+            "every discovered transcript, including the poisoned one, is fingerprinted"
+        );
+
+        let second_sweep_indexed = index
+            .startup_scan_without_emit(Some(&storage))
+            .expect("second sweep");
+        assert_eq!(
+            second_sweep_indexed, 0,
+            "flags are clear, so the second sweep must not re-extract any transcript"
+        );
+        assert_eq!(
+            index.state.lock().unwrap().file_mtimes,
+            mtimes_after_first_sweep,
+            "second sweep must not clear the mtime cache"
+        );
+
+        unsafe {
+            std::env::remove_var("QUILL_DEMO_MODE");
+            std::env::remove_var("QUILL_DATA_DIR");
+            std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
+            std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
+            std::env::remove_var("QUILL_PI_SESSIONS_DIR");
+        }
+    }
+
+    /// quill-fqwp regression: the protection the pre-fix code provided must
+    /// survive the terminal/retryable split -- a transient I/O failure (here,
+    /// an unreadable file standing in for a lock or partial write) must keep
+    /// the re-ingest flag set so the file is retried on the next sweep.
+    // @lat: [[data-flow#Session Indexing Pipeline]]
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn retryable_codex_read_failure_keeps_reingest_flag_set() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().expect("tempdir");
+        let claude = root.path().join("claude");
+        let codex = root.path().join("codex");
+        let pi = root.path().join("pi");
+        for directory in [&claude, &codex, &pi] {
+            fs::create_dir(directory).expect("create transcript root");
+        }
+
+        let locked = codex.join("rollout-locked.jsonl");
+        fs::write(
+            &locked,
+            format!(
+                "{}\n",
+                serde_json::json!({"type": "session_meta", "payload": {"id": "locked-1"}})
+            ),
+        )
+        .expect("write Codex transcript");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))
+            .expect("lock Codex transcript for reading");
+
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_DATA_DIR", root.path());
+            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", &claude);
+            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", &codex);
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
+        }
+
+        let storage = crate::storage::Storage::init().expect("init storage");
+        storage
+            .set_setting("codex_agent_identity_reingest_pending", "1")
+            .expect("seed Codex reingest flag");
+
+        let index_dir = root.path().join("index");
+        let index = SessionIndex::open_or_create(&index_dir).expect("open index");
+        index
+            .startup_scan_without_emit(Some(&storage))
+            .expect("sweep with an unreadable transcript");
+
+        assert_eq!(
+            storage
+                .get_setting("codex_agent_identity_reingest_pending")
+                .expect("read flag"),
+            Some("1".to_string()),
+            "a retryable I/O failure must keep the re-ingest flag set for the next sweep"
+        );
+
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o644));
+        unsafe {
+            std::env::remove_var("QUILL_DEMO_MODE");
+            std::env::remove_var("QUILL_DATA_DIR");
+            std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
+            std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
+            std::env::remove_var("QUILL_PI_SESSIONS_DIR");
+        }
     }
 }
