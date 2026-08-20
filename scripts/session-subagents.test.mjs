@@ -63,6 +63,13 @@ test("extrapolates runtime from producer time without running backward", () => {
 // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Sessions Agent Runtime Rows]]
 test("formats every open agent with ordered model and runtime identity", () => {
 	assert.deepEqual(formatObservedSessionAgents("claude", null, 1_000, 3_000), []);
+	// No agent here has a folded model yet, so the whole rail is empty rather
+	// than falling back to role or "?" chips: downstream this is what makes
+	// ActiveAgentRail render no rail at all.
+	assert.deepEqual(formatObservedSessionAgents("claude", [
+		{ agent_id: "a", model_id: null, agent_type: null, runtime_secs: 1, runtime_active: true },
+		{ agent_id: "b", model_id: null, agent_type: "researcher", runtime_secs: 2, runtime_active: false },
+	], 1_000, 3_000), []);
 	assert.deepEqual(formatObservedSessionAgents("claude", [
 		{ agent_id: "sonnet", model_id: "claude-sonnet-4-6", agent_type: null, runtime_secs: null, runtime_active: true },
 		{ agent_id: "opus-b", model_id: "claude-opus-4-6", agent_type: null, runtime_secs: 272, runtime_active: false },
@@ -87,6 +94,8 @@ test("formats every open agent with ordered model and runtime identity", () => {
 			ariaLabel: "claude-sonnet-4-6, agent sonnet, runtime unavailable",
 		},
 	]);
+	// An unfolded agent (no model yet) is omitted entirely, so a mixed rail
+	// keeps only its folded agents, still in correct rank order.
 	assert.deepEqual(
 		formatObservedSessionAgents("codex", [
 			{ agent_id: "luna", model_id: "gpt-5.6-luna", agent_type: null, runtime_secs: 1, runtime_active: true },
@@ -98,7 +107,6 @@ test("formats every open agent with ordered model and runtime identity", () => {
 			{ agentId: "sol", model: "Sol", runtime: "6s" },
 			{ agentId: "terra", model: "Terra", runtime: "3s" },
 			{ agentId: "luna", model: "Luna", runtime: "3s" },
-			{ agentId: "unknown", model: "?", runtime: "2s" },
 		],
 	);
 });
@@ -131,22 +139,22 @@ test("Pi agent rails reuse native model family labels", () => {
 });
 
 // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Agent Rail Tooltip Identity]]
-test("agent tooltips name the agent alongside its model", () => {
+test("agent tooltips name the agent alongside its model, and omit agents with no model yet", () => {
 	assert.deepEqual(
 		formatObservedSessionAgents("codex", [
 			{ agent_id: "a", model_id: "gpt-5.6-sol", agent_type: "Curie", runtime_secs: 1, runtime_active: false },
 			{ agent_id: "b", model_id: "gpt-5.6-sol", agent_type: null, runtime_secs: 1, runtime_active: false },
+			// c has a role but no model; d has neither. Both are omitted below:
+			// the agent chip is a model chip, and there is no role fallback or
+			// "?" placeholder for an agent whose model has not folded yet.
 			{ agent_id: "c", model_id: null, agent_type: "Kepler", runtime_secs: 1, runtime_active: false },
 			{ agent_id: "d", model_id: null, agent_type: null, runtime_secs: 1, runtime_active: false },
-		], 1_000, 3_000).map(({ model, ariaLabel }) => ({ model, ariaLabel })),
+		], 1_000, 3_000).map(({ agentId, model, ariaLabel }) => ({ agentId, model, ariaLabel })),
 		[
 			// Both known: the chip still shows the model, so the name is only
 			// readable in the tooltip.
-			{ model: "Sol", ariaLabel: "Curie · gpt-5.6-sol, agent a, 1s active runtime" },
-			{ model: "Sol", ariaLabel: "gpt-5.6-sol, agent b, 1s active runtime" },
-			// No model: the name is the chip label and the whole identity.
-			{ model: "Kepler", ariaLabel: "Kepler, agent c, 1s active runtime" },
-			{ model: "?", ariaLabel: "Unknown model, agent d, 1s active runtime" },
+			{ agentId: "a", model: "Sol", ariaLabel: "Curie · gpt-5.6-sol, agent a, 1s active runtime" },
+			{ agentId: "b", model: "Sol", ariaLabel: "gpt-5.6-sol, agent b, 1s active runtime" },
 		],
 	);
 });

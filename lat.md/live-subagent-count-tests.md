@@ -58,7 +58,7 @@ Each non-empty active-agent rail starts with exactly one decorative live indicat
 
 ## Agent Rail Tooltip Identity
 
-The chip has room for one label and spends it on the model family, so an agent's own name is named beside its model in the tooltip; an agent with no model falls back to its name as the chip label, and one with neither reads as an unknown model.
+The chip has room for one label and spends it on the model family, so an agent's own name is named beside its model in the tooltip; an agent with no folded model is omitted entirely, with no role fallback or "?" placeholder.
 
 ## Pi Agent Model Families
 

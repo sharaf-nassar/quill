@@ -70,36 +70,39 @@ export function formatObservedSessionAgents(
 	runtimeAsOfMs: number | null,
 	nowMs: number,
 ) {
-	return (agents ?? []).map((agent) => {
-		const family = agent.model_id === null
-			? agent.agent_type
-				? { label: agent.agent_type, rank: 100 }
-				: { label: "?", rank: Number.MAX_SAFE_INTEGER }
-			: agentModelFamily(provider, agent.model_id);
-		const runtime = formatExtrapolatedRuntime(
-			agent.runtime_secs,
-			runtimeAsOfMs,
-			agent.runtime_active ? 1 : 0,
-			nowMs,
-		);
-		// The chip has room for one label and shows the model family, so the
-		// agent's own name is only ever readable here. Both are named when both
-		// are known, because a Codex rail is several agents on one model and the
-		// name is the only thing that tells them apart.
-		const identity = [agent.agent_type, agent.model_id].filter(Boolean).join(" · ")
-			|| "Unknown model";
-		return {
-			agentId: agent.agent_id,
-			model: family.label,
-			runtime,
-			ariaLabel: `${identity}, agent ${agent.agent_id}, ${runtime === "—" ? "runtime unavailable" : `${runtime} active runtime`}`,
-			rank: family.rank,
-		};
-	}).sort((left, right) =>
-		left.rank - right.rank
-		|| left.model.localeCompare(right.model)
-		|| left.agentId.localeCompare(right.agentId)
-	).map(({ rank: _, ...agent }) => agent);
+	// An agent with no folded model yet is omitted rather than shown with a
+	// role or "?" placeholder: the no-model window is normally seconds
+	// (spawn to the child's first assistant message), so the rail waits for
+	// real evidence instead of a stand-in (constitution #1).
+	return (agents ?? [])
+		.filter((agent): agent is ObservedSessionAgent & { model_id: string } => agent.model_id !== null)
+		.map((agent) => {
+			const family = agentModelFamily(provider, agent.model_id);
+			const runtime = formatExtrapolatedRuntime(
+				agent.runtime_secs,
+				runtimeAsOfMs,
+				agent.runtime_active ? 1 : 0,
+				nowMs,
+			);
+			// The chip has room for one label and shows the model family, so the
+			// agent's own name is only ever readable here. Both are named when both
+			// are known, because a Codex rail is several agents on one model and the
+			// name is the only thing that tells them apart.
+			const identity = [agent.agent_type, agent.model_id].filter(Boolean).join(" · ");
+			return {
+				agentId: agent.agent_id,
+				model: family.label,
+				runtime,
+				ariaLabel: `${identity}, agent ${agent.agent_id}, ${runtime === "—" ? "runtime unavailable" : `${runtime} active runtime`}`,
+				rank: family.rank,
+			};
+		})
+		.sort((left, right) =>
+			left.rank - right.rank
+			|| left.model.localeCompare(right.model)
+			|| left.agentId.localeCompare(right.agentId)
+		)
+		.map(({ rank: _, ...agent }) => agent);
 }
 
 export function formatPiLineageStatus(reason: string): { label: string; detail: string } {
