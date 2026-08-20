@@ -105,8 +105,8 @@ test("session rows include only evidenced active root turns and cue their total 
 
 // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Session Row Column Layout]]
 test("session identity places the full provider name directly after the session name", () => {
-	const markup = (provider) => renderToStaticMarkup(createElement(SessionIdentity, {
-		row: sessionRow({ ...baseRow, provider }, NOW),
+	const markup = (provider, model_id = null) => renderToStaticMarkup(createElement(SessionIdentity, {
+		row: sessionRow({ ...baseRow, provider, model_id }, NOW),
 	}));
 	const claude = markup("claude");
 
@@ -124,30 +124,24 @@ test("session identity places the full provider name directly after the session 
 	// The short model family label renders right after the provider chip, with
 	// the raw id retained in its tooltip and accessible label — the same
 	// labels `formatObservedSessionAgents` produces for the agent rail.
-	const modelMarkup = (provider, model_id) => renderToStaticMarkup(createElement(SessionIdentity, {
-		row: sessionRow({ ...baseRow, provider, model_id }, NOW),
-	}));
 
 	// Pi row carrying a Claude-family id.
 	assert.match(
-		modelMarkup("pi", "claude-opus-5"),
+		markup("pi", "claude-opus-5"),
 		/<span class="wg-row-session-provider wg-row-datum"[^>]*>PI<\/span><span class="wg-row-session-model wg-row-datum" data-tooltip="claude-opus-5" aria-label="Model claude-opus-5">Opus<\/span>/,
 	);
 
 	// Pi row carrying a Codex-family id.
 	assert.match(
-		modelMarkup("pi", "gpt-5.6-sol"),
+		markup("pi", "gpt-5.6-sol"),
 		/<span class="wg-row-session-provider wg-row-datum"[^>]*>PI<\/span><span class="wg-row-session-model wg-row-datum" data-tooltip="gpt-5\.6-sol" aria-label="Model gpt-5\.6-sol">Sol<\/span>/,
 	);
 
 	// Native Claude row.
 	assert.match(
-		modelMarkup("claude", "claude-sonnet-4-6"),
+		markup("claude", "claude-sonnet-4-6"),
 		/<span class="wg-row-session-provider wg-row-datum"[^>]*>CLAUDE<\/span><span class="wg-row-session-model wg-row-datum" data-tooltip="claude-sonnet-4-6" aria-label="Model claude-sonnet-4-6">Sonnet<\/span>/,
 	);
-
-	// A null model_id renders no model element and no placeholder.
-	assert.doesNotMatch(modelMarkup("claude", null), /wg-row-session-model/);
 });
 
 // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Persisted Source Presentation]]

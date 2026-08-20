@@ -1458,7 +1458,9 @@ impl LiveTracker {
                 continue;
             };
             row.ephemeral = session.ephemeral;
-            row.model_id = session.model.clone();
+            if let Some(model) = &session.model {
+                row.model_id = Some(model.clone());
+            }
             let mut observed_agents = session.open_agents(now);
             if let Some(agents) = agents_by_parent.get(&key) {
                 observed_agents.extend(agents.iter().cloned());
@@ -4983,6 +4985,70 @@ mod tests {
             .iter()
             .map(|agent| agent.agent_id.as_str())
             .collect()
+    }
+
+    /// A retained row's ranked primary model stays put when the live fold has
+    /// not resolved one; the fold's own model only outranks it once folded.
+    /// Mirrors `live_fold_model_outranks_retained_primary_model_in_overlay` in
+    /// storage.rs, whose SQL-sourced fixture only exercises the fold-wins arm.
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Root Model]]
+    #[test]
+    fn a_fold_with_no_model_keeps_the_retained_primary_model() {
+        let tracker = LiveTracker::new(None);
+        let now = Utc::now();
+        assert!(tracker.record_session(
+            IntegrationProvider::Claude,
+            "matched-root",
+            "match-host",
+            Some("/live/project"),
+            now,
+            &[],
+        ));
+        let row = |model_id: &str| SessionBreakdown {
+            session_id: "matched-root".to_owned(),
+            hostname: "match-host".to_owned(),
+            model_id: Some(model_id.to_owned()),
+            ..remote_row("claude", now)
+        };
+
+        let rows = tracker.overlay(
+            vec![row("retained-model-x")],
+            &(now - TimeDelta::hours(1)).to_rfc3339(),
+            None,
+            None,
+            Some(1),
+        );
+        assert_eq!(
+            rows[0].model_id.as_deref(),
+            Some("retained-model-x"),
+            "a fold that has not resolved a model must not clobber the retained one"
+        );
+
+        tracker
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&SessionKey {
+                provider: "claude".to_owned(),
+                host: "match-host".to_owned(),
+                session_id: "matched-root".to_owned(),
+            })
+            .expect("session recorded above")
+            .model = Some("gpt-5.6-sol".to_owned());
+
+        let rows = tracker.overlay(
+            vec![row("retained-model-x")],
+            &(now - TimeDelta::hours(1)).to_rfc3339(),
+            None,
+            None,
+            Some(1),
+        );
+        assert_eq!(
+            rows[0].model_id.as_deref(),
+            Some("gpt-5.6-sol"),
+            "the live fold's own model must outrank the retained primary model"
+        );
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Claude Rail Through The Read Path]]

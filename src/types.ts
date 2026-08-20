@@ -151,7 +151,9 @@ export interface SessionBreakdown {
   /** Newest observed graceful end; newer activity reopens the session. */
   ended_at: string | null;
   project: string | null;
-  /** The session's own model, from the live fold; null when unobserved. */
+  /** The retained primary model ranked from recorded usage, replaced by the
+   * live fold's own model when the fold knows one (newer evidence); null
+   * when neither source names a model. */
   model_id: string | null;
   /** Lifetime active runtime across every native chain; null is unknown. */
   active_runtime_secs: number | null;

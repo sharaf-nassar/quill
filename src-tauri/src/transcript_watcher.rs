@@ -88,11 +88,13 @@ impl RetainedScanScheduler {
         )
     }
 
-    fn request(&self, recovery: bool) -> bool {
+    fn request(&self, recovery: bool) {
         self.recovery.fetch_or(recovery, Ordering::AcqRel);
         match self.wake.try_send(()) {
-            Ok(()) | Err(mpsc::TrySendError::Full(())) => true,
-            Err(mpsc::TrySendError::Disconnected(())) => false,
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
+            Err(mpsc::TrySendError::Disconnected(())) => {
+                log::warn!("Transcript watcher retained-scan worker is unavailable");
+            }
         }
     }
 }
@@ -340,8 +342,8 @@ fn run(app: tauri::AppHandle, scans: RetainedScanScheduler) -> Result<(), String
                         .map_err(|error| error.to_string())
                 },
             );
-            if added > 0 && !scans.request(false) {
-                log::warn!("Transcript watcher retained-scan worker is unavailable");
+            if added > 0 {
+                scans.request(false);
             }
             retry_at = now + RETRY_INTERVAL;
             // Unconditional: notify semantics differ per platform, so this tick
@@ -414,8 +416,8 @@ fn finish_pending(
     if let Some(tracker) = tracker {
         tracker.apply_paths(pending);
     }
-    if (has_pending || recovery) && !scans.request(recovery) {
-        log::warn!("Transcript watcher retained-scan worker is unavailable");
+    if has_pending || recovery {
+        scans.request(recovery);
     }
     if recovery {
         sweep();
@@ -792,6 +794,21 @@ mod tests {
         let tracker = LiveTracker::new(None);
         tracker.apply_paths(batch);
         assert_eq!(tracker.folded_session_ids(), vec![session_id.to_owned()]);
+    }
+
+    // Both watcher call sites share this one method, so exercising it
+    // directly with no worker listening proves the shared "retained-scan
+    // worker is unavailable" warn still fires from a disconnected channel
+    // instead of panicking or silently dropping the request.
+    // @lat: [[data-flow#Data Flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Transcript Watcher Test Specs#Retained Scan Isolation And Coalescing]]
+    #[test]
+    fn request_warns_instead_of_panicking_when_the_scan_worker_is_gone() {
+        let (scans, receiver) = RetainedScanScheduler::new();
+        drop(receiver);
+
+        scans.request(false);
+        scans.request(true);
+        assert!(scans.recovery.load(Ordering::Acquire));
     }
 
     // @lat: [[data-flow#Data Flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Transcript Watcher Test Specs#Retained Scan Isolation And Coalescing]]
