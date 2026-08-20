@@ -490,8 +490,9 @@ pub struct SessionBreakdown {
     /// Activity newer than this terminal marker reopens the session.
     pub ended_at: Option<String>,
     pub project: Option<String>,
-    /// The session's own model, from the live fold. Null when the row has no
-    /// live coverage or the session has folded no model yet.
+    /// The session's own model: the retained primary model ranked from its
+    /// recorded usage, replaced by the live fold's own model when the fold
+    /// knows one (newer evidence). Null when neither source names a model.
     pub model_id: Option<String>,
     /// Lifetime active runtime summed across every native chain. Null means
     /// retained runtime coverage cannot support a claim.

@@ -15312,6 +15312,12 @@ impl Storage {
         //   snapshots, except token bookkeeping after a terminal hook is
         //   clamped to that hook. A newer response or transcript scan still
         //   reopens the session after this retained identity is merged.
+        // * model_id is the session's primary retained model: the same
+        //   token-ranked derivation `get_model_sessions` uses (highest total
+        //   tokens, ties broken by turn count then model id), scoped to this
+        //   row's own candidate rather than re-scanning the corpus. The live
+        //   overlay replaces it with newer evidence when the fold knows a
+        //   model; retained rows outside the fold's coverage keep this value.
         // Rank only the cheap, range-scoped token groups and ephemeral origins
         // plus each group's indexed response-time maximum. The top-N frontier
         // plus any retained identities visible to the transcript scanner
@@ -15536,7 +15542,26 @@ impl Storage {
                    WHERE lifecycle.provider='pi'
                      AND candidates.provider='pi'
                      AND lifecycle.normalized_hostname=candidates.hostname
-                     AND lifecycle.session_id=candidates.session_id) AS pi_lineage_reason
+                     AND lifecycle.session_id=candidates.session_id) AS pi_lineage_reason,
+                 (SELECT observation.derived_model_id
+                    FROM model_usage_observations AS observation
+                         INDEXED BY idx_model_observations_session_time
+                    JOIN model_observation_sources AS source
+                      ON source.provider = observation.provider
+                     AND source.source_key = observation.source_key
+                   WHERE observation.provider = candidates.provider
+                     AND observation.analytics_session_id = candidates.session_id
+                     AND observation.derived_model_id IS NOT NULL
+                     AND {ACTIVE_MODEL_SOURCE_PREDICATE}
+                   GROUP BY observation.derived_model_id
+                   ORDER BY SUM(COALESCE(observation.input_tokens, 0)
+                                + COALESCE(observation.output_tokens, 0)
+                                + COALESCE(observation.cache_creation_tokens, 0)
+                                + COALESCE(observation.cache_read_tokens, 0)) DESC,
+                            SUM(CASE WHEN observation.observation_kind = 'turn'
+                                     THEN 1 ELSE 0 END) DESC,
+                            observation.derived_model_id ASC
+                   LIMIT 1) AS model_id
              FROM candidates
              ORDER BY candidates.last_active DESC, candidates.provider ASC,
                       candidates.hostname ASC, candidates.session_id ASC"
@@ -15619,7 +15644,7 @@ impl Storage {
                     first_seen: row.get(5)?,
                     last_active: row.get(6)?,
                     ended_at: None,
-                    model_id: None,
+                    model_id: row.get(13)?,
                     project: row.get(7)?,
                     active_runtime_secs: None,
                     agent_count: None,
@@ -23725,6 +23750,379 @@ mod tests {
             Some(vec!["agent"])
         );
         assert_eq!(rows[0].agent_count, Some(1));
+
+        clear_env();
+    }
+
+    /// Seed one `model_usage_observations` row (with its owning `ok` source)
+    /// attributing `tokens` to `model_id` for a session, the minimal shape
+    /// `session_breakdown_query`'s retained model join reads.
+    fn seed_model_observation(
+        storage: &Storage,
+        provider: &str,
+        session_id: &str,
+        source_key: &str,
+        model_id: &str,
+        tokens: i64,
+    ) {
+        let conn = storage.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO model_observation_sources (
+                 provider, source_key, source_root_key, source_path,
+                 source_session_id, analytics_session_id, chain_id,
+                 is_sidechain, seen_generation, processing_status,
+                 observation_count
+             ) VALUES (?1, ?2, ?2, ?2, ?3, ?3, ?3, 0, 1, 'ok', 1)",
+            params![provider, source_key, session_id],
+        )
+        .expect("seed model observation source");
+        conn.execute(
+            "INSERT INTO model_usage_observations (
+                 provider, source_key, source_record_key, source_ordinal,
+                 observation_kind, source_session_id, analytics_session_id,
+                 chain_id, raw_model_id, derived_model_id, is_sidechain,
+                 observed_at_ms, input_tokens, output_tokens,
+                 cache_creation_tokens, cache_read_tokens,
+                 model_evidence, token_evidence
+             ) VALUES (?1, ?2, ?2, 0, 'turn', ?3, ?3, ?3, ?4, ?4, 0,
+                       1, ?5, 0, 0, 0, 'explicit', 'direct')",
+            params![provider, source_key, session_id, model_id, tokens],
+        )
+        .expect("seed model usage observation");
+    }
+
+    /// Seed one `token_snapshots` row so a session appears in
+    /// `session_breakdown_query`'s candidate set.
+    fn seed_token_snapshot(
+        storage: &Storage,
+        provider: &str,
+        session_id: &str,
+        hostname: &str,
+        timestamp: &str,
+    ) {
+        let conn = storage.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO token_snapshots (
+                 provider, session_id, hostname, timestamp, input_tokens,
+                 output_tokens, cache_creation_input_tokens,
+                 cache_read_input_tokens, cwd, is_sidechain
+             ) VALUES (?1, ?2, ?3, ?4, 10, 0, 0, 0, NULL, 0)",
+            params![provider, session_id, hostname, timestamp],
+        )
+        .expect("seed token snapshot");
+    }
+
+    /// Break: `session_breakdown_query` hardcoded `model_id: None`, so a
+    /// retained row with no live coverage never showed the model its own
+    /// recorded usage names — quill-ihbn's repro once a session ages out of
+    /// the live window and the overlay no longer touches its row.
+    // @lat: [[backend#Backend#Tauri IPC Commands#Usage and Token Commands (13)]]
+    #[test]
+    #[serial]
+    fn retained_session_breakdown_carries_its_ranked_primary_model() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let now = Utc::now();
+        let recent = (now - TimeDelta::minutes(5)).to_rfc3339();
+
+        for session_id in ["solo-model", "multi-model", "no-model"] {
+            seed_token_snapshot(&storage, "claude", session_id, "host-a", &recent);
+        }
+        seed_model_observation(
+            &storage,
+            "claude",
+            "solo-model",
+            "solo-src",
+            "claude-opus-4-5",
+            500,
+        );
+        seed_model_observation(
+            &storage,
+            "claude",
+            "multi-model",
+            "multi-src-a",
+            "claude-opus-4-5",
+            1000,
+        );
+        seed_model_observation(
+            &storage,
+            "claude",
+            "multi-model",
+            "multi-src-b",
+            "claude-haiku-4-5",
+            200,
+        );
+
+        let rows = storage
+            .get_session_breakdown("1h", None, None, Some(10))
+            .expect("read session breakdown");
+        let model_of = |session_id: &str| {
+            rows.iter()
+                .find(|row| row.session_id == session_id)
+                .unwrap_or_else(|| panic!("{session_id} row present"))
+                .model_id
+                .clone()
+        };
+
+        assert_eq!(
+            model_of("solo-model"),
+            Some("claude-opus-4-5".to_string()),
+            "a session with one recorded model must carry it"
+        );
+        assert_eq!(
+            model_of("multi-model"),
+            Some("claude-opus-4-5".to_string()),
+            "the higher-token model must win the primary rank"
+        );
+        assert_eq!(
+            model_of("no-model"),
+            None,
+            "a session with no model observations must stay unlabelled"
+        );
+
+        clear_env();
+    }
+
+    /// The live fold's own model outranks a retained primary model for the
+    /// same session, since it is newer evidence; a session the fold does not
+    /// cover keeps its retained value instead (proven above).
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Root Model]]
+    #[test]
+    #[serial]
+    fn live_fold_model_outranks_retained_primary_model_in_overlay() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let claude_dir = TempDir::new().expect("tempdir");
+        let codex_dir = TempDir::new().expect("tempdir");
+        let pi_dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let now = Utc::now();
+
+        let session_id = "01a01745-ab70-7905-b6ef-0c047dbb6ab9";
+        let pi_root = pi_dir.path().join("--home-user-project--");
+        std::fs::create_dir_all(&pi_root).expect("create Pi cwd dir");
+        let header_at =
+            (now - TimeDelta::seconds(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let assistant_at =
+            (now - TimeDelta::seconds(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let transcript = pi_root.join(format!("2026-08-08T00-00-00-000Z_{session_id}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{session_id}\",\
+                 \"timestamp\":\"{header_at}\",\"cwd\":\"/home/user/project\"}}\n\
+                 {{\"type\":\"message\",\"id\":\"a-1\",\"parentId\":null,\
+                 \"timestamp\":\"{assistant_at}\",\"message\":{{\"role\":\"assistant\",\
+                 \"provider\":\"cliproxyapi\",\"model\":\"gpt-5.6-sol\",\
+                 \"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\
+                 \"usage\":{{\"input\":10,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\
+                 \"totalTokens\":10}}}}}}\n"
+            ),
+        )
+        .expect("write Pi transcript");
+
+        // SAFETY: env mutation; this test is serialized via `#[serial]`.
+        unsafe {
+            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", claude_dir.path());
+            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", codex_dir.path());
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", pi_dir.path());
+        }
+
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+        tracker.sweep(now);
+        let keys = tracker.session_ranking_keys();
+        assert_eq!(keys.len(), 1, "the Pi fixture must fold into one session");
+        let (provider, folded_session_id, hostname) = keys[0].clone();
+        assert_eq!(provider, "pi");
+        assert_eq!(folded_session_id, session_id);
+
+        seed_token_snapshot(
+            &storage,
+            &provider,
+            &folded_session_id,
+            &hostname,
+            &assistant_at,
+        );
+        seed_model_observation(
+            &storage,
+            &provider,
+            &folded_session_id,
+            "retained-src",
+            "retained-model-x",
+            500,
+        );
+
+        let rows = storage
+            .get_session_breakdown_with_observed("1h", None, None, Some(10), &keys)
+            .expect("read observed session breakdown");
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == folded_session_id)
+                .and_then(|row| row.model_id.clone()),
+            Some("retained-model-x".to_string()),
+            "the retained primary model must be visible before the overlay runs"
+        );
+
+        let overlaid = tracker.overlay(rows, &range_from_timestamp("1h"), None, None, Some(10));
+        assert_eq!(
+            overlaid
+                .iter()
+                .find(|row| row.session_id == folded_session_id)
+                .and_then(|row| row.model_id.clone()),
+            Some("gpt-5.6-sol".to_string()),
+            "the live fold's own model must outrank the retained primary model"
+        );
+
+        clear_env();
+    }
+
+    /// Diagnostic acceptance benchmark for the retained model_id join: proves
+    /// the pinned ranking CTEs still choose `idx_token_snap_provider_session_sidechain`
+    /// on a populated corpus and reports row counts/timing for the perf note
+    /// this join's bead requires. Run with
+    /// `cargo test session_breakdown_query_ranking_stage_plan_is_unchanged -- --ignored --nocapture`.
+    #[test]
+    #[serial]
+    #[ignore = "diagnostic query-plan/perf benchmark"]
+    fn session_breakdown_query_ranking_stage_plan_is_unchanged() {
+        clear_env();
+        const SESSIONS: i64 = 2_000;
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch(&format!(
+                "WITH RECURSIVE rows(value) AS (
+                     VALUES(1)
+                     UNION ALL
+                     SELECT value + 1 FROM rows WHERE value < {SESSIONS}
+                 )
+                 INSERT INTO token_snapshots (
+                     provider, session_id, hostname, timestamp, input_tokens,
+                     output_tokens, cache_creation_input_tokens,
+                     cache_read_input_tokens, cwd, is_sidechain
+                 )
+                 SELECT 'claude', printf('sess-%05d', value), 'host-a',
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('-%d seconds', value)),
+                        10, 0, 0, 0, NULL, 0
+                 FROM rows;"
+            ))
+            .expect("seed populated session-breakdown corpus (tokens only)");
+        }
+
+        // Before: no session has recorded model usage yet, so this is the
+        // ranking-and-enrichment cost the retained model join is added beside.
+        let before_started = Instant::now();
+        let before_rows = storage
+            .get_session_breakdown("7d", None, None, Some(100))
+            .expect("read pre-model session breakdown");
+        let before_elapsed = before_started.elapsed();
+        assert_eq!(before_rows.len(), 100);
+        assert!(before_rows.iter().all(|row| row.model_id.is_none()));
+
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch(&format!(
+                "WITH RECURSIVE rows(value) AS (
+                     VALUES(1)
+                     UNION ALL
+                     SELECT value + 1 FROM rows WHERE value < {SESSIONS}
+                 )
+                 INSERT INTO model_observation_sources (
+                     provider, source_key, source_root_key, source_path,
+                     source_session_id, analytics_session_id, chain_id,
+                     is_sidechain, seen_generation, processing_status,
+                     observation_count
+                 )
+                 SELECT 'claude', printf('src-%05d', value), printf('src-%05d', value),
+                        printf('src-%05d', value), printf('sess-%05d', value),
+                        printf('sess-%05d', value), printf('sess-%05d', value),
+                        0, 1, 'ok', 1
+                 FROM rows;
+
+                 WITH RECURSIVE rows(value) AS (
+                     VALUES(1)
+                     UNION ALL
+                     SELECT value + 1 FROM rows WHERE value < {SESSIONS}
+                 )
+                 INSERT INTO model_usage_observations (
+                     provider, source_key, source_record_key, source_ordinal,
+                     observation_kind, source_session_id, analytics_session_id,
+                     chain_id, raw_model_id, derived_model_id, is_sidechain,
+                     observed_at_ms, input_tokens, output_tokens,
+                     cache_creation_tokens, cache_read_tokens,
+                     model_evidence, token_evidence
+                 )
+                 SELECT 'claude', printf('src-%05d', value), printf('src-%05d', value),
+                        0, 'turn', printf('sess-%05d', value), printf('sess-%05d', value),
+                        printf('sess-%05d', value),
+                        CASE WHEN value % 2 = 0 THEN 'claude-opus-4-5' ELSE 'claude-haiku-4-5' END,
+                        CASE WHEN value % 2 = 0 THEN 'claude-opus-4-5' ELSE 'claude-haiku-4-5' END,
+                        0, value, 500, 0, 0, 0, 'explicit', 'direct'
+                 FROM rows;"
+            ))
+            .expect("seed populated session-breakdown corpus (model usage)");
+        }
+
+        let (sql, params_vec) =
+            Storage::session_breakdown_query(range_from_timestamp("7d"), None, None, 100, &[]);
+        assert!(
+            sql.contains("idx_token_snap_provider_session_sidechain"),
+            "the retained model join must not rewrite the pinned token scan"
+        );
+        {
+            let conn = storage.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare explain query plan");
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+            let plan = stmt
+                .query_map(params_refs.as_slice(), |row| row.get::<_, String>(3))
+                .expect("run explain query plan")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read explain query plan detail")
+                .join("\n");
+            println!("--- session_breakdown_query EXPLAIN QUERY PLAN ({SESSIONS} sessions) ---");
+            println!("{plan}");
+            assert!(
+                plan.contains("idx_token_snap_provider_session_sidechain"),
+                "ranking stage lost its pinned index: {plan}"
+            );
+            assert!(
+                !plan
+                    .to_uppercase()
+                    .contains("SCAN MODEL_USAGE_OBSERVATIONS"),
+                "retained model join must seek by session rather than scan: {plan}"
+            );
+            assert!(
+                plan.contains(
+                    "SEARCH observation USING INDEX idx_model_observations_session_time \
+                     (provider=? AND analytics_session_id=?)"
+                ),
+                "retained model join must pin the session-scoped index, not let \
+                 planner statistics substitute a derived_model_id scan: {plan}"
+            );
+        }
+
+        let started = Instant::now();
+        let rows = storage
+            .get_session_breakdown("7d", None, None, Some(100))
+            .expect("read populated session breakdown");
+        let elapsed = started.elapsed();
+        let with_model = rows.iter().filter(|row| row.model_id.is_some()).count();
+        println!(
+            "session_breakdown_query: {SESSIONS} sessions seeded, {} rows before model data \
+             ({before_elapsed:?}), {} rows after ({with_model} carrying model_id, {elapsed:?})",
+            before_rows.len(),
+            rows.len()
+        );
+        assert_eq!(rows.len(), 100);
+        assert_eq!(
+            with_model, 100,
+            "every returned row has recorded model usage"
+        );
 
         clear_env();
     }
