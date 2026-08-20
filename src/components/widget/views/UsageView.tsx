@@ -279,7 +279,8 @@ interface RowModel {
     runtimeLabel: string;
   };
   agents?: ReturnType<typeof formatObservedSessionAgents>;
-  linkedSessions?: ReadonlyArray<{ sessionId: string; modelId: string | null }>;
+  /** Short family label alongside the raw id kept for its aria-label. */
+  linkedSessions?: ReadonlyArray<{ sessionId: string; modelId: string | null; modelLabel: string | null }>;
   value: string;
   valueLabel?: string;
   activity: string;
@@ -379,7 +380,7 @@ function LiveLinkedSessionRail({
           aria-label={`Live linked session ${session.sessionId}${session.modelId ? `, model ${session.modelId}` : ""}`}
           data-tooltip={session.sessionId}
         >
-          {session.modelId ?? session.sessionId.slice(0, 8)}
+          {session.modelLabel ?? session.sessionId.slice(0, 8)}
         </span>
       ))}
     </div>
@@ -622,6 +623,9 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
         ? (row.live_linked_sessions ?? []).map((session) => ({
             sessionId: session.session_id,
             modelId: session.model_id,
+            modelLabel: session.model_id === null
+              ? null
+              : formatSessionModel(row.provider, session.model_id),
           }))
         : undefined,
     value: metrics.tokens,

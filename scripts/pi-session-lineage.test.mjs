@@ -13,19 +13,22 @@ const server = await createServer({
 		name: "expose-pi-lineage-ui",
 		transform(code, id) {
 			if (id.endsWith("/UsageView.tsx")) {
-				return `${code}\nexport { sessionRow, LiveLinkedSessionRail, SessionIdentity };`;
+				return `${code}\nexport { sessionRow, LiveLinkedSessionRail, SessionIdentity, ActiveAgentRail };`;
 			}
 			return null;
 		},
 	}],
 });
 
-const [{ sessionRow, LiveLinkedSessionRail, SessionIdentity }, { ParentSessionLink }, { default: SearchBar }] =
-	await Promise.all([
-		server.ssrLoadModule("/src/components/widget/views/UsageView.tsx"),
-		server.ssrLoadModule("/src/components/sessions/ResultCard.tsx"),
-		server.ssrLoadModule("/src/components/sessions/SearchBar.tsx"),
-	]);
+const [
+	{ sessionRow, LiveLinkedSessionRail, SessionIdentity, ActiveAgentRail },
+	{ ParentSessionLink },
+	{ default: SearchBar },
+] = await Promise.all([
+	server.ssrLoadModule("/src/components/widget/views/UsageView.tsx"),
+	server.ssrLoadModule("/src/components/sessions/ResultCard.tsx"),
+	server.ssrLoadModule("/src/components/sessions/SearchBar.tsx"),
+]);
 
 test.after(() => server.close());
 
@@ -123,6 +126,63 @@ test("Pi live lineage uses linked-session copy and never agent-count copy", () =
 	assert.match(markup, /aria-label="Live linked sessions"/);
 	assert.match(markup, />2 live linked sessions</);
 	assert.doesNotMatch(markup, /subagent|native agent|total agents/i);
+});
+
+// @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Linked Session Model Label]]
+test("Pi linked rail shortens model ids the same way the agent rail does", () => {
+	const row = sessionRow({
+		provider: "pi",
+		session_id: "parent-session",
+		parent_session_id: null,
+		hostname: "host",
+		total_tokens: 10,
+		turn_count: 1,
+		first_seen: "2026-08-14T08:00:00Z",
+		last_active: "2099-01-01T00:00:00Z",
+		ended_at: null,
+		project: "/work/quill",
+		model_id: null,
+		active_runtime_secs: null,
+		agent_count: null,
+		agent_runtime_secs: null,
+		current_turn_runtime_secs: null,
+		current_turn_runtime_active: false,
+		runtime_as_of_ms: null,
+		active_runtime_rate: 0,
+		observed_agents: [
+			{
+				agent_id: "agent-1",
+				model_id: "claude-sonnet-4-5",
+				agent_type: null,
+				runtime_secs: null,
+				runtime_active: false,
+			},
+		],
+		live_linked_sessions: [
+			{ session_id: "child-claude", model_id: "claude-sonnet-4-5" },
+			{ session_id: "child-codex", model_id: "cliproxyapi/gpt-5.6-sol" },
+			{ session_id: "child-unmodeled", model_id: null },
+		],
+		observed_only: false,
+	}, Date.now());
+
+	const agentRail = renderToStaticMarkup(createElement(ActiveAgentRail, { agents: row.agents }));
+	const linkedRail = renderToStaticMarkup(createElement(LiveLinkedSessionRail, {
+		sessions: row.linkedSessions,
+	}));
+
+	// The same model family renders the same short label on both rails.
+	assert.match(agentRail, />Sonnet</);
+	assert.match(linkedRail, />Sonnet</);
+	// A Codex-family linked child gets its own short label.
+	assert.match(linkedRail, />Sol</);
+	// Raw ids stay in the accessible label, never in the visible chip.
+	assert.match(linkedRail, /aria-label="Live linked session child-claude, model claude-sonnet-4-5"/);
+	assert.match(linkedRail, /aria-label="Live linked session child-codex, model cliproxyapi\/gpt-5\.6-sol"/);
+	assert.doesNotMatch(linkedRail, />claude-sonnet-4-5</);
+	assert.doesNotMatch(linkedRail, />cliproxyapi\/gpt-5\.6-sol</);
+	// A child with no known model still falls back to its truncated session id.
+	assert.match(linkedRail, />child-un</);
 });
 
 // @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Singular Linked Session Copy]]

@@ -22,6 +22,10 @@ Search input updates parent query state on each change so controlled text remain
 
 Two generic live Pi children render as linked sessions without agent wording; explicitly marked Pi subagents use the agent rail instead.
 
+## Linked Session Model Label
+
+A live linked child's model id renders through the same short family label as the agent rail immediately above it, keeping the raw id in the chip's accessible label. A child with no known model still falls back to its truncated session id.
+
 ## Singular Linked Session Copy
 
 One live Pi child uses the singular label `live linked session`.
