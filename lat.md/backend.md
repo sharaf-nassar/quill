@@ -2052,6 +2052,7 @@ The backend uses Tokio for async operations with specific patterns:
 - `std::sync::Mutex<T>` / `std::sync::RwLock<T>` for synchronization, including invalidatable single-writer caches (e.g. the login-shell PATH cache in [[src-tauri/src/config.rs]]); the `parking_lot` dependency was removed
 - `Arc<T>` for shared ownership across task boundaries
 - `OnceLock<T>` for one-time initialization of globals (STORAGE, HTTP_CLIENT) — used only for caches that never need to be invalidated; invalidatable caches use `std::sync::Mutex<Option<T>>` or `std::sync::RwLock<Option<T>>` instead
+- [[src-tauri/src/transcript_watcher.rs#start]] keeps filesystem admission, live folding, and the 120-second recovery sweep on the watcher thread, while one dedicated worker serializes Session Search scans and whole-root analytics reconciliation. A capacity-one wake queue plus an atomic recovery flag coalesce bursts and preserve recovery escalation without stacking one scan per batch.
 
 ## Platform-Specific Code
 

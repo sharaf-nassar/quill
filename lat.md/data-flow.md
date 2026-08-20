@@ -162,7 +162,7 @@ A state-changing fold emits `sessions-live-updated`. The emit carries no window 
 
 [[src-tauri/src/live_tracker.rs#LiveTracker#session_ranking_keys]] and [[src-tauri/src/live_tracker.rs#LiveTracker#overlay]] are the Sessions read path's only live-state surface. The keys enter the retained query so a folded session survives storage's provisional limit and can compete for final ranking; the overlay then gives each covered row its open agents and, when the fold is newer than the retained evidence, its liveness, synthesizes an observed-only row for a folded session with a validated root cwd that storage has no row for, and re-ranks the merged set before truncating it to the same clamped limit storage applies. An agent's model comes from the fold rather than from retained child evidence, so the read resolves a label in one pass and schedules no rescan. Rows the fold does not cover — every remote host — keep null agent fields, and terminal projection and the runtime pass run afterwards unchanged.
 
-[[src-tauri/src/transcript_watcher.rs#admit_pending]] feeds Claude/Codex/Pi transcript evidence. Watcher batches go to the fold alongside retained ingest, while authenticated Pi lifecycle pushes mutate the same map after durable lifecycle persistence. Startup manages the tracker before either feed starts and applies saved activity-tracking and per-provider switches, so a disabled provider is never folded or lifecycle-created.
+[[src-tauri/src/transcript_watcher.rs#admit_pending]] feeds Claude/Codex/Pi transcript evidence. Watcher batches fold on the watcher thread, while Session Search scans and whole-root analytics reconciliation run on one dedicated retained-scan worker. Its queue holds at most one follow-up request and upgrades that request when recovery is needed, so a slow retained scan never delays later folds or the watcher's unconditional 120-second sweep. Authenticated Pi lifecycle pushes mutate the same map after durable lifecycle persistence. Startup manages the tracker before either feed starts and applies saved activity-tracking and per-provider switches, so a disabled provider is never folded or lifecycle-created.
 
 ### Claude Fold Rules
 
@@ -252,7 +252,7 @@ After storage initializes, [[src-tauri/src/lib.rs#run]] resets interrupted runni
 
 [[src-tauri/src/transcript_watcher.rs#start]] recursively watches distinct Claude, Codex, and Pi transcript roots. It admits debounced JSONL changes through strict validation. Missing or failed watches retry every 120 seconds, and ambiguous canonical roots are rejected.
 
-Nonempty watcher batches, recovery events, and newly attached roots rerun incremental Session Search and admit changed sources to the shared coordinator. Pi arms transcript work only; Claude and Codex arm both transcript and model domains.
+Nonempty watcher batches, recovery events, and newly attached roots request incremental Session Search on the watcher's coalescing retained-scan worker and admit changed sources to the shared coordinator. Recovery also requests whole-root analytics reconciliation on that worker. Live folding and the 120-second recovery sweep stay on the watcher thread and never wait for either retained-side scan. Pi arms transcript work only; Claude and Codex arm both transcript and model domains.
 
 [[src/hooks/useModelAnalytics.ts#useModelAnalytics]] requests only one command-and-arguments-scoped overview through the process-lifetime invoke cache. Data-changing model events invalidate that key and join the shared five-second-or-longer mounted fan-out; the 60-second fallback poll follows the same path. Each accepted overview advances the frontend refresh generation and updates both [[src/components/widget/views/ModelsView.tsx#ModelsView]] bands as one unit. The widget has no selected-model paging or lazy chain-history request to fan out.
 
@@ -377,6 +377,12 @@ Two providers resolving to one canonical root must not register the later duplic
 ##### Live Tracker Admission
 
 A filesystem event on a watched transcript must reach the live tracker in the shape admission drains it, folding that session without a Quill window or an app handle.
+
+##### Retained Scan Isolation And Coalescing
+
+A blocking retained scan must not delay a later transcript fold or periodic live-tracker sweep.
+
+Bursts during that scan produce at most one follow-up scan. Any recovery request upgrades the coalesced work so whole-root analytics reconciliation is not lost.
 
 ### Live Analytics Origin
 

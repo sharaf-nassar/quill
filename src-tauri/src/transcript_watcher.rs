@@ -69,6 +69,44 @@ impl PendingPaths {
     }
 }
 
+/// One worker wake can wait behind the in-flight scan; later requests merge
+/// into it, and the atomic bit preserves recovery escalation.
+struct RetainedScanScheduler {
+    wake: mpsc::SyncSender<()>,
+    recovery: Arc<AtomicBool>,
+}
+
+impl RetainedScanScheduler {
+    fn new() -> (Self, mpsc::Receiver<()>) {
+        let (wake, receiver) = mpsc::sync_channel(1);
+        (
+            Self {
+                wake,
+                recovery: Arc::new(AtomicBool::new(false)),
+            },
+            receiver,
+        )
+    }
+
+    fn request(&self, recovery: bool) -> bool {
+        self.recovery.fetch_or(recovery, Ordering::AcqRel);
+        match self.wake.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => true,
+            Err(mpsc::TrySendError::Disconnected(())) => false,
+        }
+    }
+}
+
+fn run_retained_scan_worker(
+    receiver: mpsc::Receiver<()>,
+    recovery: Arc<AtomicBool>,
+    mut scan: impl FnMut(bool),
+) {
+    while receiver.recv().is_ok() {
+        scan(recovery.swap(false, Ordering::AcqRel));
+    }
+}
+
 fn transcript_roots() -> Vec<TranscriptRoot> {
     let mut roots = vec![
         (
@@ -194,11 +232,22 @@ fn collect_event_paths(
 }
 
 pub(crate) fn start(app: tauri::AppHandle) {
+    let (scans, scan_receiver) = RetainedScanScheduler::new();
+    let scan_recovery = Arc::clone(&scans.recovery);
+    let scan_app = app.clone();
+    std::thread::spawn(move || {
+        run_retained_scan_worker(scan_receiver, scan_recovery, |recovery| {
+            sync_search_index(&scan_app);
+            if recovery {
+                reconcile_all(&scan_app);
+            }
+        });
+    });
     std::thread::spawn(move || {
         // Cold start: a session that predates launch produces no event of its
         // own, so the tracker only learns about it from a sweep.
         sweep_live_tracker(&app);
-        if let Err(error) = run(app) {
+        if let Err(error) = run(app, scans) {
             log::warn!(
                 "Transcript watcher unavailable; 120-second recovery scan remains active: {error}"
             );
@@ -233,7 +282,7 @@ fn reset_changed_root_watches(
     }
 }
 
-fn run(app: tauri::AppHandle) -> Result<(), String> {
+fn run(app: tauri::AppHandle, scans: RetainedScanScheduler) -> Result<(), String> {
     let (tx, rx) = mpsc::sync_channel(MAX_PENDING_PATHS);
     let overflow = Arc::new(AtomicBool::new(false));
     let callback_overflow = Arc::clone(&overflow);
@@ -291,8 +340,8 @@ fn run(app: tauri::AppHandle) -> Result<(), String> {
                         .map_err(|error| error.to_string())
                 },
             );
-            if added > 0 {
-                sync_search_index(&app);
+            if added > 0 && !scans.request(false) {
+                log::warn!("Transcript watcher retained-scan worker is unavailable");
             }
             retry_at = now + RETRY_INTERVAL;
             // Unconditional: notify semantics differ per platform, so this tick
@@ -303,7 +352,7 @@ fn run(app: tauri::AppHandle) -> Result<(), String> {
             .timeout(now)
             .min(retry_at.saturating_duration_since(now));
         if timeout.is_zero() {
-            admit_pending(&app, pending.take());
+            admit_pending(&app, &scans, pending.take());
             continue;
         }
         match rx.recv_timeout(timeout) {
@@ -319,7 +368,7 @@ fn run(app: tauri::AppHandle) -> Result<(), String> {
                     },
                 );
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => admit_pending(&app, pending.take()),
+            Err(mpsc::RecvTimeoutError::Timeout) => admit_pending(&app, &scans, pending.take()),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("filesystem watcher channel disconnected".to_string());
             }
@@ -329,9 +378,9 @@ fn run(app: tauri::AppHandle) -> Result<(), String> {
 
 fn admit_pending(
     app: &tauri::AppHandle,
+    scans: &RetainedScanScheduler,
     (pending, recovery): (HashMap<PathBuf, IntegrationProvider>, bool),
 ) {
-    let has_pending = !pending.is_empty();
     for (path, provider) in &pending {
         match crate::sessions::validate_retained_notify_source(*provider, path) {
             Ok(Some(source)) => {
@@ -348,15 +397,28 @@ fn admit_pending(
             }
         }
     }
-    if let Some(tracker) = live_tracker(app) {
+    let tracker = live_tracker(app);
+    finish_pending(tracker.as_deref(), scans, pending, recovery, || {
+        sweep_live_tracker(app)
+    });
+}
+
+fn finish_pending(
+    tracker: Option<&LiveTracker>,
+    scans: &RetainedScanScheduler,
+    pending: HashMap<PathBuf, IntegrationProvider>,
+    recovery: bool,
+    sweep: impl FnOnce(),
+) {
+    let has_pending = !pending.is_empty();
+    if let Some(tracker) = tracker {
         tracker.apply_paths(pending);
     }
-    if has_pending || recovery {
-        sync_search_index(app);
+    if (has_pending || recovery) && !scans.request(recovery) {
+        log::warn!("Transcript watcher retained-scan worker is unavailable");
     }
     if recovery {
-        reconcile_all(app);
-        sweep_live_tracker(app);
+        sweep();
     }
 }
 
@@ -730,6 +792,188 @@ mod tests {
         let tracker = LiveTracker::new(None);
         tracker.apply_paths(batch);
         assert_eq!(tracker.folded_session_ids(), vec![session_id.to_owned()]);
+    }
+
+    // @lat: [[data-flow#Data Flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Transcript Watcher Test Specs#Retained Scan Isolation And Coalescing]]
+    #[test]
+    #[serial]
+    fn blocking_retained_scan_does_not_starve_live_folds_or_sweeps() {
+        struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    unsafe {
+                        if let Some(value) = value {
+                            std::env::set_var(key, value);
+                        } else {
+                            std::env::remove_var(key);
+                        }
+                    }
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("create watcher worker fixture");
+        let claude = temp.path().join("claude");
+        let codex = temp.path().join("codex");
+        let pi = temp.path().join("pi");
+        for root in [&claude, &codex, &pi] {
+            std::fs::create_dir_all(root).expect("create transcript root");
+        }
+        let keys = [
+            "QUILL_DEMO_MODE",
+            "QUILL_CLAUDE_PROJECTS_DIR",
+            "QUILL_CODEX_SESSIONS_DIR",
+            "QUILL_PI_SESSIONS_DIR",
+        ];
+        let _env = EnvGuard(
+            keys.into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", &claude);
+            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", &codex);
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
+        }
+
+        let now = chrono::Utc::now();
+        let parent_id = "11111111-2222-3333-4444-555555555555";
+        let child_id = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+        let run_id = "b663b5ad";
+        let parent = pi.join("parent.jsonl");
+        std::fs::write(
+            &parent,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{parent_id}\",\"timestamp\":\"{}\",\"cwd\":\"/work/quill\"}}\n",
+                (now - chrono::TimeDelta::minutes(2)).to_rfc3339(),
+            ),
+        )
+        .expect("write parent transcript");
+        let child = pi
+            .join(format!(
+                "2026-08-20T05-04-27-000Z_{parent_id}/{run_id}/run-0"
+            ))
+            .join("session.jsonl");
+        std::fs::create_dir_all(child.parent().expect("child parent"))
+            .expect("create child transcript directory");
+        std::fs::write(
+            &child,
+            format!(
+                concat!(
+                    "{{\"type\":\"session\",\"version\":3,\"id\":\"{child_id}\",",
+                    "\"timestamp\":\"{started}\",\"cwd\":\"/work/quill\"}}\n",
+                    "{{\"type\":\"session_info\",\"id\":\"info\",",
+                    "\"timestamp\":\"{started}\",",
+                    "\"name\":\"subagent-worker-{run_id}-0\"}}\n",
+                    "{{\"type\":\"message\",\"id\":\"answer\",",
+                    "\"timestamp\":\"{active}\",\"message\":{{",
+                    "\"role\":\"assistant\",\"provider\":\"cliproxyapi\",",
+                    "\"model\":\"gpt-5.6-sol\",\"content\":[],",
+                    "\"usage\":{{\"totalTokens\":10}}}}}}\n"
+                ),
+                child_id = child_id,
+                run_id = run_id,
+                started = (now - chrono::TimeDelta::seconds(30)).to_rfc3339(),
+                active = (now - chrono::TimeDelta::seconds(5)).to_rfc3339(),
+            ),
+        )
+        .expect("write child transcript");
+
+        let tracker = LiveTracker::new(None);
+        let (scan_started_tx, scan_started_rx) = mpsc::channel();
+        let (release_scan_tx, release_scan_rx) = mpsc::channel();
+        let (scans, scan_receiver) = RetainedScanScheduler::new();
+        let scan_recovery = Arc::clone(&scans.recovery);
+        let scan_worker = std::thread::spawn(move || {
+            let mut scan_count = 0usize;
+            run_retained_scan_worker(scan_receiver, scan_recovery, |recovery| {
+                scan_count += 1;
+                scan_started_tx
+                    .send((scan_count, recovery))
+                    .expect("report scan start");
+                if scan_count == 1 {
+                    release_scan_rx.recv().expect("release first scan");
+                }
+            });
+        });
+
+        finish_pending(
+            Some(&tracker),
+            &scans,
+            HashMap::from([(parent, IntegrationProvider::Pi)]),
+            false,
+            || {},
+        );
+        assert_eq!(
+            scan_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first retained scan starts"),
+            (1, false),
+        );
+        finish_pending(
+            Some(&tracker),
+            &scans,
+            HashMap::from([(child.clone(), IntegrationProvider::Pi)]),
+            false,
+            || {},
+        );
+        for recovery in [false, false, true, false, false, false] {
+            finish_pending(
+                Some(&tracker),
+                &scans,
+                HashMap::from([(child.clone(), IntegrationProvider::Pi)]),
+                recovery,
+                || tracker.sweep(now),
+            );
+        }
+        let model = tracker
+            .overlay(
+                Vec::new(),
+                &(now - chrono::TimeDelta::hours(1)).to_rfc3339(),
+                None,
+                None,
+                Some(10),
+            )
+            .into_iter()
+            .find(|row| row.session_id == parent_id)
+            .and_then(|row| row.observed_agents)
+            .and_then(|agents| agents.into_iter().next())
+            .and_then(|agent| agent.model_id);
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+
+        let swept_session_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        let swept_project = claude.join("-work-quill");
+        std::fs::create_dir_all(&swept_project).expect("create sweep fixture directory");
+        std::fs::write(
+            swept_project.join(format!("{swept_session_id}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"/work/quill\",\"timestamp\":\"{}\"}}\n",
+                (now - chrono::TimeDelta::seconds(1)).to_rfc3339(),
+            ),
+        )
+        .expect("write sweep-only transcript");
+        tracker.sweep(now);
+        assert!(
+            tracker
+                .folded_session_ids()
+                .contains(&swept_session_id.to_owned())
+        );
+
+        release_scan_tx.send(()).expect("release retained scan");
+        assert_eq!(
+            scan_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("one coalesced follow-up scan starts"),
+            (2, true),
+        );
+        assert!(matches!(
+            scan_started_rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(scans);
+        scan_worker.join().expect("join retained scan worker");
     }
 
     #[test]
