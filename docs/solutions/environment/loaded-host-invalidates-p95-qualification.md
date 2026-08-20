@@ -1,8 +1,9 @@
 ---
 title: Loaded hosts invalidate tight p95 release qualification
 date: 2026-08-18
+last_updated: 2026-08-20
 component: pi-tracking-qualification
-tags: [benchmark, p95, rss, scheduler, swap, qualification]
+tags: [benchmark, p95, rss, scheduler, swap, qualification, ports]
 problem_type: environment
 ---
 
@@ -55,8 +56,37 @@ If controlled runs still fail, file separate measured production performance
 bugs for RSS and Sessions. Do not attribute loaded-host results to production
 code before that reproduction.
 
+## Preflight check before dispatching qualification
+
+Added 2026-08-20, during `implement-ready` run `run-20260820T050427`. The
+qualification bead `quill-oyie.9` came up ready and was **not** dispatched,
+because a two-command preflight showed the host was disqualified on both
+counts at once:
+
+```bash
+ss -ltnp | grep -E "19876|19877"   # ports the harness must never bind
+uptime                              # load average
+```
+
+A live dev Quill (`target/debug/quill`, pid 3473342) held **both** 19876 and
+19877, alongside a `tauri dev` and a `vite` process, at load average 5.72.
+
+The port dimension is separate from the load dimension recorded above and can
+invalidate a run just as completely. Since the handshake consolidation moved
+every identity onto the published 19876/19877 pair, the harness must pass
+`QUILL_PORT`/`QUILL_CONTEXT_PORT` overrides and must never bind the ports a
+live Quill already holds — contending for them can disturb the running app as
+well as the measurement.
+
+Run both checks before dispatch, not after a failed attempt. This bead had
+already burned at least three attempts, one of them (attempt 3) failing purely
+on RSS p95 for the load reason documented here; each of those attempts was
+cheap to avoid and expensive to run.
+
 ## Prevention
 
+- Run the two-command preflight above before dispatching qualification, and
+  treat either signal as disqualifying on its own.
 - Record load, swap, and top CPU consumers beside every tight p95 result.
 - Reject a qualification sample before comparison when the host is outside the
   baseline's environment assumptions.
