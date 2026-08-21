@@ -13,8 +13,8 @@ use crate::sessions::{
     extract_skill_accesses_from_tool_action, retained_jsonl_source_root_identities,
 };
 use crate::storage::{
-    Storage, StoredTranscriptAnalyticsSource, TranscriptAnalyticsReplacement,
-    UnchangedTranscriptAnalyticsSource,
+    FailedTranscriptAnalyticsSource, Storage, StoredTranscriptAnalyticsSource,
+    TranscriptAnalyticsReplacement, UnchangedTranscriptAnalyticsSource,
 };
 #[cfg(test)]
 use crate::transcript_identity::RETAINED_TRANSCRIPT_MAX_BYTES;
@@ -400,6 +400,10 @@ pub(crate) struct CompletedTranscriptSourceRoot {
     pub(crate) provider: IntegrationProvider,
     pub(crate) source_root_key: String,
     pub(crate) generation: i64,
+    /// Every source key this pass enumerated under the root. Pruning deletes
+    /// exactly the registry rows outside this set, so a still-present source
+    /// needs no per-pass write to prove it survived.
+    pub(crate) discovered_source_keys: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,10 +429,10 @@ fn stored_native_identity(source: &StoredTranscriptAnalyticsSource) -> Option<Na
 /// One inventory refresh owed by a source that did not change, held until the
 /// caller decides when to persist it.
 ///
-/// Classification never writes it itself: the startup walk accumulates a whole
-/// root's worth and commits them in a single transaction, while the live path
-/// applies its single refresh immediately. Fields are owned because the batch
-/// outlives the borrowed classification inputs.
+/// Only the live path persists one: a whole-root pass proves survival through
+/// the discovered key set it hands the prune, so an unchanged source there owes
+/// no write at all. Fields are owned because the refresh outlives the borrowed
+/// classification inputs.
 struct PendingUnchangedRefresh {
     provider: IntegrationProvider,
     source_key: String,
@@ -454,10 +458,6 @@ impl PendingUnchangedRefresh {
             size_bytes: self.size_bytes,
             content_sha256: self.content_sha256.as_deref(),
         }
-    }
-
-    fn stale_generation_failure(&self) -> String {
-        TranscriptAnalyticsError::Storage(self.stale_generation_error.into()).to_string()
     }
 }
 
@@ -493,8 +493,9 @@ enum TranscriptSourceFreshness {
 /// the mtime and content-digest short-circuits are bypassed so an interrupted
 /// rebuild replays every retained source instead of trusting stale fingerprints.
 ///
-/// An unchanged verdict carries its owed inventory refresh instead of writing
-/// it, so callers choose the transaction granularity.
+/// An unchanged verdict carries a refresh descriptor for the live caller.
+/// Whole-root identity classification drops it because the discovered key set
+/// proves survival without a registry write.
 fn classify_transcript_source_freshness(
     source: &DiscoveredRetainedJsonlSource,
     existing: Option<&StoredTranscriptAnalyticsSource>,
@@ -643,8 +644,39 @@ struct TranscriptSourceIdentity {
     suppressed: bool,
     /// The source content changed, so it must be re-parsed and committed.
     changed: bool,
-    /// Inventory refresh owed by an unchanged source, flushed once per root.
-    pending_refresh: Option<PendingUnchangedRefresh>,
+}
+
+enum RootSourceClassification {
+    Identity(Box<TranscriptSourceIdentity>),
+    /// A source that already failed and whose bytes have not moved since. It
+    /// stays a failed source of this pass, without the read, the reparse, or
+    /// the rewritten diagnostic that would all reproduce the same result.
+    UnchangedFailure,
+}
+
+/// Whether a persisted failure is still the current verdict for this content.
+///
+/// The stored fingerprint is the one recorded when the source failed, so a
+/// match means re-reading the file would fail identically. A stat that cannot
+/// be taken is not a match: classification then runs normally and records
+/// whatever the real error turns out to be.
+fn failed_with_unchanged_fingerprint(
+    source: &DiscoveredRetainedJsonlSource,
+    existing: &StoredTranscriptAnalyticsSource,
+) -> bool {
+    if existing.processing_status != "failed"
+        || existing.suppressed_sha256.is_some()
+        || existing.source_path != source.canonical_path
+    {
+        return false;
+    }
+    let Some(stat) = std::fs::metadata(&source.canonical_path)
+        .ok()
+        .and_then(|metadata| model_source_fast_fingerprint(&metadata).ok())
+    else {
+        return false;
+    };
+    existing.mtime_ns == Some(stat.mtime_ns()) && existing.size_bytes == Some(stat.size_bytes())
 }
 
 fn classify_transcript_source_identity(
@@ -652,16 +684,22 @@ fn classify_transcript_source_identity(
     existing: Option<&StoredTranscriptAnalyticsSource>,
     generation: i64,
     force_full_reparse: bool,
-) -> Result<TranscriptSourceIdentity, TranscriptAnalyticsError> {
+) -> Result<RootSourceClassification, TranscriptAnalyticsError> {
+    if !force_full_reparse
+        && existing.is_some_and(|stored| failed_with_unchanged_fingerprint(source, stored))
+    {
+        return Ok(RootSourceClassification::UnchangedFailure);
+    }
     match classify_transcript_source_freshness(source, existing, generation, force_full_reparse)? {
-        TranscriptSourceFreshness::Unchanged(unchanged) => Ok(TranscriptSourceIdentity {
-            discovered: unchanged.discovered,
-            native_identity: unchanged.native_identity,
-            previous_root: unchanged.previous_root,
-            suppressed: unchanged.suppressed,
-            changed: false,
-            pending_refresh: Some(unchanged.refresh),
-        }),
+        TranscriptSourceFreshness::Unchanged(unchanged) => Ok(RootSourceClassification::Identity(
+            Box::new(TranscriptSourceIdentity {
+                discovered: unchanged.discovered,
+                native_identity: unchanged.native_identity,
+                previous_root: unchanged.previous_root,
+                suppressed: unchanged.suppressed,
+                changed: false,
+            }),
+        )),
         TranscriptSourceFreshness::Changed(changed) => {
             let contents = std::str::from_utf8(&changed.bytes)
                 .map_err(|_| TranscriptAnalyticsError::InvalidUtf8)?;
@@ -670,14 +708,15 @@ fn classify_transcript_source_identity(
             drop(records);
             drop(changed);
             log_record_diagnostics(source, &diagnostics);
-            Ok(TranscriptSourceIdentity {
-                discovered: source.clone(),
-                native_identity: Some(native_identity),
-                previous_root: existing.and_then(|stored| stored.analytics_session_id.clone()),
-                suppressed: false,
-                changed: true,
-                pending_refresh: None,
-            })
+            Ok(RootSourceClassification::Identity(Box::new(
+                TranscriptSourceIdentity {
+                    discovered: source.clone(),
+                    native_identity: Some(native_identity),
+                    previous_root: existing.and_then(|stored| stored.analytics_session_id.clone()),
+                    suppressed: false,
+                    changed: true,
+                },
+            )))
         }
     }
 }
@@ -696,28 +735,41 @@ enum RootReconciliationFault {
 /// Persist a bounded per-source diagnostic.
 ///
 /// A storage failure here is the deliberate signal that the database itself is
-/// unusable: the write is a single bounded upsert, and without it the failed
-/// source keeps a stale `seen_generation` and would be pruned as if deleted.
+/// unusable: the write is a single bounded upsert, and without it nothing can
+/// retain last-known-good state for the rest of the run.
+///
+/// Only content-deterministic classification failures carry a fingerprint, so
+/// transient storage, graph, and live-source failures retry on the next pass.
 fn record_source_failure(
     storage: &Storage,
     source: &DiscoveredRetainedJsonlSource,
     generation: i64,
     error: &str,
+    fingerprint_failure: bool,
 ) -> Result<(), RootReconciliationFault> {
     log::warn!(
         "Retained transcript analytics source failed: provider={} source={} error={error}",
         source.provider.as_str(),
         source.source_key,
     );
+    let failed_stat = fingerprint_failure
+        .then(|| {
+            std::fs::metadata(&source.canonical_path)
+                .ok()
+                .and_then(|metadata| model_source_fast_fingerprint(&metadata).ok())
+        })
+        .flatten();
     storage
-        .record_transcript_analytics_source_failure(
-            source.provider,
-            &source.source_key,
-            source.source_root_key,
-            &source.canonical_path,
+        .record_transcript_analytics_source_failure(FailedTranscriptAnalyticsSource {
+            provider: source.provider,
+            source_key: &source.source_key,
+            source_root_key: source.source_root_key,
+            source_path: &source.canonical_path,
             generation,
             error,
-        )
+            fingerprint_failure,
+            failed_stat: failed_stat.map(|stat| (stat.mtime_ns(), stat.size_bytes())),
+        })
         .map_err(|storage_error| {
             RootReconciliationFault::Database(format!(
                 "cannot persist transcript analytics failure for source {}: {storage_error}",
@@ -737,7 +789,7 @@ fn record_live_source_failure(
     if let Err(
         RootReconciliationFault::Database(message)
         | RootReconciliationFault::RootUnavailable(message),
-    ) = record_source_failure(storage, source, generation, error)
+    ) = record_source_failure(storage, source, generation, error, false)
     {
         log::warn!("Could not persist transcript analytics failure: {message}");
     }
@@ -857,58 +909,6 @@ fn commit_reconciled_source(
     })
 }
 
-/// Persist every deferred unchanged-source refresh for one root in a single
-/// transaction and report the sources the caller must still fail.
-///
-/// The batched write reports which rows did not update, so a source whose
-/// generation advanced under a concurrent run keeps the same per-source
-/// treatment it had when each refresh owned its own transaction. A batch-level
-/// storage error is attributed to every source in the batch for the same
-/// reason: none of their rows advanced.
-fn flush_unchanged_refreshes(
-    storage: &Storage,
-    identities: &[TranscriptSourceIdentity],
-) -> HashMap<String, String> {
-    let pending = identities
-        .iter()
-        .filter_map(|identity| identity.pending_refresh.as_ref())
-        .collect::<Vec<_>>();
-    if pending.is_empty() {
-        return HashMap::new();
-    }
-    let descriptors = pending
-        .iter()
-        .map(|refresh| refresh.descriptor())
-        .collect::<Vec<_>>();
-    match storage.refresh_unchanged_transcript_analytics_sources(&descriptors) {
-        Ok(stale_keys) => {
-            let stale_keys = stale_keys
-                .iter()
-                .map(String::as_str)
-                .collect::<HashSet<_>>();
-            pending
-                .iter()
-                .filter(|refresh| stale_keys.contains(refresh.source_key.as_str()))
-                .map(|refresh| {
-                    (
-                        refresh.source_key.clone(),
-                        refresh.stale_generation_failure(),
-                    )
-                })
-                .collect()
-        }
-        Err(error) => pending
-            .iter()
-            .map(|refresh| {
-                (
-                    refresh.source_key.clone(),
-                    TranscriptAnalyticsError::Storage(error.clone()).to_string(),
-                )
-            })
-            .collect(),
-    }
-}
-
 /// Reconcile one provider root in two phases.
 ///
 /// Phase one resolves cross-source native identity without extracting any rows,
@@ -917,9 +917,13 @@ fn flush_unchanged_refreshes(
 /// one source rather than the entire retained corpus, at the cost of a second
 /// read of each source that actually needs committing.
 ///
-/// A single failed source never cancels the rest of the root: its bounded
-/// diagnostic refreshes `seen_generation`, which keeps it out of the prune set,
-/// so enumeration completeness alone decides whether the root can be pruned.
+/// An unchanged source performs no write at all. Survival is proved by the
+/// enumerated key set handed to the prune, not by a per-pass `seen_generation`
+/// bump, so a root of unchanged sources costs zero registry updates.
+///
+/// A single failed source never cancels the rest of the root: it stays in that
+/// enumerated set, so enumeration completeness alone decides whether the root
+/// can be pruned.
 // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots]]
 fn reconcile_transcript_source_root(
     storage: &Storage,
@@ -940,13 +944,14 @@ fn reconcile_transcript_source_root(
     let discovered_keys = root
         .sources
         .iter()
-        .map(|source| source.source_key.as_str())
+        .map(|source| source.source_key.clone())
         .collect::<HashSet<_>>();
     let enumeration_complete = matches!(root.outcome, ProviderRootEnumerationOutcome::Complete);
 
     let mut outcome = RootReconciliationOutcome::default();
     let mut identities = Vec::with_capacity(root.sources.len());
     let mut handled_keys = HashSet::new();
+    let mut unchanged_failures = 0usize;
     for source in &root.sources {
         match classify_transcript_source_identity(
             source,
@@ -954,31 +959,40 @@ fn reconcile_transcript_source_root(
             generation,
             force_full_reparse,
         ) {
-            Ok(identity) => {
+            Ok(RootSourceClassification::Identity(identity)) => {
                 handled_keys.insert(source.source_key.as_str());
-                identities.push(identity);
+                identities.push(*identity);
+            }
+            Ok(RootSourceClassification::UnchangedFailure) => {
+                outcome.failed_sources = outcome.failed_sources.saturating_add(1);
+                unchanged_failures = unchanged_failures.saturating_add(1);
             }
             Err(error) => {
                 outcome.failed_sources = outcome.failed_sources.saturating_add(1);
-                record_source_failure(storage, source, generation, &error.to_string())?;
+                let fingerprint_failure = matches!(
+                    &error,
+                    TranscriptAnalyticsError::InvalidUtf8
+                        | TranscriptAnalyticsError::InvalidSourceMetadata
+                        | TranscriptAnalyticsError::SourceTooLarge
+                        | TranscriptAnalyticsError::Identity(_)
+                );
+                record_source_failure(
+                    storage,
+                    source,
+                    generation,
+                    &error.to_string(),
+                    fingerprint_failure,
+                )?;
             }
         }
     }
-
-    // Every unchanged source owes only a `seen_generation` bump, so the whole
-    // root advances in one transaction instead of one per source.
-    let refresh_failures = flush_unchanged_refreshes(storage, &identities);
-    let (refresh_failed, identities): (Vec<_>, Vec<_>) = identities
-        .into_iter()
-        .partition(|identity| refresh_failures.contains_key(&identity.discovered.source_key));
-    for identity in refresh_failed {
-        handled_keys.remove(identity.discovered.source_key.as_str());
-        outcome.failed_sources = outcome.failed_sources.saturating_add(1);
-        let error = refresh_failures
-            .get(&identity.discovered.source_key)
-            .map(String::as_str)
-            .unwrap_or("unchanged transcript refresh failed");
-        record_source_failure(storage, &identity.discovered, generation, error)?;
+    if unchanged_failures > 0 {
+        // One line per pass rather than one warning per permanently broken
+        // source: the diagnostic each of them already carries is unchanged.
+        log::debug!(
+            "Retained transcript analytics kept unchanged source failures: provider={} count={unchanged_failures}",
+            root.provider.as_str(),
+        );
     }
 
     let mut graph_metadata = identities
@@ -1009,6 +1023,7 @@ fn reconcile_transcript_source_root(
                 &identity.discovered,
                 generation,
                 "unchanged transcript has no last-good native identity",
+                false,
             )?;
             continue;
         };
@@ -1021,6 +1036,7 @@ fn reconcile_transcript_source_root(
                     &identity.discovered,
                     generation,
                     &error.to_string(),
+                    false,
                 )?;
                 continue;
             }
@@ -1046,7 +1062,7 @@ fn reconcile_transcript_source_root(
             }
             Err(error) => {
                 outcome.failed_sources = outcome.failed_sources.saturating_add(1);
-                record_source_failure(storage, &identity.discovered, generation, &error)?;
+                record_source_failure(storage, &identity.discovered, generation, &error, false)?;
             }
         }
     }
@@ -1056,6 +1072,7 @@ fn reconcile_transcript_source_root(
             provider: root.provider,
             source_root_key: root.source_root_key.to_owned(),
             generation,
+            discovered_source_keys: discovered_keys,
         });
     }
     Ok(outcome)
@@ -3024,7 +3041,14 @@ mod tests {
             .err()
             .expect("drifted Pi source must fail");
         assert!(
-            record_source_failure(&storage, &source, generation, &drift_error.to_string()).is_ok(),
+            record_source_failure(
+                &storage,
+                &source,
+                generation,
+                &drift_error.to_string(),
+                false,
+            )
+            .is_ok(),
             "record Pi source failure",
         );
         assert_eq!(

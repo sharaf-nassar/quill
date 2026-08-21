@@ -1611,9 +1611,19 @@ impl SessionIndex {
         app_handle: &tauri::AppHandle,
         storage: Option<&crate::storage::Storage>,
     ) -> Result<usize, String> {
+        let roots = enumerate_retained_jsonl_source_roots();
+        self.startup_scan_with_roots(app_handle, storage, &roots)
+    }
+
+    pub(crate) fn startup_scan_with_roots(
+        &self,
+        app_handle: &tauri::AppHandle,
+        storage: Option<&crate::storage::Storage>,
+        roots: &[ProviderSourceRoot],
+    ) -> Result<usize, String> {
         use tauri::Emitter;
 
-        let total_indexed = self.startup_scan_inner(storage)?;
+        let total_indexed = self.startup_scan_inner(storage, roots)?;
         let _ = app_handle.emit("sessions-index-updated", total_indexed);
         Ok(total_indexed)
     }
@@ -1623,19 +1633,20 @@ impl SessionIndex {
         &self,
         storage: Option<&crate::storage::Storage>,
     ) -> Result<usize, String> {
-        self.startup_scan_inner(storage)
+        let roots = enumerate_retained_jsonl_source_roots();
+        self.startup_scan_inner(storage, &roots)
     }
 
     fn startup_scan_inner(
         &self,
         storage: Option<&crate::storage::Storage>,
+        roots: &[ProviderSourceRoot],
     ) -> Result<usize, String> {
         let mut total_indexed = 0usize;
         let mut index_changed = false;
         let mut state = self.state.lock().unwrap();
         let hostname = Self::local_hostname();
         let mut writer = self.writer.lock().unwrap();
-        let roots = enumerate_retained_jsonl_source_roots();
         let discovered_paths = roots
             .iter()
             .flat_map(|root| &root.sources)

@@ -592,6 +592,21 @@ pub(crate) struct UnchangedTranscriptAnalyticsSource<'a> {
     pub(crate) content_sha256: Option<&'a str>,
 }
 
+pub(crate) struct FailedTranscriptAnalyticsSource<'a> {
+    pub(crate) provider: IntegrationProvider,
+    pub(crate) source_key: &'a str,
+    pub(crate) source_root_key: &'a str,
+    pub(crate) source_path: &'a Path,
+    pub(crate) generation: i64,
+    pub(crate) error: &'a str,
+    /// Only content-deterministic classification failures may persist this
+    /// fingerprint. It is never the last-good fingerprint.
+    pub(crate) fingerprint_failure: bool,
+    /// Fingerprint of the content that failed, absent when it could not be
+    /// stat'd.
+    pub(crate) failed_stat: Option<(i64, i64)>,
+}
+
 /// Durable origin supplied by a live analytics producer. Missing fields stay
 /// unknown; callers must not infer them from another analytics table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6025,12 +6040,12 @@ impl Storage {
     /// Advance inventory state for every source whose last-good snapshot is
     /// still authoritative, in one transaction for the whole batch.
     ///
-    /// Startup reconciliation walks thousands of unchanged sources per root, so
-    /// a per-source transaction would cost one WAL round-trip and one
-    /// connection-mutex acquisition each. Returns the source keys whose rows
-    /// did not update because the root generation advanced under a concurrent
-    /// run, so callers keep per-source stale-generation handling instead of one
-    /// aggregate verdict.
+    /// Only the live path refreshes an unchanged source now — a whole-root pass
+    /// proves survival through its discovered key set and writes nothing — so
+    /// the batch normally holds one source. It stays batch-shaped because the
+    /// per-source stale-generation verdict is the part callers depend on:
+    /// the returned keys are the rows that did not update because the root
+    /// generation advanced under a concurrent run.
     pub(crate) fn refresh_unchanged_transcript_analytics_sources(
         &self,
         sources: &[UnchangedTranscriptAnalyticsSource<'_>],
@@ -6111,25 +6126,28 @@ impl Storage {
     }
 
     /// Persist a bounded retry diagnostic without modifying the last-good
-    /// identity, fingerprint, or any source-owned analytics rows.
+    /// identity, content digest, or any source-owned analytics rows.
+    ///
+    /// Only content-deterministic classification failures persist `failed_stat`.
+    /// It never touches `content_sha256`, which still describes the retained
+    /// last-good rows; all transient, graph, storage, and live failures retry.
     pub(crate) fn record_transcript_analytics_source_failure(
         &self,
-        provider: IntegrationProvider,
-        source_key: &str,
-        source_root_key: &str,
-        source_path: &Path,
-        generation: i64,
-        error: &str,
+        source: FailedTranscriptAnalyticsSource<'_>,
     ) -> Result<(), String> {
-        let bounded_error = error.chars().take(1024).collect::<String>();
+        let bounded_error = source.error.chars().take(1024).collect::<String>();
         let now = chrono::Utc::now().timestamp_millis();
+        let (failed_mtime_ns, failed_size_bytes) = match source.failed_stat {
+            Some((mtime_ns, size_bytes)) => (Some(mtime_ns), Some(size_bytes)),
+            None => (None, None),
+        };
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO transcript_analytics_sources (
                  provider, source_key, source_root_key, source_path,
                  seen_generation, processing_status, last_attempt_at_ms,
-                 last_error
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'failed', ?6, ?7)
+                 last_error, mtime_ns, size_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'failed', ?6, ?7, ?8, ?9)
              ON CONFLICT(provider, source_key) DO UPDATE SET
                  source_root_key = excluded.source_root_key,
                  source_path = excluded.source_path,
@@ -6141,17 +6159,22 @@ impl Storage {
                      ELSE 'failed'
                  END,
                  last_attempt_at_ms = excluded.last_attempt_at_ms,
-                 last_error = excluded.last_error
+                 last_error = excluded.last_error,
+                 mtime_ns = CASE WHEN ?10 THEN excluded.mtime_ns ELSE NULL END,
+                 size_bytes = CASE WHEN ?10 THEN excluded.size_bytes ELSE NULL END
              WHERE transcript_analytics_sources.seen_generation
                    <= excluded.seen_generation",
             params![
-                provider.as_str(),
-                source_key,
-                source_root_key,
-                source_path.to_string_lossy(),
-                generation,
+                source.provider.as_str(),
+                source.source_key,
+                source.source_root_key,
+                source.source_path.to_string_lossy(),
+                source.generation,
                 now,
                 bounded_error,
+                failed_mtime_ns,
+                failed_size_bytes,
+                source.fingerprint_failure,
             ],
         )
         .map_err(|error| format!("Record transcript analytics failure: {error}"))?;
@@ -6199,6 +6222,14 @@ impl Storage {
         Ok(generation)
     }
 
+    /// Delete every registry row of one completely enumerated root that the
+    /// pass did not discover, plus the analytics rows those sources own.
+    ///
+    /// Membership in the pass's discovered key set is what proves a source is
+    /// still present, so unchanged sources need no per-pass `seen_generation`
+    /// bump. The generation guard covers the other direction: a live commit
+    /// racing this pass stamps a strictly newer generation, so a source this
+    /// pass never enumerated survives on that stamp alone.
     pub(crate) fn prune_transcript_analytics_sources_for_root(
         &self,
         proof: &crate::transcript_analytics::CompletedTranscriptSourceRoot,
@@ -6222,7 +6253,7 @@ impl Storage {
         if current_generation > proof.generation {
             return Ok(0);
         }
-        let mut stmt = tx.prepare("SELECT source_key FROM transcript_analytics_sources WHERE provider=?1 AND source_root_key=?2 AND seen_generation < ?3 AND processing_status != 'suppressed'")
+        let mut stmt = tx.prepare("SELECT source_key FROM transcript_analytics_sources WHERE provider=?1 AND source_root_key=?2 AND seen_generation <= ?3 AND processing_status != 'suppressed'")
             .map_err(|e| format!("Prepare transcript prune: {e}"))?;
         let keys: Vec<String> = stmt
             .query_map(
@@ -6234,8 +6265,11 @@ impl Storage {
                 |r| r.get(0),
             )
             .map_err(|e| format!("Query transcript prune: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Read transcript prune key: {e}"))?;
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| format!("Read transcript prune key: {e}"))?
+            .into_iter()
+            .filter(|key| !proof.discovered_source_keys.contains(key))
+            .collect();
         drop(stmt);
         let rollup_sources = keys
             .iter()
@@ -30159,6 +30193,305 @@ mod tests {
         .expect("reconcile under a forced reparse");
 
         assert_no_resurrection(&fixture.storage);
+        clear_env();
+    }
+
+    /// One reconciled Claude root: a real transcript on disk plus the registry
+    /// row and owned rows its first whole-root pass committed.
+    struct ReconciledTranscriptRoot {
+        _data_dir: TempDir,
+        _projects_dir: TempDir,
+        _codex_dir: TempDir,
+        storage: Storage,
+        transcript: PathBuf,
+        source_key: String,
+    }
+
+    impl ReconciledTranscriptRoot {
+        fn reconcile(&self) {
+            crate::transcript_analytics::run_startup_transcript_analytics_reconciliation(
+                &self.storage,
+                "host-a",
+            )
+            .expect("whole-root reconciliation");
+        }
+
+        /// `(processing_status, seen_generation, last_attempt_at_ms)`. Reading
+        /// it at all also proves the row survived the pass's prune.
+        fn registry_state(&self) -> (String, i64, Option<i64>) {
+            let conn = self.storage.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT processing_status, seen_generation, last_attempt_at_ms
+                 FROM transcript_analytics_sources
+                 WHERE provider = 'claude' AND source_key = ?1",
+                params![self.source_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read reconciled registry row")
+        }
+
+        /// Stamp an impossible attempt time so any registry write during the
+        /// next pass shows up as a changed value rather than a
+        /// same-millisecond tie.
+        fn stamp_attempt_sentinel(&self) {
+            let conn = self.storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE transcript_analytics_sources SET last_attempt_at_ms = 1
+                 WHERE provider = 'claude' AND source_key = ?1",
+                params![self.source_key],
+            )
+            .expect("stamp attempt sentinel");
+        }
+
+        /// The registry row a failed pass leaves behind: the diagnostic plus
+        /// the fingerprint of the content that failed, over last-good identity
+        /// and analytics rows the failure did not disturb.
+        fn mark_failed_at_current_fingerprint(&self) {
+            let metadata = std::fs::metadata(&self.transcript).expect("stat transcript");
+            let stat = crate::transcript_identity::model_source_fast_fingerprint(&metadata)
+                .expect("fingerprint transcript");
+            let conn = self.storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE transcript_analytics_sources
+                 SET processing_status = 'failed', last_error = 'seeded failure',
+                     mtime_ns = ?2, size_bytes = ?3, last_attempt_at_ms = 1
+                 WHERE provider = 'claude' AND source_key = ?1",
+                params![self.source_key, stat.mtime_ns(), stat.size_bytes()],
+            )
+            .expect("mark source failed at its current fingerprint");
+        }
+
+        fn mark_failed_without_fingerprint(&self) {
+            let conn = self.storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE transcript_analytics_sources
+                 SET processing_status = 'failed', last_error = 'transient failure',
+                     mtime_ns = NULL, size_bytes = NULL, last_attempt_at_ms = 1
+                 WHERE provider = 'claude' AND source_key = ?1",
+                params![self.source_key],
+            )
+            .expect("mark source failed without a fingerprint");
+        }
+
+        fn append_record(&self, uuid: &str, timestamp: &str) {
+            let grown = std::fs::read_to_string(&self.transcript).expect("read transcript")
+                + &claude_user_record(uuid, timestamp)
+                + "\n";
+            std::fs::write(&self.transcript, grown).expect("append to transcript");
+        }
+    }
+
+    fn seed_reconciled_transcript_root() -> ReconciledTranscriptRoot {
+        clear_env();
+        let data_dir = TempDir::new().expect("tempdir");
+        let projects_dir = TempDir::new().expect("tempdir");
+        let codex_dir = TempDir::new().expect("tempdir");
+        let project_dir = projects_dir.path().join("proj");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let transcript = project_dir.join("sess-a.jsonl");
+        std::fs::write(
+            &transcript,
+            claude_user_record("uuid-1", RESURRECTION_KEPT_USER) + "\n",
+        )
+        .expect("write transcript");
+
+        // SAFETY: env mutation; every consuming test is `#[serial]`.
+        unsafe {
+            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", projects_dir.path());
+            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", codex_dir.path());
+        }
+        let storage = init_storage_in(&data_dir);
+        crate::transcript_analytics::run_startup_transcript_analytics_reconciliation(
+            &storage, "host-a",
+        )
+        .expect("seed reconciliation");
+        let source_key = {
+            let conn = storage.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT source_key FROM transcript_analytics_sources WHERE provider = 'claude'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("exactly one reconciled Claude source")
+        };
+
+        ReconciledTranscriptRoot {
+            _data_dir: data_dir,
+            _projects_dir: projects_dir,
+            _codex_dir: codex_dir,
+            storage,
+            transcript,
+            source_key,
+        }
+    }
+
+    /// Survival is proved by the key set the pass enumerated, so a whole-root
+    /// pass over an unchanged root must write nothing to the registry — the
+    /// bulk `seen_generation` restamp it used to owe is what made an idle pass
+    /// cost tens of megabytes of WAL on a real corpus.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Unchanged Root Pass Writes Nothing]]
+    #[test]
+    #[serial]
+    fn an_unchanged_whole_root_pass_writes_no_transcript_source_rows() {
+        let fixture = seed_reconciled_transcript_root();
+        let (status, generation, _) = fixture.registry_state();
+        assert_eq!(status, "ok");
+        fixture.stamp_attempt_sentinel();
+
+        fixture.reconcile();
+
+        assert_eq!(
+            fixture.registry_state(),
+            ("ok".to_string(), generation, Some(1)),
+            "an unchanged source must survive the prune without being restamped"
+        );
+        clear_env();
+    }
+
+    /// A failed source without a content fingerprint is transient and must be
+    /// reparsed even if its last-good stat still matches the file.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Content-Deterministic Failure Fingerprints]]
+    #[test]
+    #[serial]
+    fn an_unchanged_failed_source_without_fingerprint_is_reparsed() {
+        let fixture = seed_reconciled_transcript_root();
+        fixture.mark_failed_without_fingerprint();
+
+        fixture.reconcile();
+
+        assert_eq!(
+            fixture.registry_state().0,
+            "ok",
+            "a failed row without a fingerprint must retry on the next pass"
+        );
+        clear_env();
+    }
+
+    /// A content-deterministic failure is not re-read, re-parsed, or
+    /// re-diagnosed until its fingerprint moves.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Content-Deterministic Failure Fingerprints]]
+    #[test]
+    #[serial]
+    fn an_unchanged_failed_source_is_not_reparsed_until_its_fingerprint_moves() {
+        let fixture = seed_reconciled_transcript_root();
+        fixture.mark_failed_at_current_fingerprint();
+
+        fixture.reconcile();
+        let (status, _, attempt) = fixture.registry_state();
+        assert_eq!(
+            status, "failed",
+            "the transcript on disk parses cleanly, so an 'ok' status here would \
+             prove the pass reparsed a source it should have skipped"
+        );
+        assert_eq!(
+            attempt,
+            Some(1),
+            "a skipped content-deterministic failure must not rewrite its diagnostic"
+        );
+
+        // A moved fingerprint is the retry signal.
+        fixture.append_record("uuid-2", RESURRECTION_KEPT_TOOL);
+        fixture.reconcile();
+        let (status, _, attempt) = fixture.registry_state();
+        assert_eq!(status, "ok", "changed content must be reparsed in full");
+        assert_ne!(attempt, Some(1));
+
+        // So is the durable reingest marker, even at an identical fingerprint.
+        fixture.mark_failed_at_current_fingerprint();
+        fixture
+            .storage
+            .set_setting("transcript_analytics_reingest_pending", "1")
+            .expect("arm the forced-reparse marker");
+        fixture.reconcile();
+        assert_eq!(
+            fixture.registry_state().0,
+            "ok",
+            "a forced reparse must retry a content-deterministic failure"
+        );
+        clear_env();
+    }
+
+    /// Pruning deletes exactly the rows this pass did not enumerate. A stale
+    /// `seen_generation` no longer means "absent" — unchanged sources never
+    /// advance one — while a generation newer than the pass still protects a
+    /// source the pass never saw.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Discovered-Set Prune]]
+    #[test]
+    #[serial]
+    fn transcript_prune_deletes_only_sources_the_pass_did_not_discover() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let provider = IntegrationProvider::Claude;
+        let root = "root-discovered-prune";
+
+        let discovered = TranscriptSourceSpec {
+            provider,
+            source_root_key: root,
+            source_key: "source-discovered",
+            session_id: "session-discovered",
+            generation: 1,
+            marker: "keep",
+            rows: 2,
+        };
+        let vanished = TranscriptSourceSpec {
+            source_key: "source-vanished",
+            session_id: "session-vanished",
+            marker: "gone",
+            ..discovered
+        };
+        seed_transcript_source(&storage, &discovered);
+        seed_transcript_source(&storage, &vanished);
+
+        let generation = storage
+            .begin_transcript_analytics_generation(provider, root)
+            .expect("begin the pass generation");
+        assert_eq!(generation, 2);
+
+        // A live commit landing while this pass runs stamps a strictly newer
+        // generation, and the pass's inventory predates it.
+        let live = TranscriptSourceSpec {
+            source_key: "source-live",
+            session_id: "session-live",
+            generation: generation + 1,
+            marker: "live",
+            ..discovered
+        };
+        seed_transcript_source(&storage, &live);
+
+        let pruned = storage
+            .prune_transcript_analytics_sources_for_root(
+                &crate::transcript_analytics::CompletedTranscriptSourceRoot {
+                    provider,
+                    source_root_key: root.to_string(),
+                    generation,
+                    discovered_source_keys: HashSet::from(["source-discovered".to_string()]),
+                },
+            )
+            .expect("prune the completed root");
+        assert_eq!(pruned, 1, "only the vanished source may be pruned");
+
+        let remaining = storage
+            .list_transcript_analytics_sources_for_root(provider, root)
+            .expect("read the registry after the prune")
+            .into_iter()
+            .map(|source| (source.source_key, source.seen_generation))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remaining,
+            vec![
+                ("source-discovered".to_string(), 1),
+                ("source-live".to_string(), generation + 1),
+            ],
+            "a discovered source survives on its stale generation, and a newer \
+             generation protects a source this pass never enumerated"
+        );
+        for (table, count, _) in owned_source_rows(&storage, provider, discovered.source_key) {
+            assert_eq!(count, 2, "{table} must keep the discovered source's rows");
+        }
+        for (table, count, _) in owned_source_rows(&storage, provider, vanished.source_key) {
+            assert_eq!(count, 0, "{table} must lose the vanished source's rows");
+        }
         clear_env();
     }
 

@@ -1285,9 +1285,11 @@ Missing Codex source rows force the independent transcript and model reconciliat
 
 [[src-tauri/src/lib.rs#run]] schedules whole-root transcript reconciliation during app setup, independently of Session Search or Analytics-window mounting. Blocking inventory and parsing run in the background under the same provider/root permits as live source work. An existing empty root proves an empty inventory; a missing, unreadable, or unavailable configured root is incomplete and cannot authorize pruning or marker clearance.
 
-Reconciliation compares canonical source key/path and last-good status before reading content. Matching `mtime_ns` plus size advances only `seen_generation`; a changed fast fingerprint hashes one stable read and likewise preserves all five tables when the stored hash matches. Only new, changed, failed, or root-restamped sources parse and replace. Failures persist bounded retry diagnostics without changing the last-good fingerprint, identity, or child rows. While `transcript_analytics_reingest_pending` is set both short-circuits are bypassed, so an interrupted rebuild genuinely replays every retained source instead of trusting a stale fingerprint; the marker clears only after every root supplies complete inventory and prune proof.
+Reconciliation compares canonical source key/path and last-good status before reading content. Matching `mtime_ns` plus size costs nothing at all in a whole-root pass; a changed fast fingerprint hashes one stable read and likewise preserves all five tables when the stored hash matches. Only new, changed, and root-restamped sources parse and replace. Failures persist bounded retry diagnostics without changing the last-good digest, identity, or child rows. Only content-deterministic classification failures — invalid UTF-8/metadata, oversized sources, and identity failures — store a fingerprint. A `failed` row whose stored fingerprint still matches the file is skipped without the read, reparse, or rewritten diagnostic; transient, storage, graph, and live failures keep no fingerprint and retry every pass. Any fingerprint movement, or `transcript_analytics_reingest_pending`, retries a fingerprinted failure in full. While that marker is set every short-circuit is bypassed, so an interrupted rebuild genuinely replays every retained source instead of trusting a stale fingerprint; the marker clears only after every root supplies complete inventory and prune proof.
 
-[[src-tauri/src/storage.rs#Storage#refresh_unchanged_transcript_analytics_sources]] advances every unchanged source of one root in a single transaction rather than one per source — a real corpus collapses roughly 5,500 transactions into one. It returns the source keys whose rows did not update because the root generation moved under a concurrent run, so callers keep per-source stale-generation handling instead of one aggregate verdict; the single-source method is a thin wrapper over it.
+A whole-root pass therefore writes to `transcript_analytics_sources` only for sources it actually replaced or newly failed. Survival is proved by the enumerated key set the pass hands [[src-tauri/src/storage.rs#Storage#prune_transcript_analytics_sources_for_root]], not by restamping `seen_generation` on every row, so an idle pass over ~9,800 retained sources costs zero registry updates rather than tens of megabytes of WAL.
+
+[[src-tauri/src/storage.rs#Storage#refresh_unchanged_transcript_analytics_sources]] is now reached only by the live single-source path, whose one refresh is already one transaction. It stays batch-shaped for the part callers depend on: it returns the source keys whose rows did not update because the root generation moved under a concurrent run, so a stale-generation verdict remains per source rather than one aggregate.
 
 `replace_transcript_analytics_snapshot` replaces all five owned analytics tables and the source registry in one transaction; Pi snapshots extend that same transaction across lifecycle, receipts, token snapshots, native model observations, unpruned model rollups, and the model source registry. Valid empty snapshots remove only that source, while suppression, identity drift, stale generation, or any final insert failure leaves every prior row intact. Owned inserts use `INSERT OR IGNORE` through prepared statements, and generation guards reject stale plans before rows change. The `session_events`, `tool_actions`, and Pi usage inserts obey the retention watermark so delete-and-reinsert cannot resurrect pruned history. Shared tool/skill helpers keep notify and retained keys identical.
 
@@ -1385,9 +1387,27 @@ A version at [[src-tauri/src/storage.rs#MAX_SUPPORTED_SCHEMA_VERSION]] still ope
 
 ##### Batched Unchanged Source Refresh
 
-[[src-tauri/src/storage.rs#Storage#refresh_unchanged_transcript_analytics_sources]] advances many sources in one transaction without losing the per-source stale detection the per-source transactions used to provide.
+[[src-tauri/src/storage.rs#Storage#refresh_unchanged_transcript_analytics_sources]] keeps a batch-shaped storage contract for per-source stale detection, although production now calls it only for one unchanged live source.
 
-It must return exactly the keys that did not update — including a row already stamped past the generation the batch was prepared against — while advancing the rest, and a mid-batch failure must roll the whole batch back rather than leaving a partially advanced root.
+The storage-level test passes multiple descriptors to pin the contract: return exactly the keys that did not update, including a row already stamped past the prepared generation, and roll the whole transaction back on a mid-batch failure. Whole-root reconciliation never calls this helper.
+
+##### Unchanged Root Pass Writes Nothing
+
+A whole-root pass over a root whose every source is unchanged must not write to `transcript_analytics_sources` at all.
+
+A reconciled Claude root is restamped with an impossible `last_attempt_at_ms` sentinel; replaying the pass must leave that sentinel and the row's `seen_generation` exactly as they were, and the row must still survive the pass's own prune. The bulk restamp this replaces is what made an idle pass write tens of megabytes of WAL on a real corpus.
+
+##### Content-Deterministic Failure Fingerprints
+
+Only a persisted content-deterministic classification failure whose path and `mtime_ns`/size fingerprint still match must not be re-read, re-parsed, or re-diagnosed on every pass; failures without a fingerprint retry.
+
+The fixture marks a cleanly parsing transcript `failed` at its current fingerprint, so an `ok` status after the next pass would prove it was reparsed. The status and diagnostic sentinel must stay untouched. Appending moves the fingerprint and retries in full, as does `transcript_analytics_reingest_pending` at an unmoved source.
+
+##### Discovered-Set Prune
+
+[[src-tauri/src/storage.rs#Storage#prune_transcript_analytics_sources_for_root]] deletes exactly the non-suppressed rows the pass did not enumerate, because a stale `seen_generation` no longer means absence.
+
+A discovered source seeded behind the pass generation keeps its row, generation, and all five owned tables; an undiscovered source at the same generation loses all of them. A source stamped past the pass generation — a live commit racing the pass — survives even though the pass never enumerated it.
 
 ##### Runtime Totals Across Native Chains
 
@@ -1423,7 +1443,7 @@ Records with no `sessionId`, and a sidechain record with no `agentId`, are indiv
 
 [[src-tauri/src/transcript_analytics.rs#classify_transcript_source_freshness]] decides reparse without extracting rows, and each short-circuit must fire on exactly its own condition.
 
-Eight cases pin the ladder: identical mtime and size skip the digest entirely (including an in-place rewrite that preserves both, which stays trusted by design); mtime drift falls through to a digest that may match or reparse; and a missing stored digest, a `failed` status, a row with no last-good identity, or a row recorded for another path all refuse the fast path. Every unchanged verdict carries the current run's generation on its owed refresh.
+Eight cases pin the ladder: identical mtime and size skip the digest entirely (including an in-place rewrite that preserves both, which stays trusted by design); mtime drift falls through to a digest that may match or reparse; and a missing stored digest, a `failed` status, a row with no last-good identity, or a row recorded for another path all refuse the fast path. Every unchanged verdict carries the current generation in a refresh descriptor for the live path; whole-root identity classification drops it and proves survival through the discovered set.
 
 ##### Fast Path Avoids Source Reads
 

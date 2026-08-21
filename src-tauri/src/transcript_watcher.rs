@@ -16,6 +16,8 @@ const QUIET_DEBOUNCE: Duration = Duration::from_millis(250);
 const MAX_DEBOUNCE: Duration = Duration::from_secs(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(120);
 const MAX_PENDING_PATHS: usize = 4_096;
+// Bound repeated whole-root work while self-generated or external bursts converge.
+const RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 struct TranscriptRoot {
@@ -99,13 +101,55 @@ impl RetainedScanScheduler {
     }
 }
 
+fn recovery_cooldown_elapsed(
+    last_reconcile: Option<Instant>,
+    now: Instant,
+    cooldown: Duration,
+) -> bool {
+    last_reconcile.is_none_or(|last| now.saturating_duration_since(last) >= cooldown)
+}
+
 fn run_retained_scan_worker(
     receiver: mpsc::Receiver<()>,
     recovery: Arc<AtomicBool>,
+    scan: impl FnMut(bool),
+) {
+    run_retained_scan_worker_with_cooldown(receiver, recovery, RECOVERY_COOLDOWN, scan);
+}
+
+fn run_retained_scan_worker_with_cooldown(
+    receiver: mpsc::Receiver<()>,
+    recovery: Arc<AtomicBool>,
+    cooldown: Duration,
     mut scan: impl FnMut(bool),
 ) {
-    while receiver.recv().is_ok() {
-        scan(recovery.swap(false, Ordering::AcqRel));
+    let mut last_reconcile = None;
+    loop {
+        let connected = if recovery.load(Ordering::Acquire) {
+            let now = Instant::now();
+            let remaining = last_reconcile.map_or(Duration::ZERO, |last| {
+                cooldown.saturating_sub(now.saturating_duration_since(last))
+            });
+            match receiver.recv_timeout(remaining) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => true,
+                Err(mpsc::RecvTimeoutError::Disconnected) => false,
+            }
+        } else {
+            receiver.recv().is_ok()
+        };
+        if !connected {
+            break;
+        }
+
+        let recovery_requested = recovery.swap(false, Ordering::AcqRel);
+        let reconcile = recovery_requested
+            && recovery_cooldown_elapsed(last_reconcile, Instant::now(), cooldown);
+        scan(reconcile);
+        if reconcile {
+            last_reconcile = Some(Instant::now());
+        } else if recovery_requested {
+            recovery.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -239,10 +283,11 @@ pub(crate) fn start(app: tauri::AppHandle) {
     let scan_app = app.clone();
     std::thread::spawn(move || {
         run_retained_scan_worker(scan_receiver, scan_recovery, |recovery| {
-            sync_search_index(&scan_app);
+            let roots = crate::sessions::enumerate_retained_jsonl_source_roots();
             if recovery {
-                reconcile_all(&scan_app);
+                reconcile_all(&scan_app, &roots);
             }
+            sync_search_index(&scan_app, &roots);
         });
     });
     std::thread::spawn(move || {
@@ -262,6 +307,10 @@ fn forward_event(
     overflow: &AtomicBool,
     event: Result<Event, notify::Error>,
 ) {
+    if matches!(&event, Ok(event) if matches!(&event.kind, EventKind::Access(_)) && !event.need_rescan())
+    {
+        return;
+    }
     if tx.try_send(event).is_err() {
         overflow.store(true, Ordering::Release);
     }
@@ -424,9 +473,11 @@ fn finish_pending(
     }
 }
 
-fn sync_search_index(app: &tauri::AppHandle) {
+fn sync_search_index(app: &tauri::AppHandle, roots: &[crate::sessions::ProviderSourceRoot]) {
     if let Some(index) = app.try_state::<crate::sessions::SessionIndexState>()
-        && let Err(error) = index.0.startup_scan(app, crate::STORAGE.get())
+        && let Err(error) = index
+            .0
+            .startup_scan_with_roots(app, crate::STORAGE.get(), roots)
     {
         log::warn!("Transcript watcher search-index sync failed: {error}");
     }
@@ -451,11 +502,12 @@ fn sweep_live_tracker(app: &tauri::AppHandle) {
     }
 }
 
-fn reconcile_all(app: &tauri::AppHandle) {
+fn reconcile_all(app: &tauri::AppHandle, roots: &[crate::sessions::ProviderSourceRoot]) {
     let result = crate::get_storage().and_then(|storage| {
-        crate::transcript_analytics::run_startup_transcript_analytics_reconciliation(
+        crate::transcript_analytics::run_transcript_analytics_reconciliation(
             storage,
             &crate::sessions::SessionIndex::local_hostname(),
+            roots,
         )
     });
     match result {
@@ -472,7 +524,9 @@ fn reconcile_all(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode};
+    use notify::event::{
+        AccessKind, CreateKind, DataChange, Flag, MetadataKind, RemoveKind, RenameMode,
+    };
     use serial_test::serial;
 
     fn roots() -> Vec<TranscriptRoot> {
@@ -724,6 +778,61 @@ mod tests {
         );
     }
 
+    // @lat: [[data-flow#Data Flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Transcript Watcher Test Specs#Relevant Event Filtering And Prune Recovery]]
+    #[test]
+    fn access_events_are_dropped_before_the_bounded_channel() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let overflow = AtomicBool::new(false);
+
+        forward_event(
+            &tx,
+            &overflow,
+            Ok(Event::new(EventKind::Access(AccessKind::Any))),
+        );
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        forward_event(
+            &tx,
+            &overflow,
+            Ok(Event::new(EventKind::Access(AccessKind::Any)).set_flag(Flag::Rescan)),
+        );
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Ok(event)) if matches!(event.kind, EventKind::Access(AccessKind::Any))
+                && event.need_rescan()
+        ));
+
+        forward_event(
+            &tx,
+            &overflow,
+            Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                DataChange::Content,
+            )))),
+        );
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Ok(event))
+                if matches!(event.kind, EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+        ));
+
+        forward_event(&tx, &overflow, Err(notify::Error::generic("watch failed")));
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(Err(error)) => assert_eq!(error.to_string(), "watch failed"),
+            other => panic!("expected watcher error, got {other:?}"),
+        }
+
+        forward_event(
+            &tx,
+            &overflow,
+            Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+        );
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Ok(event)) if event.kind == EventKind::Other && event.need_rescan()
+        ));
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
     // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Transcript Watcher Test Specs#Bounded Overflow Recovery]]
     #[test]
     fn pending_path_overflow_requests_reconciliation() {
@@ -807,6 +916,76 @@ mod tests {
         let tracker = LiveTracker::new(None);
         tracker.apply_paths(batch);
         assert_eq!(tracker.folded_session_ids(), vec![session_id.to_owned()]);
+    }
+
+    // @lat: [[data-flow#Data Flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Transcript Watcher Test Specs#Recovery Cooldown]]
+    #[test]
+    fn recovery_cooldown_is_prompt_then_gated_until_elapsed() {
+        let completed = Instant::now();
+        assert!(recovery_cooldown_elapsed(
+            None,
+            completed,
+            RECOVERY_COOLDOWN
+        ));
+        assert!(!recovery_cooldown_elapsed(
+            Some(completed),
+            completed + RECOVERY_COOLDOWN - Duration::from_millis(1),
+            RECOVERY_COOLDOWN,
+        ));
+        assert!(recovery_cooldown_elapsed(
+            Some(completed),
+            completed + RECOVERY_COOLDOWN,
+            RECOVERY_COOLDOWN,
+        ));
+    }
+
+    // @lat: [[data-flow#Data Flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Transcript Watcher Test Specs#Recovery Cooldown]]
+    #[test]
+    fn deferred_recovery_runs_without_another_request() {
+        let cooldown = Duration::from_millis(250);
+        let (scans, scan_receiver) = RetainedScanScheduler::new();
+        let scan_recovery = Arc::clone(&scans.recovery);
+        let (scan_tx, scan_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut count = 0usize;
+            run_retained_scan_worker_with_cooldown(
+                scan_receiver,
+                scan_recovery,
+                cooldown,
+                |recovery| {
+                    count += 1;
+                    scan_tx
+                        .send((count, recovery, Instant::now()))
+                        .expect("report retained scan");
+                    if count == 1 {
+                        release_first_rx.recv().expect("release first recovery");
+                    }
+                },
+            );
+        });
+
+        scans.request(true);
+        let first = scan_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first recovery runs promptly");
+        assert_eq!((first.0, first.1), (1, true));
+
+        scans.request(true);
+        release_first_tx.send(()).expect("finish first recovery");
+        let deferred_scan = scan_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deferred recovery still scans immediately");
+        assert_eq!((deferred_scan.0, deferred_scan.1), (2, false));
+
+        let deferred_recovery = scan_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deferred recovery runs after cooldown");
+        assert_eq!((deferred_recovery.0, deferred_recovery.1), (3, true));
+        assert!(deferred_recovery.2.duration_since(first.2) >= cooldown);
+
+        drop(scans);
+        worker.join().expect("join retained scan worker");
     }
 
     // Both watcher call sites share this one method, so exercising it

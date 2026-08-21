@@ -1,3 +1,19 @@
 {
-  "identifier": "com.quilltoolkit.app.dev"
+  "identifier": "com.quilltoolkit.app.dev",
+  "app": {
+    "windows": [
+      {
+        "title": "Quill",
+        "width": 360,
+        "height": 800,
+        "minWidth": 320,
+        "minHeight": 200,
+        "alwaysOnTop": false,
+        "transparent": true,
+        "decorations": false,
+        "resizable": true,
+        "focus": false
+      }
+    ]
+  }
 }
