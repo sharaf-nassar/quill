@@ -34,6 +34,7 @@ import type {
   SearchFacets,
   SearchResults,
   SessionBreakdown,
+  SessionContext,
   SkillBreakdown,
   ToolCount,
   TokenDataPoint,
@@ -45,6 +46,11 @@ const now = Date.now();
 const M = 60_000;
 const H = 3_600_000;
 const D = 24 * H;
+
+function marketingScreenshotMode(): boolean {
+  return typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("screenshot") === "marketing";
+}
 // Most timestamps mirror the Rust backend's `to_rfc3339()` (zone-designated)
 // and are consumed directly via `new Date(...)` — session times, rate-limit
 // resets, verification stamps.
@@ -448,8 +454,179 @@ const learningRuns: LearningRun[] = [
   { id: 41, trigger_mode: "on-demand", observations_analyzed: 96, rules_created: 1, rules_updated: 2, duration_ms: 22_800, status: "completed", error: null, logs: null, created_at: sqliteUtc(28 * H), phases: null, provider_scope: ["claude"] },
 ];
 
-const searchResults: SearchResults = { hits: [], total_hits: 0, query_time_ms: 2 };
-const searchFacets: SearchFacets = { providers: [], projects: [], hosts: [] };
+const searchResults: SearchResults = {
+  hits: [
+    {
+      provider: "claude",
+      message_id: "search-claude-parser",
+      session_id: "a1b2c3d4",
+      parent_session_id: null,
+      content: "The parser dropped quoted flags when it split the command.",
+      snippet: "The <mark>parser</mark> dropped quoted flags when it split the command.",
+      role: "assistant",
+      project: "quill",
+      host: "demo-workstation",
+      git_branch: "fix/parser-quotes",
+      timestamp: iso(18 * M),
+      tools_used: "Read Edit Bash",
+      files_modified: "src/parser.ts",
+      code_changes: "fixed quote-aware tokenization",
+      commands_run: "npm test",
+      tool_details: "Read src/parser.ts; Edit src/parser.ts; Bash npm test",
+      score: 9.8,
+    },
+    {
+      provider: "codex",
+      message_id: "search-codex-parser",
+      session_id: "e5f6a7b8",
+      parent_session_id: null,
+      content: "I replaced the parser fallback with the schema-owned decoder.",
+      snippet: "I replaced the <mark>parser</mark> fallback with the schema-owned decoder.",
+      role: "assistant",
+      project: "gateway",
+      host: "demo-workstation",
+      git_branch: "refactor/schema-decoder",
+      timestamp: iso(52 * M),
+      tools_used: "Grep Edit",
+      files_modified: "src/decoder.rs",
+      code_changes: "removed legacy fallback",
+      commands_run: "cargo test",
+      tool_details: "Grep parser; Edit src/decoder.rs",
+      score: 8.7,
+    },
+    {
+      provider: "pi",
+      message_id: "search-pi-parser",
+      session_id: "pi-root",
+      parent_session_id: null,
+      content: "The date parser now preserves timezone offsets at minute precision.",
+      snippet: "The date <mark>parser</mark> now preserves timezone offsets at minute precision.",
+      role: "assistant",
+      project: "pipeline",
+      host: "demo-workstation",
+      git_branch: "test/date-offsets",
+      timestamp: iso(95 * M),
+      tools_used: "Read Bash",
+      files_modified: "src/date.ts",
+      code_changes: "added offset cases",
+      commands_run: "npm test",
+      tool_details: "Read src/date.ts; Bash npm test",
+      score: 7.9,
+    },
+  ],
+  total_hits: 3,
+  query_time_ms: 3,
+};
+const searchFacets: SearchFacets = {
+  providers: [
+    { name: "claude", count: 1 },
+    { name: "codex", count: 1 },
+    { name: "pi", count: 1 },
+  ],
+  projects: [
+    { name: "quill", count: 1 },
+    { name: "gateway", count: 1 },
+    { name: "pipeline", count: 1 },
+  ],
+  hosts: [{ name: "demo-workstation", count: 3 }],
+};
+
+const searchContext: SessionContext = {
+  provider: "claude",
+  session_id: "a1b2c3d4",
+  project: "quill",
+  messages: [
+    {
+      message_id: "context-user",
+      role: "user",
+      content: "Why does the parser lose quoted command arguments?",
+      tool_summary: "",
+      tools_used: "",
+      timestamp: iso(21 * M),
+      is_match: false,
+    },
+    {
+      message_id: "search-claude-parser",
+      role: "assistant",
+      content: "The parser dropped quoted flags when it split the command. I am switching it to the quote-aware tokenizer.",
+      tool_summary: "",
+      tools_used: "Read Edit",
+      timestamp: iso(18 * M),
+      is_match: true,
+    },
+    {
+      message_id: "context-result",
+      role: "assistant",
+      content: "The regression case now passes and preserves both quoted paths and separators.",
+      tool_summary: "",
+      tools_used: "Bash",
+      timestamp: iso(16 * M),
+      is_match: false,
+    },
+  ],
+};
+
+const knownProjects = [
+  { path: "/workspace/quill", name: "quill", has_memories: true, memory_count: 1, is_custom: false, providers: ["claude"] },
+  { path: "/workspace/gateway", name: "gateway", has_memories: true, memory_count: 1, is_custom: false, providers: ["codex"] },
+  { path: "/workspace/pipeline", name: "pipeline", has_memories: true, memory_count: 1, is_custom: false, providers: ["claude", "codex"] },
+  { path: "/workspace/dashboard", name: "dashboard", has_memories: true, memory_count: 1, is_custom: false, providers: ["claude"] },
+];
+
+const memoryFiles = [
+  {
+    id: 1,
+    project_path: "/workspace/quill",
+    provider: "claude",
+    file_path: "/workspace/quill/memory/conventions.md",
+    file_name: "conventions.md",
+    content_hash: "mock-conventions",
+    last_scanned_at: iso(20 * M),
+    memory_type: "convention",
+    description: "Repository conventions and validation commands.",
+    content: "# Conventions\n\nUse focused diffs and run the repository checks before finishing.",
+    changed_since_last_run: false,
+  },
+  {
+    id: 2,
+    project_path: "/workspace/gateway",
+    provider: "codex",
+    file_path: "/workspace/gateway/memory/rate-limits.md",
+    file_name: "rate-limits.md",
+    content_hash: "mock-rate-limits",
+    last_scanned_at: iso(42 * M),
+    memory_type: "context",
+    description: "Quota windows and reset semantics for providers.",
+    content: "# Rate limits\n\nReset timestamps are end-exclusive and stored in UTC.",
+    changed_since_last_run: true,
+  },
+  {
+    id: 3,
+    project_path: "/workspace/pipeline",
+    provider: "claude",
+    file_path: "/workspace/pipeline/memory/data-prep.md",
+    file_name: "data-prep.md",
+    content_hash: "mock-data-prep",
+    last_scanned_at: iso(75 * M),
+    memory_type: "context",
+    description: "Data preparation workflow and fixture boundaries.",
+    content: "# Data preparation\n\nKeep production inputs separate from screenshot fixtures.",
+    changed_since_last_run: false,
+  },
+  {
+    id: 4,
+    project_path: "/workspace/dashboard",
+    provider: "claude",
+    file_path: "/workspace/dashboard/memory/components.md",
+    file_name: "components.md",
+    content_hash: "mock-components",
+    last_scanned_at: iso(2 * H),
+    memory_type: "convention",
+    description: "Shared component patterns and accessibility rules.",
+    content: "# Components\n\nPreserve keyboard behavior and semantic labels.",
+    changed_since_last_run: false,
+  },
+];
 
 // --- Session model analytics -------------------------------------------------
 
@@ -811,6 +988,69 @@ const modelObservations: MockModelObservation[] = [
     hostname: "glass-cockpit.local",
   },
 ];
+
+const marketingModelSeries: ReadonlyArray<{
+  provider: ProviderStatus["provider"];
+  modelId: string;
+  sessionId: string;
+  points: ReadonlyArray<readonly [minutesAgo: number, tokens: number]>;
+}> = [
+  {
+    provider: "claude",
+    modelId: "claude-opus-4-6",
+    sessionId: "marketing-claude-opus",
+    points: [[330, 9_000], [250, 28_000], [170, 12_000], [95, 36_000], [35, 18_000]],
+  },
+  {
+    provider: "claude",
+    modelId: "claude-sonnet-4-6",
+    sessionId: "marketing-claude-sonnet",
+    points: [[300, 18_000], [210, 9_000], [135, 26_000], [60, 15_000], [6, 32_000]],
+  },
+  {
+    provider: "codex",
+    modelId: "gpt-5.6-terra",
+    sessionId: "marketing-codex-terra",
+    points: [[315, 12_000], [225, 24_000], [150, 8_000], [75, 30_000], [4, 22_000]],
+  },
+  {
+    provider: "codex",
+    modelId: "gpt-5.6-sol",
+    sessionId: "marketing-codex-sol",
+    points: [[285, 7_000], [195, 18_000], [120, 25_000], [45, 10_000]],
+  },
+  {
+    provider: "pi",
+    modelId: "google/gemini-3.1-pro",
+    sessionId: "marketing-pi-gemini",
+    points: [[345, 16_000], [260, 8_000], [185, 30_000], [105, 14_000], [30, 42_000], [2, 24_000]],
+  },
+];
+
+const marketingModelObservations: MockModelObservation[] = marketingModelSeries.flatMap(
+  ({ provider, modelId, sessionId, points }) =>
+    points.map(([minutesAgo, tokens]) => {
+      const inputTokens = Math.round(tokens * 0.55);
+      const outputTokens = Math.round(tokens * 0.2);
+      const cacheCreationTokens = Math.round(tokens * 0.07);
+      return {
+        provider,
+        sourceKey: `${provider}/${sessionId}.jsonl`,
+        sessionId,
+        observedAt: now - minutesAgo * M,
+        modelId,
+        kind: "turn" as const,
+        inputTokens,
+        outputTokens,
+        cacheCreationTokens,
+        cacheReadTokens: tokens - inputTokens - outputTokens - cacheCreationTokens,
+        chainId: sessionId,
+        displayName: sessionId,
+        cwd: `/workspace/${sessionId}`,
+        hostname: "demo-workstation",
+      };
+    }),
+);
 
 type ModelFixtureScenario =
   | "pending"
@@ -1207,7 +1447,9 @@ function getModelFixtureObservations(
       },
     ];
   } else {
-    observations = modelObservations;
+    observations = marketingScreenshotMode()
+      ? marketingModelObservations
+      : modelObservations;
   }
 
   const suppressedSourceKeys = new Set(
@@ -2071,12 +2313,18 @@ type FixtureHandler = (args?: Record<string, unknown>) => unknown;
 
 const fixtures: Record<string, FixtureHandler> = {
   // integrations / settings
-  get_provider_statuses: () => providerStatuses,
-  rescan_integrations: () => providerStatuses,
+  get_provider_statuses: () => marketingScreenshotMode()
+    ? providerStatuses.filter(({ provider }) => provider !== "mini_max")
+    : providerStatuses,
+  rescan_integrations: () => marketingScreenshotMode()
+    ? providerStatuses.filter(({ provider }) => provider !== "mini_max")
+    : providerStatuses,
   get_indicator_primary_provider: () => "claude",
   get_context_preservation_status: () => contextPreservation,
   set_context_preservation_enabled: () => contextPreservation,
-  get_integration_features: () => integrationFeatures,
+  get_integration_features: () => marketingScreenshotMode()
+    ? { ...integrationFeatures, brevity: true }
+    : integrationFeatures,
   get_runtime_settings: () => runtimeSettings,
   set_runtime_settings: () => runtimeSettings,
   get_learning_settings: () => learningSettings,
@@ -2101,7 +2349,9 @@ const fixtures: Record<string, FixtureHandler> = {
   preview_retention: () => previewRetentionFixture(),
   run_retention_maintenance: (args) => runRetentionMaintenanceFixture(args),
   // live usage
-  fetch_usage_data: () => usageData,
+  fetch_usage_data: () => marketingScreenshotMode()
+    ? { ...usageData, provider_errors: [] }
+    : usageData,
   // tokens
   get_token_history: (args) => tokenHistory(rangeArg(args)),
   get_token_stats: () => tokenStats,
@@ -2137,17 +2387,19 @@ const fixtures: Record<string, FixtureHandler> = {
   delete_learned_rule: () => null,
   submit_rule_feedback: () => null,
   // memory
-  get_memory_files: () => [],
+  get_memory_files: (args) => memoryFiles.filter(
+    (file) => file.project_path === args?.projectPath,
+  ),
   get_optimization_suggestions: () => [],
   get_optimization_runs: () => [],
-  get_known_projects: () => [],
+  get_known_projects: () => knownProjects,
   add_custom_project: () => null,
   remove_custom_project: () => null,
   trigger_memory_optimization: () => null,
   // sessions
   search_sessions: () => searchResults,
   get_search_facets: () => searchFacets,
-  get_session_context: () => ({ provider: "claude", messages: [], session_id: "a1b2c3d4", project: "quill" }),
+  get_session_context: () => searchContext,
   sync_search_index: () => 0,
   // release notes / updates
   get_release_notes: () => [],

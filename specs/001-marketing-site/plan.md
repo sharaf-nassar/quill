@@ -5,19 +5,19 @@
 
 ## Summary
 
-Build a static, single-page marketing site for Quill, hosted at the project's GitHub Pages URL, with a **Signal Theater** visual identity: Quill's dark app surface, actual logo mark, clipped geometry, Cabinet Grotesk display stack, cyan/purple logo accents, progressive native motion, and real dark product screenshots as the primary proof. The page deep-links to seven anchored sections (`#hero`, `#live`, `#analytics`, `#context`, `#search`, `#learning`, `#install`). All UI screenshots come from a sandboxed Quill instance pointed at temp directories via two new env vars (`QUILL_DATA_DIR`, `QUILL_RULES_DIR`) gated by an opt-in `QUILL_DEMO_MODE=1` flag, so a maintainer's personal Quill state is never touched. The existing seeder (`scripts/populate_dummy_data.py`) and screenshot driver (`scripts/take_screenshots.sh`) are extended; two new cross-platform launchers wire the sandbox together. A new GitHub Actions workflow (`.github/workflows/pages.yml`) deploys the site via `actions/deploy-pages`.
+Build a static, single-page marketing site for Quill with a **Signal Theater** identity, stable anchors, progressive motion, and real app screenshots as primary proof. Canonical screenshots now render the actual React entry point in dev-only Browser Mock Mode inside network-disabled Docker and are driven through headless Chromium. The sandboxed Tauri launcher and SQLite seeder remain backend-development tools. GitHub Actions deploys the static site via `actions/deploy-pages`.
 
 ## Technical Context
 
 **Language/Version**: HTML5 + CSS3 + small progressive JavaScript for the site; Rust 2024 edition for the env-var override (existing toolchain); Python 3 for the seeder extension (existing).
 **Primary Dependencies**: Browser-native IntersectionObserver and CSS transitions for progressive marketing-page motion; no framework, runtime dependency, or build step. GitHub Actions: `actions/checkout@v4`, `actions/configure-pages@v5`, `actions/upload-pages-artifact@v3`, `actions/deploy-pages@v4`. App-side reuses existing crates (`tauri`, `directories` already pulled by Tauri).
-**Storage**: N/A for the marketing site (static deliverable). Demo Quill instance writes its SQLite DB to `$QUILL_DATA_DIR/usage.db` instead of the platform default.
-**Testing**: Site — manual Lighthouse run (Chrome DevTools or `npx @lhci/cli`) before merge, manual cross-browser smoke (latest Chromium, Firefox, WebKit). App-side — one new unit test in `src-tauri/src/data_paths.rs` covering the env-var resolver under set / unset / demo-mode-off cases. Seeder — manual launcher round-trip on Linux at minimum.
-**Target Platform**: GitHub Pages (`https://*.github.io/quill/`) for the site. Demo Quill isolation works on Linux, macOS, and Windows.
-**Project Type**: Web (static site, single-page) + small backend changes (Rust path resolver) + scripting (Python seeder flag, two launchers, screenshot driver extension) + one CI workflow.
+**Storage**: N/A for the site or canonical screenshot runtime; marketing fixtures are in-memory Browser Mock Mode data.
+**Testing**: Project gates, Docker capture round-trip, PNG dimension checks, responsive/cross-browser review, and Lighthouse before merge.
+**Target Platform**: GitHub Pages for the site; Linux Docker + Chromium for canonical capture.
+**Project Type**: Static site + dev-only frontend fixture profile + bounded CDP capture script + Pages workflow.
 **Performance Goals**: Lighthouse Performance ≥ 90 on mobile and desktop; Largest Contentful Paint < 2.0 s on simulated broadband; Cumulative Layout Shift < 0.1; total transferred page weight on first load < 500 KB (excluding any optional self-hosted font, kept off for v1 per FR-007 / FR-026).
-**Constraints**: Static-only (no server runtime); hero readable with JavaScript disabled (FR-024); honors `prefers-reduced-motion: reduce` (FR-025); WCAG 2.1 AA contrast (FR-008); usable from 320px to 2560px viewport (FR-023); no third-party tracking (FR-028); production builds MUST refuse env-var overrides without `QUILL_DEMO_MODE=1` (FR-018).
-**Scale/Scope**: One HTML page, ~7 anchored sections, ~6–10 screenshots, ~250–400 lines HTML + ~800–1,200 lines CSS and a small progressive motion script for the site. App-side: ~30–50 lines new Rust in `src-tauri/src/data_paths.rs` + ~5–10 call-site updates in `lib.rs`. Scripts: ~30 lines of new Python flag handling + ~40 lines × 2 launcher scripts + minor extension to `take_screenshots.sh`.
+**Constraints**: Static-only site; actual app components only; Browser Mock Mode remains dev-only; capture has no host state or external network; hero works without JavaScript; reduced motion, WCAG AA, 320–2560px responsiveness, and no tracking.
+**Scale/Scope**: One HTML page, eleven anchors, nine screenshots, one existing mock fixture module, and one CDP capture script.
 
 ## Constitution Check
 
@@ -25,7 +25,7 @@ Build a static, single-page marketing site for Quill, hosted at the project's Gi
 
 The project's `.specify/memory/constitution.md` is unfilled — every section still contains `[PRINCIPLE_*]` template placeholders and no version has been ratified. There are therefore no ratified gates to evaluate, and the default acceptance criteria apply:
 
-- **Simplicity**: Plan adds one HTML file, one CSS file, one optional ~50-line JS file, one CI workflow, one Rust module, one Python flag set, and two launcher scripts. No new framework, no SSG, no build step, no extra runtime, no extra dependency added to the Tauri app.
+- **Simplicity**: The site stays plain HTML/CSS/JS. Capture reuses Vite, Chromium, and the installed Tauri API mocks; no browser automation dependency or screenshot-only UI is added.
 - **Scope discipline**: Each artifact maps directly to a numbered FR or to a single locked clarification. No speculative features (no waitlist form, no analytics, no docs site, no localization) are introduced.
 - **Reversibility**: All changes can be reverted by deleting `marketing-site/`, `.github/workflows/pages.yml`, `src-tauri/src/data_paths.rs`, the launcher scripts, and the `--data-dir` / `--rules-dir` flags from the seeder. Existing Quill production behavior is unchanged when neither `QUILL_DEMO_MODE` nor any override env var is set.
 
@@ -56,11 +56,11 @@ specs/001-marketing-site/
 
 ```text
 marketing-site/                              # NEW — site source root (FR-002)
-├── index.html                               # Single page with seven anchored sections
+├── index.html                               # Single page with eleven anchored sections
 ├── styles.css                               # Signal Theater theme; no remote fonts
 ├── motion.js                                # Progressive native scroll-reveal behavior
 ├── assets/
-│   ├── screenshots/                         # @2x PNG captures from sandboxed Quill
+│   ├── screenshots/                         # @2x Browser Mock Mode captures
 │   │   ├── hero.png
 │   │   ├── live.png
 │   │   ├── models.png
@@ -80,14 +80,16 @@ src-tauri/src/
 └── lib.rs                                   # MODIFIED — call resolver instead of bare app_data_dir() / hard-coded learned-rules dirs
 
 scripts/
-├── populate_dummy_data.py                   # MODIFIED — accepts --data-dir / --rules-dir (FR-018)
-├── take_screenshots.sh                      # MODIFIED — captures additional views (Context tab, Settings)
-└── run_quill_demo.sh                        # NEW — POSIX launcher (Linux + macOS) (FR-018)
+├── capture_browser_screenshots.mjs          # CDP driver for the actual frontend
+├── capture_screenshots_docker.sh            # isolated publishing wrapper
+├── populate_dummy_data.py                   # backend/Tauri fixture tool
+├── take_screenshots.sh                      # manual Tauri debugging driver
+└── run_quill_demo.sh                        # sandboxed backend/Tauri launcher
 
 CLAUDE.md                                    # MODIFIED — SPECKIT block points at this plan
 ```
 
-**Structure Decision**: Single static-page web deliverable (`marketing-site/`) plus a thin app-side path-isolation seam (`src-tauri/src/data_paths.rs`) and the launcher/seeder script trio (`scripts/run_quill_demo.*`, `scripts/populate_dummy_data.py`). No build step, no SSG, no framework. Existing screenshot driver (`scripts/take_screenshots.sh`) is extended rather than replaced. The `marketing-site/` directory is the sole source root for the site and the only path the Pages workflow uploads as the Pages artifact, so source layout and deploy contract are 1:1.
+**Structure Decision**: `marketing-site/` remains the sole static deploy root. Canonical screenshots come from the real frontend through Browser Mock Mode and a standalone CDP driver. The sandboxed Tauri launcher and Python seeder remain separate backend-development tools.
 
 ## Complexity Tracking
 
@@ -103,7 +105,7 @@ See [research.md](./research.md) for full Decision / Rationale / Alternatives en
 2. Typography (FR-007 forbids Inter) → **Cabinet Grotesk-first display stack + local sans/mono fallbacks**
 3. Rust env-var override pattern → **dedicated `data_paths.rs` module, opt-in via `QUILL_DEMO_MODE=1`**
 4. Cross-platform launcher shape → **`.sh` + `.ps1` pair, no Python launcher**
-5. Screenshot scope → **7 captures matching the seven anchored sections**
+5. Screenshot scope → **9 captures covering every marketed app surface**
 6. GitHub Pages workflow shape → **two-job `pages.yml` using official `actions/deploy-pages`**
 7. OG / social-share image → **hand-built 1200×630 PNG, hero-derived**
 8. Lighthouse verification → **manual pre-merge run for v1 (no CI gate yet)**
@@ -120,7 +122,7 @@ See [data-model.md](./data-model.md), [contracts/](./contracts/), and [quickstar
 - **Seeder CLI contract** (`contracts/seeder-cli.md`): `populate_dummy_data.py` flag surface and exit codes after extension.
 - **Launcher CLI contract** (`contracts/launcher-cli.md`): `run_quill_demo.sh` / `.ps1` arguments, environment, lifecycle.
 - **Pages workflow contract** (`contracts/pages-workflow.md`): triggers, paths filter, permissions, concurrency, jobs.
-- **Quickstart** (`quickstart.md`): the maintainer walkthrough — clone, install Quill, run launcher, capture, preview locally, commit, ship.
+- **Quickstart** (`quickstart.md`): build the capture image, drive Browser Mock Mode, inspect, preview, validate, and ship.
 
 ## Constitution Check (post-Phase-1 re-evaluation)
 

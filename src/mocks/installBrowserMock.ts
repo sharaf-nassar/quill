@@ -9,6 +9,10 @@ import { handleInvoke } from "./ipcFixtures";
 
 const BADGE_ID = "quill-mock-data-badge";
 
+function marketingScreenshotMode(): boolean {
+  return new URLSearchParams(window.location.search).get("screenshot") === "marketing";
+}
+
 function addMockBadge(): void {
   if (document.getElementById(BADGE_ID)) return;
   const mount = () => {
@@ -48,6 +52,6 @@ export function installBrowserMock(): void {
     { shouldMockEvents: true },
   );
   (window as unknown as { __QUILL_BROWSER_MOCK__?: boolean }).__QUILL_BROWSER_MOCK__ = true;
-  addMockBadge();
+  if (!marketingScreenshotMode()) addMockBadge();
   console.info("[quill] browser mock IPC installed — running with fixture data");
 }

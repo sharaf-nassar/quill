@@ -63,7 +63,7 @@ All current call-sites in `src-tauri/src/lib.rs` and adjacent modules that compu
 
 ## R4. Cross-platform launcher shape
 
-**Decision**: One launcher script:
+**Decision**: One launcher script remains for sandboxed backend/Tauri debugging; it is not the marketing screenshot source:
 - `scripts/run_quill_demo.sh` — POSIX shell, used on Linux and macOS.
 
 It:
@@ -86,28 +86,30 @@ It:
 
 ## R5. Screenshot scope (which views to capture)
 
-**Decision**: The capture script produces seven PNGs from the dummy-data instance, all at 2× for HiDPI rendering per FR-021.
+**Decision**: The publishing workflow produces nine PNGs from the real React app in dev-only Browser Mock Mode, driven by headless Chromium at DPR 2.
 
 | Filename                       | View                                            | Section anchor   |
 |--------------------------------|-------------------------------------------------|------------------|
 | `hero.png`                     | Widget → Usage view                             | `#hero`, `#analytics` |
 | `live.png`                     | Copy of the Usage frame                         | `#live`          |
-| `models.png`                   | Widget → Models view                            | Product docs     |
+| `models.png`                   | Widget → Models view                            | `#models`        |
 | `analytics-context.png`        | Widget → Context view                           | `#context`       |
-| `sessions.png`                 | Manage → Sessions                               | `#search`        |
-| `learning.png`                 | Manage → Learning                               | `#learning`      |
-| `settings.png`                 | Manage → Settings                               | Product docs     |
-
-Memory and brevity remain manual sub-panel captures because they are not Manage sections.
+| `sessions.png`                 | Tools → Sessions                                | `#search`        |
+| `learning.png`                 | Tools → Learning → Rules                        | `#learning`      |
+| `memory.png`                   | Tools → Learning → Memories                     | `#memory`        |
+| `settings.png`                 | Tools → Settings → Integrations                  | `#integrations` |
+| `brevity.png`                  | Tools → Settings → Context                      | `#brevity`       |
 
 **Rationale**:
+- Browser Mock Mode renders the same components and `invoke()` call sites as the desktop webview without requiring personal state or a second UI implementation.
+- `screenshot=marketing` is dev-only, suppresses the mock badge, and selects complete Claude/Codex/Pi fixtures.
+- Chrome DevTools Protocol gives selector-based navigation and exact DPR 2 surface captures without X11 focus or coordinate drift.
 - `hero.png` intentionally serves both the product hero and analytics section.
-- Models and Settings captures support product documentation outside the marketing anchors.
-- @2x captures honor FR-021 / SC-007.
 
 **Alternatives considered**:
-- **One Usage shot only**: Leaves Context and Manage claims without visual proof. Rejected.
-- **Capture every sub-panel**: Makes the asset set unwieldy. Keep only the two marketed sub-panels manual.
+- **Seed SQLite and automate a Tauri window**: Real backend, but duplicates the maintained frontend mock contract, requires low-level schema fixtures, and is brittle under X11/WebKit rendering. Retained for backend debugging only.
+- **Screenshot-only HTML or generated images**: Does not prove the actual app UI. Rejected.
+- **One Usage shot only**: Leaves other claims without visual proof. Rejected.
 
 ## R6. GitHub Pages workflow shape
 

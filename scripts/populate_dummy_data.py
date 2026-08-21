@@ -427,6 +427,34 @@ def populate_token_snapshots(conn: sqlite3.Connection) -> list[tuple[str, str, d
 		if emitted >= LAST_HOUR_TOKEN_BUDGET:
 			break
 
+	# SHOWCASE cluster: fixed identities match the retained model sources below,
+	# so the visible Usage rows reliably include Claude, Codex and Pi plus
+	# retained Claude/Codex agent totals. The alternating turn weights prevent a
+	# flat activity shape, and the latest timestamps outrank random fixtures.
+	showcase_sessions = [
+		("demo-claude-chain-session", "claude", PROJECTS[0], 6, "demo-claude-agent-alpha"),
+		("demo-pi-showcase-session", "pi", PROJECTS[1], 12, None),
+		("demo-codex-chain-root", "codex", PROJECTS[2], 18, "demo-codex-chain-child"),
+	]
+	for session_index, (session_id, provider, project, minutes_ago, agent_id) in enumerate(showcase_sessions):
+		hostname = DEMO_MODEL_HOSTNAME
+		recent_sessions.append((session_id, hostname, project, provider))
+		t = NOW - timedelta(minutes=minutes_ago + 25)
+		for turn, weight in enumerate([1.0, 1.8, 0.9, 2.6, 1.3, 2.1]):
+			base = [2_800, 2_300, 2_600][session_index]
+			total = int(base * weight)
+			input_tokens = int(total * 0.56)
+			output_tokens = int(total * 0.19)
+			cache_creation = int(total * 0.07)
+			cache_read = total - input_tokens - output_tokens - cache_creation
+			sidechain = agent_id is not None and 2 <= turn <= 4
+			rows.append((
+				session_id, hostname, ts(t), input_tokens, output_tokens,
+				cache_creation, cache_read, project, provider,
+				1 if sidechain else 0, agent_id if sidechain else None,
+			))
+			t += timedelta(minutes=5)
+
 	conn.executemany(
 		"INSERT INTO token_snapshots "
 		"(session_id, hostname, timestamp, input_tokens, output_tokens, "
@@ -434,6 +462,16 @@ def populate_token_snapshots(conn: sqlite3.Connection) -> list[tuple[str, str, d
 		" provider, is_sidechain, agent_id) "
 		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		rows,
+	)
+	conn.executemany(
+		"INSERT OR REPLACE INTO live_analytics_sessions "
+		"(provider, session_id, cwd, hostname, updated_at, ephemeral) "
+		"VALUES (?, ?, ?, ?, ?, 0)",
+		[
+			(provider, session_id, project, DEMO_MODEL_HOSTNAME,
+			 ts_tz(NOW - timedelta(minutes=minutes_ago)))
+			for session_id, provider, project, minutes_ago, _ in showcase_sessions
+		],
 	)
 	providers = sorted({row[8] for row in rows})
 	subagent_rows = sum(1 for row in rows if row[9] == 1)
@@ -494,9 +532,9 @@ def populate_token_hourly(conn: sqlite3.Connection) -> None:
 def populate_settings(conn: sqlite3.Connection) -> None:
 	# integration.providers.v1 is deserialized by manager.rs::load_saved_statuses
 	# into Vec<ProviderStatus> (serde rename_all = "camelCase"). Seeding it makes
-	# the demo self-rendering: claude + codex enabled so both providers' rate
-	# bars, live summaries, and provider toggles populate without manual setup,
-	# plus mini_max enabled-but-unconfigured so the SETUP row renders.
+	# the demo self-rendering: Claude, Codex and Pi are enabled so their
+	# analytics and provider controls populate without manual setup. MiniMax is
+	# deliberately disabled in the current product screenshot corpus.
 	# setupState uses the snake_case serde variants ("installed",
 	# "not_installed"); merge_saved_statuses keeps `enabled` from this row and
 	# re-derives the rest from live detection.
@@ -522,16 +560,24 @@ def populate_settings(conn: sqlite3.Connection) -> None:
 			"lastError": None,
 			"lastVerifiedAt": verified_at,
 		},
-		# MiniMax is enabled but not installed, which is the exact state the
-		# LIMITS row renders as SETUP (LimitsSection.emptyRowState: an enabled
-		# provider with no buckets and a missing/not_installed setup state is
-		# actionable, not broken). The marketing copy for the live section
-		# describes that row, and a disabled provider gets no row at all.
+		{
+			"provider": "pi",
+			"detectedCli": True,
+			"detectedHome": True,
+			"enabled": True,
+			"setupState": "installed",
+			"userHasMadeChoice": True,
+			"lastError": None,
+			"lastVerifiedAt": verified_at,
+		},
+		# MiniMax remains a supported integration, but the product screenshot
+		# corpus currently spotlights the three agent CLIs. Disabled providers do
+		# not render in LIMITS, while Settings still keeps the control available.
 		{
 			"provider": "mini_max",
 			"detectedCli": False,
 			"detectedHome": False,
-			"enabled": True,
+			"enabled": False,
 			"setupState": "not_installed",
 			"userHasMadeChoice": True,
 			"lastError": None,
@@ -551,6 +597,9 @@ def populate_settings(conn: sqlite3.Connection) -> None:
 		("app.window_height", "800"),
 		# Enable brevity so the demo reflects the recommended profile.
 		("feature.brevity.enabled", "true"),
+		# The production migration archives pre-governance rule files once. Demo
+		# rules are current fixtures, not legacy input, so keep them live.
+		("legacy_rules_archived", "1"),
 		# Suppress the AppImage first-run desktop-integration prompt (modal dialog).
 		("appimage.integration", "declined"),
 		# Self-render claude + codex as installed/enabled.
@@ -834,6 +883,37 @@ def populate_observation_summaries(conn: sqlite3.Connection) -> None:
 		rows,
 	)
 	print(f"  observation_summaries: {len(rows)} rows")
+
+
+def populate_skill_usages(conn: sqlite3.Connection) -> None:
+	"""Populate the hero's Skills breakdown with all three agent CLIs."""
+	counts = {
+		"systematic-debugging": {"claude": 18, "codex": 12, "pi": 7},
+		"frontend-design": {"claude": 10, "codex": 5, "pi": 4},
+		"code-reviewer": {"claude": 8, "codex": 13, "pi": 6},
+		"image-gen": {"claude": 6, "codex": 3, "pi": 5},
+	}
+	rows = []
+	ordinal = 0
+	for skill_name, providers in counts.items():
+		for provider, count in providers.items():
+			for _ in range(count):
+				when = NOW - timedelta(minutes=15 + (ordinal * 17) % 320)
+				session_id = f"demo-skill-{provider}-{ordinal % 9}"
+				rows.append((
+					provider, session_id, session_id, f"skill-message-{ordinal}",
+					skill_name, f"/skills/{skill_name}/SKILL.md", ts_tz(when),
+					"Read", PROJECTS[ordinal % len(PROJECTS)], DEMO_MODEL_HOSTNAME,
+				))
+				ordinal += 1
+	conn.executemany(
+		"INSERT INTO skill_usages ("
+		"provider, session_id, chain_id, message_id, skill_name, skill_path, "
+		"timestamp, tool_name, cwd, hostname"
+		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		rows,
+	)
+	print(f"  skill_usages: {len(rows)} rows across Claude, Codex and Pi")
 
 
 # ── 11. tool_actions ──────────────────────────────────────────────────────────
@@ -1169,6 +1249,10 @@ def populate_memory_markdown() -> None:
 	if MEMORY_HOME is None:
 		print("  memory docs: skipped (--home-dir not set)")
 		return
+
+	# The container supplies a harmless `pi --version` stub. Pair it with a
+	# fictional Pi home so Settings can show the current integration as enabled.
+	(MEMORY_HOME / ".pi" / "agent" / "sessions").mkdir(parents=True, exist_ok=True)
 
 	written = 0
 	for project, file_name, memory_type, description, body in MEMORY_DOCS:
@@ -1956,7 +2040,9 @@ def write_claude_model_edge_fixtures() -> list[dict]:
 	scale_path = scale_project / f"{scale_session_id}.jsonl"
 	scale_records = []
 	scale_observations = []
-	scale_start = NOW - timedelta(minutes=25)
+	# Keep the 1,001-id stress source outside every photographed range. It still
+	# exercises uncapped identity storage without overwhelming the product views.
+	scale_start = NOW - timedelta(days=10, minutes=25)
 	for model_index in range(1001):
 		observed_at = scale_start + timedelta(seconds=model_index)
 		record = {
@@ -2037,16 +2123,16 @@ def write_claude_model_edge_fixtures() -> list[dict]:
 		return record
 
 	parent_records = [
-		chain_record(54, "demo-parent-turn-1", "demo/claude/parent-alpha", False),
-		chain_record(50, "demo-parent-turn-2", None, False),
-		chain_record(46, "demo-parent-turn-3", "demo/claude/parent-beta", False),
-		chain_record(42, "demo-parent-turn-4", "demo/claude/parent-beta", False),
+		chain_record(39, "demo-parent-turn-1", "claude-opus-4-6", False),
+		chain_record(35, "demo-parent-turn-2", None, False),
+		chain_record(31, "demo-parent-turn-3", "claude-sonnet-4-6", False),
+		chain_record(27, "demo-parent-turn-4", "claude-sonnet-4-6", False),
 	]
 	subagent_records = [
-		chain_record(52, "demo-agent-turn-1", "demo/claude/agent-alpha", True),
-		chain_record(48, "demo-agent-turn-2", "demo/claude/agent-alpha", True),
-		chain_record(44, "demo-agent-turn-3", None, True),
-		chain_record(40, "demo-agent-turn-4", "demo/claude/agent-beta", True),
+		chain_record(37, "demo-agent-turn-1", "claude-haiku-4-5", True),
+		chain_record(33, "demo-agent-turn-2", "claude-haiku-4-5", True),
+		chain_record(29, "demo-agent-turn-3", None, True),
+		chain_record(25, "demo-agent-turn-4", "claude-sonnet-4-6", True),
 	]
 	for path, records, agent_id, is_sidechain in [
 		(parent_path, parent_records, None, False),
@@ -2147,15 +2233,22 @@ def populate_codex_session_jsonls() -> list[dict]:
 
 	root_session_id = "demo-codex-chain-root"
 	child_session_id = "demo-codex-chain-child"
-	cwd = PROJECTS[2]
 	day_dir = CODEX_SESSIONS_DIR / NOW.strftime("%Y/%m/%d")
 	fixture_sources = []
+	terra = "gpt-5.6-terra"
+	sol = "gpt-5.6-sol"
+	luna = "gpt-5.6-luna"
+	session_specs = [
+		(root_session_id, None, 38, PROJECTS[2], [terra, None, sol, sol], 1.5),
+		(child_session_id, root_session_id, 37, PROJECTS[2], [luna, luna, None, terra], 0.9),
+		("demo-codex-terra-session", None, 310, PROJECTS[3], [terra] * 4, 1.3),
+		("demo-codex-sol-session", None, 210, PROJECTS[1], [sol] * 4, 2.2),
+		("demo-codex-luna-session", None, 110, PROJECTS[0], [luna] * 4, 1.1),
+	]
 
-	for session_id, parent_id, minute_offset in [
-		(root_session_id, None, 38),
-		(child_session_id, root_session_id, 37),
-	]:
+	for session_id, parent_id, minute_offset, cwd, models, scale in session_specs:
 		start = NOW - timedelta(minutes=minute_offset)
+		analytics_session_id = parent_id or session_id
 		path = day_dir / f"rollout-{session_id}.jsonl"
 		session_payload = {"id": session_id, "cwd": cwd}
 		if parent_id is not None:
@@ -2163,14 +2256,8 @@ def populate_codex_session_jsonls() -> list[dict]:
 		records = [{"timestamp": ts_tz(start), "type": "session_meta", "payload": session_payload}]
 		observations = []
 		cumulative = [0, 0, 0, 0]
-		models = [
-			f"demo/codex/dynamic-{0 if parent_id is None else 2}",
-			None,
-			f"demo/codex/dynamic-{1 if parent_id is None else 3}",
-			f"demo/codex/dynamic-{1 if parent_id is None else 3}",
-		]
 		for turn_index, model in enumerate(models):
-			turn_time = start + timedelta(minutes=turn_index * 2 + 1)
+			turn_time = start + timedelta(minutes=turn_index * 7 + 1)
 			turn_payload = {"turn_id": f"{session_id}-turn-{turn_index}"}
 			if model is not None:
 				turn_payload["model"] = model
@@ -2179,14 +2266,20 @@ def populate_codex_session_jsonls() -> list[dict]:
 				len(records) - 1,
 				turn_time,
 				session_id,
-				root_session_id,
+				analytics_session_id,
 				parent_id,
 				cwd,
 				turn_payload["turn_id"],
 				model,
 			))
 
-			delta = (55 + turn_index * 3, 18 + turn_index, 4 + turn_index, 20 + turn_index * 2)
+			wave = [0.8, 1.7, 0.95, 2.4][turn_index]
+			delta = (
+				int(2_800 * scale * wave),
+				int(900 * scale * wave),
+				int(240 * scale * wave),
+				int(1_100 * scale * wave),
+			)
 			for dimension, value in enumerate(delta):
 				cumulative[dimension] += value
 			token_time = turn_time + timedelta(seconds=20)
@@ -2208,7 +2301,7 @@ def populate_codex_session_jsonls() -> list[dict]:
 				len(records) - 1,
 				token_time,
 				session_id,
-				root_session_id,
+				analytics_session_id,
 				parent_id,
 				cwd,
 				delta,
@@ -2220,7 +2313,7 @@ def populate_codex_session_jsonls() -> list[dict]:
 			source_root_key="codex:sessions",
 			path=path,
 			source_session_id=session_id,
-			analytics_session_id=root_session_id,
+			analytics_session_id=analytics_session_id,
 			chain_id=session_id,
 			parent_chain_id=parent_id,
 			agent_id=None,
@@ -2299,20 +2392,30 @@ def populate_model_analytics(conn: sqlite3.Connection, fixture_sources: list[dic
 				observation_count, source_success_at_ms, source_success_at_ms,
 			),
 		)
+		running_models: dict[str, str] = {}
 		for observation in source["observations"]:
+			raw_model_id = observation["raw_model_id"]
+			if (
+				observation["observation_kind"] == "turn"
+				and raw_model_id is not None
+				and raw_model_id != "<synthetic>"
+			):
+				running_models[observation["chain_id"]] = raw_model_id
+			derived_model_id = running_models.get(observation["chain_id"])
 			conn.execute(
 				"INSERT INTO model_usage_observations ("
 				"provider, source_key, source_record_key, source_ordinal, observation_kind, "
 				"source_session_id, analytics_session_id, chain_id, parent_chain_id, agent_id, "
-				"turn_id, raw_model_id, cwd, hostname, is_sidechain, observed_at_ms, input_tokens, "
-				"output_tokens, cache_creation_tokens, cache_read_tokens, model_evidence, token_evidence"
-				") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				"turn_id, raw_model_id, derived_model_id, cwd, hostname, is_sidechain, "
+				"observed_at_ms, input_tokens, output_tokens, cache_creation_tokens, "
+				"cache_read_tokens, model_evidence, token_evidence"
+				") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 				(
 					source["provider"], source_key, observation["source_record_key"],
 					observation["source_ordinal"], observation["observation_kind"],
 					observation["source_session_id"], observation["analytics_session_id"],
 					observation["chain_id"], observation["parent_chain_id"], observation["agent_id"],
-					observation["turn_id"], observation["raw_model_id"], observation["cwd"],
+					observation["turn_id"], raw_model_id, derived_model_id, observation["cwd"],
 					observation["hostname"], int(observation["is_sidechain"]),
 					observation["observed_at_ms"], observation["input_tokens"],
 					observation["output_tokens"], observation["cache_creation_tokens"],
@@ -2363,6 +2466,133 @@ def populate_model_analytics(conn: sqlite3.Connection, fixture_sources: list[dic
 			f"  model_analytics: pending runtime reconciliation; seeded "
 			f"{len(fixture_sources)} of {discovered_count} retained sources"
 		)
+
+
+def populate_pi_model_analytics(conn: sqlite3.Connection) -> None:
+	"""Seed Pi's watcher-side model evidence without inventing a transcript parser."""
+	accepted_at_ms = datetime_to_ms(datetime.now(timezone.utc))
+	pi_sessions = [
+		("demo-pi-showcase-session", 0.62, PROJECTS[1], "google/gemini-3.1-pro", 24_000),
+		("demo-pi-gemini-session-a", 4.6, PROJECTS[3], "google/gemini-3.1-pro", 38_000),
+		("demo-pi-sonnet-session", 3.2, PROJECTS[0], "anthropic/claude-sonnet-4-6", 68_000),
+		("demo-pi-sol-session", 1.8, PROJECTS[2], "openai/gpt-5.6-sol", 46_000),
+		("demo-pi-gemini-session-b", 0.9, PROJECTS[1], "google/gemini-3.1-pro", 92_000),
+	]
+	total_observations = 0
+	for session_id, hours_ago, cwd, model_id, session_budget in pi_sessions:
+		source_key = f"pi:demo:{session_id}"
+		source_path = f"/home/alex/.pi/agent/sessions/{session_id}.jsonl"
+		start = NOW - timedelta(hours=hours_ago)
+		observations = []
+		for ordinal, weight in enumerate([0.14, 0.34, 0.18, 0.34]):
+			observed_at = start + timedelta(minutes=ordinal * 8)
+			total = int(session_budget * weight)
+			input_tokens = int(total * 0.54)
+			output_tokens = int(total * 0.2)
+			cache_creation = int(total * 0.06)
+			cache_read = total - input_tokens - output_tokens - cache_creation
+			observations.append((
+				ordinal, observed_at, input_tokens, output_tokens,
+				cache_creation, cache_read,
+			))
+
+		first_activity_at_ms = datetime_to_ms(observations[0][1])
+		last_activity_at_ms = datetime_to_ms(observations[-1][1])
+		content_sha256 = hashlib.sha256(session_id.encode()).hexdigest()
+		conn.execute(
+			"INSERT INTO model_observation_sources ("
+			"provider, source_key, source_root_key, source_path, source_session_id, "
+			"analytics_session_id, chain_id, is_sidechain, cwd, hostname, "
+			"first_activity_at_ms, last_activity_at_ms, mtime_ns, size_bytes, "
+			"content_sha256, seen_generation, processing_status, observation_count, "
+			"last_attempt_at_ms, last_success_at_ms"
+			") VALUES ('pi', ?, 'pi:sessions', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 1, "
+			"'ok', ?, ?, ?)",
+			(
+				source_key, source_path, session_id, session_id, session_id, cwd,
+				DEMO_MODEL_HOSTNAME, first_activity_at_ms, last_activity_at_ms,
+				last_activity_at_ms * 1_000_000, len(observations), content_sha256,
+				len(observations), accepted_at_ms, accepted_at_ms,
+			),
+		)
+		for ordinal, observed_at, input_tokens, output_tokens, cache_creation, cache_read in observations:
+			turn_id = f"{session_id}-turn-{ordinal}"
+			conn.execute(
+				"INSERT INTO model_usage_observations ("
+				"provider, source_key, source_record_key, source_ordinal, observation_kind, "
+				"source_session_id, analytics_session_id, chain_id, turn_id, "
+				"raw_model_id, derived_model_id, cwd, hostname, is_sidechain, "
+				"observed_at_ms, input_tokens, output_tokens, cache_creation_tokens, "
+				"cache_read_tokens, model_evidence, token_evidence, event_uuid"
+				") VALUES ('pi', ?, ?, ?, 'turn', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, "
+				"'explicit', 'direct', ?)",
+				(
+					source_key, f"v1:pi_assistant:{ordinal}:0", ordinal,
+					session_id, session_id, session_id, turn_id, model_id, model_id,
+					cwd, DEMO_MODEL_HOSTNAME, datetime_to_ms(observed_at), input_tokens,
+					output_tokens, cache_creation, cache_read, turn_id,
+				),
+			)
+		total_observations += len(observations)
+
+	conn.execute(
+		"INSERT OR REPLACE INTO settings (key, value) VALUES "
+		"('model_analytics.data_revision.v1', '2')"
+	)
+	print(
+		f"  pi_model_analytics: {total_observations} observations across "
+		f"{len(pi_sessions)} watcher-side sessions"
+	)
+
+
+def validate_showcase_fixtures(conn: sqlite3.Connection) -> None:
+	"""Fail seeding when the published screenshot composition would regress."""
+	cutoff_ms = datetime_to_ms(NOW - timedelta(hours=6))
+	providers = {
+		row[0]
+		for row in conn.execute(
+			"SELECT DISTINCT provider FROM model_usage_observations "
+			"WHERE observed_at_ms >= ? AND derived_model_id IS NOT NULL",
+			(cutoff_ms,),
+		)
+	}
+	if providers != {"claude", "codex", "pi"}:
+		raise ValueError(f"showcase model providers mismatch: {sorted(providers)}")
+
+	bucket_count = conn.execute(
+		"SELECT COUNT(*) FROM ("
+		"SELECT (observed_at_ms - ?1) / ?2 AS bucket "
+		"FROM model_usage_observations "
+		"WHERE observed_at_ms >= ?1 AND derived_model_id IS NOT NULL "
+		"AND COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) "
+		"+ COALESCE(cache_creation_tokens, 0) + COALESCE(cache_read_tokens, 0) > 0 "
+		"GROUP BY bucket)",
+		(cutoff_ms, 45 * 60 * 1_000),
+	).fetchone()[0]
+	if bucket_count < 6:
+		raise ValueError(f"showcase model activity spans only {bucket_count} buckets")
+
+	skill_providers = {
+		row[0]
+		for row in conn.execute("SELECT DISTINCT provider FROM skill_usages")
+	}
+	if skill_providers != {"claude", "codex", "pi"}:
+		raise ValueError(f"showcase skill providers mismatch: {sorted(skill_providers)}")
+
+	stress_in_range = conn.execute(
+		"SELECT COUNT(*) FROM model_usage_observations "
+		"WHERE observed_at_ms >= ? AND raw_model_id LIKE 'demo/generated/%'",
+		(datetime_to_ms(NOW - timedelta(days=7)),),
+	).fetchone()[0]
+	if stress_in_range:
+		raise ValueError("stress model ids leaked into the photographed range")
+
+	provider_statuses = json.loads(conn.execute(
+		"SELECT value FROM settings WHERE key='integration.providers.v1'"
+	).fetchone()[0])
+	enabled = {row["provider"] for row in provider_statuses if row["enabled"]}
+	if enabled != {"claude", "codex", "pi"}:
+		raise ValueError(f"showcase enabled providers mismatch: {sorted(enabled)}")
 
 
 def restore_pending_model_state_after_failure() -> None:
@@ -2453,6 +2683,18 @@ def populate_session_jsonls() -> list[dict]:
 
 	ensure_configured_fixture_root("claude", PROJECTS_DIR)
 
+	# Eight retained sessions fill the photographed six-hour range with a
+	# deliberate model mix and peak/valley token budgets. Each session has one
+	# primary model; the separate chain fixture demonstrates model switching.
+	session_hours_ago = [5.6, 4.9, 4.1, 3.4, 2.7, 2.0, 1.3, 0.7]
+	primary_models = [
+		"claude-sonnet-4-6", "claude-sonnet-4-6",
+		"claude-opus-4-6", "claude-haiku-4-5",
+		"claude-sonnet-4-6", "claude-opus-4-6",
+		"claude-sonnet-4-6", "claude-haiku-4-5",
+	]
+	session_token_budgets = [18_000, 54_000, 26_000, 72_000, 33_000, 88_000, 41_000, 105_000]
+
 	total_messages = 0
 	total_files = 0
 	fixture_sources = []
@@ -2465,15 +2707,18 @@ def populate_session_jsonls() -> list[dict]:
 
 		# Two sessions per project, with a few exchanges each.
 		for session_idx in range(2):
+			session_ordinal = project_index * 2 + session_idx
 			session_id = rand_session()
 			session_file = project_dir / f"{session_id}.jsonl"
 			lines = []
 			observations = []
-			session_start = NOW - timedelta(hours=random.randint(1, 96))
+			session_start = NOW - timedelta(hours=session_hours_ago[session_ordinal])
+			primary_model = primary_models[session_ordinal]
+			session_budget = session_token_budgets[session_ordinal]
 			branch = random.choice(branches)
-			turn_count = random.randint(2, 5)
+			turn_count = 4
 			for turn in range(turn_count):
-				turn_time = session_start + timedelta(minutes=turn * random.randint(2, 15))
+				turn_time = session_start + timedelta(minutes=turn * 7)
 				prompt = random.choice(prompts)
 				reply = random.choice(assistant_replies)
 				tools_picked = random.sample(tools_used_pool, k=random.randint(1, 3))
@@ -2519,6 +2764,13 @@ def populate_session_jsonls() -> list[dict]:
 						"input": tool_input,
 					})
 
+				turn_total = int(session_budget * [0.16, 0.31, 0.21, 0.32][turn])
+				input_tokens = int(turn_total * 0.55)
+				output_tokens = int(turn_total * 0.18)
+				cache_creation_tokens = int(turn_total * 0.08)
+				cache_read_tokens = (
+					turn_total - input_tokens - output_tokens - cache_creation_tokens
+				)
 				assistant_record = {
 					"type": "assistant",
 					"uuid": str(uuid.UUID(int=random.getrandbits(128))),
@@ -2528,12 +2780,12 @@ def populate_session_jsonls() -> list[dict]:
 					"gitBranch": branch,
 					"message": {
 						"role": "assistant",
-						"model": f"demo-claude-opaque-{project_index}-{session_idx}-{turn % 3}",
+						"model": primary_model,
 						"usage": {
-							"input_tokens": 120 + turn * 7,
-							"output_tokens": 36 + turn * 3,
-							"cache_creation_input_tokens": 12 + turn,
-							"cache_read_input_tokens": 48 + turn * 2,
+							"input_tokens": input_tokens,
+							"output_tokens": output_tokens,
+							"cache_creation_input_tokens": cache_creation_tokens,
+							"cache_read_input_tokens": cache_read_tokens,
 						},
 						"content": assistant_blocks,
 					},
@@ -2724,6 +2976,7 @@ def main() -> None:
 		populate_learning_runs(conn)
 		populate_learned_rules(conn)
 		populate_observation_summaries(conn)
+		populate_skill_usages(conn)
 		populate_tool_actions(conn)
 		populate_memory_files(conn)
 		populate_memory_markdown()
@@ -2752,6 +3005,8 @@ def main() -> None:
 		model_conn = sqlite3.connect(str(DB_PATH))
 		try:
 			populate_model_analytics(model_conn, fixture_sources)
+			populate_pi_model_analytics(model_conn)
+			validate_showcase_fixtures(model_conn)
 			model_conn.commit()
 		except Exception:
 			model_conn.rollback()

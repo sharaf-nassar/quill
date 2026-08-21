@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+FROM node:22-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+
+COPY index.html tsconfig.json vite.config.ts ./
+COPY public ./public
+COPY marketing-site/assets/logo-mark.png ./marketing-site/assets/logo-mark.png
+COPY src ./src
+COPY scripts/capture_browser_screenshots.mjs ./scripts/capture_browser_screenshots.mjs
+
+RUN mkdir -p /output
+
+ENV HOME=/tmp/quill-screenshot-home \
+    CHROME_BIN=/usr/bin/chromium \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=UTC
+
+ENTRYPOINT ["node", "scripts/capture_browser_screenshots.mjs", "/output"]

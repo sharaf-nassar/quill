@@ -65,24 +65,24 @@ A visitor curious enough to scroll past the hero wants to see what each feature 
 
 ### User Story 3 - Maintainer regenerates screenshots without leaking real data (Priority: P2)
 
-A Quill maintainer needs to refresh the marketing screenshots after a UI change. They run a separate, dedicated instance of Quill on their development machine that points at a pre-seeded dummy dataset (fake projects, fake sessions, plausible token counts, fake learned rules), capture the relevant views, and replace the screenshots in the site source — all without touching their personal `~/.claude` or `~/.codex` directories or the Quill database their day-to-day work relies on.
+A Quill maintainer needs to refresh marketing screenshots after a UI change. They run the real frontend in its dev-only Browser Mock Mode inside Docker, drive the relevant views through headless Chromium, and replace site assets without exposing or touching personal state.
 
-**Why this priority**: Without this workflow, screenshots either go stale (the site silently misrepresents the product) or maintainers ship real personal data publicly. This story is independently testable from the visitor-facing pages: a maintainer can validate the dummy-data instance produces good screenshots before any site code changes.
+**Why this priority**: Without this workflow, screenshots either go stale, drift into a screenshot-only reimplementation, or leak personal data. The capture must prove that current app components render every marketed feature from one maintained mock contract.
 
-**Independent Test**: Follow the documented dummy-instance workflow from a clean checkout on a development machine, verify the resulting Quill window shows realistic-looking but obviously fictional data across every screen the marketing site references, capture screenshots, and confirm none of the captured pixels contain real local data.
+**Independent Test**: Follow the Docker workflow from a clean checkout, verify Chromium renders the actual Quill entry point with fictional data across every referenced view, and confirm no capture contains the mock badge or real local data.
 
 **Acceptance Scenarios**:
 
-1. **Given** a maintainer wants new screenshots, **When** they follow the documented dummy-instance procedure, **Then** they obtain a running Quill window populated with dummy data without overwriting their normal Quill database, settings, or provider configuration.
-2. **Given** the dummy data is loaded, **When** the maintainer opens each marketed view (live usage, all analytics tabs, sessions, learning, context tab), **Then** every view renders with non-empty, plausible-looking data.
-3. **Given** a freshly captured screenshot set, **When** the maintainer inspects every image, **Then** zero real personal data is visible (no real project paths, hostnames, session prompts, or git branch names).
-4. **Given** the maintainer finishes capturing, **When** they tear down the dummy instance, **Then** their personal Quill installation is unchanged.
+1. **Given** a maintainer wants new screenshots, **When** they run the Docker capture command, **Then** Vite serves Quill's real frontend and Browser Mock Mode answers its normal IPC calls.
+2. **Given** the marketing fixture profile is active, **When** Chromium opens Usage, Models, Context, Sessions, Learning, Memories, Integrations, and Context settings, **Then** every view is non-empty and plausible.
+3. **Given** a freshly captured set, **When** the maintainer inspects it, **Then** Claude/Codex/Pi and agent evidence are visible, MiniMax and the mock badge are absent, and every identifier is fictional.
+4. **Given** capture succeeds or fails, **When** the container exits, **Then** personal Quill state is unchanged and tracked assets are replaced only after full validation.
 
 ---
 
 ### User Story 4 - Developer evaluates technical fit (Priority: P3)
 
-A developer past the marketing pitch wants to confirm Quill fits their setup before they install: which providers it supports (Claude Code, Codex, MiniMax), what platforms it runs on, how it integrates (hooks, MCP), what data it stores locally, and where the source lives.
+A developer past the marketing pitch wants to confirm the three agent integrations currently spotlighted by the site (Claude Code, Codex, Pi), what platforms Quill runs on, how it integrates, what data it stores locally, and where the source lives. The README retains the complete provider matrix.
 
 **Why this priority**: This audience is smaller and is largely served by the linked GitHub README. A "Built for / Integrates with / Runs on" strip and clear repo links satisfy most of it without duplicating the README.
 
@@ -90,7 +90,7 @@ A developer past the marketing pitch wants to confirm Quill fits their setup bef
 
 **Acceptance Scenarios**:
 
-1. **Given** the page, **When** the developer scans for "what providers does this support?", **Then** they find an explicit list naming Claude Code, Codex, and MiniMax.
+1. **Given** the page, **When** the developer scans for the spotlighted agent integrations, **Then** they find Claude Code, Codex, and Pi with correct local integration semantics.
 2. **Given** the page, **When** the developer wants to see the source, **Then** a clearly labelled link reaches the GitHub repository.
 3. **Given** the page, **When** the developer wants the latest release, **Then** a clearly labelled link reaches the GitHub releases page.
 
@@ -133,7 +133,7 @@ A developer past the marketing pitch wants to confirm Quill fits their setup bef
 - **FR-010**: The site MUST include dedicated feature sections for Live Usage analytics, Context Savings, Session Search, and Learning System.
 - **FR-011**: Each feature section MUST include a benefit-oriented heading, a short description, and at least one screenshot showing that feature in the actual UI.
 - **FR-012**: The Analytics section MUST explicitly explain *how analytics and insights help when working with an LLM* — covering at minimum: subscription-usage awareness (Pro/Max/Plus 5-hour and 7-day windows), latency visibility, token-efficiency feedback, context savings, code velocity, and routing-cost transparency.
-- **FR-013**: The site MUST include a "supported providers" affordance naming Claude Code, Codex, and MiniMax with the correct integration semantics for each.
+- **FR-013**: The site MUST include an agent-integrations affordance naming Claude Code, Codex, and Pi with the correct local integration semantics. The repository README remains the complete provider-support reference.
 - **FR-014**: The site MUST include a "supported platforms" affordance covering the platforms Quill currently ships for.
 - **FR-015**: The site MUST link to the GitHub repository, the latest releases page, and the project's existing documentation surface.
 - **FR-016**: A short, accurate footer MUST identify the project, link the source, and credit the license.
@@ -141,14 +141,10 @@ A developer past the marketing pitch wants to confirm Quill fits their setup bef
 
 #### Screenshots and dummy data
 
-- **FR-017**: All UI screenshots MUST be captured from a separate Quill instance running against pre-seeded dummy data, not from any maintainer's personal Quill installation.
-- **FR-018**: Isolation MUST be achieved through environment-variable path overrides. Specifically:
-  - Quill MUST read `QUILL_DATA_DIR` and `QUILL_RULES_DIR` (and any additional override needed for provider hook directories) at startup, BEFORE it computes default paths, and use them when set.
-  - Production behavior MUST be safe by default: the override MUST require an explicit opt-in (e.g., a `QUILL_DEMO_MODE=1` flag, a `--data-dir` CLI argument, or equivalent) so a stray env var in a maintainer's shell never redirects their real Quill installation to an unrelated directory.
-  - `scripts/populate_dummy_data.py` MUST accept matching `--data-dir` / `--rules-dir` flags so the seeder can target an arbitrary sandbox without touching the platform default.
-  - The repository MUST ship a cross-platform launcher (`scripts/run_quill_demo.sh` for POSIX shells and an equivalent PowerShell script for Windows) that creates a fresh sandbox directory, runs the seeder against it, and launches Quill against it — leaving the maintainer's `~/.local/share/com.quilltoolkit.app/`, `~/Library/Application Support/com.quilltoolkit.app/`, `~/.config/quill/`, `~/.claude/`, and `~/.cache/quill/` untouched.
-- **FR-019**: Dummy data MUST be obviously fictional on inspection (project names, host names, branch names, learned-rule text) so a real-data leak would be immediately spotted at review time.
-- **FR-020**: Dummy data MUST be plausible (non-empty, non-uniform, realistic-looking distributions of token counts, session lengths, time ranges) so screenshots demonstrate the product's value rather than empty states.
+- **FR-017**: All UI screenshots MUST render Quill's real React components and production view composition. Reimplementing the UI in screenshot-only HTML or generating images is forbidden.
+- **FR-018**: Marketing capture MUST use the existing dev-only Browser Mock Mode under the app's normal Tauri `invoke()` call sites. The mock import and `screenshot=marketing` profile MUST remain unreachable in production bundles.
+- **FR-019**: Capture MUST run inside a Docker container with runtime networking disabled and no host display, home directory, Quill database, transcript roots, or provider configuration mounted.
+- **FR-020**: Fixture data MUST be obviously fictional, plausible, non-empty, and non-uniform. The profile MUST cover Claude Code, Codex, and Pi models/sessions, Session Search, Learning, Memories, Context, and Settings while omitting MiniMax from the current marketing composition.
 - **FR-021**: Screenshots MUST be captured at sufficient resolution to render crisply on high-DPI displays.
 - **FR-022**: Every screenshot used on the site MUST cover at least one feature claimed nearby in copy, and every claimed feature MUST have at least one screenshot.
 
@@ -172,9 +168,9 @@ A developer past the marketing pitch wants to confirm Quill fits their setup bef
 - **Marketing Site**: The full GitHub-Pages-hosted static deliverable. Owns visual identity, copy, screenshot assets, and metadata. Lives in this repository.
 - **Hero Section**: Above-the-fold visitor-conversion surface. Owns the headline, one-line value proposition, primary call-to-action, and primary screenshot.
 - **Feature Section**: A repeatable content block with a benefit-oriented heading, short description, screenshot(s), and optional supporting copy. The site has one per highlighted feature.
-- **Screenshot Asset**: An image file captured from the dummy-data Quill instance. Owns its high-DPI rendering and its mapping to a specific feature section.
-- **Dummy Dataset**: A pre-seeded fictional state (projects, sessions, tokens, learned rules, context-savings events, plugins) used only by the screenshot-capture instance. Not tied to any real user data.
-- **Capture Workflow**: The maintainer-facing procedure to spin up a Quill instance pointed at the dummy dataset, take screenshots, and shut it down without touching personal state.
+- **Screenshot Asset**: A high-DPI Chromium surface capture of the real app frontend, mapped to a feature section.
+- **Marketing Fixture Profile**: The deterministic `screenshot=marketing` subset of Browser Mock Mode covering every published view without personal data.
+- **Capture Workflow**: The Docker + Chrome DevTools Protocol procedure that drives the actual app, validates nine assets, and publishes them without touching personal state.
 
 ## Success Criteria *(mandatory)*
 

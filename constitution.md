@@ -1,8 +1,7 @@
 # Constitution
 
-The engineering principles governing this repository. Read by the `speckit`
-formula's spec-review, plan, and analyze gates — every feature is checked
-against these.
+The engineering principles governing this repository. Read by spec-review,
+planning, and analyze gates — every feature is checked against these.
 
 ## Principles
 
@@ -36,9 +35,9 @@ against these.
    or test changes and require `lat check` before completion.
    _Rationale:_ Implementation, design intent, and test specifications must stay
    synchronized.
-9. **Glass Cockpit discipline** — `PRODUCT.md` and `DESIGN.md` govern UI
-   changes, including two densities, semantic color, stable numerics, keyboard
-   focus, contrast, and reduced motion.
+9. **Flat Polish discipline** — `PRODUCT.md` and `DESIGN.md` govern UI
+   changes, including the single Flat Polish density, semantic color, stable
+   numerics, keyboard focus, contrast, and reduced motion.
    _Rationale:_ One instrument-grade vocabulary must span every surface.
 10. **Measured performance** — Performance-sensitive work defines explicit
     budgets and demonstrates them with reproducible measurements.

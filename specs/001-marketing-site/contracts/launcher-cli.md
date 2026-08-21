@@ -64,8 +64,7 @@ If none resolve, exit with code `4` and print a message instructing the maintain
 
 ## Out-of-scope (deliberately)
 
-- The launcher does NOT capture screenshots. That remains `scripts/take_screenshots.sh`'s job; the maintainer runs it manually after Quill is on screen with the demo data loaded.
-- The launcher does NOT publish or copy assets. The maintainer is responsible for moving captured PNGs into `marketing-site/assets/screenshots/`.
+- The launcher does NOT capture or publish marketing screenshots. Publishing uses `scripts/capture_screenshots_docker.sh` and Browser Mock Mode; `scripts/take_screenshots.sh` remains a manual Tauri/backend debugging aid.
 - The launcher does NOT install Quill. It assumes the binary already exists (see auto-discovery).
 
 ## Test surface
