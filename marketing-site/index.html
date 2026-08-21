@@ -6,27 +6,27 @@
 	<meta name="color-scheme" content="dark">
 
 	<title>Quill - analytics and tools for AI coding agents</title>
-	<meta name="description" content="Quill is a local desktop console for Claude Code, Codex, and Pi: token analytics plus context, search, and learning tools your agents use too. Open source.">
+	<meta name="description" content="Quill is a local desktop companion for Claude Code, Codex, and Pi: usage and model analytics, session search, learning, memory, and context tools. Open source.">
 
 	<link rel="canonical" href="https://sharaf-nassar.github.io/quill/">
 	<link rel="icon" type="image/png" href="assets/logo.png">
 	<link rel="preload" as="image" href="assets/logo-mark.png">
-	<link rel="preload" as="image" href="assets/screenshots/hero.png?v=7" fetchpriority="high">
+	<link rel="preload" as="image" href="assets/screenshots/hero.png?v=9" fetchpriority="high">
 	<link rel="preload" as="font" type="font/woff2" href="assets/fonts/SpaceGrotesk-wght.woff2" crossorigin>
 	<link rel="preload" as="font" type="font/woff2" href="assets/fonts/Geist-wght.woff2" crossorigin>
 
 	<meta property="og:type" content="website">
 	<meta property="og:url" content="https://sharaf-nassar.github.io/quill/">
 	<meta property="og:title" content="Quill - analytics and tools for AI coding agents">
-	<meta property="og:description" content="A local desktop console for Claude Code, Codex, and Pi: token analytics plus context, search, and learning tools your agents use too.">
-	<meta property="og:image" content="https://sharaf-nassar.github.io/quill/assets/screenshots/hero.png">
+	<meta property="og:description" content="Usage and model analytics, session search, learning, memory, and context tools for Claude Code, Codex, and Pi.">
+	<meta property="og:image" content="https://sharaf-nassar.github.io/quill/assets/screenshots/hero.png?v=9">
 	<meta property="og:image:width" content="720">
-	<meta property="og:image:height" content="1532">
+	<meta property="og:image:height" content="1600">
 
 	<meta name="twitter:card" content="summary_large_image">
 	<meta name="twitter:title" content="Quill - analytics and tools for AI coding agents">
-	<meta name="twitter:description" content="Token analytics plus context, search, and learning tools for Claude Code, Codex, and Pi — local, on your own plan.">
-	<meta name="twitter:image" content="https://sharaf-nassar.github.io/quill/assets/screenshots/hero.png">
+	<meta name="twitter:description" content="Usage and model analytics plus context, search, learning, and memory tools for Claude Code, Codex, and Pi.">
+	<meta name="twitter:image" content="https://sharaf-nassar.github.io/quill/assets/screenshots/hero.png?v=9">
 
 	<script type="application/ld+json">
 	{
@@ -35,7 +35,7 @@
 		"name": "Quill",
 		"applicationCategory": "DeveloperApplication",
 		"operatingSystem": "macOS, Linux, Windows",
-		"description": "A local desktop console for Claude Code, Codex, and Pi: token analytics plus context, search, and learning tools your agents use too.",
+		"description": "A local desktop companion for Claude Code, Codex, and Pi with usage and model analytics, session search, learning, memory, and context tools.",
 		"offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
 		"license": "https://github.com/sharaf-nassar/quill/blob/main/LICENSE",
 		"url": "https://sharaf-nassar.github.io/quill/",
@@ -59,10 +59,10 @@
 		</a>
 
 		<nav class="site-nav" aria-label="Marketing sections">
-			<a href="#analytics">Analytics</a>
+			<a href="#analytics">Usage</a>
+			<a href="#models">Models</a>
 			<a href="#context">Context</a>
 			<a href="#search">Search</a>
-			<a href="#live">Live</a>
 			<a href="#learning">Learning</a>
 			<a href="#install">Install</a>
 		</nav>
@@ -84,8 +84,8 @@
 				</h1>
 				<p class="hero-deck">You get the insight. Your agents get the tools.</p>
 				<p class="hero-lede">
-					A local console for Claude Code, Codex, and Pi. It accounts for every
-					token, session, and rule your agents touch — then hands them tools they can use.
+					A local companion for Claude Code, Codex, and Pi. It tracks usage,
+					models, sessions, and rule evidence, then gives your agents tools they can call.
 				</p>
 				<div class="hero-actions" aria-label="Primary actions">
 					<a class="button button-primary" href="https://github.com/sharaf-nassar/quill/releases/latest">
@@ -102,7 +102,7 @@
 					</a>
 				</div>
 				<p class="hero-reassure">
-					Runs on your own Claude plan — no API key, no cloud, no tracking
+					Local data, no Quill account, opt-out scrubbed crash reports
 					<span aria-hidden="true">·</span> Open source (MIT)
 					<span aria-hidden="true">·</span> macOS, Linux, Windows
 				</p>
@@ -111,10 +111,10 @@
 			<figure class="hero-stage motion-rise">
 				<div class="hero-window">
 					<img
-						src="assets/screenshots/hero.png?v=7"
-						alt="The Quill widget: a 360-pixel always-on-top window with a LIMITS band showing Claude and Codex utilization bars with reset countdowns, and below it the Usage view — a six-hour token chart, runtime, tokens-per-line and lines-per-hour readouts with sparklines, and a session breakdown."
-						width="360"
-						height="766"
+						src="assets/screenshots/hero.png?v=9"
+						alt="The Quill widget with Claude and Codex limits above a six-hour chart grouped by model, six measured readouts, and skill counts across Claude Code, Codex, and Pi."
+						width="720"
+						height="1600"
 						loading="eager"
 						fetchpriority="high"
 					>
@@ -125,21 +125,38 @@
 		<section id="analytics" class="spotlight motion-rise" style="--shot-w: 360px" aria-labelledby="analytics-heading">
 			<div class="spotlight-copy">
 				<p class="card-label">Usage over time</p>
-				<h2 id="analytics-heading">Every token accounted for — not estimated.</h2>
+				<h2 id="analytics-heading">Usage you can trace back to the work.</h2>
 				<p>
-					Token usage, runtime, code efficiency, and activity share one
-					selected window from the last hour out to seven days. Every point
-					comes from real Claude, Codex, and Pi sessions, not sampled estimates.
+					Group the same measured token evidence by CLI, upstream provider, or
+					model. Runtime, code efficiency, projects, sessions, and net lines
+					follow the selected window, while unattributed activity stays visible.
 				</p>
 			</div>
 			<figure class="spotlight-media">
 				<div class="shot">
-					<img src="assets/screenshots/hero.png?v=5" alt="The Quill widget on its Usage view: provider token history and six measured readouts under the LIMITS band, with the six-hour range selected." width="720" height="1532" loading="lazy">
+					<img src="assets/screenshots/hero.png?v=9" alt="The Quill Usage view grouped by model over six hours, with varied token activity, six readouts, and Claude Code, Codex, and Pi skill counts." width="720" height="1600" loading="lazy">
 				</div>
 			</figure>
 		</section>
 
-		<section id="context" class="spotlight spotlight-reverse motion-rise" style="--shot-w: 360px" aria-labelledby="context-heading">
+		<section id="models" class="spotlight spotlight-reverse motion-rise" style="--shot-w: 360px" aria-labelledby="models-heading">
+			<div class="spotlight-copy">
+				<p class="card-label">Model evidence</p>
+				<h2 id="models-heading">See which models actually did the work.</h2>
+				<p>
+					Quill keeps provider-qualified model ids exactly as observed. See what
+					is running now, what it replaced, and the top models by sessions and
+					attributed tokens, with incomplete coverage stated instead of guessed.
+				</p>
+			</div>
+			<figure class="spotlight-media">
+				<div class="shot">
+					<img src="assets/screenshots/models.png?v=2" alt="The Quill Models view showing current Claude Code, Codex, and Pi model evidence plus the top five models ranked by sessions." width="720" height="1600" loading="lazy">
+				</div>
+			</figure>
+		</section>
+
+		<section id="context" class="spotlight motion-rise" style="--shot-w: 360px" aria-labelledby="context-heading">
 			<div class="spotlight-copy">
 				<p class="card-label">Working memory · your agents use it too</p>
 				<h2 id="context-heading">Keep bloated context out of the model's window.</h2>
@@ -162,18 +179,18 @@
 			</div>
 			<figure class="spotlight-media">
 				<div class="shot">
-					<img src="assets/screenshots/analytics-context.png?v=4" alt="The Quill widget on its Context view: preserved and retrieved token totals with a split ratio bar, the tokens-saved insight line, and the routing cost the offloading itself spends." width="360" height="449" loading="lazy">
+					<img src="assets/screenshots/analytics-context.png?v=6" alt="The Quill Context view over six hours, with preserved and retrieved token totals, source reuse, and routing cost." width="720" height="1600" loading="lazy">
 				</div>
 			</figure>
 		</section>
 
 		<div class="section-intro section-intro-band">
 			<p class="prelude">Across Claude Code, Codex &amp; Pi</p>
-			<h2 id="bento-heading">Recall, limits, and learning — in one local window.</h2>
-			<p>Pi contributes session and model analytics plus local tools, but has no LIMITS row.</p>
+			<h2 id="bento-heading">Recall, limits, and learning in one local workspace.</h2>
+			<p>Pi contributes session and model analytics plus local tools, but has no LIMITS row. Learning rules are scoped to Claude Code and Codex.</p>
 		</div>
 
-		<section id="search" class="spotlight motion-rise" style="--shot-w: 640px" aria-labelledby="search-heading">
+		<section id="search" class="spotlight spotlight-reverse motion-rise" style="--shot-w: 640px" aria-labelledby="search-heading">
 			<div class="spotlight-copy">
 				<p class="card-label">Total recall</p>
 				<h2 id="search-heading">Every past run, indexed — Claude, Codex, and Pi.</h2>
@@ -181,33 +198,33 @@
 			</div>
 			<figure class="spotlight-media">
 				<div class="shot">
-					<img src="assets/screenshots/sessions.png?v=3" alt="The Sessions section of Quill's Manage workspace: a search for “parser” returning ten ranked results with provider badges, branch names, timestamps, snippets and code-change counts, and the selected result's transcript open beside them." width="960" height="680" loading="lazy">
+					<img src="assets/screenshots/sessions.png?v=5" alt="The Sessions section of Quill's Tools workspace with a parser query, ranked matches, and surrounding transcript context open beside the results." width="1920" height="1360" loading="lazy">
 				</div>
 			</figure>
 		</section>
 
-		<section id="live" class="spotlight spotlight-reverse motion-rise" style="--shot-w: 360px" aria-labelledby="live-heading">
+		<section id="live" class="spotlight motion-rise" style="--shot-w: 360px" aria-labelledby="live-heading">
 			<div class="spotlight-copy">
 				<p class="card-label">Live limits</p>
 				<h2 id="live-heading">Know the cap before it cuts the run.</h2>
-				<p>Real-time quota pressure for Claude and Codex — utilization, reset countdowns, and severity, in the band that sits above every view, refreshing while the agents work.</p>
+				<p>Live quota pressure for Claude and Codex, with utilization, reset countdowns, and severity above every view. Pi contributes session and model evidence but has no quota row. Connect CLI Proxy API to replace direct rows with pooled account pressure.</p>
 			</div>
 			<figure class="spotlight-media">
 				<div class="shot shot-band">
-					<img src="assets/screenshots/live.png?v=4" alt="The LIMITS band of the Quill widget: a row per provider — Claude at 42 percent of its five-hour window and 58 percent of its week, Codex at 48 and 63 percent — each with utilization bars and a reset countdown, and MiniMax offering setup." width="360" height="766" loading="lazy">
+					<img src="assets/screenshots/live.png?v=6" alt="The Quill LIMITS band with Claude and Codex utilization windows and reset countdowns." width="720" height="1600" loading="lazy">
 				</div>
 			</figure>
 		</section>
 
-		<section id="learning" class="spotlight motion-rise" style="--shot-w: 640px" aria-labelledby="learning-heading">
+		<section id="learning" class="spotlight spotlight-reverse motion-rise" style="--shot-w: 640px" aria-labelledby="learning-heading">
 			<div class="spotlight-copy">
 				<p class="card-label">Behavioral learning</p>
-				<h2 id="learning-heading">Your agent learns your rules — only after Quill proves they help.</h2>
-				<p>Quill mines your sessions, git history, and tool use for reusable rules, then runs each through a counterfactual replay test before it's ever written to your agent's config. You approve everything that ships.</p>
+				<h2 id="learning-heading">Turn repeated behavior into reviewable rules.</h2>
+				<p>Quill combines tool observations, git history, and recent sessions into evidence-backed candidates. Nothing reaches an agent file until you explicitly promote it, and operator feedback outweighs model opinion.</p>
 			</div>
 			<figure class="spotlight-media">
 				<div class="shot">
-					<img src="assets/screenshots/learning.png?v=3" alt="The Learning section of Quill's Manage workspace: an observation header with an Analyze control above five active rules and three discovered candidates, each with its domain, provider badge and confidence value." width="960" height="618" loading="lazy">
+					<img src="assets/screenshots/learning.png?v=5" alt="The Learning section of Quill's Tools workspace with five active rules, three discovered candidates, provider scopes, evidence scores, and promotion controls." width="1920" height="1360" loading="lazy">
 				</div>
 			</figure>
 		</section>
@@ -217,7 +234,7 @@
 			<h2 id="tools-heading">Help your coding agents operate better.</h2>
 		</div>
 
-		<section id="memory" class="spotlight spotlight-reverse motion-rise" style="--shot-w: 600px" aria-labelledby="memory-heading">
+		<section id="memory" class="spotlight motion-rise" style="--shot-w: 640px" aria-labelledby="memory-heading">
 			<div class="spotlight-copy">
 				<p class="card-label">Memory tools</p>
 				<h2 id="memory-heading">Keep your agent's memory clean and current.</h2>
@@ -225,12 +242,12 @@
 			</div>
 			<figure class="spotlight-media spotlight-media-wide">
 				<div class="shot">
-					<img src="assets/screenshots/memory.png?v=3" alt="Quill Memories panel with an All Projects (4) selector, listing one memory file per project — conventions.md, rate-limits.md, data-prep.md, components.md — each tagged CONTEXT or CONVENTION with a one-line description, and an Optimize All control." width="751" height="374" loading="lazy">
+					<img src="assets/screenshots/memory.png?v=5" alt="The Memories tab in Quill's Tools workspace, listing provider-aware memory files across four fictional projects with an Optimize All control." width="1920" height="1360" loading="lazy">
 				</div>
 			</figure>
 		</section>
 
-		<section id="brevity" class="spotlight motion-rise" style="--shot-w: 600px" aria-labelledby="brevity-heading">
+		<section id="brevity" class="spotlight spotlight-reverse motion-rise" style="--shot-w: 640px" aria-labelledby="brevity-heading">
 			<div class="spotlight-copy">
 				<p class="card-label">Prose compression</p>
 				<h2 id="brevity-heading">Get tighter answers from your agents.</h2>
@@ -238,7 +255,20 @@
 			</div>
 			<figure class="spotlight-media spotlight-media-wide spotlight-media-brevity">
 				<div class="shot">
-					<img src="assets/screenshots/brevity.png?v=3" alt="Quill's Brevity profile toggle switched on, with an explanation that it compresses the agent's prose while preserving code, paths, URLs and commands verbatim, and a note on the managed block it writes per provider." width="751" height="228" loading="lazy">
+					<img src="assets/screenshots/brevity.png?v=5" alt="Quill Context settings with Working Context Preservation, local savings telemetry, and the Brevity profile switched on." width="1920" height="1360" loading="lazy">
+				</div>
+			</figure>
+		</section>
+
+		<section id="integrations" class="spotlight motion-rise" style="--shot-w: 640px" aria-labelledby="integrations-heading">
+			<div class="spotlight-copy">
+				<p class="card-label">Provider control</p>
+				<h2 id="integrations-heading">One place to manage every connection.</h2>
+				<p>Enable Claude Code, Codex, or Pi only after reviewing the local files Quill installs. Choose the provider behind the tray indicator and connect pooled Claude or Codex accounts through CLI Proxy API.</p>
+			</div>
+			<figure class="spotlight-media spotlight-media-wide">
+				<div class="shot">
+					<img src="assets/screenshots/settings.png?v=2" alt="Quill Integrations settings with activity tracking and Claude Code, Codex, and Pi enabled." width="1920" height="1020" loading="lazy">
 				</div>
 			</figure>
 		</section>
@@ -250,9 +280,9 @@
 					Put it beside the agents you already use.
 				</h2>
 				<p>
-					Quill runs entirely on your machine and your own Claude plan — its AI
-					features drive your local Claude CLI inside an OS sandbox. No API key,
-					no account, no tracking. MIT-licensed.
+					Quill keeps session content, indexes, and context stores on your machine.
+					Learning and memory analysis use your local Claude CLI inside an OS sandbox.
+					No Quill account. Scrubbed crash reports are optional. MIT-licensed.
 				</p>
 				<div class="hero-actions">
 					<a class="button button-primary" href="https://github.com/sharaf-nassar/quill/releases/latest">
@@ -273,7 +303,7 @@
 			<div class="install-ledger" aria-label="Install details">
 				<div>
 					<span>Providers</span>
-					<p>Claude Code, Codex, and Pi, with setup and status surfaced in the app.</p>
+					<p>Claude Code, Codex, and Pi integrations, plus optional pooled Claude and Codex quotas.</p>
 				</div>
 				<div>
 					<span>Platforms</span>
@@ -281,7 +311,7 @@
 				</div>
 				<div>
 					<span>Privacy</span>
-					<p>100% local. Sandboxed inference on your own plan, read-only OAuth, no tracking.</p>
+					<p>Local session data and read-only OAuth. Opt-out crash reports strip messages, paths, breadcrumbs, and request data before transmission.</p>
 				</div>
 			</div>
 		</section>

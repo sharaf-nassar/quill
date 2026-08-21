@@ -121,8 +121,8 @@ function LearningTab({ learning, runtime }: LearningTabProps) {
       />
 
       <SettingRow
-        label="Min confidence"
-        description="Wilson-score floor for auto-promoting a discovered rule (0.5 – 1.0)."
+        label="Review threshold"
+        description="Evidence-score floor for making a candidate review-eligible. Promotion stays manual (0.5 – 1.0)."
         control={
           <input
             type="number"

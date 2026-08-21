@@ -4,23 +4,23 @@
   <img src="src-tauri/icons/quill-original.png" width="128" alt="Quill icon" />
 </p>
 
-A cross-platform desktop widget for Claude Code, Codex, Pi, and other AI assistants. It combines usage analytics, full-text session search, behavioral learning, and optional context preservation in a compact, always-on-top window. Built with Tauri + React.
+A cross-platform desktop companion for Claude Code, Codex, Pi. It combines usage and model analytics, session search, behavioral learning, memory tools, and optional context preservation in a compact always-on-top widget plus a consolidated Tools workspace. Built with Tauri + React.
 
-> Marketing site (live limits, analytics, search, learning): <https://sharaf-nassar.github.io/quill/> · Source under [`marketing-site/`](marketing-site/README.md).
+> Marketing site: <https://sharaf-nassar.github.io/quill/> · Source under [`marketing-site/`](marketing-site/README.md).
 
 ## Features
 
 A one-line tour. Each item links to its full description in [Features in depth](#features-in-depth).
 
-- **[Live usage](#live-usage)** — a LIMITS band pinned above everything else, one row per enabled provider (Claude, Codex, MiniMax), with per-window utilization bars and reset countdowns
+- **[Live usage](#live-usage)** — a LIMITS band pinned above everything else with Claude and Codex utilization windows and reset countdowns; Pi contributes analytics but has no quota row
 - **[Widget views](#widget-views)** — Usage, Models, and Context swap in one region under a shared 1H/6H/24H/7D range strip; widget graphics use an internal SVG kit, so Quill ships no charting dependency
-- **[Agent visibility](#agent-visibility)** — sessions show the subagents Quill actually observed running, grouped by model (`2×Opus · 3×Sonnet`)
+- **[Agent visibility](#agent-visibility)** — session rows separate root-turn runtime, retained agent totals, and the models of agents currently observed working
 - **[Multi-account pools](#multi-account-pools)** — connect a local CLI Proxy API instance and LIMITS reports mean pool pressure instead of a single account
-- **[Manage workspace](#manage-workspace)** — one rail-navigated window (⌘M / Ctrl+M) holding Sessions, Learning, and Settings
+- **[Tools workspace](#tools-workspace)** — one rail-navigated window (⌘M / Ctrl+M) holding Sessions, Learning, and Settings
 - **[Session search](#session-search)** — Tantivy-backed full-text search across every Claude Code, Codex, and Pi session, with filters and snippet highlighting
-- **[Token tracking](#token-tracking)** — per-turn input/output/cache counts collected by each provider integration
+- **[Token tracking](#token-tracking)** — per-turn input/output/cache counts from Claude Code, Codex, and Pi evidence
 - **[Code stats](#code-stats)** — lines added and removed per session by language, plus tokens per LOC and LOC per hour
-- **[Learning](#learning)** — observes tool-use patterns across sessions and extracts reusable rules with confidence scores
+- **[Learning](#learning)** — combines tool use, git history, and recent sessions into reviewable rule candidates with evidence scores
 - **[Memory optimizer](#memory-optimizer)** — suggests merges, updates, and removals for your memory files; every change is diff-reviewed and undoable
 - **[Brevity profile](#brevity-profile)** — a managed instruction block that compresses assistant prose while leaving code, paths, and commands untouched
 - **[Working context preservation](#working-context-preservation)** — routes large transient output into a local searchable store instead of the LLM transcript
@@ -30,85 +30,104 @@ A one-line tour. Each item links to its full description in [Features in depth](
 
 ## Screenshots
 
-The main window is an always-on-top widget, 360px wide by default: a LIMITS
-band that never leaves the frame, and one view below it that the header's
-dropdown swaps.
+The 360px widget keeps LIMITS visible above three switchable views.
 
 <table>
   <tr>
     <td align="center"><strong>Usage</strong></td>
+    <td align="center"><strong>Models</strong></td>
     <td align="center"><strong>Context</strong></td>
   </tr>
   <tr>
-    <td valign="top"><img src="marketing-site/assets/screenshots/hero.png" width="300" alt="The Quill widget on its Usage view: LIMITS rows for Claude and Codex with utilization bars and reset countdowns, a six-hour token chart, runtime and tokens-per-line readouts with sparklines, and a session breakdown" /></td>
-    <td valign="top"><img src="marketing-site/assets/screenshots/analytics-context.png" width="300" alt="The Quill widget on its Context view: preserved and retrieved token totals with a ratio bar, the tokens-saved insight line, and routing cost" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/hero.png" width="240" alt="Quill Usage view with Claude and Codex limits, a six-hour model chart, six measured readouts, and skill counts across Claude Code, Codex, and Pi" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/models.png" width="240" alt="Quill Models view with running Claude Code, Codex, and Pi models plus a session-ranked model list" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/analytics-context.png" width="240" alt="Quill Context view with preserved and retrieved token totals, reuse ratio, and routing cost" /></td>
   </tr>
 </table>
 
-Learning, session search, and settings live in the Manage workspace
-(⌘M / Ctrl+M); their shots are captured by `scripts/take_screenshots.sh`.
+Everything else lives in the rail-navigated Tools workspace opened with
+⌘M / Ctrl+M.
+
+<table>
+  <tr>
+    <td align="center"><strong>Session search</strong></td>
+    <td align="center"><strong>Learning</strong></td>
+    <td align="center"><strong>Memories</strong></td>
+  </tr>
+  <tr>
+    <td valign="top"><img src="marketing-site/assets/screenshots/sessions.png" width="300" alt="Quill Sessions search with a parser query, ranked matches, and surrounding transcript context" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/learning.png" width="300" alt="Quill Learning rules with active and discovered states, provider scope, evidence scores, and explicit promotion controls" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/memory.png" width="300" alt="Quill Memories view listing provider-aware memory files across four fictional projects" /></td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center"><strong>Integrations</strong></td>
+    <td align="center"><strong>Context and brevity</strong></td>
+  </tr>
+  <tr>
+    <td valign="top"><img src="marketing-site/assets/screenshots/settings.png" width="420" alt="Quill Integrations settings with Claude Code, Codex, and Pi enabled" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/brevity.png" width="420" alt="Quill Context settings with working-context preservation, local savings telemetry, and the Brevity profile" /></td>
+  </tr>
+</table>
+
+All images come from the deterministic Docker capture workflow described under
+[Development](#development). No personal Quill data or desktop session is mounted.
 
 ## Architecture
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {
-  'primaryColor': '#1e293b',
-  'primaryTextColor': '#e2e8f0',
-  'lineColor': '#94a3b8',
-  'secondaryColor': '#334155',
-  'tertiaryColor': '#0f172a',
-  'fontFamily': 'ui-sans-serif, system-ui, sans-serif',
-  'fontSize': '14px',
-  'edgeLabelBackground': '#1e293b'
-}}}%%
-
 graph TB
-    subgraph Sources [" Claude Code Integration "]
-        CC(["Claude Code"])
-        BH(["Bundled Hooks"])
-        MS(["MCP Server"])
+    subgraph Providers
+        CC[Claude Code]
+        CX[Codex]
+        PI[Pi]
+        CPA[CLI Proxy API]
     end
 
-    subgraph Widget [" Quill · Tauri Desktop App "]
-        FE(["React Frontend"])
-        BE(["Rust Backend"])
-        DB[(SQLite)]
-        FTS[(Tantivy)]
+    subgraph Integrations
+        HM[Managed hooks and MCP]
+        PE[Managed Pi extension]
     end
 
-    API(["Anthropic API"])
-    GH(["GitHub Releases"])
+    subgraph Quill[Quill desktop app]
+        FE[React widget and Tools workspace]
+        BE[Rust backend]
+        DB[(SQLite analytics)]
+        FTS[(Tantivy session index)]
+        CTX[(Local context store)]
+    end
 
-    CC -- hooks --> BH
-    CC <-->|protocol| MS
+    CLI[Local Claude CLI inference]
+    GH[GitHub releases]
+    SENTRY[Opt-out scrubbed crash reports]
 
-    BH -- "tokens · sessions" --> BE
-    MS -- queries --> BE
+    CC <--> HM
+    CX <--> HM
+    PI <--> PE
+    HM --> BE
+    PE --> BE
+    CPA -- pooled quotas --> BE
 
-    FE <-->|Tauri IPC| BE
+    FE <--> BE
     BE <--> DB
     BE <--> FTS
-
-    API -- "usage data" --> BE
-    BE -. "LLM analysis" .-> API
-    GH -- "update check" --> FE
-
-    style CC fill:#6366f1,stroke:#818cf8,color:#fff,stroke-width:2px
-    style BH fill:#6366f1,stroke:#818cf8,color:#fff,stroke-width:2px
-    style MS fill:#6366f1,stroke:#818cf8,color:#fff,stroke-width:2px
-    style FE fill:#3b82f6,stroke:#60a5fa,color:#fff,stroke-width:2px
-    style BE fill:#3b82f6,stroke:#60a5fa,color:#fff,stroke-width:2px
-    style DB fill:#8b5cf6,stroke:#a78bfa,color:#fff,stroke-width:2px
-    style FTS fill:#8b5cf6,stroke:#a78bfa,color:#fff,stroke-width:2px
-    style API fill:#f59e0b,stroke:#fbbf24,color:#000,stroke-width:2px
-    style GH fill:#f59e0b,stroke:#fbbf24,color:#000,stroke-width:2px
-    style Sources fill:#0f172a,stroke:#334155,color:#94a3b8
-    style Widget fill:#0f172a,stroke:#475569,color:#e2e8f0
+    BE <--> CTX
+    BE -. learning and memory analysis .-> CLI
+    GH -- update metadata --> BE
+    BE -. stack frames only .-> SENTRY
 ```
 
 ## Prerequisites
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and logged in (`claude /login`)
+Quill can run before any provider is enabled. Install whichever local CLIs you
+want it to integrate with: Claude Code, Codex, or Pi. MiniMax live limits use an
+API key instead of a local CLI.
+
+Behavioral learning and memory optimization run through the local Claude Code
+CLI, so those two features require Claude Code to be installed and logged in
+with `claude /login`.
 
 ### For development
 
@@ -185,24 +204,26 @@ rm -rf ~/.config/quill
 git clone https://github.com/sharaf-nassar/quill.git
 cd quill
 npm install
-cargo tauri build
+npm run tauri -- build
 ```
 
 The built binary will be in `src-tauri/target/release/`.
 
 ## Setup
 
-The widget reads OAuth tokens from Claude Code's credentials file (`~/.claude/.credentials.json`). Make sure you are logged in:
+1. Launch Quill and open **Tools → Settings → Integrations**.
+2. Enable Claude Code, Codex, or Pi. Quill asks before installing its managed
+   hooks, MCP files, or Pi extension.
+3. Add a MiniMax API key only if you want MiniMax plan limits.
+4. Restart an already-running provider CLI after first enable so it loads the
+   new integration files.
 
-```bash
-claude /login
-```
-
-No additional configuration is needed — the widget starts tracking utilization immediately.
+Claude live limits use the existing Claude Code OAuth session. If that session
+is logged out, run `claude /login`; Quill never refreshes the token itself.
 
 ### Enabling context preservation (optional)
 
-Open the Manage workspace (⌘M / Ctrl+M, or the settings key in the widget titlebar) and toggle **Working Context Preservation** in **Settings → Context**. For Claude Code and Codex, enabling installs the context MCP tool, routing hooks, and capture scripts. Pi receives the core history and context tools plus equivalent routing policy through its managed extension. Disabling redeploys the base integrations and removes context assets while preserving historical context stores and analytics rows. The widget's **Context** view then reports what the store kept out of the transcript, what came back, and what routing cost.
+Open the Tools workspace (⌘M / Ctrl+M, or the settings key in the widget titlebar) and toggle **Working Context Preservation** in **Settings → Context**. For Claude Code and Codex, enabling installs the context MCP tool, routing hooks, and capture scripts. Pi receives the core history and context tools plus equivalent routing policy through its managed extension. Disabling redeploys the base integrations and removes context assets while preserving historical context stores and analytics rows. The widget's **Context** view then reports what the store kept out of the transcript, what came back, and what routing cost.
 
 ### Pi integration
 
@@ -213,40 +234,41 @@ It also registers `quill_` history and
 working-context tools through Pi's extension API and Quill's local HTTP API.
 Pi does not use MCP or external hook commands, and it has no LIMITS row.
 
-## Token Tracking, Learning & Session Search
+## Local data collection
 
-The app includes an HTTP server (port `19876`, configurable via `QUILL_PORT`) that receives data from Claude Code via hooks. This powers three features:
+Quill's authenticated local server listens on port `19876` by default
+(configurable with `QUILL_PORT`). Enabled integrations report or expose:
 
-- **Token tracking** — per-turn input/output/cache token counts, powering the Usage view's provider chart, its readout sparklines, and the In / Out / Cache footer
-- **Learning** — observes tool usage patterns across sessions and can analyze them to extract reusable rules (stored in `~/.claude/rules/learned/`)
-- **Session search** — indexes Claude Code session transcripts for full-text search with filters
+- **Claude Code and Codex** — token, tool, hook, and lifecycle telemetry through
+  managed local scripts; transcripts remain the retained source for search and
+  model analytics
+- **Pi** — session lifecycle and usage through its managed extension, with
+  transcript indexing for search and model evidence
+- **MiniMax** — plan limits only; it has no transcript or learning integration
 
-The HTTP server uses bearer-token authentication and rate limiting to secure incoming data.
+Enabling Claude Code or Codex deploys the required scripts and MCP files under
+`~/.config/quill/`, updates the provider's owned configuration, and writes the
+shared local connection contract. Enabling Pi installs one managed extension.
+Disabling a provider removes only Quill-owned integration state. All mutations
+are explicit and confirmation-gated in **Settings → Integrations**.
 
-### Local setup (automatic)
-
-When the Quill app runs on the same machine as Claude Code, **everything is configured automatically** on app startup — no manual steps required. The app:
-
-1. Deploys hook scripts to `~/.config/quill/scripts/`
-2. Deploys the MCP server to `~/.config/quill/mcp/`
-3. Registers hooks in `~/.claude/settings.json`
-4. Registers the MCP server in `~/.claude.json`
-5. Writes connection config to `~/.config/quill/config.json`
-6. Adds MCP usage instructions to `~/.claude/CLAUDE.md`
-
-Just install the app, launch it, and restart Claude Code. Token tracking, learning, session search, and MCP tools will all be active.
+The local server uses a generated bearer secret and endpoint rate limits. It is
+also the ingestion path for token tracking, live session state, context-savings
+telemetry, and observed hooks.
 
 ### Using the Learning section
 
 Once observations are being collected:
 
-1. Open the Manage workspace (⌘M / Ctrl+M, or the settings key in the widget titlebar) and select **Learning**
-2. Toggle learning **ON** with the switch in the section header
-3. Choose a trigger mode:
-   - **On-demand** — click "Analyze" in the status strip to run analysis manually
-   - **Periodic** — runs on a configurable interval once enough new observations have accumulated
-4. Analysis extracts patterns from observations and creates rule files in `~/.claude/rules/learned/`
-5. Learned rules appear as cards under **Rules** with confidence scores and domain tags; **Runs** docks the analysis history beside them
+1. Open Tools with ⌘M / Ctrl+M and select **Learning**.
+2. Click **Analyze** for an on-demand run, or configure periodic analysis under
+   **Settings → Learning**.
+3. Quill combines tool observations, git history, and recent indexed sessions
+   into evidence-backed candidates.
+4. Review candidates under **Discovered**. Analysis never writes a rule file by
+   itself; explicit promotion is the only path to an active `.md` rule.
+5. Use the clock button to dock run history, phase results, inference cost, and
+   live logs beside the rules.
 
 ### Verify
 
@@ -285,16 +307,31 @@ one finds the port taken, says so in a dialog, and quits. Stop the installed app
 before `npm run tauri -- dev`. `QUILL_PORT` and `QUILL_CONTEXT_PORT` still
 override the ports when you really do want two.
 
+### Refresh documentation screenshots
+
+```bash
+./scripts/capture_screenshots_docker.sh
+```
+
+This builds the current release binary with the embedded frontend, starts it in
+a private Xvfb/Openbox desktop, seeds deterministic fictional data, captures all
+widget and Tools views, validates every expected PNG, and only then replaces
+`marketing-site/assets/screenshots/`. The container has no host display socket,
+personal home directory, Quill data directory, or published network port.
+
+The first build downloads the Linux/Tauri toolchain. Later runs reuse Docker and
+Cargo caches.
+
 ## Controls
 
 - **Drag the titlebar** to move the widget; **drag any edge or corner** to resize it (floor 320×200, no ceiling) — both position and size are remembered
 - **Pin key** in the titlebar toggles always-on-top
-- **Settings key** in the titlebar opens the Manage workspace at its Settings section
+- **Settings key** in the titlebar opens the Tools workspace at its Settings section
 - **Close key** in the titlebar hides the widget to the tray; Quill keeps running
 - **View name** below LIMITS opens the view list — Usage, Models, Context
 - **1H / 6H / 24H / 7D** re-scopes every band of the active view at once
-- **⌘M / Ctrl+M**, or the Manage button in the Usage footer, opens the Manage workspace
-- **⌘K / Ctrl+K** inside Manage opens the command palette
+- **⌘M / Ctrl+M**, or the Manage button in the Usage footer, opens the Tools workspace
+- **⌘K / Ctrl+K** inside Tools opens the command palette
 - **Right-click the widget** for Refresh and Quit
 - **System tray menu** — Show Widget, Always on Top, Check for Update, and Quit
 - **Ctrl+/- (or Cmd+/-)** to zoom and **Ctrl+0** to reset, remembered per window
@@ -324,22 +361,24 @@ Everything below LIMITS is one swappable view region. The view name and a shared
 selected window. Every chart is drawn by an internal SVG kit — Quill ships no
 charting dependency.
 
-- **Usage** (default) — a per-provider stacked area chart with the range's total tokens and an in-range momentum delta overlaid, a hover-only legend chip, one computed insight line, a 3×2 readout grid (LLM runtime, tokens per LOC, LOC per hour, sessions, projects, net lines) where each metric carries its own sparkline, a switchable breakdown (Sessions, Projects, Hosts, Skills, Hooks), and an In / Out / Cache footer
+- **Usage** (default) — one evidence-backed token chart switchable by CLI, upstream provider, or model, with the range total and in-range momentum; one computed insight line; a 3×2 readout grid (LLM runtime, tokens per LOC, LOC per hour, sessions, projects, net lines); a Sessions / Projects / Hosts / Skills / Hooks breakdown; and an In / Out / Cache footer
 - **Models** — a running-now strip per provider plus the session-ranked model list; raw model ids exactly as observed, qualified by a provider swatch, with attributed tokens beside each
 - **Context** — preserved and retrieved token totals with a split bar, the shared cache-savings line, and the routing cost
 - Honesty disclosures keep the home that matches their data: the Hooks breakdown carries the Claude/Codex tracking-asymmetry note, and a condensed retention line appears wherever pruning affects what is drawn
 
 ### Agent visibility
 
-Sessions in the Usage breakdown report the subagents Quill observed for that
-session, so a row shows the work fanned out beneath it rather than just its own
-turns.
+The Sessions breakdown keeps retained lifetime facts separate from live evidence.
 
-- A row with positive lifecycle evidence renders an agent icon and a tabular model breakdown such as `2×Opus · 3×Sonnet`; Claude tiers sort Opus → Sonnet → Haiku → Fable and Codex tiers sort Sol → Terra → Luna
-- Counts come from observed starts without matching stops inside a trustworthy current-boot epoch — evidence of observed agents, not a liveness probe
-- Anything less than positive evidence renders nothing at all: zero, disabled coverage, and incomplete coverage make no numeric claim. Lost parent-end delivery falls back to no claim once the 15-minute inactivity bound expires
-- An active session with no retained token metrics shows an em dash for tokens rather than implying zero usage
-- Models resolve from retained transcripts where available, with a validated start-time type as the interim label
+- The main row shows the root model when known, completed root turns, lifetime
+  family runtime, tokens, and current-turn runtime or inactive recency.
+- Retained subagent count and agent-only runtime remain visible after agents
+  close. Unknown totals render as em dashes rather than inferred zeroes.
+- A second rail appears only for agents currently observed open, with each
+  agent's own model and runtime. Claude and Codex families use stable ordering.
+- Explicit Pi subagents flatten into the proven root session. Missing, cyclic,
+  or cross-host lineage stays an independent live row until proof arrives.
+- Stale transcript evidence is never presented as verified process liveness.
 
 ### Multi-account pools
 
@@ -353,7 +392,7 @@ instance, Quill can read the whole pool instead of one account. Configured from
 - A pool row replaces that provider's direct row while it exists, so a provider never appears twice; the direct row returns when the pool does not
 - Disconnecting purges the saved URL, key, CPA runtime rows, and CPA-derived snapshots, and advances the usage cache epoch so an in-flight refresh cannot resurrect them. Direct provider data is untouched
 
-### Manage workspace
+### Tools workspace
 
 One rail-navigated window for everything that is not live monitoring, opened
 from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
@@ -368,7 +407,7 @@ from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
 - Filter by provider, project, host, role, and date range; sort by relevance or recency
 - Snippet highlighting with expandable message context and a session detail panel
 - Indexes subagent transcripts and Codex inter-agent messages alongside root sessions
-- Lives in the **Sessions** section of the Manage workspace
+- Lives in the **Sessions** section of the Tools workspace
 
 ### Token tracking
 
@@ -384,10 +423,10 @@ from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
 
 ### Learning
 
-- The Manage workspace's **Learning** section shows learned usage rules, observation stats, and analysis history
+- The Tools workspace's **Learning** section shows learned usage rules, observation stats, and analysis history
 - Trigger modes: on-demand, or periodic once enough new observations have accumulated
 - Rule lifecycle tracking (candidate → awaiting review → active, plus rejected, suppressed, superseded, and conflict-flagged states)
-- Domain-grouped rules with confidence scores, written to `~/.claude/rules/learned/`
+- Domain-grouped candidates with evidence-weighted scores; explicit promotion writes provider-scoped rule files
 - Run history with real-time analysis logs, opened as a docked panel beside the rules
 - Git history integration for cross-source pattern synthesis
 
@@ -397,11 +436,11 @@ from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
 - Approval-based workflow — review each suggestion with a diff preview before applying
 - Undo any applied change to restore the original file
 - Batched "optimize all" to review and apply suggestions across an entire project
-- Optional **Compress prose** pre-pass — rewrites every eligible memory file in caveman style via Anthropic Haiku before the optimizer runs. Skips instruction files, files over 500 KB, files on the secrets denylist, and files that already have an `.original.md` backup. Validates that headings, code blocks, URLs, file paths, and bullets are preserved; on failure restores the original. Successful rewrites leave a `<file>.original.md` backup next to the compressed file so the change is reversible
+- Optional **Compress prose** pre-pass — rewrites every eligible memory file in caveman style through the local Claude Code CLI using Sonnet 4.6 before the optimizer runs. Skips instruction files, files over 500 KB, files on the secrets denylist, and files that already have an `.original.md` backup. Validates that headings, code blocks, URLs, file paths, and bullets are preserved; on failure restores the original. Successful rewrites leave a `<file>.original.md` backup next to the compressed file so the change is reversible
 
 ### Brevity profile
 
-- Toggled from **Settings → Context** in the Manage workspace, and applied to whichever providers (Claude Code, Codex) are enabled
+- Toggled from **Settings → Context** in the Tools workspace, and applied to whichever providers (Claude Code, Codex) are enabled
 - Injects a managed "Quill Brevity Profile" instruction block into the provider's primary agent file (`~/.claude/CLAUDE.md` for Claude Code, `~/.codex/AGENTS.md` for Codex), asking the assistant to write in a compressed caveman style for its own prose responses while preserving code blocks, file paths, URLs, library names, command names, numbers, env vars, and markdown structure exactly
 - Symlink-aware — when `AGENTS.md` is a symlink to `CLAUDE.md`, only one block is written so the same instructions are not duplicated
 - Toggling off strips just the managed block; the rest of the agent file is left untouched
@@ -413,7 +452,7 @@ from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
 - **Claude Code and Codex tools** — MCP installs `quill_index_context`, `quill_search_context`, `quill_get_context_source`, `quill_execute`, `quill_execute_file`, `quill_batch_execute`, `quill_fetch_and_index`, `quill_purge_context`, and `quill_context_stats`. Claude Code and Codex receive `quill_execute_file` and `quill_batch_execute` through MCP; Pi does not register those two tools
 - **Pi tools** — Pi registers `quill_index_context`, `quill_fetch_and_index`, `quill_execute`, `quill_search_context`, `quill_get_context_source`, `quill_context_stats`, and `quill_purge_context`, plus `quill_search_history`, through its managed extension and local HTTP APIs
 - **Routing integrations** — Claude Code and Codex hooks block raw `WebFetch` and noisy `curl`/`wget` dumps and nudge broad output toward `quill_*` tools. Pi applies the same policy inside its managed extension
-- **Telemetry** — every preservation event reports compact byte and token estimates to the widget's Context view; large content stays in the local context store and never enters the analytics database
+- **Telemetry** — when its local-only sub-toggle is enabled, preservation and routing events report compact byte/token estimates to the widget's Context view; large content stays in the context store and never enters the analytics database
 - Toggling the feature deploys or removes each provider's context assets; historical context stores and analytics rows are preserved on disable
 - Available for Claude Code and Codex through MCP and hooks, and for Pi through its managed extension
 
@@ -423,7 +462,7 @@ from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
 - Session-history tool:
   - **`search_history`** — full-text search across all sessions by content, edits, commands, or tool use (filter by project, git branch, role, date)
 - Context tools (only when context preservation is enabled): see [Working context preservation](#working-context-preservation)
-- Automatically configured when the app starts — no manual setup needed
+- Installed and removed with the explicit Claude Code or Codex integration toggle
 
 ### Desktop integration
 

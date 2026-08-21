@@ -45,7 +45,7 @@ The seeder uses `random.seed(42)` for full determinism. Every reseed produces th
 | Domain                | Content                                                                      | Size (rows)  |
 |-----------------------|------------------------------------------------------------------------------|--------------|
 | Hostnames             | `macbook-pro`, `dev-server`, `workstation`                                   | 3            |
-| Project paths         | `/home/alex/projects/quill`, `…/api-gateway`, `…/ml-pipeline`, `…/dashboard` | 4            |
+| Project paths         | `/home/alex/quill`, `/home/alex/gateway`, `/home/alex/pipeline`, `/home/alex/dashboard` | 4 |
 | Bucket labels         | `5 hours`, `7 days`, `Sonnet`, `Opus`, `Code`, `OAuth`                       | 6            |
 | Tools                 | `Edit`, `Write`, `Read`, `Bash`, `Grep`, `Glob`, `WebSearch`, `Task`, …      | 10           |
 | Sessions              | UUIDs derived from seeded RNG                                                | ~30–50       |
@@ -54,12 +54,15 @@ The seeder uses `random.seed(42)` for full determinism. Every reseed produces th
 | Learned rules         | Sample rule files written to `$QUILL_RULES_DIR/{claude,codex,shared}/`       | ~10–15       |
 | Tool actions          | PreToolUse/PostToolUse/Stop observations for the Memory + Learning tabs      | ~150         |
 | Context savings events| Preservation/retrieval/routing/telemetry events across the last 7 days       | ~80          |
+| Model observations    | Curved six-hour evidence for Claude, Codex, and Pi model identities           | ~100 + stress source |
+| Skill usage           | Four skills with explicit Claude/Codex/Pi counts                              | ~100         |
 
 **Naming discipline (FR-019, FR-020)**:
-- All project paths begin with `/home/alex/projects/` so the demo data is obviously fictional on a glance and obviously non-personal.
+- All project paths use the fictional `/home/alex/<project>` form, with single-segment names so the memory slug/path round-trip stays unambiguous.
 - All hostnames are generic dev-machine names; no real personal hostnames.
 - Learned-rule text is generic best-practice flavor (e.g., "Always use specific exception types"); no real production rules from any maintainer's actual rule set.
-- Token volumes are plausible but not extreme — pick the band that demonstrates each feature well without screaming "fake."
+- Token volumes form visible peaks and valleys across the six-hour model chart. The 1,001-id stress source is older than every photographed range.
+- Screenshot provider state enables Claude Code, Codex, and Pi; MiniMax stays disabled and below the Integrations crop.
 
 ## 3. Screenshot asset naming
 
@@ -69,15 +72,21 @@ Captured PNGs land in `marketing-site/assets/screenshots/`. The table states eve
 |---------------------------|--------------------------------------------|-----------------|
 | `hero.png`                | Widget → Usage view                        | `#hero`, `#analytics` |
 | `live.png`                | Copy of the Widget Usage view              | `#live`         |
+| `models.png`              | Widget → Models view                       | `#models`       |
 | `analytics-context.png`   | Widget → Context view                      | `#context`      |
-| `sessions.png`            | Manage → Sessions                          | `#search`       |
-| `learning.png`            | Manage → Learning                          | `#learning`     |
+| `sessions.png`            | Tools → Sessions, query + detail           | `#search`       |
+| `learning.png`            | Tools → Learning → Rules                   | `#learning`     |
+| `memory.png`              | Tools → Learning → Memories                | `#memory`       |
+| `settings.png`            | Tools → Settings → Integrations            | `#integrations` |
+| `brevity.png`             | Tools → Settings → Context                 | `#brevity`      |
 | `logo.png`                | Real Quill app icon, resized for web use   | header + favicon |
 
 **Capture conventions**:
-- 2× pixel density (FR-021): if the source window is 800×600 logical px, capture at 1600×1200 physical px. ImageMagick `import` honors X11 DPI; on macOS use `screencapture -R` with retina device.
-- File format PNG with alpha disabled (PNG-24).
-- Each PNG has an authored `alt` attribute when used in HTML (accessibility).
+- `scripts/capture_screenshots_docker.sh` is the publishing entry point.
+- Widget sources are 360×800 logical; Tools sources are 960×680 logical.
+- Every PNG is upscaled to 2×, stripped, and compressed after capture. `settings.png` is then cropped to 1920×1020 after the Pi row.
+- The runtime container uses a private Xvfb/Openbox/xcompmgr desktop and no host display, home, Quill data, or published port.
+- Each PNG has an authored `alt` attribute when used in HTML.
 
 ## 4. Site source layout (`marketing-site/`)
 
@@ -106,7 +115,7 @@ marketing-site/
 The three pieces above relate as follows:
 
 - The **launcher** (`scripts/run_quill_demo.*`) creates the **sandbox directory tree** (§ 1) and runs the **seeder** to populate it with **dummy data** (§ 2).
-- The **screenshot driver** (`scripts/take_screenshots.sh`) attaches to the running demo Quill window and writes **screenshot assets** (§ 3) to `marketing-site/assets/screenshots/`.
+- The **Docker wrapper** (`scripts/capture_screenshots_docker.sh`) builds and launches the isolated desktop, invokes the lower-level **screenshot driver** (`scripts/take_screenshots.sh`), validates § 3, then replaces `marketing-site/assets/screenshots/` atomically at file granularity.
 - The **site source** (§ 4) references those screenshot files from `index.html`.
 
 There is no runtime data model for the site itself.

@@ -6,7 +6,7 @@ Source for the [Quill](https://github.com/sharaf-nassar/quill) marketing site. S
 
 ```text
 marketing-site/
-├── index.html              Single page; nine anchored sections (analytics + agent tools)
+├── index.html              Single page; eleven anchored product sections
 ├── styles.css              Signal Theater theme; no framework; self-hosted woff2 fonts
 ├── motion.js               Progressive native scroll-reveal (motion-rise) only
 ├── README.md               This file
@@ -15,36 +15,40 @@ marketing-site/
     ├── logo-mark.png       Borderless feather mark (app-icon frame stripped) — header brand
     ├── fonts/              Self-hosted woff2 — Space Grotesk (display) + Geist (body), OFL
     └── screenshots/        @2x captures from the dummy-data Quill instance
-        ├── hero.png            Usage view for #hero, #analytics, and social previews
-        ├── live.png            Same frame; the #live section clips it to LIMITS
-        ├── analytics-context.png The widget on its Context view (the #context section)
-        ├── sessions.png         Manage → Sessions, a query typed and a result open
-        ├── learning.png         Manage → Learning, active rules over candidates
-        ├── memory.png          Memories panel — "All Projects (4)" (the #memory section)
-        └── brevity.png         Brevity profile toggle (the #brevity section)
+        ├── hero.png             Widget → Usage for #hero, #analytics, and social previews
+        ├── live.png             Same frame; #live clips it to the LIMITS band
+        ├── models.png           Widget → Models for #models
+        ├── analytics-context.png Widget → Context for #context
+        ├── sessions.png         Tools → Sessions, with a query and detail open
+        ├── learning.png         Tools → Learning → Rules
+        ├── memory.png           Tools → Learning → Memories
+        ├── settings.png         Tools → Settings → Integrations
+        └── brevity.png          Tools → Settings → Context, showing Brevity
 ```
 
 The main window is the 360px widget. `hero.png` serves both `#hero` and
-`#analytics`; `live.png` copies that Usage frame for `#live`;
-`analytics-context.png` shows Context. `sessions.png` and `learning.png` are
-whole Manage sections captured by `take_screenshots.sh`, while `memory.png`
-and `brevity.png` are sub-panels and stay manual.
+`#analytics`; `live.png` copies that Usage frame for `#live`; `models.png` and
+`analytics-context.png` show the other two widget views. Tools images use the
+full 960×680 workspace except `settings.png`, cropped after Pi to omit the
+currently deferred MiniMax row.
 
 ## Anchored sections
 
-The page exposes stable URL fragments — part of the public deep-link surface. See [contracts/site-anchors.md](../specs/001-marketing-site/contracts/site-anchors.md). The 2026-06-19 redesign reordered the narrative (analytics first, then the agent tools built on it) and added two anchors:
+The page exposes stable URL fragments as a public deep-link surface. See [contracts/site-anchors.md](../specs/001-marketing-site/contracts/site-anchors.md). The current narrative starts with usage/model analytics, then the agent tools built on them:
 
 - `#hero` — value proposition + primary install CTA
-- `#analytics` — complete analytical insight (lead flagship)
-- `#context` — context offloading / working memory (the agent calls Quill's MCP tools)
+- `#analytics` — measured usage photographed in model grouping
+- `#models` — current and session-ranked model evidence
+- `#context` — context offloading / working memory (the agent calls Quill tools)
 - `#search` — session search
 - `#live` — live limits
 - `#learning` — learning system
 - `#memory` — memory tools (added 2026-06-19)
 - `#brevity` — brevity / prose compression (added 2026-06-19)
+- `#integrations` — Claude Code, Codex, Pi, and pooled usage sources
 - `#install` — providers, platforms, privacy, repo links
 
-The original seven (`#hero`, `#live`, `#analytics`, `#context`, `#search`, `#learning`, `#install`) are a stable contract — renaming or removing any of them is a breaking change. `#memory` and `#brevity` are additive.
+The original seven (`#hero`, `#live`, `#analytics`, `#context`, `#search`, `#learning`, `#install`) are a stable contract — renaming or removing any of them is a breaking change. `#memory`, `#brevity`, `#models`, and `#integrations` are additive.
 
 ## Visual direction
 
@@ -52,10 +56,9 @@ The original seven (`#hero`, `#live`, `#analytics`, `#context`, `#search`, `#lea
 
 ## Screenshot display & section layout
 
-The screenshots are captured "lean" — each PNG is tightly cropped to its own
-content (no excess window chrome, no scrollbars, no dead space) and they have
-varied aspect ratios. They are displayed **whole at their natural aspect ratio**
-— never cropped, never letterboxed.
+The screenshot set uses two fixed surfaces: the 360×800 widget and the 960×680
+Tools workspace. PNGs are stored at 2× and displayed whole at or below their
+native logical size. Only `#live` clips the shared widget image to its LIMITS band.
 
 - Every screenshot lives in a `.shot` frame: a thin `rgba(192,202,245,0.10)`
   hairline border, soft shadow, ≤6px radius, and a dark `#08090c` matte behind
@@ -63,16 +66,14 @@ varied aspect ratios. They are displayed **whole at their natural aspect ratio**
   display: block` — no `object-fit: cover`, no fixed height. Each `<img>` also
   carries explicit `width`/`height` attributes matching its 2× source so the
   browser reserves correct space (no layout shift) and the aspect ratio is right.
-- The PNGs are stored at 2× for retina; their display sizes are half the pixel
-  dimensions (e.g. `hero.png` 720×1532 → 360×766).
+- The PNGs are stored at 2× for retina: widget images are 720×1600, full Tools
+  images are 1920×1360, and `settings.png` is 1920×1020.
 - **Slim, never upscaled.** Each `.spotlight` sets a `--shot-w` custom property
   at or below the shot's native retina display width (its `width` attribute), and
   the media grid track is `minmax(0, var(--shot-w, 480px))`. So the product
   window renders at — or below — its captured size, never stretched wider or
-  taller to fill the column. The four widget shots use 360px (the widget's own
-  width); the landscape Manage shots use 640px and the two sub-panel shots
-  600px — each still at or under its own captured width. The copy column
-  (`1fr`) takes the remaining width.
+  taller to fill the column. Widget shots use 360px; Tools shots use 640px.
+  The copy column (`1fr`) takes the remaining width.
 - **One exception to "shown whole":** `#live` reuses the widget frame through a
   `.shot-band` frame with `aspect-ratio: 360 / 185`, clipping it to the LIMITS
   band at that band's own hairline. The widget is a single window, so LIMITS has
@@ -99,24 +100,23 @@ The page is pure HTML/CSS, so any static file server works. Live-reload is not n
 
 ## Refreshing screenshots
 
-Screenshots come from a sandboxed Quill instance — never the maintainer's personal Quill. The full workflow is in [`specs/001-marketing-site/quickstart.md`](../specs/001-marketing-site/quickstart.md). Short version:
+Screenshots come from a deterministic Quill instance inside a private Docker
+X11 desktop. The container receives no host display socket, personal home,
+Quill data directory, or published port.
 
 ```sh
-# 1. Spin up a sandboxed Quill against dummy data
-./scripts/run_quill_demo.sh --clean
-
-# 2. Capture the canonical widget and Manage PNGs into
-#    marketing-site/assets/screenshots/ (memory.png and brevity.png are manual)
-./scripts/take_screenshots.sh
-
-# 3. Privacy review — open every PNG, confirm only fictional identifiers
-#    (look for /home/alex/projects/..., dev-server, macbook-pro, etc.)
-
-# 4. Tear down the sandbox
-rm -rf /tmp/quill-demo-$USER
+./scripts/capture_screenshots_docker.sh
 ```
 
-The launcher uses env-var path overrides (`QUILL_DEMO_MODE=1`, `QUILL_DATA_DIR`, `QUILL_RULES_DIR`, `QUILL_CLAUDE_PROJECTS_DIR`, `QUILL_CODEX_SESSIONS_DIR`) so the maintainer's `~/.local/share/com.quilltoolkit.app/`, `~/.claude/`, and `~/.codex/` are never touched. See [`specs/001-marketing-site/contracts/env-vars.md`](../specs/001-marketing-site/contracts/env-vars.md).
+The command builds the current release binary with Tauri's custom protocol,
+starts Xvfb, Openbox, and a compositor, seeds fictional Claude/Codex data, drives
+all widget and Tools compositions, and replaces the canonical PNGs only after
+every expected output passes. Docker and Cargo caches make later runs much
+faster than the first.
+
+The lower-level host launcher remains available for debugging, but it is no
+longer the publishing workflow. See
+[`specs/001-marketing-site/quickstart.md`](../specs/001-marketing-site/quickstart.md).
 
 ## Editing rules
 

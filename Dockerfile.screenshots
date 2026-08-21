@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1
+FROM node:22-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/root/.cargo/bin:$PATH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    dbus-x11 \
+    file \
+    imagemagick \
+    libayatana-appindicator3-dev \
+    libgl1-mesa-dri \
+    librsvg2-dev \
+    libssl-dev \
+    libwebkit2gtk-4.1-dev \
+    libxdo-dev \
+    openbox \
+    patchelf \
+    pkg-config \
+    python3 \
+    wget \
+    x11-utils \
+    xcompmgr \
+    xdotool \
+    xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal
+
+WORKDIR /workspace
+
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+
+COPY index.html rust-toolchain.toml tsconfig.json vite.config.ts eslint.config.js knip.json ./
+COPY public ./public
+COPY marketing-site/assets/logo-mark.png ./marketing-site/assets/logo-mark.png
+COPY src ./src
+COPY scripts/verify-sentry-output.mjs ./scripts/verify-sentry-output.mjs
+COPY src-tauri ./src-tauri
+
+RUN npm run build
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/workspace/src-tauri/target \
+    cargo build --release --locked --features tauri/custom-protocol \
+        --manifest-path src-tauri/Cargo.toml \
+    && mkdir -p /opt/quill \
+    && cp /workspace/src-tauri/target/release/quill /opt/quill/quill \
+    && cp -R /workspace/src-tauri/target/release/claude-integration /opt/quill/ \
+    && cp -R /workspace/src-tauri/target/release/codex-integration /opt/quill/ \
+    && cp -R /workspace/src-tauri/target/release/pi-integration /opt/quill/
+
+COPY scripts ./scripts
+
+RUN printf '#!/bin/sh\necho 0.84.1\n' > /usr/local/bin/pi \
+    && chmod 0755 /usr/local/bin/pi \
+    && useradd --create-home capture \
+    && mkdir -p /output /tmp/.X11-unix \
+    && chmod 1777 /tmp/.X11-unix \
+    && chown capture:capture /output
+
+USER capture
+ENV HOME=/home/capture \
+    USER=capture \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=UTC
+
+ENTRYPOINT ["./scripts/capture_screenshots_docker.sh", "--inside"]

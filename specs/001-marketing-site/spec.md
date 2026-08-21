@@ -74,7 +74,7 @@ A Quill maintainer needs to refresh the marketing screenshots after a UI change.
 **Acceptance Scenarios**:
 
 1. **Given** a maintainer wants new screenshots, **When** they follow the documented dummy-instance procedure, **Then** they obtain a running Quill window populated with dummy data without overwriting their normal Quill database, settings, or provider configuration.
-2. **Given** the dummy data is loaded, **When** the maintainer opens each marketed view (live usage, all analytics tabs, sessions, learning, context tab), **Then** every view renders with non-empty, plausible-looking data.
+2. **Given** the dummy data is loaded, **When** the maintainer opens Usage, Models, Context, Sessions, Learning, Memories, Integrations, and Context settings, **Then** every view renders with non-empty, plausible-looking data.
 3. **Given** a freshly captured screenshot set, **When** the maintainer inspects every image, **Then** zero real personal data is visible (no real project paths, hostnames, session prompts, or git branch names).
 4. **Given** the maintainer finishes capturing, **When** they tear down the dummy instance, **Then** their personal Quill installation is unchanged.
 
@@ -82,7 +82,7 @@ A Quill maintainer needs to refresh the marketing screenshots after a UI change.
 
 ### User Story 4 - Developer evaluates technical fit (Priority: P3)
 
-A developer past the marketing pitch wants to confirm Quill fits their setup before they install: which providers it supports (Claude Code, Codex, MiniMax), what platforms it runs on, how it integrates (hooks, MCP), what data it stores locally, and where the source lives.
+A developer past the marketing pitch wants to confirm the three agent integrations currently spotlighted by the site (Claude Code, Codex, Pi), what platforms Quill runs on, how it integrates, what data it stores locally, and where the source lives. The README retains the complete provider matrix.
 
 **Why this priority**: This audience is smaller and is largely served by the linked GitHub README. A "Built for / Integrates with / Runs on" strip and clear repo links satisfy most of it without duplicating the README.
 
@@ -90,7 +90,7 @@ A developer past the marketing pitch wants to confirm Quill fits their setup bef
 
 **Acceptance Scenarios**:
 
-1. **Given** the page, **When** the developer scans for "what providers does this support?", **Then** they find an explicit list naming Claude Code, Codex, and MiniMax.
+1. **Given** the page, **When** the developer scans for the spotlighted agent integrations, **Then** they find Claude Code, Codex, and Pi with correct local integration semantics.
 2. **Given** the page, **When** the developer wants to see the source, **Then** a clearly labelled link reaches the GitHub repository.
 3. **Given** the page, **When** the developer wants the latest release, **Then** a clearly labelled link reaches the GitHub releases page.
 
@@ -133,7 +133,7 @@ A developer past the marketing pitch wants to confirm Quill fits their setup bef
 - **FR-010**: The site MUST include dedicated feature sections for Live Usage analytics, Context Savings, Session Search, and Learning System.
 - **FR-011**: Each feature section MUST include a benefit-oriented heading, a short description, and at least one screenshot showing that feature in the actual UI.
 - **FR-012**: The Analytics section MUST explicitly explain *how analytics and insights help when working with an LLM* — covering at minimum: subscription-usage awareness (Pro/Max/Plus 5-hour and 7-day windows), latency visibility, token-efficiency feedback, context savings, code velocity, and routing-cost transparency.
-- **FR-013**: The site MUST include a "supported providers" affordance naming Claude Code, Codex, and MiniMax with the correct integration semantics for each.
+- **FR-013**: The site MUST include an agent-integrations affordance naming Claude Code, Codex, and Pi with the correct local integration semantics. The repository README remains the complete provider-support reference.
 - **FR-014**: The site MUST include a "supported platforms" affordance covering the platforms Quill currently ships for.
 - **FR-015**: The site MUST link to the GitHub repository, the latest releases page, and the project's existing documentation surface.
 - **FR-016**: A short, accurate footer MUST identify the project, link the source, and credit the license.

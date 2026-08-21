@@ -47,13 +47,11 @@
 #                           the same 360px frame now)
 #   models.png              widget on the Models view
 #   analytics-context.png   widget on the Context view  (site anchor #context)
-#   sessions.png            Manage → Sessions
-#   learning.png            Manage → Learning
-#   settings.png            Manage → Settings
-#
-# `memory.png` and `brevity.png` stay manual: both live inside a Manage section
-# rather than being one, and both need dataset grooming first (see
-# lat.md/infrastructure.md, Screenshot Capture).
+#   sessions.png            Manage → Sessions, with a query and detail open
+#   learning.png            Manage → Learning → Rules
+#   memory.png              Manage → Learning → Memories
+#   settings.png            Manage → Settings → Integrations
+#   brevity.png             Manage → Settings → Context, scrolled to Brevity
 
 set -euo pipefail
 
@@ -87,8 +85,9 @@ MENU_PIXELS_MIN=8000
 MAX_TAB_PROBE=24
 
 DELAY_KEY=0.12      # after a keystroke that only moves focus
-DELAY_VIEW=0.9      # after committing a view, before capturing
+DELAY_VIEW=3.0      # after committing a view, before capturing
 DELAY_SECTION=1.6   # after selecting a Manage section (lazy chunk + first read)
+DELAY_SEARCH=2.0    # after typing the seeded Session Search query
 DELAY_WINDOW=8      # seconds to wait for a window to appear
 
 # Blur target: logical offsets into the LIMITS band, just under the 40px
@@ -117,7 +116,7 @@ usage() {
 	cat <<EOF >&2
 Usage: $(basename "$0")
 
-Captures every widget view and Manage section of a running Quill instance.
+Captures every canonical product screenshot from a running Quill instance.
 
 Environment:
   OUTDIR=<dir>   Output directory (default marketing-site/assets/screenshots)
@@ -179,6 +178,24 @@ activate() {
 	sleep 0.25
 }
 
+# click_in_window <window-id> <logical-x> <logical-y> [scale]
+click_in_window() {
+	local wid="$1" x="$2" y="$3" scale="${4:-1}" wx wy
+	wx="$(geom_field "$wid" X)"
+	wy="$(geom_field "$wid" Y)"
+	xdotool mousemove $(( wx + x * scale )) $(( wy + y * scale ))
+	xdotool click 1
+	sleep 0.3
+}
+
+# scroll_window_to_bottom <window-id> <logical-x> <logical-y> [scale]
+scroll_window_to_bottom() {
+	local wid="$1" x="$2" y="$3" scale="${4:-1}"
+	click_in_window "$wid" "$x" "$y" "$scale"
+	xdotool click --repeat 24 --delay 25 5
+	sleep 0.5
+}
+
 # park_pointer <window-id>
 # Moves the pointer off the window so no hover state, chart legend or native
 # tooltip is baked into the next capture. Parks beside the window rather than
@@ -220,7 +237,10 @@ capture() {
 		BLANK_SHOTS=$(( BLANK_SHOTS + 1 ))
 	fi
 	if [[ "$RETINA" == "1" ]]; then
-		"$IM_CONVERT" "$output" -filter Catrom -resize 200% "$output"
+		"$IM_CONVERT" "$output" -filter Catrom -resize 200% \
+			-strip -define png:compression-level=9 "$output"
+	else
+		"$IM_CONVERT" "$output" -strip -define png:compression-level=9 "$output"
 	fi
 	log "Saved: $output"
 }
@@ -281,9 +301,11 @@ open_view_menu() {
 	local wid="$1" hop
 	drop_focus "$wid"
 	for (( hop = 1; hop <= MAX_TAB_PROBE; hop++ )); do
+		local pixels
 		press Tab
 		press Down
-		if (( $(menu_pixels "$wid") >= MENU_PIXELS_MIN )); then
+		pixels="$(menu_pixels "$wid")"
+		if (( pixels >= MENU_PIXELS_MIN )); then
 			log "View switcher reached in $hop focus hop(s)"
 			return 0
 		fi
@@ -309,17 +331,32 @@ capture_view() {
 	activate "$WIDGET_WID"
 	open_view_menu "$WIDGET_WID" || die "could not open the view dropdown for '$label'."
 	select_view "$row"
+	# Selection returns focus to the view trigger. Walk the native tab order to
+	# a range instead of using a y-coordinate that changes with LIMITS height.
+	if (( row == VIEW_ROW_MODELS )); then
+		press Tab 4
+	else
+		press Tab 2
+	fi
+	press Return
 	sleep "$DELAY_VIEW"
 	drop_focus "$WIDGET_WID"
 	scroll_to_top "$WIDGET_WID"
+	# Usage keeps model grouping, while Skills exposes Claude/Codex/Pi counts in
+	# the same hero frame instead of a single-provider session slice.
+	if (( row == VIEW_ROW_USAGE )); then
+		click_in_window "$WIDGET_WID" 195 515 "$WIDGET_SCALE"
+		sleep "$DELAY_VIEW"
+		drop_focus "$WIDGET_WID"
+	fi
 	capture "$output" "$WIDGET_WID"
 }
 
 # ── Manage navigation ─────────────────────────────────────────────────────────
 
-# capture_section <palette-label> <output-path>
-capture_section() {
-	local label="$1" output="$2"
+# select_section <palette-label>
+select_section() {
+	local label="$1"
 	activate "$MANAGE_WID"
 	xdotool key --clearmodifiers ctrl+k
 	sleep 0.4
@@ -327,7 +364,52 @@ capture_section() {
 	sleep 0.3
 	xdotool key --clearmodifiers Return
 	sleep "$DELAY_SECTION"
-	capture "$output" "$MANAGE_WID"
+}
+
+capture_sessions() {
+	select_section "Sessions"
+	click_in_window "$MANAGE_WID" 380 52 "$MANAGE_SCALE"
+	xdotool key --clearmodifiers ctrl+a
+	xdotool type --clearmodifiers --delay 35 "parser"
+	sleep "$DELAY_SEARCH"
+	click_in_window "$MANAGE_WID" 380 145 "$MANAGE_SCALE"
+	sleep 1
+	capture "$OUTDIR/sessions.png" "$MANAGE_WID"
+}
+
+capture_learning() {
+	select_section "Learning"
+	capture "$OUTDIR/learning.png" "$MANAGE_WID"
+}
+
+capture_memories() {
+	select_section "Learning"
+	click_in_window "$MANAGE_WID" 365 52 "$MANAGE_SCALE"
+	sleep "$DELAY_SECTION"
+	capture "$OUTDIR/memory.png" "$MANAGE_WID"
+}
+
+capture_settings() {
+	select_section "Settings"
+	click_in_window "$MANAGE_WID" 365 58 "$MANAGE_SCALE"
+	sleep "$DELAY_SECTION"
+	capture "$OUTDIR/settings.png" "$MANAGE_WID"
+	# Keep Claude, Codex and Pi in frame while leaving the deferred MiniMax row
+	# below the published crop.
+	"$IM_CONVERT" "$OUTDIR/settings.png" -crop 1920x1020+0+0 +repage \
+		-strip -define png:compression-level=9 "$OUTDIR/settings.png"
+}
+
+capture_brevity() {
+	activate "$MANAGE_WID"
+	# Establish focus on the known Integrations tab, then use native tab order
+	# for Context instead of another pointer target.
+	click_in_window "$MANAGE_WID" 365 58 "$MANAGE_SCALE"
+	press Tab
+	press Return
+	sleep "$DELAY_SECTION"
+	scroll_window_to_bottom "$MANAGE_WID" 800 420 "$MANAGE_SCALE"
+	capture "$OUTDIR/brevity.png" "$MANAGE_WID"
 }
 
 # ── Locate the widget ─────────────────────────────────────────────────────────
@@ -351,53 +433,62 @@ fi
 
 # ── Widget views ──────────────────────────────────────────────────────────────
 
-echo ""
-echo "[1/6] hero.png + live.png (Usage view)"
-capture_view "$VIEW_ROW_USAGE" "Usage" "$OUTDIR/hero.png"
-cp "$OUTDIR/hero.png" "$OUTDIR/live.png"
-log "Saved: $OUTDIR/live.png (copy of hero.png)"
-
-echo ""
-echo "[2/6] models.png (Models view)"
-capture_view "$VIEW_ROW_MODELS" "Models" "$OUTDIR/models.png"
-
-echo ""
-echo "[3/6] analytics-context.png (Context view)"
-capture_view "$VIEW_ROW_CONTEXT" "Context" "$OUTDIR/analytics-context.png"
-
 # ── Manage workspace ──────────────────────────────────────────────────────────
 
+# Session Search runs the retained transcript sync. Capture Tools first so the
+# later Usage shot can show retained agent totals and model identities.
 echo ""
 echo "Opening the Manage workspace (Ctrl+M)..."
+# The window can map before React registers the app-scoped accelerator.
+sleep 3
 activate "$WIDGET_WID"
 xdotool key --clearmodifiers ctrl+m
 MANAGE_WID="$(wait_for_window '^Manage$' || true)"
 [[ -n "$MANAGE_WID" ]] || die "the Manage workspace did not open within ${DELAY_WINDOW}s."
 log "Manage window: $MANAGE_WID"
+MANAGE_W="$(geom_field "$MANAGE_WID" WIDTH)"
+MANAGE_SCALE=$(( MANAGE_W / 960 ))
+(( MANAGE_SCALE < 1 )) && MANAGE_SCALE=1
+if (( MANAGE_W != 960 * MANAGE_SCALE )); then
+	warn "Manage is ${MANAGE_W}px wide, expected a multiple of 960px; pointer targets may drift."
+fi
 sleep 0.6
 
 echo ""
-echo "[4/6] sessions.png (Manage → Sessions)"
-capture_section "Sessions" "$OUTDIR/sessions.png"
+echo "[1/8] sessions.png (Manage → Sessions, query + detail)"
+capture_sessions
 
 echo ""
-echo "[5/6] learning.png (Manage → Learning)"
-capture_section "Learning" "$OUTDIR/learning.png"
+echo "[2/8] learning.png (Manage → Learning → Rules)"
+capture_learning
 
 echo ""
-echo "[6/6] settings.png (Manage → Settings)"
-capture_section "Settings" "$OUTDIR/settings.png"
+echo "[3/8] memory.png (Manage → Learning → Memories)"
+capture_memories
 
-xdotool windowclose "$MANAGE_WID" 2>/dev/null || true
-sleep 0.5
+echo ""
+echo "[4/8] settings.png (Manage → Settings → Integrations)"
+capture_settings
 
-# Leave the widget on Usage so a re-run — and the operator — start from the
-# state the app launches in.
-activate "$WIDGET_WID"
-if open_view_menu "$WIDGET_WID"; then
-	select_view "$VIEW_ROW_USAGE"
-	drop_focus "$WIDGET_WID"
-fi
+echo ""
+echo "[5/8] brevity.png (Manage → Settings → Context)"
+capture_brevity
+
+# ── Widget views ──────────────────────────────────────────────────────────────
+
+echo ""
+echo "[6/8] hero.png + live.png (Usage view)"
+capture_view "$VIEW_ROW_USAGE" "Usage" "$OUTDIR/hero.png"
+cp "$OUTDIR/hero.png" "$OUTDIR/live.png"
+log "Saved: $OUTDIR/live.png (copy of hero.png)"
+
+echo ""
+echo "[7/8] models.png (Models view)"
+capture_view "$VIEW_ROW_MODELS" "Models" "$OUTDIR/models.png"
+
+echo ""
+echo "[8/8] analytics-context.png (Context view)"
+capture_view "$VIEW_ROW_CONTEXT" "Context" "$OUTDIR/analytics-context.png"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 
@@ -408,5 +499,3 @@ if (( BLANK_SHOTS > 0 )); then
 	exit 1
 fi
 echo "All screenshots saved to: $OUTDIR"
-echo "Still manual: memory.png (Manage -> Learning -> Memories) and brevity.png"
-echo "(Manage -> Settings -> Brevity); both are sub-panels, not sections."

@@ -86,23 +86,23 @@ It:
 
 ## R5. Screenshot scope (which views to capture)
 
-**Decision**: The capture script produces seven PNGs from the dummy-data instance, all at 2× for HiDPI rendering per FR-021.
+**Decision**: The capture script produces nine PNGs from the dummy-data instance, all at 2× for HiDPI rendering per FR-021.
 
 | Filename                       | View                                            | Section anchor   |
 |--------------------------------|-------------------------------------------------|------------------|
 | `hero.png`                     | Widget → Usage view                             | `#hero`, `#analytics` |
 | `live.png`                     | Copy of the Usage frame                         | `#live`          |
-| `models.png`                   | Widget → Models view                            | Product docs     |
+| `models.png`                   | Widget → Models view                            | `#models`        |
 | `analytics-context.png`        | Widget → Context view                           | `#context`       |
-| `sessions.png`                 | Manage → Sessions                               | `#search`        |
-| `learning.png`                 | Manage → Learning                               | `#learning`      |
-| `settings.png`                 | Manage → Settings                               | Product docs     |
-
-Memory and brevity remain manual sub-panel captures because they are not Manage sections.
+| `sessions.png`                 | Tools → Sessions                                | `#search`        |
+| `learning.png`                 | Tools → Learning → Rules                        | `#learning`      |
+| `memory.png`                   | Tools → Learning → Memories                     | `#memory`        |
+| `settings.png`                 | Tools → Settings → Integrations, cropped after Pi | `#integrations` |
+| `brevity.png`                  | Tools → Settings → Context                      | `#brevity`       |
 
 **Rationale**:
 - `hero.png` intentionally serves both the product hero and analytics section.
-- Models and Settings captures support product documentation outside the marketing anchors.
+- Models and Integrations receive their own additive marketing anchors.
 - @2x captures honor FR-021 / SC-007.
 
 **Alternatives considered**:

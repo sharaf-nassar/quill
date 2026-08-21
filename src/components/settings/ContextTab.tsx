@@ -59,7 +59,7 @@ function ContextTab({ integrations, features }: ContextTabProps) {
         label="Context savings telemetry"
         description={
           contextPreservation.enabled
-            ? "Records local-only metadata (event type, byte counts, refs — never the actual content) into the Quill database to power the Analytics → Context dashboard. When this is off, routing still works but new dashboard data is not recorded."
+            ? "Records local-only metadata (event type, byte counts, refs — never the actual content) into the Quill database to power the widget's Context view. When this is off, routing still works but new savings data is not recorded."
             : "Enable Working Context Preservation first. Telemetry rides with context preservation — without it there is nothing to record."
         }
         control={
@@ -94,21 +94,19 @@ function ContextTab({ integrations, features }: ContextTabProps) {
       />
       <div className="settings-prose">
         <p>
-          When ON, Quill installs context-routing hooks, the <code>quill_*</code> MCP
-          tools (index_context, search_context, execute, fetch_and_index, etc.),
-          and context-savings telemetry into every enabled provider.
+          Claude Code and Codex receive context-routing hooks plus the <code>quill_*</code> MCP
+          tools. Pi receives the equivalent history, context, and routing behavior through its
+          managed extension. MiniMax is excluded.
         </p>
         <p>
-          Hooks block raw WebFetch and noisy <code>curl</code>/<code>wget</code> dumps and route Bash, Read, Grep, build,
-          and test output through the MCP. Large outputs become <code>source:N</code> and{" "}
-          <code>chunk:N</code> refs so the assistant stays compact and pulls exact details only on
-          demand.
+          Routing blocks raw WebFetch and noisy <code>curl</code>/<code>wget</code> dumps and nudges
+          broad command, read, search, build, and test output toward bounded Quill tools. Large
+          outputs become <code>source:N</code> and <code>chunk:N</code> refs for focused retrieval.
         </p>
         <p>
-          Disabling redeploys the base provider integration without context hooks. Historical
-          context savings stay searchable in Analytics → Context.
+          Disabling redeploys each base integration without context assets. Historical stores and
+          savings remain available in the widget's Context view.
         </p>
-        <p>The setting applies globally across Claude Code and Codex.</p>
       </div>
 
       <div className="settings-section-header">Brevity profile</div>

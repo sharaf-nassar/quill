@@ -1,127 +1,110 @@
 # Quickstart — Maintainer Workflow
 
-How to refresh the marketing site (especially screenshots) end-to-end, without touching your personal Quill state.
+Refresh Quill's README and marketing screenshots without opening a window on the maintainer's desktop or reading personal Quill state.
 
 ## Prerequisites
 
-- A working Quill installation OR a checkout you can build (`cargo build --release` from `src-tauri/`).
-- Python 3 (already required for the existing seeder).
-- POSIX shell (Linux / macOS).
-- For Linux screenshot capture only: `xdotool` and ImageMagick (`import`) — already required by `scripts/take_screenshots.sh`.
-- A modern browser to preview the site locally (Chromium-based for Lighthouse verification).
+- Docker with a running Linux container engine.
+- Enough free space for the first Tauri/WebKitGTK build.
+- Python 3 for local site preview.
+- A modern browser for responsive and Lighthouse checks.
 
-## 1. Spin up a sandboxed Quill instance
+The capture image installs its own Rust, Node, WebKitGTK, Xvfb, Openbox, xcompmgr, xdotool, ImageMagick, and Python dependencies. The host does not need those tools.
 
-```bash
-# POSIX (Linux/macOS)
-scripts/run_quill_demo.sh                      # uses /tmp/quill-demo-$USER
-scripts/run_quill_demo.sh --clean              # nuke and reseed first
-scripts/run_quill_demo.sh --bin /custom/quill  # use a specific binary
-```
-
-The launcher prints the sandbox path on start, e.g.:
-
-```text
-[demo] sandbox at /tmp/quill-demo-alex
-[demo] launching quill ...
-```
-
-A Quill window opens, populated with the deterministic dummy data set (Alex's projects, plausible token volumes, sample learned rules). Your real `~/.local/share/com.quilltoolkit.app/` is NOT touched — confirm by running `ls -lh ~/.local/share/com.quilltoolkit.app/` before and after; the timestamps should be unchanged.
-
-## 2. Capture screenshots
-
-With the demo window on screen, run the screenshot driver. On Linux:
+## 1. Capture every canonical screenshot
 
 ```bash
-scripts/take_screenshots.sh
+./scripts/capture_screenshots_docker.sh
 ```
 
-This produces PNGs under `screenshots/` at the repo root. After the marketing-site landing, the script writes its outputs directly into `marketing-site/assets/screenshots/` (one of the script-extension tasks).
+The command:
 
-For views the existing driver doesn't yet capture (Settings, Context tab, Release Notes), capture manually with your platform tool:
-- Linux: `import -window <wid> file.png`
-- macOS: `screencapture -R x,y,w,h file.png` or `Cmd+Shift+4`
-- Windows: Snipping Tool, or `Get-Clipboard | Save-Image`
+1. Builds `Dockerfile.screenshots` with the current frontend embedded through `tauri/custom-protocol`.
+2. Starts a private 1280×1024 Xvfb desktop with Openbox and xcompmgr.
+3. Runs `scripts/run_quill_demo.sh --clean` inside the container.
+4. Seeds deterministic fictional usage, model, session, learning, memory, context, and provider-state data. A harmless `pi --version` stub makes the fictional Pi integration render as enabled.
+5. Captures Usage, Models, Context, Sessions, Learning, Memories, Integrations, and Context/Brevity.
+6. Checks every expected PNG before copying anything to the checkout.
+7. Replaces `marketing-site/assets/screenshots/` only after the complete run passes.
 
-Save into `marketing-site/assets/screenshots/` using the [naming convention](./data-model.md#3-screenshot-asset-naming).
+The runtime container has no host display socket, personal home directory, Quill data directory, or published network port. It runs with Docker networking disabled. Only the repository build context enters the image; only validated PNGs leave it.
 
-**Privacy gate before continuing**: open every PNG and visually scan for any non-fictional identifier. If you see anything that isn't `/home/alex/projects/...`, `macbook-pro`, `dev-server`, `workstation`, etc., recapture before committing.
+The first build downloads the Linux/Tauri toolchain. Docker BuildKit caches npm, Cargo registry, and Cargo target data for later runs.
 
-## 3. Preview the site locally
+## 2. Review the images
+
+Open every PNG under `marketing-site/assets/screenshots/` and confirm:
+
+- `hero.png`: Usage, 6H, model grouping, varied curves, and Skills rows with Claude/Codex/Pi counts.
+- `models.png`: Models, 7D, current Claude/Codex/Pi model evidence and a ranked list.
+- `analytics-context.png`: Context, 6H, preserved/retrieved/routing values.
+- `sessions.png`: the `parser` query and a selected result detail.
+- `learning.png`: active rules above discovered candidates.
+- `memory.png`: `All Projects (4)` and four fictional memory files.
+- `settings.png`: Claude Code, Codex, and Pi enabled; MiniMax remains below the crop.
+- `brevity.png`: Context settings with Brevity ON.
+- Every path, host, project, branch, and model identifier is fictional.
+
+A blank capture fails automatically. This visual review catches a nonblank but incorrect UI state.
+
+## 3. Preview the site
 
 ```bash
-# Any of these works:
 python3 -m http.server -d marketing-site 8000
-# or
-npx http-server marketing-site -p 8000 --no-cache
-# or just:
-xdg-open marketing-site/index.html             # Linux
-open marketing-site/index.html                 # macOS
 ```
 
-Visit `http://localhost:8000` and walk every anchored section (`#hero` through `#install`). Resize the browser to 320 px wide and to a 4K-ish width to confirm responsive correctness (FR-023).
+Visit `http://localhost:8000` and check every anchor from `#hero` through `#install`. Resize to 320px wide and a large desktop width. Confirm screenshots remain whole, text stays readable, and no horizontal scrolling appears.
 
-## 4. Run Lighthouse before merging
-
-In Chrome / Edge DevTools:
-- Open DevTools → Lighthouse panel
-- Categories: Performance + Accessibility + Best Practices + SEO
-- Form factor: Mobile + Desktop, run both
-- Confirm Performance ≥ 90 on both (SC-004)
-- Largest Contentful Paint < 2.0 s on the desktop run (SC-005)
-- Cumulative Layout Shift < 0.1 (SC-006)
-
-If Performance dips, the most likely cause is an oversized PNG. Re-export at @2x and inspect file size; aim to keep each screenshot under ~150 KB.
-
-## 5. Tear down the sandbox
+## 4. Run project checks
 
 ```bash
-# POSIX
-rm -rf /tmp/quill-demo-$USER
+npm test
+npm run typecheck
+npm run lint
+npm run knip
 ```
 
-```powershell
-# Windows
-Remove-Item -Recurse -Force $env:TEMP\quill-demo-$env:USERNAME
-```
+Run Lighthouse mobile and desktop checks when marketing HTML/CSS changes. Screenshot-only refreshes still need a visual page pass because source dimensions and aspect ratios can change.
 
-The launcher prints the exact teardown command on exit; copy-paste it.
+## 5. Commit and deploy
 
-## 6. Commit & push
+Stage the documentation, marketing, screenshot, capture, spec, and LAT files that changed. Merging to `main` with changes under `marketing-site/**` triggers `.github/workflows/pages.yml`.
 
-Stage only the marketing-site changes (the env-var override Rust changes are a separate commit landing once across the repo, not per screenshot refresh):
+After deployment:
+
+- Open every new anchor directly.
+- Confirm the refreshed screenshot query versions load.
+- Check the OpenGraph image.
+- Confirm source and release links.
+
+## Lower-level debugging
+
+The host scripts remain available when diagnosing the capture workflow:
 
 ```bash
-git add marketing-site/
-git commit -m "marketing-site: refresh screenshots after <change>"
-git push origin <branch>
+./scripts/run_quill_demo.sh --clean
+./scripts/take_screenshots.sh
 ```
 
-Open a PR. On merge to `main`, the GitHub Actions Pages workflow runs and the live URL updates within ~1 minute.
-
-## 7. Verify the live deploy
-
-After the Actions run finishes:
-- Click the green check on the merge commit → "View deployment" → opens the deployed URL.
-- Confirm the new screenshots are visible.
-- Confirm the OG preview by pasting the URL into a chat client (Slack, Discord, X) — the social card should render `screenshots/hero.png`.
+That path uses the host X11 session and can move focus or the pointer. Do not use it for routine publishing.
 
 ## Troubleshooting
 
-| Symptom                                                            | Likely cause / fix                                                                 |
-|--------------------------------------------------------------------|-------------------------------------------------------------------------------------|
-| Demo Quill opens but shows your real data                          | `QUILL_DEMO_MODE` not set. Re-run via the launcher; do NOT export the env vars manually. |
-| Demo Quill shows empty analytics                                   | Seeder didn't run. Try `scripts/run_quill_demo.sh --clean` to force a reseed.       |
-| Lighthouse Performance drops to 70-something                       | Probably a PNG over ~300 KB. Re-export tighter; consider PNG-8 for low-color shots. |
-| Pages workflow stays "queued" forever                              | Concurrency lock from a previous run. Cancel the queued job in the Actions UI.     |
-| Screenshot driver complains "no window titled Quill"               | Demo Quill not on screen yet, or `xdotool` not installed (Linux only).             |
-| OG preview shows a generic Pages icon                              | `screenshots/hero.png` missing or `<meta>` tag wrong. Validate with the LinkedIn / Twitter / OG previewer. |
+| Symptom | Fix |
+|---|---|
+| Docker is unavailable | Start the installed Docker engine; the wrapper exits before changing screenshots. |
+| First build takes several minutes | Expected: WebKitGTK packages and the release binary are cold. Later builds reuse caches. |
+| Window opens but capture is blank | Keep `WEBKIT_DISABLE_COMPOSITING_MODE=1`, `WEBKIT_DISABLE_DMABUF_RENDERER=1`, Mesa software rendering, and xcompmgr in the container entrypoint. |
+| Models view is empty | Confirm the seeder writes carry-forward `derived_model_id` values before the app folds hourly model rollups. |
+| Learning has no active rules | Confirm the demo setting `legacy_rules_archived=1` is seeded before the current fixture rule files are written. |
+| Sessions lacks detail | Check the fixed 960×680 query/result composition in `scripts/take_screenshots.sh`. |
+| Images changed but Pages shows old versions | Bump every matching `?v=N` reference in `marketing-site/index.html`. |
 
 ## Independent test mapping
 
-| Spec user story                | Quickstart step covering it |
-|--------------------------------|------------------------------|
-| US1 — visitor comprehension     | Step 3 + Step 7              |
-| US2 — feature deep-dives        | Step 2 + Step 3 + Step 7     |
-| US3 — maintainer dummy-data flow| Steps 1, 2, 5                |
-| US4 — technical fit             | Step 7 (Install section live)|
+| Spec user story | Workflow coverage |
+|---|---|
+| US1 — visitor comprehension | Steps 2, 3, and post-deploy review |
+| US2 — feature deep-dives | Steps 1–3 |
+| US3 — maintainer dummy-data flow | Step 1 plus lower-level debugging |
+| US4 — technical fit | Steps 3–5 |
