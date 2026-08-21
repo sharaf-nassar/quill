@@ -1244,16 +1244,14 @@ body {
 }
 
 .wg-limits-bucket-top {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  display: flex;
   align-items: baseline;
   min-width: 0;
 }
 
 .wg-limits-pct {
-  grid-column: 2;
-  grid-row: 1;
-  justify-self: center;
+  flex: 1 1 auto;
+  text-align: center;
   font-size: 11px;
   font-weight: 600;
   line-height: 1;
@@ -1275,9 +1273,8 @@ body {
 }
 
 .wg-limits-window {
-  grid-column: 1;
-  grid-row: 1;
-  justify-self: start;
+  flex: 0 1 auto;
+  min-width: 0;
   font-size: 8px;
   font-weight: 500;
   letter-spacing: 0.04em;
@@ -2137,15 +2134,53 @@ body {
   position: relative;
 }
 
-/* The grouping controls occupy the chart's quiet top-right corner. */
-.wg-chart-dimensions {
+/* The grouping toggle and its compact legend occupy the chart's quiet
+   top-right corner, packed to the right edge and wrapping the legend above
+   the toggle if a wide model set will not fit on one line. */
+.wg-chart-controls {
   position: absolute;
   top: 4px;
   right: 2px;
   z-index: 3;
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px var(--space-sm);
+}
+
+.wg-chart-dimensions {
+  display: flex;
+  flex: 0 0 auto;
   border: 1px solid var(--line);
   background: var(--surface);
+}
+
+.wg-chart-legend-mini {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px 7px;
+  min-width: 0;
+}
+
+.wg-chart-legend-mini-item {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--label);
+  white-space: nowrap;
+}
+
+.wg-chart-legend-mini-swatch {
+  width: 6px;
+  height: 2px;
+  border-radius: var(--radius-xs);
+  flex: 0 0 6px;
 }
 
 .wg-chart-dimensions button {

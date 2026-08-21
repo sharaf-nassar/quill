@@ -4,6 +4,7 @@ import type { WidgetChartDimension } from "./rangePreference";
 export interface ChartSeries {
   readonly id: string;
   readonly label: string;
+  readonly provider: string;
   readonly values: readonly number[];
   readonly color: string;
 }

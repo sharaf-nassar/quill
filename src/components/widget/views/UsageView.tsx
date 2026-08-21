@@ -759,6 +759,16 @@ function UsageView({ range }: UsageViewProps) {
     const totals = bucketTotals(series);
     return {
       series,
+      // Compact legend beside the toggle: models collapse to the same short
+      // family name the agent rail uses, everything else keeps its label.
+      legend: source.series.map((entry) => ({
+        id: entry.id,
+        label:
+          chartDimension === "models"
+            ? formatSessionModel(entry.provider as IntegrationProvider, entry.label)
+            : entry.label,
+        color: entry.color,
+      })),
       totalTokens: totals.reduce((sum, value) => sum + value, 0),
       delta: rangeMomentum(totals),
       labels: axisLabels(source.labels, range),
@@ -839,21 +849,36 @@ function UsageView({ range }: UsageViewProps) {
     <>
       <div className="wg-usage-band">
         <div className="wg-usage-chart">
-          <div className="wg-chart-dimensions" role="group" aria-label="Graph grouping">
-            {([
-              ["cli", "CLI"],
-              ["llm", "Provider"],
-              ["models", "Model"],
-            ] as const).map(([dimension, label]) => (
-              <button
-                key={dimension}
-                type="button"
-                aria-pressed={dimension === chartDimension}
-                onClick={() => setChartDimension(dimension)}
-              >
-                {label}
-              </button>
-            ))}
+          <div className="wg-chart-controls">
+            {chart && chart.totalTokens > 0 && (
+              <div className="wg-chart-legend-mini" aria-hidden="true">
+                {chart.legend.map((entry) => (
+                  <span className="wg-chart-legend-mini-item" key={entry.id}>
+                    <i
+                      className="wg-chart-legend-mini-swatch"
+                      style={{ background: entry.color }}
+                    />
+                    {entry.label}
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="wg-chart-dimensions" role="group" aria-label="Graph grouping">
+              {([
+                ["cli", "CLI"],
+                ["llm", "Provider"],
+                ["models", "Model"],
+              ] as const).map(([dimension, label]) => (
+                <button
+                  key={dimension}
+                  type="button"
+                  aria-pressed={dimension === chartDimension}
+                  onClick={() => setChartDimension(dimension)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
           {overview.initialLoading && !chart ? (
             <div

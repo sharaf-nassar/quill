@@ -27,21 +27,26 @@ which the landing commit never touched.
 
 ## Root cause
 
-`src/sessions.rs:6071` is
-`let index = SessionIndex::open_or_create(temp.path()).expect("reopen index");`
-— column 63 is the `.expect`, so `open_or_create` returned `Err`.
+A constrained reproducer captured the error hidden by the original `.expect`:
 
-`SessionIndex::open_or_create` ends in `index.writer(50_000_000)`
-(`src-tauri/src/sessions.rs:1169-1170`). Every test that opens a `SessionIndex`
-therefore reserves a 50 MB tantivy writer heap and spawns tantivy indexing
-threads. The test is plain `#[test]`, not `#[serial]`, so several such tests
-run concurrently under the default harness parallelism and reserve that budget
-at the same time. On a loaded host the writer allocation or its thread spawn
-can fail.
+```text
+Failed to create IndexWriter: An IO error occurred:
+'Resource temporarily unavailable (os error 11)'
+```
 
-50 MB is a production figure. These tests index a handful of documents.
+The failure is Tantivy worker-thread creation under host thread pressure, not
+index corruption. `SessionIndex::open_or_create` remains wired to the 50 MB
+production writer heap at `src-tauri/src/sessions.rs:1137-1143`; the reproducer
+showed that budget selecting three writer workers per index. Default-parallel
+tests opened several independent temporary indexes at once, multiplying that
+thread demand until the OS refused another thread.
 
-The host at the time was running a live dev Quill, a `tauri dev` session, and
+50 MB is a production figure. These tests index a handful of documents. The
+shared test opener now uses 15 MB and one writer worker at
+`src-tauri/src/sessions.rs:1139-1150`, while writer construction remains shared
+at `src-tauri/src/sessions.rs:1153-1187`.
+
+The original host was running a live dev Quill, a `tauri dev` session, and
 `vite`, at load average around 5.7 — the same class of host pressure recorded
 in `loaded-host-invalidates-p95-qualification.md`.
 
@@ -64,10 +69,16 @@ lock normally.
 
 ## Fix
 
-None landed. Filed as `quill-l459` (P2), with the reduced test-only writer
-heap as the cheapest candidate, `#[serial]` on the index tests as the fallback,
-and capturing the real `Err` string instead of `.expect(...)` so the next
-occurrence names its own cause.
+`quill-l459` landed as commit
+`9ac1af19731f5274ca0dfc5019e823c6481a5e2c`.
+
+All index tests now call the explicit 15 MB test opener; production
+`SessionIndex::open_or_create` still calls the 50 MB production path. The
+budget regression at `src-tauri/src/sessions.rs:5891-5896` pins both values.
+The loaded full suite then passed 20 consecutive runs, each with 509 passing
+tests and no recurrence, across load averages 5.97-29.09. Rust formatting,
+clippy, the full Rust suite, frontend tests, typecheck, lint, and `lat check`
+also passed on the squash commit.
 
 ## Prevention
 

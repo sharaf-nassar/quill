@@ -447,8 +447,21 @@ pub(crate) fn parse_scoped_weekly_limits(
 }
 
 fn abbreviate_codex_model(name: &str) -> String {
+    if name.ends_with("-Codex-Spark") {
+        return "Spark".to_string();
+    }
     let name = name.strip_prefix("GPT-").unwrap_or(name);
     name.replace("-Codex-", "-").replace("-Codex", "")
+}
+
+#[cfg(test)]
+mod codex_usage_tests {
+    use super::abbreviate_codex_model;
+
+    #[test]
+    fn codex_spark_label_omits_model_version() {
+        assert_eq!(abbreviate_codex_model("GPT-5.3-Codex-Spark"), "Spark");
+    }
 }
 
 fn codex_window_label(window_minutes: i64) -> String {
