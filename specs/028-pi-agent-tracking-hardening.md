@@ -69,10 +69,10 @@ persisted in a supported Pi session.
 - Emit one canonical hook/runtime event for each Pi lifecycle boundary. Remove
   missing hook names, duplicate Pre/Post pairs, false root-subagent labels, and
   assistant-text evidence for tool-only turns.
-- Ensure managed, npm, project, and child-process reporter copies cannot silently
-  select an incompatible or feature-incomplete reporter. Child tracking
-  availability must be observable when agent extension allowlists disable
-  ambient discovery.
+- Ensure Quill's managed reporter and explicitly configured child-process
+  instances cannot silently run an incompatible or feature-incomplete payload.
+  Child tracking availability must be observable when agent extension allowlists
+  disable ambient discovery.
 - Preserve local-only transmission, bounded Pi hot-path work, transactional
   provider assets, existing context tools/routing behavior, and explicit gaps.
 - Update `lat.md` contracts and owning test specs to match the final behavior,
@@ -135,10 +135,10 @@ Acceptance criteria:
   installed.
 - A successful handshake identifies the running Quill build/protocol and the
   active reporter version/capabilities.
-- Managed, npm, and project copies elect only a compatible reporter; an
-  incompatible first-loaded copy cannot indefinitely block a compatible copy.
+- Quill deploys and verifies one compatible managed reporter; foreign copies
+  cannot replace its owned global extension path.
 - A wire-shape change cannot pass CI without the corresponding fixture,
-  protocol/version disposition, server acceptance, and package checks.
+  protocol/version disposition, server acceptance, and deployment checks.
 
 ### 2. Keep lifecycle ordering truthful across resume and replay
 
@@ -272,8 +272,8 @@ Acceptance criteria:
   nested parent IDs, agent names, and no child Quill tools/router. Ambient-
   disabled children without an explicit Quill extension remain unsupported.
 - Deployment tests cover valid foreign overwrite, newer-extension/older-server,
-  older-extension/newer-server, managed/npm/project coexistence, development
-  identity opt-in, rollback, and mid-process drift.
+  older-extension/newer-server, managed ownership, development identity opt-in,
+  rollback, and mid-process drift.
 - Fleet load evidence uses concurrent persisted Pi processes and records
   aggregate request rate, handler/event-loop delay, RSS, session-file growth,
   reconciliation backlog, retry rate, and recovery.
@@ -296,8 +296,7 @@ Acceptance criteria:
   session-parse, and recovery failures are typed with enough context to act;
   unexpected failures retain their cause.
 - Principle 6: formatting, lint, typecheck, Rust checks/tests, Node tests,
-  package tests, build, diff checks, and existing project gates pass with zero
-  warnings.
+  build, diff checks, and existing project gates pass with zero warnings.
 - Principle 7: automated behavior-test additions require explicit authorization
   at the clarify gate. Every authorized key test must live at the owning layer.
 - Principle 8: behavior, architecture, and test changes update matching
@@ -332,9 +331,9 @@ Acceptance criteria:
 4. Must Quill tracking remain available inside child processes whose launcher
    intentionally disables ambient extensions, and if so may Quill define a
    mandatory tracking-only child reporter contract with pi-subagents?
-5. What compatibility window must managed and npm extension releases support
-   across Quill downgrade/upgrade, and may incompatible future spool records be
-   retained until the user upgrades?
+5. What compatibility window must the managed extension support across Quill
+   downgrade/upgrade, and may incompatible future spool records be retained
+   until the user upgrades?
 6. What explicit operator action should clear a durable spool-gap warning after
    evidence is reconciled or deliberately discarded?
 7. Does the user authorize the new automated cross-wire, lifecycle, spool,
@@ -378,19 +377,19 @@ is a coordinated protocol/storage redesign rather than a small patch.
    Recommended: when the active Quill extension is explicitly configured for
    the child through generic extension loading. `PI_SUBAGENT_CHILD=1` keeps that
    instance tracking-only, and generic runtime acknowledgement is best-effort.
-   Quill does not auto-inject the broker winner or require a Quill-specific
-   upstream release. Ambient-disabled children without explicit configuration
-   remain unsupported. Approve? Flagged by: gaps, feasibility, scope,
+   Quill does not auto-inject the managed extension path or require a
+   Quill-specific upstream release. Ambient-disabled children without explicit
+   configuration remain unsupported. Approve? Flagged by: gaps, feasibility, scope,
    stakeholders.
 
 5. **What compatibility, trust, disable, and rollback policy should ship?**
    Recommended: support current and immediately previous protocol generations;
    release server support before reporter emission; quarantine bounded future
-   records; require reload/removal for pre-broker legacy copies; prefer official
-   managed/npm identities, with project/development reporters opt-in; disabling
-   Pi rejects ingestion from every channel without modifying user-owned
-   packages. Database migrations remain forward-only and rollback outside the
-   window requires restoring the pre-upgrade database or fixing forward. Is
+   records; require reload/removal for legacy copies; accept only Quill's
+   managed reporter by default; disabling Pi rejects ingestion from every
+   channel without modifying user-owned files. Database migrations remain
+   forward-only. Rollback outside the window requires restoring the pre-upgrade
+   database or fixing forward. Is
    that risk/support window accepted? Flagged by: requirements, gaps,
    feasibility, scope, stakeholders.
 
@@ -460,13 +459,11 @@ is a coordinated protocol/storage redesign rather than a small patch.
   persisted-source reconciliation gap, and recovery. Aggregate the worst active
   condition plus affected count; only same-reporter/source recovery clears its
   transient error.
-- **Reporter election:** new reporters register candidates before one delegating
-  wrapper owns handlers. Prefer compatible managed, then npm, then opted-in
-  project/development candidates; within a channel require the exact server
-  protocol/reporter version pair and prefer the highest compatible capability.
-  A renewable lease re-elects after failure or capability drift. Legacy
-  pre-broker handlers require Pi reload/removal; exact-version mismatch remains
-  typed and inert rather than entering a compatibility window.
+- **Reporter ownership:** Quill installs one marked global reporter and verifies
+  its exact server/protocol version before use. Unmarked copies are unsupported
+  and never replace the managed path. Legacy handlers
+  require Pi reload/removal; exact-version mismatch remains typed and inert
+  rather than entering a compatibility window.
 - **Canonical telemetry:** `tool_execution_start/end` exclusively own
   PreToolUse/PostToolUse; `tool_call` remains routing-only; `turn_start` emits no
   hook without a defined mapping; explicit child lineage supplies subagent
@@ -488,11 +485,10 @@ is a coordinated protocol/storage redesign rather than a small patch.
 - **Migration/rollout:** add forward-only durable lifecycle-instance, direct
   lineage, reporter-health, event-receipt, and source-reconciliation metadata in
   one migration. Ship the desktop server and managed reporter as one exact
-  pair; publish the matching npm reporter only after desktop availability.
-  Preserve a pre-migration database backup for rollback evidence.
+  pair. Preserve a pre-migration database backup for rollback evidence.
 - **Trust boundary:** the bearer secret cannot protect against malicious code
-  running as the same user. Official identity checks and project/development
-  opt-in are product safety/diagnostic controls, not cryptographic attestation.
+  running as the same user. Managed markers and exact-byte verification are
+  product safety/diagnostic controls, not cryptographic attestation.
 - **Sensitive metadata:** bounded launcher role/name may persist locally in the
   Pi session's custom tracking entry, but is excluded from search, routine logs,
   and support export by default. Task- or prompt-derived freeform labels are
@@ -551,7 +547,7 @@ A: **Explicit configuration only.** Existing generic `extensions` or
 `subagentOnlyExtensions` loading is sufficient when it names the Quill
 extension. `PI_SUBAGENT_CHILD=1` then registers tracking without context tools
 or routing, and generic runtime acknowledgement is best-effort. Quill does not
-auto-propagate the broker-selected path or pin a Quill-specific upstream
+auto-propagate the managed extension path or pin a Quill-specific upstream
 release. Ambient-disabled children without explicit Quill configuration and
 arbitrary launchers remain unsupported.
 
@@ -559,10 +555,10 @@ arbitrary launchers remain unsupported.
 
 A: **Option B for compatibility.** Require an exact Quill server/protocol and
 reporter version pair; do not dual-read the previous protocol. Mismatch is typed,
-inert, and recoverable by installing the exact pair and reloading Pi. Official
-managed/npm reporters are accepted by default; project/development reporters
-require explicit opt-in. Disabling Pi rejects ingestion from all channels
-without modifying user-owned packages. Forward-only schema changes preserve a
+inert, and recoverable by repairing the managed extension and reloading Pi.
+Only Quill's managed reporter is supported. Disabling Pi rejects ingestion from
+all channels without modifying user-owned files. Forward-only schema changes
+preserve a
 pre-upgrade database backup for rollback.
 
 **Q6: What evidence-loss and recovery policy governs offline tracking?**
@@ -647,15 +643,13 @@ metric split remains: family activity/active runtime include descendants,
 agent count/runtime remain explicit, root turns remain root-only, and child
 usage/turn evidence remains separately inspectable and counted once globally.
 
-Reporter coexistence moves from first-loaded ownership to a process-global
-candidate registry with one delegating handler set. Candidates declare source,
-exact reporter/protocol version, capabilities, and extension path. Exact-match
-managed and npm candidates are accepted by default; project/development
-candidates require opt-in. Legacy pre-broker copies require removal/reload.
-Child launchers may load the Quill extension through their generic explicit
+Reporter ownership is single-source: Quill installs one marked global extension
+and verifies its exact reporter/protocol version. Unmarked copies are unsupported
+and never join the managed lifecycle. Legacy copies require removal/reload. Child
+launchers may load the Quill extension through their generic explicit
 extension configuration. For `pi-subagents`, `extensions` or
 `subagentOnlyExtensions` is sufficient; Quill does not rewrite agent settings,
-auto-propagate the broker-selected path, or pin a Quill-specific upstream
+auto-propagate the managed extension path, or pin a Quill-specific upstream
 release. In a configured child process, `PI_SUBAGENT_CHILD=1` makes the
 extension register tracking only, with no tools or router. Generic runtime
 acknowledgement is useful evidence but not a Quill-controlled guarantee.
@@ -722,18 +716,11 @@ Constitution alignment:
   - Export deterministic event builders; append `quill-tracking` entries before
     live delivery; maintain process instance/sequence; skip non-persistent
     sessions; remove spool/log paths; register tracking-only child behavior;
-    canonicalize telemetry; implement exact-pair candidate registration.
+    canonicalize telemetry; and enforce exact managed-reporter compatibility.
 - `src-tauri/pi-integration/quill.test.mjs`
   - Cover persistent/no-session boundaries, append-before-send, exact payload
-    bytes, reload/resume occurrence identity, typed responses, broker election,
+    bytes, reload/resume occurrence identity, typed responses, managed ownership,
     child acknowledgement, telemetry mapping, and handler budgets.
-- `src-tauri/pi-integration/package.json`,
-  `src-tauri/pi-integration/README.md`,
-  `.github/workflows/publish-pi-extension.yml`, and
-  `scripts/pi-package.test.mjs`
-  - Bump reporter/protocol contract, publish exact-pair compatibility, ship the
-    generated fixture, and gate package release on the real Rust contract.
-
 ### Persisted Pi source parsing and reconciliation
 
 - `src-tauri/src/pi_session.rs`
@@ -779,8 +766,8 @@ Constitution alignment:
 - `src-tauri/src/integrations/manager.rs` and
   `src-tauri/src/integrations/types.rs`
   - Replace global last-writer health with per-reporter/process dimensions and a
-    worst-state aggregate; enforce disable for every install channel without
-    mutating user-owned packages.
+    worst-state aggregate; enforce disable for the managed install without
+    mutating user-owned files.
 - `src/types.ts`, `src/utils/format.ts`,
   `src/components/widget/views/UsageView.tsx`, and
   `src/mocks/ipcFixtures.ts`
@@ -798,12 +785,12 @@ Constitution alignment:
   - `extensions` or `subagentOnlyExtensions` may explicitly load the Quill
     extension. Configured children use `PI_SUBAGENT_CHILD=1` for tracking-only
     registration and may expose generic runtime acknowledgement.
-  - Quill does not mutate launcher settings, auto-inject the broker-selected
-    reporter, or pin a Quill-specific `pi-subagents` release. Ambient-disabled
+  - Quill does not mutate launcher settings, auto-inject the managed extension,
+    or pin a Quill-specific `pi-subagents` release. Ambient-disabled
     children without explicit configuration and arbitrary launchers remain out
     of scope.
 - `scripts/dev-runtime-isolation.mjs`
-  - Add opted-in project/development reporter scenarios and prove they cannot
+  - Add development-identity managed-reporter scenarios and prove they cannot
     overwrite or report to production without explicit selection.
 - `lat.md/data-flow.md`, `lat.md/infrastructure.md`, `lat.md/backend.md`,
   `lat.md/features.md`, `lat.md/frontend.md`, and the existing `lat.md/pi-*.md`
@@ -861,9 +848,8 @@ usage/runtime cannot double-count and a stable source can correct it.
 
 Bounded per-reporter/process dimensions:
 
-- normalized host, process instance, install channel, reporter/protocol/build
-  version; primary key `(normalized_hostname, process_instance_id,
-  install_channel)`
+- normalized host, process instance, and reporter/protocol/build version;
+  primary key `(normalized_hostname, process_instance_id)`
 - last handshake, last known-session acceptance, last heartbeat
 - connection, compatibility, lifecycle, child-ack, source-reconciliation, and
   transport states
@@ -1043,11 +1029,11 @@ updated `lat.md` specs.
   known-session versus unknown-session acceptance, child acknowledgement,
   recovering/reconciled source, same-reporter error clearing, worst-state
   aggregation, disable/re-enable, and no subject for `--no-session`.
-- **Reporter broker/deployment:** managed/npm/project candidates, opted-in dev,
-  legacy pre-broker reload requirement, valid foreign overwrite,
-  newer-reporter/older-server and older-reporter/newer-server rejection,
-  mid-process server drift, feature flags, user-owned files, transactional
-  repair/rollback, package tag, npm provenance, and matching Pi/Node support.
+- **Reporter deployment:** managed ownership, legacy reload requirement, valid
+  foreign overwrite, newer-reporter/older-server and
+  older-reporter/newer-server rejection, mid-process server drift, feature
+  flags, user-owned files, transactional repair/rollback, and matching Pi/Node
+  support.
 - **Configured child boundary:** child-mode extension fixtures prove
   tracking-only registration and no `quill_` tools/router. Generic launcher
   acknowledgement may be recorded when an explicit Quill extension path is
@@ -1071,7 +1057,7 @@ updated `lat.md` specs.
 Full gates: focused Node/Rust/UI suites, real Pi 0.84 minimum and current
 supported runs, configured child-mode extension tests, `cargo fmt --check`,
 Clippy with warnings denied, Rust checks/tests, npm test/lint/build/knip,
-package tarball, `git diff --check`, `lat check`, and exact-pair release dry run.
+`git diff --check`, and `lat check`.
 
 ## Risks
 
@@ -1093,10 +1079,9 @@ package tarball, `git diff --check`, `lat check`, and exact-pair release dry run
   one session-owned source, event receipts, rollup write permit, and atomic
   replacement tests.
 - **Exact version pairing increases operational friction.** Mitigation: server
-  and managed extension ship atomically, npm publication follows desktop,
-  integration health names exact required versions, and release notes require
-  Pi reload.
-- **Legacy reporters cannot join the broker.** Mitigation: explicit reload or
+  and managed extension ship atomically, integration health names exact required
+  versions, and release notes require Pi reload.
+- **Legacy reporters cannot be hot-replaced.** Mitigation: explicit reload or
   removal, server-side duplicate tolerance during upgrade, and no claim that
   hot replacement can unregister old handlers.
 - **Generic child extension configuration may drift upstream.** Mitigation:
@@ -1321,14 +1306,12 @@ Blocks all remaining implementation tasks.
 Depends on contract. Refactor the extension to append lifecycle/lineage custom
 entries before live push, derive stable native IDs, intentionally omit tracking
 for `--no-session`, maintain process instance/sequence across reload, implement
-409/426 behavior, expose broker/child descriptors, and stop creating the
+409/426 behavior, expose managed/child descriptors, and stop creating the
 failed-request spool. Preserve the exact eight root `quill_` tools and router;
 injected children register tracking only.
 
 Files: `src-tauri/pi-integration/quill.ts`,
 `src-tauri/pi-integration/quill.test.mjs`,
-`src-tauri/pi-integration/package.json`,
-`src-tauri/pi-integration/README.md`,
 `lat.md/pi-extension-tests.md`, `lat.md/infrastructure.md`.
 
 Acceptance:
@@ -1344,7 +1327,7 @@ Acceptance:
 
 Focused command: `node --test src-tauri/pi-integration/quill.test.mjs`.
 
-Blocks persisted-source reconciliation and broker deployment.
+Blocks persisted-source reconciliation and managed deployment.
 
 ### Reconcile persisted Pi sources and migrate ownership — P1
 
@@ -1413,14 +1396,13 @@ Acceptance:
 Focused commands: real router/lifecycle/live-tracker tests and focused frontend
 formatter/row tests, then `lat check`.
 
-Blocks broker, child integration, and telemetry/health.
+Blocks managed deployment, child integration, and telemetry/health.
 
-### Ship exact-pair reporter broker and retire legacy deployment — P1
+### Ship exact-pair managed reporter and retire legacy deployment — P1
 
 Depends on extension persistence, reconciliation, and transactional lifecycle.
-Implement candidate broker/election, exact managed/npm/project/development
-policy, disable behavior, valid foreign overwrite handling, legacy reporter
-reload detection, package versioning, and release ordering. Own the cutover:
+Enforce exact managed-reporter ownership, disable behavior, valid foreign
+overwrite handling, and legacy reporter reload detection. Own the cutover:
 restore extension bytes on failure; require Pi reload; stop legacy writer/drain;
 remove only dead or rename-claimed spool artifacts after reconciliation; record
 one retirement gap/count; never import spool evidence.
@@ -1429,39 +1411,33 @@ Files: `src-tauri/pi-integration/quill.ts`,
 `src-tauri/src/server.rs`, `src-tauri/src/integrations/pi.rs`,
 `src-tauri/src/integrations/manager.rs`,
 `src-tauri/src/integrations/types.rs`,
-`src-tauri/pi-integration/package.json`,
-`.github/workflows/publish-pi-extension.yml`,
-`scripts/pi-package.test.mjs`, `scripts/dev-runtime-isolation.mjs`,
-`lat.md/infrastructure.md`, `lat.md/pi-lifecycle-tests.md`,
-`lat.md/pi-package-tests.md`, `lat.md/pi-spool-tests.md`.
+`scripts/dev-runtime-isolation.mjs`, `lat.md/infrastructure.md`,
+`lat.md/pi-lifecycle-tests.md`, `lat.md/pi-spool-tests.md`.
 
 Acceptance:
 
-- Exact mismatch in both directions, mid-process drift, managed/npm/project
-  coexistence, opted-in dev, legacy pre-broker, disable/re-enable, user-owned
-  files, transactional repair, DB backup restore, extension-byte restore, and
-  required Pi reload pass.
+- Exact mismatch in both directions, mid-process drift, managed ownership,
+  legacy reporter reload, disable/re-enable, user-owned files, transactional
+  repair, DB backup restore, extension-byte restore, and required Pi reload
+  pass.
 - Old drain/writer cannot race cutover; only owned dead/claimed artifacts are
   removed after persisted reconciliation; rollback reopens the backup and
   verifies exact old reporter/server behavior.
-- Desktop/managed reporter ships first; matching npm publication is gated on
-  available desktop build and dry-run provenance checks.
 
-Focused commands: Pi lifecycle/package/dev-isolation suites, package dry run,
-rollback fixture, and `lat check`.
+Focused commands: Pi lifecycle and dev-isolation suites, rollback fixture, and
+`lat check`.
 
 Blocks external child integration and telemetry/health.
 
 ### Document the generic pi-subagents extension boundary — P1
 
-Depends on broker. Document that current generic `extensions` or
+Depends on managed deployment. Document that current generic `extensions` or
 `subagentOnlyExtensions` configuration is sufficient when a launcher explicitly
 names the Quill extension. Quill does not require a Quill-specific upstream
-release, auto-inject the broker-selected reporter, or mutate launcher settings.
+release, auto-inject the managed extension, or mutate launcher settings.
 If upstream behavior changes later, Quill may ship a matching extension update.
 
-Files: `src-tauri/pi-integration/README.md`,
-`lat.md/pi-extension-tests.md`, `lat.md/pi-live-session-tests.md`,
+Files: `lat.md/pi-extension-tests.md`, `lat.md/pi-live-session-tests.md`,
 `specs/028-pi-agent-tracking-hardening.md`.
 
 Acceptance:
@@ -1470,7 +1446,7 @@ Acceptance:
   and generic runtime acknowledgement remains best-effort evidence.
 - Ambient-disabled children without an explicitly configured Quill extension
   and arbitrary launchers remain outside the supported tracking guarantee.
-- No runtime, package, external release pin, or launcher-setting mutation is
+- No runtime dependency, external release pin, or launcher-setting mutation is
   introduced.
 
 Focused commands: existing Pi extension child-mode tests and `lat check`.
@@ -1479,7 +1455,8 @@ Blocks telemetry/health and final qualification.
 
 ### Canonicalize telemetry and bound reporter health — P2
 
-Depends on lifecycle, broker, and pinned child acknowledgement. Remove duplicate
+Depends on lifecycle, managed deployment, and pinned child acknowledgement.
+Remove duplicate
 or undefined hook/runtime evidence, check non-2xx responses, store bounded
 per-reporter health, render worst-state/affected-count/remediation/recovery, and
 remove only Pi no-file/EPHEMERAL production presentation while preserving
@@ -1514,9 +1491,9 @@ Blocks final qualification.
 
 Depends on every prior task. Evidence-only gate: run real cross-wire, migration,
 persisted reconciliation, directional deployment-skew, mid-process drift,
-rollback, 64-child fleet, performance, UI/accessibility, removal, package, and
-full quality suites. Compare against the baseline and append final evidence to
-this spec. Rewrite remaining superseded Feature 027 claims, release notes, and
+rollback, 64-child fleet, performance, UI/accessibility, removal, and full
+quality suites. Compare against the baseline and append final evidence to this
+spec. Rewrite remaining superseded Feature 027 claims, release notes, and
 README. If a gate exposes a defect, create a focused child bead with file
 ownership and dependency back to this task; do not patch implementation files
 inside qualification.
@@ -1535,8 +1512,7 @@ Acceptance:
 - Repo-wide removal audit finds no spool writer/drain/offset/cap, active Pi
   ephemeral branch, push-only discovery assumption, duplicate telemetry, or
   stale contradictory `lat.md` claim.
-- Full zero-warning gates, `git diff --check`, package tarball/provenance dry run,
-  exact-pair release dry run, and `lat check` pass.
+- Full zero-warning gates, `git diff --check`, and `lat check` pass.
 
 Focused commands: the full Testing Strategy command set plus
 `node scripts/pi-agent-tracking-baseline.mjs --compare`.
@@ -1548,9 +1524,10 @@ Dependency graph:
 - Extension persistence follows contract.
 - Reconciliation follows extension persistence.
 - Transactional lifecycle follows reconciliation.
-- Broker/cutover follows extension persistence, reconciliation, and lifecycle.
-- Pinned child contract follows broker.
-- Telemetry/health follows lifecycle, broker, and child acknowledgement.
+- Managed cutover follows extension persistence, reconciliation, and lifecycle.
+- Pinned child contract follows managed deployment.
+- Telemetry/health follows lifecycle, managed deployment, and child
+  acknowledgement.
 - Final qualification follows all prior work.
 
 Serialization is intentional: `quill.ts`, `storage.rs`, shared protocol types,
@@ -1590,7 +1567,7 @@ reopening or superseding completed work.
 - Serialized all repeated `quill.ts`, `storage.rs`, protocol, child-ack, health,
   and `lat.md` ownership; child integration now blocks telemetry/health.
 - Documented the generic `pi-subagents` extension-loading boundary without a
-  Quill-specific upstream release pin or automatic broker-path guarantee.
+  Quill-specific upstream release pin or automatic managed-path guarantee.
 - Bounded reporter-health identity, expiry, row caps, saturation behavior, and
   summary cleanup.
 - Defined pre-assistant/no-file behavior as intentional absence rather than an

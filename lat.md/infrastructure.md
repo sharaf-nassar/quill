@@ -365,21 +365,11 @@ The selected `$PI_CODING_AGENT_DIR` and `$PI_CODING_AGENT_SESSION_DIR`, or their
 
 Installation copies the bundled `quill.ts` to `<Pi config>/extensions/quill.ts` and maintains one Quill block in `<Pi config>/AGENTS.md`. The extension payload marker and managed block markers define ownership. A user-owned `quill.ts` blocks installation; unrelated extension files and user instruction bytes remain untouched. Disabling removes marked Quill files, the managed block, state, stamp, and bounded extension log, then gates lifecycle ingestion. It does not delete indexed Pi sessions or analytics. Legacy spool cleanup proceeds after persisted-source reconciliation without waiting for a reporter-generation acknowledgement.
 
-Pi's npm package is user-owned. Quill never edits Pi package settings or npm storage, while `pi install`, `pi update`, `pi config`, and `pi remove` own that lifecycle. Managed uninstall cannot remove the package, and package removal cannot remove Quill's managed file or local data.
-
 Pi uses [[src-tauri/src/integrations/deploy.rs#FileSnapshots]] as a configuration-only transaction over individual files, including the shared provider contract. The same transaction snapshots and restores context-listener and lifecycle-ingestion settings, so config, database gates, deployed bytes, instruction/state files, and stamp roll back together. It never stages or renames the extensions directory, so sibling extensions cannot enter Quill's backup. The global mutation guard invokes Pi recovery before every provider mutation.
 
-Startup repair takes the same fast path as Codex: a deployment is current only when its bundled-source stamp matches and semantic verification passes. An old stamp therefore triggers the idempotent install path and replaces the owned extension with current bundled bytes without user action. Verification checks exact extension bytes, payload ownership, the current AGENTS block, four-field integration state, and local shared config. Tauri bundles `pi-integration/**/*`, and [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Packaged Assets]] pins that package input.
+Startup repair takes the same fast path as Codex: a deployment is current only when its bundled-source stamp matches and semantic verification passes. An old stamp therefore triggers the idempotent install path and replaces the owned extension with current bundled bytes without user action. Verification checks exact extension bytes, payload ownership, the current AGENTS block, four-field integration state, and local shared config. Tauri bundles `pi-integration/**/*`, and [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Packaged Assets]] pins that resource input.
 
-### npm package
-
-`@sharaf-nassar/quill-pi` publishes the same dependency-free `quill.ts` source that Quill bundles, with independent SemVer and support for Pi `>=0.84.0 <1` on Node.js `>=22.19.0`.
-
-Quill repairs only its marked managed file; Pi owns package install, update, and removal. The extension no longer brokers or ranks copies, requires path opt-in, or matches an exact desktop/reporter generation before registering. Protocol 2 remains the lifecycle wire boundary, while non-empty reporter/build/capability metadata is descriptive and older protocol-2 providers remain accepted across desktop upgrades.
-
-`.github/workflows/publish-pi-extension.yml` accepts only `pi-vX.Y.Z` tags matching package and reporter versions, requires published non-prerelease desktop `vX.Y.Z` assets first, injects that exact desktop build into the reporter source, and performs pack plus provenance publish dry runs before `npm publish --provenance --access public` from a GitHub-hosted OIDC runner.
-
-The npm trusted-publisher record must name `sharaf-nassar/quill` and that exact workflow filename. npm's Sigstore provenance and registry attestation are the package signature; CI stores no long-lived npm token. Package metadata fixes the public registry, repository directory, MIT license, export, Pi manifest, and supported host versions. [[pi-package-tests]] pins the shipped files.
+Quill is the only Pi extension installer and lifecycle owner. It repairs and removes only its marked managed file. Protocol 2 remains the lifecycle wire boundary, while non-empty reporter/build/capability metadata is descriptive and older protocol-2 providers remain accepted across desktop upgrades.
 
 ### Extension Tools and Telemetry
 

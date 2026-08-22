@@ -111,7 +111,7 @@ Pi telemetry has one canonical tool pair and settled root/child stop semantics.
 
 `tool_execution_start` maps to `PreToolUse` and `tool_execution_end` maps to `PostToolUse`; `tool_call` and `tool_result` never duplicate it. Root `agent_settled` emits `Stop`, while configured child `agent_start`/`agent_settled` exclusively emit `SubagentStart`/`SubagentStop`; turn completion emits neither.
 
-Every authenticated telemetry request carries the elected reporter's normalized host, process instance, install channel, and exact generation headers and uses Codex's exact local timeout value.
+Every authenticated telemetry request carries the managed reporter's normalized host, process instance, and exact generation headers and uses Codex's exact local timeout value.
 
 ## Context router parity
 

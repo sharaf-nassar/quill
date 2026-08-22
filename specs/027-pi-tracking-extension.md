@@ -41,9 +41,9 @@ cost, `provider`, `model`), `tool_execution_start/end`, `model_select`,
 file, cwd, `parentSession`). Replace the scraping architecture with one
 production-quality Quill Pi extension that reports all session and agent
 tracking Quill requires, and completely remove the transcript-scraping
-approach. The extension is intended for public release (npm pi package), so
-production quality — health visibility, versioned compatibility, typed
-failure handling, real-Pi tests — is a requirement, not a nicety.
+approach. Quill installs and owns the extension directly, so production
+quality — health visibility, versioned compatibility, typed failure handling,
+and real-Pi tests — is a requirement, not a nicety.
 
 ## Goals
 
@@ -82,13 +82,11 @@ failure handling, real-Pi tests — is a requirement, not a nicety.
   and tool events feed the session-events/response-times pipeline so Pi
   appears in the Runtime card and per-turn latency surfaces, ending the
   `UnsupportedProvider` exclusion.
-- The extension source is production-ready for later public release:
-  versioned event protocol, health/handshake visible in Quill's
-  Integrations UI (runtime health, not just bytes-on-disk verification),
-  typed and bounded failure handling instead of blanket `catch {}`, no
-  blocking work on Pi's hot path, and a real-Pi load test. Packaging and
-  npm publication are a follow-up spec; the managed file drop remains the
-  only deployment vehicle in this release.
+- The Quill-managed extension is production-ready: versioned event protocol,
+  health/handshake visible in Quill's Integrations UI (runtime health, not
+  just bytes-on-disk verification), typed and bounded failure handling instead
+  of blanket `catch {}`, no blocking work on Pi's hot path, and a real-Pi load
+  test. The managed file drop is the only deployment vehicle.
 - The Pi-only-install dead-config bug is fixed: enabling Pi provisions the
   full config contract the extension needs (`config.json` with url, secret,
   hostname, context url), independent of Claude/Codex ever being enabled.
@@ -115,10 +113,8 @@ failure handling, real-Pi tests — is a requirement, not a nicety.
   continues to keep indexed data. Usage analytics for sessions that ran
   before this upgrade remain whatever the old adapter ingested; any
   remainder is an explicit gap, never silently backfilled.
-- No npm packaging, publication, gallery listing, or npm-coexistence
-  policy in this release — that is a named follow-up spec. The extension
-  source is written to be publishable (no separately maintained public
-  fork later), but the managed drop is the only install path now.
+- No alternate extension distribution or user-managed install path. Quill's
+  managed file drop is the only supported installation and lifecycle owner.
 - No cost display anywhere in this release: Pi cost is stored only;
   display is its own cross-provider feature.
 - No generic multi-provider agent-events protocol; any new ingestion
@@ -209,9 +205,8 @@ Acceptance criteria:
 
 ### 4. Production-quality extension engineering
 
-As a Quill maintainer, I want the extension engineered for public release,
-so that third-party Pi users can install it safely and Quill can trust its
-health.
+As a Quill maintainer, I want the managed extension engineered for production,
+so Quill can install it safely and trust its health.
 
 Acceptance criteria:
 - A versioned event protocol (protocol version + extension version +
@@ -419,13 +414,10 @@ decisions in Spec Review. Kept for the record.
    `sessions/notify` with Pi fields, or add a dedicated versioned
    `/api/v1/pi/track` (or generic `/api/v1/agent-events`) endpoint that
    other extension-based providers could later share?
-8. **npm coexistence policy.** When both the managed drop and an npm
-   install are present, which wins, and how does the orphan sweep treat the
-   npm copy (it is not Quill-owned by marker)?
-9. **Min Pi version bump.** Which minimum Pi version do the required
+8. **Min Pi version bump.** Which minimum Pi version do the required
    events/fields impose (e.g. `session_tree` and `targetSessionFile`
    availability), and does detection reject or degrade below it?
-10. **Subagent semantics.** Core Pi has no subagents; lineage-linked
+9. **Subagent semantics.** Core Pi has no subagents; lineage-linked
     concurrent sessions are today's proxy. Is that still the only
     "agent count" Pi surfaces, and should bash-spawned child pi processes
     (identifiable via `PI_SESSION_ID` env inheritance) ever link?
@@ -462,12 +454,9 @@ present, and all below the existing 0.84.0 minimum version.
    transcript usage reader for catch-up), or (C) accept an explicit gap.
    Recommendation: (A), given the production-release intent. Flagged by:
    requirements, gaps, ambiguity, scope, feasibility, stakeholders.
-3. **npm packaging scope (story 5).** Keep "publishable artifact now,
-   publication deferred" in this feature (matches the stated intent to
-   release publicly later), or cut packaging + coexistence policy to a
-   follow-up spec and keep only the config-contract fix? Scope review
-   recommends deferring; the problem statement leans keep. Flagged by:
-   scope, stakeholders.
+3. **Distribution scope (story 5).** Keep Quill as the sole installer and
+   lifecycle owner, with no alternate distribution path? Flagged by: scope,
+   stakeholders.
 4. **Cost display (Open Question 4).** Pi supplies per-message cost.
    Store-only (recommended — display reopens the deliberate cross-provider
    "no pricing table" stance and is its own design task), or surface in UI
@@ -521,9 +510,9 @@ present, and all below the existing 0.84.0 minimum version.
   Codex, and Pi enables (three unlocked writers exist today); Pi enable
   provisions the full contract (fixes the dead-install bug); the file
   persists on uninstall until no provider needs it; Pi repair heals drift.
-  Feature gates stay placeholder-substituted in this release; the
-  config-delivered-gates / byte-identical-artifact redesign moves to the
-  packaging follow-up spec (clarification 3B).
+  Feature gates stay placeholder-substituted in this release; a
+  config-delivered-gates / byte-identical-artifact redesign remains out of
+  scope.
 - **Lifecycle hygiene**: spool and taint-marker directories join the
   owned-artifact manifest, orphan sweep, and uninstall verification.
   Quill downgrade restores the scraping payload via old-stamp repair;
@@ -536,23 +525,18 @@ present, and all below the existing 0.84.0 minimum version.
   travels in the handshake and surfaces in the Integrations detail plus a
   bounded extension log file.
 - **No-Quill installs are fully inert**: missing/invalid config ⇒ zero
-  tools, zero telemetry, zero disk writes (no spool), one discoverable
-  notice; the package README states exactly what is captured and that it
-  goes only to a local Quill.
-- **npm coexistence (Open Question 8)**: deferred with packaging to the
-  follow-up spec (clarification 3B). Direction recorded for it: managed
-  drop wins via an instance claim; the orphan sweep never touches
-  non-marker npm copies; server dedupe collapses residual double-fire;
-  old-Quill + new-npm skew degrades to a typed state without retry storms.
-- **Min Pi version (Open Question 9)**: stays 0.84.0 — every required
+  tools, zero telemetry, zero disk writes (no spool), and one discoverable
+  notice. [[infrastructure#Infrastructure#Pi Integration Deployment]] states
+  exactly what is captured and that it goes only to local Quill listeners.
+- **Min Pi version (Open Question 8)**: stays 0.84.0 — every required
   event exists since 0.80.4; pre-1.0 drift is handled by the handshake,
   not a version bump.
-- **Subagents (Open Question 10)**: status quo — lineage-linked concurrent
+- **Subagents (Open Question 9)**: status quo — lineage-linked concurrent
   sessions only; no `PI_SESSION_ID` bash-child linking (non-goal).
 - **Security/process**: the repo's security-review pass runs over the new
-  ingestion endpoints before release; npm provenance/2FA is part of the
-  packaging story; ingestion follows the same demo-mode gate as existing
-  endpoints; constitution 9 joins the Constraints (degraded states render
+  ingestion endpoints before release; ingestion follows the same demo-mode
+  gate as existing endpoints; constitution 9 joins the Constraints (degraded
+  states render
   slate/amber, never red; no severity-color borrowing for badges; Pi dark
   green everywhere; Integrations keeps legacy density per DESIGN.md §6).
 - **Test authorization (constitution 7)**: this spec records authorization
@@ -566,19 +550,18 @@ present, and all below the existing 0.84.0 minimum version.
   answer supersedes the drafted wording either way.
 - Deterministic session end can still be lost on process kill; the
   awaited-shutdown-POST decision above plus idle fallback covers it.
-- Docs owed beyond the package README: Quill release notes describing
-  visible upgrade behavior (pre-upgrade sessions go dark until Pi
-  restarts, ephemeral sessions newly appear, cost data arrives).
-- Multi-machine setups: `config.json` `url` may legitimately point
-  off-device (the router binds 0.0.0.0 deliberately); the public README
-  must document transmission posture (constitution 11), and per-host
-  attribution semantics ride the config contract.
-- Pre-publish checklist for the epic: package name decision, upstream Pi
-  maintainer heads-up, supported-version statement ("supports Pi ≥ X,
-  tested against Y").
+- Quill release notes must describe visible upgrade behavior: pre-upgrade
+  sessions go dark until Pi restarts, ephemeral sessions newly appear, and
+  cost data arrives.
+- Multi-machine setups: `config.json` `url` may legitimately point off-device
+  (the router binds 0.0.0.0 deliberately); architecture docs must describe the
+  transmission posture (constitution 11), and per-host attribution semantics
+  ride the config contract.
+- Release checklist: upstream Pi maintainer heads-up and supported-version
+  statement ("supports Pi ≥ X, tested against Y").
 - Predictable day-after asks to pre-empt in Non-Goals: Pi in Limits/CPA,
-  cost-display parity for other providers, Windows (amplified by npm
-  users), other providers on the tracking endpoints.
+  cost-display parity for other providers, Windows, and other providers on the
+  tracking endpoints.
 
 ## Clarifications
 
@@ -599,11 +582,9 @@ the retained parser; their analytics remain whatever the old adapter
 already ingested — any remainder is an explicit gap. (Reflected in Goals,
 Non-Goals, stories 1/2/4.)
 
-**Q3: npm packaging scope?**
-A: 3B — packaging, publication, and npm-coexistence policy move to a
-follow-up spec. This release keeps the managed file drop as the only
-deployment vehicle and keeps the config-contract fix; the extension
-source itself stays held to publishable quality. (Reflected in Goals,
+**Q3: Distribution scope?**
+A: 3B — Quill's managed file drop is the only deployment vehicle and lifecycle
+owner. No alternate distribution path is planned. (Reflected in Goals,
 Non-Goals, story 4; former story 5 replaced.)
 
 **Q4: Cost display?**
@@ -624,9 +605,8 @@ Runtime card and per-turn latency surfaces this release, ending the
 
 ## Architecture Approach
 
-One rewritten `quill.ts` (still a single Quill-managed file drop —
-packaging deferred per clarification 3B) becomes the sole Pi tracking
-source. It fans events into purpose-built lanes instead of one generic
+One rewritten `quill.ts`, installed only through Quill's managed file drop,
+becomes the sole Pi tracking source. It fans events into purpose-built lanes instead of one generic
 pipe, because each lane's validation and storage already exist
 (constitution 2):
 
@@ -697,9 +677,8 @@ delivery via beads).
   `model_select`, `input`), spool append, handshake, typed degradation,
   stable event/message id minting; existing tools + routing preserved.
   The three feature-gate placeholders and byte-exact substitution survive
-  the rewrite (config-delivered gates deferred with packaging); the
-  no-Quill notice (one discoverable message, then fully inert) and a
-  bounded extension log file are part of the payload.
+  the rewrite; the no-Quill notice (one discoverable message, then fully inert)
+  and a bounded extension log file are part of the payload.
 - `src-tauri/pi-integration/quill.test.mjs` — rewritten suite (see
   Testing Strategy).
 - `src-tauri/src/server.rs` — new `/api/v1/pi/track` route (auth, rate
@@ -967,8 +946,7 @@ retire.
 - Downgrade→re-upgrade double-count rule added to Risks (B, should).
 - Extension payload completeness (A, should): gate placeholders survive
   the rewrite with stamp coverage; no-Quill notice and bounded log file
-  added to payload, owned manifest, uninstall sweep, and tests; README
-  ships with the packaging follow-up spec.
+  added to payload, owned manifest, uninstall sweep, and tests.
 - Test coverage added (A, should): tools/routing regression through the
   rewrite, upgrade-in-place repair, config persist-until-last-provider,
   health-state machine transitions, remote-session live rows visible
