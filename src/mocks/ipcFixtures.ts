@@ -337,6 +337,89 @@ const sessionBreakdown: SessionBreakdown[] = [
   { provider: "codex", session_id: "f1a2b3c4", parent_session_id: null, hostname: "mbp.local", total_tokens: 0, turn_count: 0, first_seen: iso(3 * M), last_active: iso(M), ended_at: null, model_id: "gpt-5.6-sol", project: "/home/mamba/work/poe", active_runtime_secs: 155, agent_count: null, agent_runtime_secs: null, current_turn_runtime_secs: 51, current_turn_runtime_active: true, runtime_as_of_ms: now - 250, active_runtime_rate: 2, observed_agents: [{ agent_id: "agent-sol", model_id: "gpt-5.6-sol", agent_type: null, runtime_secs: 86, runtime_active: true }, { agent_id: "agent-terra", model_id: "gpt-5.6-terra", agent_type: null, runtime_secs: 31, runtime_active: false }], live_linked_sessions: null, observed_only: true },
 ];
 
+const marketingSessionBreakdown: SessionBreakdown[] = [
+  {
+    provider: "claude",
+    session_id: "marketing-claude-root",
+    parent_session_id: null,
+    hostname: "demo-workstation",
+    total_tokens: 184_600,
+    turn_count: 42,
+    first_seen: iso(78 * M),
+    last_active: iso(8 * 1000),
+    ended_at: null,
+    model_id: "claude-opus-4-6",
+    project: "quill",
+    active_runtime_secs: 5_480,
+    agent_count: 3,
+    agent_runtime_secs: 3_920,
+    current_turn_runtime_secs: 68,
+    current_turn_runtime_active: true,
+    runtime_as_of_ms: now - 300,
+    active_runtime_rate: 3,
+    observed_agents: [
+      { agent_id: "review", model_id: "claude-opus-4-6", agent_type: "reviewer", runtime_secs: 1_840, runtime_active: true },
+      { agent_id: "implement", model_id: "claude-sonnet-4-6", agent_type: "implementer", runtime_secs: 1_260, runtime_active: true },
+      { agent_id: "research", model_id: "claude-haiku-4-5", agent_type: "researcher", runtime_secs: 820, runtime_active: true },
+    ],
+    live_linked_sessions: null,
+    observed_only: false,
+  },
+  {
+    provider: "pi",
+    session_id: "marketing-pi-root",
+    parent_session_id: null,
+    pi_lineage: { kind: "root" },
+    hostname: "demo-workstation",
+    total_tokens: 126_400,
+    turn_count: 31,
+    first_seen: iso(64 * M),
+    last_active: iso(12 * 1000),
+    ended_at: null,
+    model_id: "anthropic/claude-fable-5",
+    project: "agent-orchestrator",
+    active_runtime_secs: 4_140,
+    agent_count: 2,
+    agent_runtime_secs: 2_360,
+    current_turn_runtime_secs: 47,
+    current_turn_runtime_active: true,
+    runtime_as_of_ms: now - 250,
+    active_runtime_rate: 3,
+    observed_agents: [
+      { agent_id: "pi-review", model_id: "anthropic/claude-opus-4-6", agent_type: "reviewer", runtime_secs: 1_420, runtime_active: true },
+      { agent_id: "pi-build", model_id: "openai/gpt-5.6-sol", agent_type: "implementer", runtime_secs: 940, runtime_active: true },
+    ],
+    live_linked_sessions: [],
+    observed_only: false,
+  },
+  {
+    provider: "codex",
+    session_id: "marketing-codex-root",
+    parent_session_id: null,
+    hostname: "demo-workstation",
+    total_tokens: 98_800,
+    turn_count: 27,
+    first_seen: iso(52 * M),
+    last_active: iso(18 * 1000),
+    ended_at: null,
+    model_id: "gpt-5.6-terra",
+    project: "gateway",
+    active_runtime_secs: 3_260,
+    agent_count: 2,
+    agent_runtime_secs: 1_780,
+    current_turn_runtime_secs: 39,
+    current_turn_runtime_active: true,
+    runtime_as_of_ms: now - 200,
+    active_runtime_rate: 3,
+    observed_agents: [
+      { agent_id: "codex-sol", model_id: "gpt-5.6-sol", agent_type: "implementer", runtime_secs: 1_040, runtime_active: true },
+      { agent_id: "codex-terra", model_id: "gpt-5.6-terra", agent_type: "reviewer", runtime_secs: 740, runtime_active: true },
+    ],
+    live_linked_sessions: null,
+    observed_only: false,
+  },
+];
+
 const skillBreakdown: SkillBreakdown[] = [
   { skill_name: "impeccable", total_count: 151, claude_count: 120, codex_count: 22, pi_count: 9, project_count: 3, last_used: iso(12 * M) },
   { skill_name: "find-docs", total_count: 93, claude_count: 60, codex_count: 28, pi_count: 5, project_count: 5, last_used: iso(4 * H) },
@@ -1021,8 +1104,8 @@ const marketingModelSeries: ReadonlyArray<{
   },
   {
     provider: "pi",
-    modelId: "google/gemini-3.1-pro",
-    sessionId: "marketing-pi-gemini",
+    modelId: "anthropic/claude-fable-5",
+    sessionId: "marketing-pi-fable",
     points: [[345, 16_000], [260, 8_000], [185, 30_000], [105, 14_000], [30, 42_000], [2, 24_000]],
   },
 ];
@@ -2344,7 +2427,9 @@ const fixtures: Record<string, FixtureHandler> = {
     return result;
   },
   // retention pruning
-  get_retention_policy: () => retentionPolicy(),
+  get_retention_policy: () => marketingScreenshotMode()
+    ? { window_days: null, watermark: null, last_run: null }
+    : retentionPolicy(),
   set_retention_policy: (args) => setRetentionPolicyFixture(args),
   preview_retention: () => previewRetentionFixture(),
   run_retention_maintenance: (args) => runRetentionMaintenanceFixture(args),
@@ -2364,7 +2449,9 @@ const fixtures: Record<string, FixtureHandler> = {
   // breakdowns
   get_host_breakdown: () => hostBreakdown,
   get_project_breakdown: () => projectBreakdown,
-  get_session_breakdown: () => sessionBreakdown,
+  get_session_breakdown: () => marketingScreenshotMode()
+    ? marketingSessionBreakdown
+    : sessionBreakdown,
   get_skill_breakdown: () => skillBreakdown,
   get_hook_breakdown: () => hookBreakdown,
   // stats

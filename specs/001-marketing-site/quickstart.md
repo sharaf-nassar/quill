@@ -33,8 +33,8 @@ The `?screenshot=marketing` query is dev-only. It hides the visible `MOCK DATA` 
 
 Open every PNG under `marketing-site/assets/screenshots/` and confirm:
 
-- `hero.png`: Usage, 6H, Model grouping, varied curves, and Claude/Pi/Codex session rows with agent models.
-- `models.png`: Models, 7D, current Claude/Codex/Pi evidence and five ranked models.
+- `hero.png`: Usage at 480×800, 6H, Model grouping, no retention line, and full Claude/Pi/Codex session names with running agent models.
+- `models.png`: Models, 7D, current Claude/Codex/Pi evidence and five ranked models; no Gemini identity.
 - `analytics-context.png`: Context, 6H, preserved/retrieved/routing values.
 - `sessions.png`: the `parser` query, Claude/Codex/Pi results, and selected context.
 - `learning.png`: active rules above a discovered candidate.

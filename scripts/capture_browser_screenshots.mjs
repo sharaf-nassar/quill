@@ -173,9 +173,10 @@ async function screenshot(client, filename) {
 }
 
 async function captureWidget(client) {
-  await setViewport(client, 360, 800);
+  await setViewport(client, 480, 800);
   await navigate(client, "/?screenshot=marketing", "Boolean(document.querySelector('.wg-shell'))");
   await clickText(client, ".wg-toggle", "6H");
+  await clickText(client, '[aria-label="Breakdown mode"] button', "Sessions");
   await screenshot(client, "hero.png");
   copyFileSync(resolve(OUTDIR, "hero.png"), resolve(OUTDIR, "live.png"));
 
@@ -199,7 +200,7 @@ function pngDimensions(path) {
 function validateOutput() {
   for (const file of ["hero.png", "live.png", "models.png", "analytics-context.png"]) {
     const dimensions = pngDimensions(resolve(OUTDIR, file));
-    if (dimensions[0] !== 720 || dimensions[1] !== 1600) {
+    if (dimensions[0] !== 960 || dimensions[1] !== 1600) {
       throw new Error(`Unexpected widget dimensions for ${file}: ${dimensions.join("x")}`);
     }
   }
@@ -278,6 +279,17 @@ async function main() {
     await client.open();
     await client.send("Page.enable");
     await client.send("Runtime.enable");
+    await client.send("Page.addScriptToEvaluateOnNewDocument", {
+      source: `(() => {
+        const fixed = Date.parse("2026-08-22T12:00:00.000Z");
+        const NativeDate = Date;
+        class FixedDate extends NativeDate {
+          constructor(...args) { super(...(args.length ? args : [fixed])); }
+          static now() { return fixed; }
+        }
+        window.Date = FixedDate;
+      })();`,
+    });
     await captureWidget(client);
     await captureTools(client);
     validateOutput();

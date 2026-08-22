@@ -812,12 +812,9 @@ figcaption {
 }
 
 /* Band frame — the one exception to "shown whole". The widget is a single
-   360px frame, so the LIMITS section the #live copy sells has no capture of its
-   own: the frame is clipped to the band's own hairline (185 of 756 captured
-   rows) instead of publishing the hero shot twice. The image still renders at
-   its native width, top-aligned, so nothing is scaled or letterboxed. */
+   480px frame, so LIMITS is clipped to its own 185px-high band. */
 .shot-band {
-	aspect-ratio: 360 / 185;
+	aspect-ratio: 480 / 185;
 }
 
 .shot-band img {
@@ -1044,13 +1041,13 @@ figcaption {
 	text-wrap: pretty;
 }
 
-/* The product window is the 360px widget, captured at its own width. The stage
-   is capped there so the shot renders 1:1 and is never upscaled. */
+/* The marketing capture widens the resizable widget to 480px so session and
+   agent identities remain readable. The stage preserves that native width. */
 .hero-stage {
 	grid-column: auto;
 	grid-row: auto;
 	position: relative;
-	max-width: 360px;
+	max-width: 480px;
 	margin: 0;
 	padding: 0;
 }

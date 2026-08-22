@@ -39,9 +39,9 @@ The 360px widget keeps LIMITS visible above three switchable views.
     <td align="center"><strong>Context</strong></td>
   </tr>
   <tr>
-    <td valign="top"><img src="marketing-site/assets/screenshots/hero.png" width="240" alt="Quill Usage view with a six-hour model chart and Claude Code, Codex, and Pi sessions showing agent models and runtime" /></td>
-    <td valign="top"><img src="marketing-site/assets/screenshots/models.png" width="240" alt="Quill Models view with running Claude Code, Codex, and Pi models plus a session-ranked model list" /></td>
-    <td valign="top"><img src="marketing-site/assets/screenshots/analytics-context.png" width="240" alt="Quill Context view with preserved and retrieved token totals, reuse ratio, and routing cost" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/hero.png" width="300" alt="Quill Usage view widened to show full Claude Code, Codex, and Pi session names with running agent models and runtime" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/models.png" width="300" alt="Quill Models view with running Claude Code, Codex, and Pi models plus a session-ranked model list" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/analytics-context.png" width="300" alt="Quill Context view with preserved and retrieved token totals, reuse ratio, and routing cost" /></td>
   </tr>
 </table>
 

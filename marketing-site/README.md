@@ -26,7 +26,8 @@ marketing-site/
         └── brevity.png          Tools → Settings → Context, showing Brevity
 ```
 
-The main window is the 360px widget. `hero.png` serves both `#hero` and
+The app widget defaults to 360px, but marketing captures widen the resizable
+window to 480px so session and agent names remain readable. `hero.png` serves both `#hero` and
 `#analytics`; `live.png` copies that Usage frame for `#live`; `models.png` and
 `analytics-context.png` show the other two widget views. Every Tools image uses
 the real 960×680 workspace surface.
@@ -65,16 +66,16 @@ native logical size. Only `#live` clips the shared widget image to its LIMITS ba
   display: block` — no `object-fit: cover`, no fixed height. Each `<img>` also
   carries explicit `width`/`height` attributes matching its 2× source so the
   browser reserves correct space (no layout shift) and the aspect ratio is right.
-- The PNGs are stored at 2× for retina: widget images are 720×1600 and Tools
+- The PNGs are stored at 2× for retina: widget images are 960×1600 and Tools
   images are 1920×1360.
 - **Slim, never upscaled.** Each `.spotlight` sets a `--shot-w` custom property
   at or below the shot's native retina display width (its `width` attribute), and
   the media grid track is `minmax(0, var(--shot-w, 480px))`. So the product
   window renders at — or below — its captured size, never stretched wider or
-  taller to fill the column. Widget shots use 360px; Tools shots use 640px.
+  taller to fill the column. Widget shots use 480px; Tools shots use 640px.
   The copy column (`1fr`) takes the remaining width.
 - **One exception to "shown whole":** `#live` reuses the widget frame through a
-  `.shot-band` frame with `aspect-ratio: 360 / 185`, clipping it to the LIMITS
+  `.shot-band` frame with `aspect-ratio: 480 / 185`, clipping it to the LIMITS
   band at that band's own hairline. The widget is a single window, so LIMITS has
   no capture of its own, and clipping beats publishing the hero shot twice. The
   image itself is still rendered at native width and never scaled.
@@ -82,7 +83,7 @@ native logical size. Only `#live` clips the shared widget image to its LIMITS ba
   `.spotlight` rhythm**: copy on one side, the slim screenshot on the other,
   sides flipping down the page (`.spotlight-reverse` swaps order). `#hero` stays
   in the right column beside the copy as `hero.png` (the widget on its Usage
-  view) on a 360px stage — shown whole, with no height clip or bottom fade,
+  view) on a 480px stage — shown whole, with no height clip or bottom fade,
   because the widget frame ends at its own footer row; the hero collapses to a
   single centered column under 980px.
 - On `<980px` each spotlight collapses to a single column (copy then image) with

@@ -75,7 +75,7 @@ A Quill maintainer needs to refresh marketing screenshots after a UI change. The
 
 1. **Given** a maintainer wants new screenshots, **When** they run the Docker capture command, **Then** Vite serves Quill's real frontend and Browser Mock Mode answers its normal IPC calls.
 2. **Given** the marketing fixture profile is active, **When** Chromium opens Usage, Models, Context, Sessions, Learning, Memories, Integrations, and Context settings, **Then** every view is non-empty and plausible.
-3. **Given** a freshly captured set, **When** the maintainer inspects it, **Then** Claude/Codex/Pi and agent evidence are visible, MiniMax and the mock badge are absent, and every identifier is fictional.
+3. **Given** a freshly captured set, **When** the maintainer inspects it, **Then** wide Claude/Codex/Pi session rows and running-agent evidence are visible, MiniMax, Gemini, the retention line, and the mock badge are absent, and every identifier is fictional.
 4. **Given** capture succeeds or fails, **When** the container exits, **Then** personal Quill state is unchanged and tracked assets are replaced only after full validation.
 
 ---
@@ -144,7 +144,7 @@ A developer past the marketing pitch wants to confirm the three agent integratio
 - **FR-017**: All UI screenshots MUST render Quill's real React components and production view composition. Reimplementing the UI in screenshot-only HTML or generating images is forbidden.
 - **FR-018**: Marketing capture MUST use the existing dev-only Browser Mock Mode under the app's normal Tauri `invoke()` call sites. The mock import and `screenshot=marketing` profile MUST remain unreachable in production bundles.
 - **FR-019**: Capture MUST run inside a Docker container with runtime networking disabled and no host display, home directory, Quill database, transcript roots, or provider configuration mounted.
-- **FR-020**: Fixture data MUST be obviously fictional, plausible, non-empty, and non-uniform. The profile MUST cover Claude Code, Codex, and Pi models/sessions, Session Search, Learning, Memories, Context, and Settings while omitting MiniMax from the current marketing composition.
+- **FR-020**: Fixture data MUST be obviously fictional, plausible, non-empty, and non-uniform. The profile MUST cover Claude Code, Codex, and Pi models/sessions, Session Search, Learning, Memories, Context, and Settings while omitting MiniMax, Gemini, and the retention-watermark disclosure from the current marketing composition.
 - **FR-021**: Screenshots MUST be captured at sufficient resolution to render crisply on high-DPI displays.
 - **FR-022**: Every screenshot used on the site MUST cover at least one feature claimed nearby in copy, and every claimed feature MUST have at least one screenshot.
 

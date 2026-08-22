@@ -12,14 +12,14 @@ The URL query `screenshot=marketing` selects the publishing profile. It exists o
 |---|---|
 | Providers | Claude Code, Codex, and Pi enabled; MiniMax filtered out |
 | Limits | Claude and Codex windows spanning normal, warning, stale, and critical states |
-| Usage models | Opus, Sonnet, Terra, Sol, and Pi-routed Gemini with staggered six-hour curves |
-| Live sessions | Claude, Pi, and Codex rows with retained agent counts, live agent models, runtime, turns, and tokens |
+| Usage models | Opus, Sonnet, Terra, Sol, and Pi-routed Fable with staggered six-hour curves |
+| Live sessions | Claude, Pi, and Codex rows with full project names, agent counts, live agent models, runtime, turns, and tokens |
 | Model view | One running-now row per Claude/Codex/Pi and five ranked models |
 | Session Search | `parser` query with one result per Claude/Codex/Pi plus selected surrounding context |
 | Learning | Active shared/Claude rules and one Codex candidate |
 | Memories | Four projects and four provider-aware files |
 | Context | Preservation, retrieval, routing, and source-reuse totals |
-| Settings | Claude/Codex/Pi integrations, context preservation, telemetry, and Brevity enabled |
+| Settings | Claude/Codex/Pi integrations, context preservation, telemetry, and Brevity enabled; retention watermark absent |
 
 **Invariants**:
 
@@ -51,8 +51,8 @@ Captured PNGs land in `marketing-site/assets/screenshots/`.
 
 - `scripts/capture_screenshots_docker.sh` is the publishing entry point.
 - `scripts/capture_browser_screenshots.mjs` drives the app through Chrome DevTools Protocol.
-- Widget viewports are 360×800 CSS pixels; Tools viewports are 960×680; device scale factor is 2.
-- Widget PNGs are 720×1600. Tools PNGs are 1920×1360.
+- Widget viewports are 480×800 CSS pixels; Tools viewports are 960×680; device scale factor is 2.
+- Widget PNGs are 960×1600. Tools PNGs are 1920×1360.
 - Chromium captures the rendered surface directly. No image generator, HTML reimplementation, post-capture scaling, or manual crop participates.
 - The Node driver validates PNG headers, dimensions, and `hero.png == live.png`.
 - Every HTML use has authored alt text and explicit source dimensions.
