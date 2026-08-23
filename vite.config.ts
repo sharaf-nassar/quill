@@ -2,8 +2,8 @@ import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { sentryVitePlugin } from "@sentry/vite-plugin";
 
-const sentryUpload =
-  process.env.SENTRY_AUTH_TOKEN && process.env.NODE_ENV === "production"
+function sentryUpload(enabled: boolean) {
+  return enabled && process.env.SENTRY_AUTH_TOKEN && process.env.NODE_ENV === "production"
     ? sentryVitePlugin({
         org: process.env.SENTRY_ORG ?? "stable-tech",
         project: process.env.SENTRY_PROJECT ?? "quill",
@@ -23,6 +23,7 @@ const sentryUpload =
         },
       })
     : null;
+}
 
 // Dev-only CSP relaxation. The production index.html ships a strict Tauri CSP
 // (script-src 'self'; connect-src limited to IPC and Sentry). It blocks Vite HMR,
@@ -51,21 +52,32 @@ function liveDevCsp(): Plugin {
   };
 }
 
-export default defineConfig({
-  plugins: [react(), liveDevCsp(), ...(sentryUpload ? [sentryUpload] : [])],
-  clearScreen: false,
-  server: {
-    host: "0.0.0.0",
-    allowedHosts: true,
-    port: 8181,
-    strictPort: true,
-    watch: {
-      ignored: ["**/src-tauri/**", "**/.worktrees/**"],
+export default defineConfig(({ mode }) => {
+  const webBuild = mode === "web";
+  const upload = sentryUpload(!webBuild);
+
+  return {
+    plugins: [react(), liveDevCsp(), ...(upload ? [upload] : [])],
+    clearScreen: false,
+    server: {
+      host: "0.0.0.0",
+      allowedHosts: true,
+      port: 8181,
+      strictPort: true,
+      watch: {
+        ignored: ["**/src-tauri/**", "**/.worktrees/**"],
+      },
     },
-  },
-  build: {
-    target: "esnext",
-    sourcemap: Boolean(sentryUpload),
-    chunkSizeWarningLimit: 550,
-  },
+    build: {
+      target: "esnext",
+      sourcemap: Boolean(upload),
+      chunkSizeWarningLimit: 550,
+      ...(webBuild
+        ? {
+            outDir: "dist-web",
+            rollupOptions: { input: "web.html" },
+          }
+        : {}),
+    },
+  };
 });

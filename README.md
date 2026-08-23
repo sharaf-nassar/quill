@@ -289,6 +289,18 @@ npm install
 npm run tauri -- dev
 ```
 
+### Web UI bundle
+
+The browser-only monitor bundle builds from `web.html` into the ignored
+`dist-web/` directory:
+
+```bash
+npm run build:web
+```
+
+`npm run tauri -- dev` and `npm run tauri -- build` run this first, so no
+manual asset build is needed before development or packaging.
+
 This loads `src-tauri/tauri.dev.conf.json`, so a dev run identifies as
 `com.quilltoolkit.app.dev` and keeps its database, auth secret, session index,
 and single-instance lock separate from an installed Quill. Invoking the Tauri

@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build && npm run verify:sentry-output",
+    "build:web": "vite build --mode web",
     "test": "node --test --test-concurrency=1 \"scripts/*.test.mjs\"",
     "test:dev-isolation": "node scripts/dev-runtime-isolation.mjs",
     "baseline:pi-tracking": "node scripts/pi-agent-tracking-baseline.mjs",

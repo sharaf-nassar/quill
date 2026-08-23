@@ -10,12 +10,17 @@ The frontend uses Vite with the React plugin; the backend uses Cargo with Tauri.
 
 Vite serves on port 8181 in dev mode, binds `0.0.0.0`, and sets `allowedHosts: true` so a local `npx tauri dev` accepts network interfaces and arbitrary host headers. It ignores `src-tauri/**` to avoid extra frontend reloads during Rust rebuilds.
 
-Production builds use esbuild minification and generate sourcemaps only when an
-authenticated Sentry upload is configured. Other builds omit maps so native
-packages cannot expose them. The build then rejects any remaining map before
-Tauri can package it. The uncompressed chunk warning limit is 550 kB.
+Desktop production builds use esbuild minification and generate sourcemaps only
+when an authenticated Sentry upload is configured. Other builds omit maps so
+native packages cannot expose them. The build then rejects any remaining map
+before Tauri can package it. The uncompressed chunk warning limit is 550 kB.
 TypeScript uses strict mode, ESNext modules, and bundler resolution. See
 `vite.config.ts` and `tsconfig.json`.
+
+`npm run build:web` invokes Vite's `web` mode, emitting an isolated `dist-web/`
+from `web.html` only. That mode keeps the browser bundle out of desktop Sentry
+upload and sourcemap handling. Tauri runs it before its dev server and desktop
+bundle builds; `dist-web/` remains generated and ignored.
 
 #### Crash Transport CSP
 
@@ -58,7 +63,7 @@ Manual dispatch must select an existing `v*` tag. The `create-release` job rejec
 
 `.github/workflows/ci.yml` is the cross-platform Rust backend gate that also blocks release on failure.
 
-It triggers on `pull_request`, `push` to `main`, and `workflow_call`, runs in `src-tauri` with `permissions: contents: read`, and pins Rust 1.95.0 plus the Cargo cache. The Linux job installs Tauri development packages, provisions uv, and runs `cargo test` through the locked MCP Python project so Rust/Python parity tests receive the packaged dependencies; it also enforces `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`. The `macos-latest` job keeps `cargo check --all-targets` for AppKit-only code and runs the focused `runtime_backfill_` tests against bundled SQLite in the macOS filesystem/runtime environment before merge.
+It triggers on `pull_request`, `push` to `main`, and `workflow_call`, runs in `src-tauri` with `permissions: contents: read`, and pins Rust 1.95.0 plus the Cargo cache. Both Rust jobs install Node 24, run `npm ci`, and build `dist-web/` before their Rust commands, so embedded web assets are present. The Linux job installs Tauri development packages, provisions uv, and runs `cargo test` through the locked MCP Python project so Rust/Python parity tests receive the packaged dependencies; it also enforces `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`. The `macos-latest` job keeps `cargo check --all-targets` for AppKit-only code and runs the focused `runtime_backfill_` tests against bundled SQLite in the macOS filesystem/runtime environment before merge.
 
 Because the base Tauri config enables `app.macOSPrivateApi`, the `tauri` dependency must keep the matching `macos-private-api` Cargo feature on every target; Tauri rejects config/feature drift before release.
 

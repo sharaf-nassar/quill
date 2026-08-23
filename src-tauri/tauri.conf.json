@@ -2,8 +2,8 @@
   "productName": "Quill",
   "identifier": "com.quilltoolkit.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run build:web && npm run dev",
+    "beforeBuildCommand": "npm run build:web && npm run build",
     "devUrl": "http://localhost:8181",
     "frontendDist": "../dist"
   },
