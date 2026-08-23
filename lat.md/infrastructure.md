@@ -26,9 +26,9 @@ bundle builds; `dist-web/` remains generated and ignored.
 
 Production permits outbound frontend connections only to Tauri IPC and the exact HTTPS origin derived from the crash reporter DSN.
 
-`index.html` names `https://o1373069.ingest.us.sentry.io` in `connect-src` so the browser SDK can post envelopes without widening the policy to every Sentry tenant. The dev-only policy in `vite.config.ts` keeps the same origin alongside its localhost tooling exceptions. `scripts/csp.test.mjs` pins the production allowlist to both IPC endpoints and the DSN origin.
+`index.html` names `https://o1373069.ingest.us.sentry.io` in `connect-src` so the browser SDK can post envelopes without widening the policy to every Sentry tenant. The dev-only policy in `vite.config.ts` keeps the same origin alongside its localhost tooling exceptions. `scripts/csp.test.mjs` pins the desktop policy byte-for-byte and keeps its Vite build on the default `index.html` entry.
 
-`web.html` has its own HTTP CSP: `connect-src 'self'` reaches the same-origin invoke bridge and no Sentry origin appears. The web build imports neither the crash reporter nor updater, so the browser client creates no extra outbound telemetry transport.
+`web.html` has its own HTTP CSP: `connect-src 'self'` reaches the same-origin invoke bridge and no Sentry origin appears. `scripts/csp.test.mjs` pins that policy separately and verifies Vite's web mode emits `dist-web/` from `web.html`. The web build imports neither the crash reporter nor updater, so the browser client creates no extra outbound telemetry transport.
 
 ### Backend Build
 
