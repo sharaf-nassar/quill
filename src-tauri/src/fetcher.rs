@@ -1,6 +1,7 @@
 use crate::config::{claude_user_agent, http_client, read_access_token};
 use crate::integrations::IntegrationProvider;
 use crate::models::{ProviderCredits, UsageBucket};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
@@ -234,6 +235,8 @@ mod context_fetch_tests {
 const CODEX_USAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_USER_AGENT: &str = "codex_cli_rs/0.76.0";
 const MINIMAX_USAGE_URL: &str = "https://api.minimax.io/v1/api/openplatform/coding_plan/remains";
 
 // Flat top-level usage keys. `five_hour`, `seven_day`, and `extra_usage` are
@@ -783,24 +786,13 @@ fn fetch_codex_usage_from_sessions() -> Result<Vec<UsageBucket>, String> {
         })
 }
 
-pub async fn fetch_claude_usage() -> Result<Vec<UsageBucket>, ClaudeUsageError> {
-    let token = match read_access_token() {
-        Ok(t) => t,
-        Err(e) => {
-            return Err(ClaudeUsageError {
-                kind: ClaudeUsageErrorKind::Credentials,
-                message: e,
-                retry_after_seconds: None,
-            });
-        }
-    };
-
-    let resp = match do_fetch(&token).await {
-        Ok(r) => r,
-        Err(e) => {
+async fn fetch_claude_usage_with_token(token: &str) -> Result<Vec<UsageBucket>, ClaudeUsageError> {
+    let resp = match do_fetch(token).await {
+        Ok(response) => response,
+        Err(error) => {
             return Err(ClaudeUsageError {
                 kind: ClaudeUsageErrorKind::Request,
-                message: format!("Request failed: {e}"),
+                message: format!("Request failed: {error}"),
                 retry_after_seconds: None,
             });
         }
@@ -830,29 +822,203 @@ pub async fn fetch_claude_usage() -> Result<Vec<UsageBucket>, ClaudeUsageError> 
     } else {
         match resp.json::<serde_json::Value>().await {
             Ok(data) => Ok(parse_buckets(&data)),
-            Err(e) => Err(ClaudeUsageError {
+            Err(error) => Err(ClaudeUsageError {
                 kind: ClaudeUsageErrorKind::Parse,
-                message: format!("Parse error: {e}"),
+                message: format!("Parse error: {error}"),
                 retry_after_seconds: None,
             }),
         }
     }
 }
 
-pub fn fetch_codex_usage() -> Result<(Vec<UsageBucket>, Option<ProviderCredits>), String> {
-    match fetch_codex_usage_direct() {
-        Ok(result) => Ok(result),
-        Err(direct_error) => {
-            log::warn!("Codex app-server usage fetch failed: {direct_error}");
-            fetch_codex_usage_from_sessions()
-                .map(|buckets| (buckets, None))
-                .map_err(|fallback_error| {
-                    format!(
-                        "Codex usage fetch failed via app-server ({direct_error}) and transcript fallback ({fallback_error})."
-                    )
-                })
+pub async fn fetch_claude_usage(
+    pi_oauth_fallback: bool,
+) -> Result<Vec<UsageBucket>, ClaudeUsageError> {
+    let direct_result = match read_access_token() {
+        Ok(token) => fetch_claude_usage_with_token(&token).await,
+        Err(message) => Err(ClaudeUsageError {
+            kind: ClaudeUsageErrorKind::Credentials,
+            message,
+            retry_after_seconds: None,
+        }),
+    };
+
+    match direct_result {
+        Ok(buckets) => Ok(buckets),
+        Err(direct_error) if pi_oauth_fallback => {
+            let token = match crate::integrations::pi::oauth_bearer_token("anthropic").await {
+                Ok(token) => token,
+                Err(error) => {
+                    log::debug!("Claude Pi OAuth fallback unavailable: {error}");
+                    return Err(direct_error);
+                }
+            };
+            match fetch_claude_usage_with_token(&token).await {
+                Ok(buckets) => {
+                    log::info!("Claude usage served by Pi OAuth fallback");
+                    Ok(buckets)
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Claude Pi OAuth fallback failed after native source error: {:?}",
+                        error.kind
+                    );
+                    Err(error)
+                }
+            }
         }
+        Err(error) => Err(error),
     }
+}
+
+fn codex_account_id_from_token(token: &str) -> Result<String, String> {
+    let Some((header, rest)) = token.split_once('.') else {
+        return Err("Pi Codex OAuth token is not a JWT".to_string());
+    };
+    let Some((payload, signature)) = rest.rsplit_once('.') else {
+        return Err("Pi Codex OAuth token is not a JWT".to_string());
+    };
+    if header.is_empty() || payload.is_empty() || signature.is_empty() || payload.contains('.') {
+        return Err("Pi Codex OAuth token is not a JWT".to_string());
+    }
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| "Pi Codex OAuth token has an invalid JWT payload".to_string())?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|_| "Pi Codex OAuth token has an invalid JWT payload".to_string())?;
+    payload
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Pi Codex OAuth token has no ChatGPT account id".to_string())
+}
+
+fn parse_codex_wham_usage(payload: &serde_json::Value) -> Vec<UsageBucket> {
+    let Some(rate_limit) = payload.get("rate_limit") else {
+        return Vec::new();
+    };
+    let mut buckets = Vec::new();
+
+    for (scope, window_key, default_window_minutes) in [
+        ("primary", "primary_window", 300_i64),
+        ("secondary", "secondary_window", 10080_i64),
+    ] {
+        let Some(window) = rate_limit.get(window_key) else {
+            continue;
+        };
+        let Some(utilization) = window
+            .get("used_percent")
+            .and_then(serde_json::Value::as_f64)
+            .and_then(validate_utilization)
+        else {
+            continue;
+        };
+        let window_minutes = window
+            .get("limit_window_seconds")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| seconds / 60)
+            .unwrap_or(default_window_minutes);
+        let resets_at = window
+            .get("reset_at")
+            .and_then(parse_resets_at)
+            .or_else(|| {
+                window
+                    .get("reset_after_seconds")
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|seconds| *seconds >= 0)
+                    .map(|seconds| (Utc::now() + chrono::TimeDelta::seconds(seconds)).to_rfc3339())
+            });
+
+        buckets.push(UsageBucket {
+            provider: IntegrationProvider::Codex,
+            key: format!("{scope}_{window_minutes}m"),
+            label: codex_window_label(window_minutes),
+            utilization,
+            resets_at,
+            sort_order: 0,
+            source: Default::default(),
+            account_id: None,
+            account_label: None,
+        });
+    }
+
+    buckets
+}
+
+async fn fetch_codex_usage_from_pi_oauth()
+-> Result<(Vec<UsageBucket>, Option<ProviderCredits>), String> {
+    let token = crate::integrations::pi::oauth_bearer_token("openai-codex").await?;
+    let account_id = codex_account_id_from_token(&token)?;
+    let response = http_client()
+        .get(CODEX_USAGE_URL)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", CODEX_USER_AGENT)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Chatgpt-Account-Id", account_id)
+        .send()
+        .await
+        .map_err(|error| format!("Pi Codex OAuth request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Pi Codex OAuth usage API returned {}",
+            response.status()
+        ));
+    }
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("Pi Codex OAuth response parse failed: {error}"))?;
+    let buckets = parse_codex_wham_usage(&payload);
+    if buckets.is_empty() {
+        Err("Pi Codex OAuth usage API returned no buckets".to_string())
+    } else {
+        Ok((buckets, None))
+    }
+}
+
+pub async fn fetch_codex_usage(
+    pi_oauth_fallback: bool,
+) -> Result<(Vec<UsageBucket>, Option<ProviderCredits>), String> {
+    let direct_error = match tokio::task::spawn_blocking(fetch_codex_usage_direct).await {
+        Ok(Ok(result)) => return Ok(result),
+        Ok(Err(error)) => error,
+        Err(error) => format!("Codex app-server task failed: {error}"),
+    };
+    log::warn!("Codex app-server usage fetch failed: {direct_error}");
+
+    let pi_error = if pi_oauth_fallback {
+        match fetch_codex_usage_from_pi_oauth().await {
+            Ok(result) => {
+                log::info!("Codex usage served by Pi OAuth fallback");
+                return Ok(result);
+            }
+            Err(error) => {
+                log::debug!("Codex Pi OAuth fallback unavailable: {error}");
+                Some(error)
+            }
+        }
+    } else {
+        None
+    };
+
+    let transcript_result = tokio::task::spawn_blocking(fetch_codex_usage_from_sessions)
+        .await
+        .map_err(|error| format!("Codex transcript fallback task failed: {error}"))?;
+    transcript_result
+        .map(|buckets| (buckets, None))
+        .map_err(|fallback_error| match pi_error {
+            Some(pi_error) => format!(
+                "Codex usage fetch failed via app-server ({direct_error}), Pi OAuth ({pi_error}), and transcript fallback ({fallback_error})."
+            ),
+            None => format!(
+                "Codex usage fetch failed via app-server ({direct_error}) and transcript fallback ({fallback_error})."
+            ),
+        })
 }
 
 // --- MiniMax usage ---

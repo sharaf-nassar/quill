@@ -55,6 +55,8 @@ export default defineConfig({
   plugins: [react(), liveDevCsp(), ...(sentryUpload ? [sentryUpload] : [])],
   clearScreen: false,
   server: {
+    host: "0.0.0.0",
+    allowedHosts: true,
     port: 8181,
     strictPort: true,
     watch: {

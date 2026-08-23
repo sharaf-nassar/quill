@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 use tauri::Manager;
 
 pub(crate) const INTEGRATION_STATE_VERSION: u8 = 2;
@@ -142,6 +143,52 @@ fn read_pi_version(cli_path: &Path) -> Result<String, String> {
     String::from_utf8(output.stdout)
         .map(|output| output.trim().to_string())
         .map_err(|_| "pi --version returned non-UTF-8 output".to_string())
+}
+
+/// Export a refreshed subscription token through Pi's credential boundary.
+/// The minimum supported Pi version includes this command, so Quill never
+/// reads or writes Pi's refresh token directly.
+pub(crate) async fn oauth_bearer_token(provider: &'static str) -> Result<String, String> {
+    let cli_path = crate::config::resolve_command_path("pi")
+        .ok_or_else(|| "Pi CLI was not found in PATH".to_string())?;
+    let mut command = tokio::process::Command::new(&cli_path);
+    command
+        .args([
+            "auth",
+            "print-bearer-token",
+            "--provider",
+            provider,
+            "--min-expiry",
+            "5m",
+        ])
+        .env("PATH", crate::config::path_for_resolved_command(&cli_path))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Failed to run Pi OAuth export: {error}"))?;
+    let output = match tokio::time::timeout(Duration::from_secs(15), child.wait_with_output()).await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => return Err(format!("Pi OAuth export failed: {error}")),
+        Err(_) => return Err("Pi OAuth export timed out".to_string()),
+    };
+    if !output.status.success() {
+        return Err(format!(
+            "Pi has no usable OAuth bearer token for {provider}"
+        ));
+    }
+
+    let token = String::from_utf8(output.stdout)
+        .map_err(|_| "Pi OAuth export returned non-UTF-8 output".to_string())?;
+    let token = token.trim();
+    if token.is_empty() || token.chars().any(char::is_whitespace) {
+        return Err("Pi OAuth export returned an invalid bearer token".to_string());
+    }
+    Ok(token.to_string())
 }
 
 fn validate_pi_version(output: &str) -> Result<String, String> {

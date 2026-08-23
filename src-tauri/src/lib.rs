@@ -2706,6 +2706,7 @@ async fn refresh_usage_cache(
 
         let refresh_epoch = USAGE_CACHE_EPOCH.load(AtomicOrdering::SeqCst);
         let enabled_providers = native_usage_providers(&statuses, cpa_connection.is_some());
+        let pi_oauth_fallback = enabled_providers.contains(&integrations::IntegrationProvider::Pi);
 
         if enabled_providers.is_empty() && cpa_connection.is_none() {
             let usage = UsageData {
@@ -2768,7 +2769,7 @@ async fn refresh_usage_cache(
 
                     write_usage_setting_timestamp(CLAUDE_USAGE_LAST_ATTEMPT_KEY, now);
 
-                    match fetcher::fetch_claude_usage().await {
+                    match fetcher::fetch_claude_usage(pi_oauth_fallback).await {
                         Ok(mut buckets) => {
                             clear_provider_cooldowns(CLAUDE_COOLDOWN_KEYS);
                             // A successful fetch proves the user is logged in;
@@ -2841,7 +2842,7 @@ async fn refresh_usage_cache(
                     }
                 }
                 integrations::IntegrationProvider::Codex => {
-                    match run_blocking(fetcher::fetch_codex_usage) {
+                    match fetcher::fetch_codex_usage(pi_oauth_fallback).await {
                         Ok((mut buckets, credits)) => {
                             display_buckets.extend(buckets.clone());
                             live_buckets.append(&mut buckets);

@@ -3815,6 +3815,7 @@ name = "quill"
 version = "0.0.0-injected-by-ci"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "block2",
  "chrono",
  "dirs",

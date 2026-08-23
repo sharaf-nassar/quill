@@ -8,7 +8,7 @@ The frontend uses Vite with the React plugin; the backend uses Cargo with Tauri.
 
 ### Frontend Build
 
-Vite serves on port 8181 in dev mode and ignores `src-tauri/**` to avoid extra frontend reloads during Rust rebuilds.
+Vite serves on port 8181 in dev mode, binds `0.0.0.0`, and sets `allowedHosts: true` so a local `npx tauri dev` accepts network interfaces and arbitrary host headers. It ignores `src-tauri/**` to avoid extra frontend reloads during Rust rebuilds.
 
 Production builds use esbuild minification and generate sourcemaps only when an
 authenticated Sentry upload is configured. Other builds omit maps so native
@@ -407,7 +407,7 @@ Claude and Codex detection share [[src-tauri/src/config.rs#detect_provider_cli]]
 
 ## Shared Outbound HTTP Client
 
-[[src-tauri/src/config.rs#http_client]] is the single `reqwest::Client` instance shared by every outbound HTTP call the app makes: live usage polling against the Anthropic OAuth API and the MiniMax coding-plan API in [[src-tauri/src/fetcher.rs]], and GitHub release lookups in [[src-tauri/src/releases.rs]].
+[[src-tauri/src/config.rs#http_client]] is the single `reqwest::Client` instance shared by every outbound HTTP call the app makes: live usage polling against the Anthropic OAuth, ChatGPT WHAM, and MiniMax coding-plan APIs in [[src-tauri/src/fetcher.rs]], and GitHub release lookups in [[src-tauri/src/releases.rs]].
 
 The client is built with `connect_timeout(5s)` and `timeout(15s)`. Without these explicit timeouts `reqwest::Client::new()` has no upper bound on connect time and can block the `tokio` runtime indefinitely on a dead network or captive portal (see seanmonstar/reqwest#1256). The 5-second connect timeout is also the signal the poller uses to enter offline cooldown — see [[features#Features#Live Usage View]] and [[src-tauri/src/lib.rs#compute_network_backoff]].
 
@@ -435,7 +435,7 @@ Rust crate dependencies grouped by role. Full list in `src-tauri/Cargo.toml`.
 
 **Tauri plugins**: tauri-plugin-dialog 2, tauri-plugin-single-instance 2, tauri-plugin-window-state 2, tauri-plugin-updater 2, tauri-plugin-log 2.
 
-**Utilities**: serde/serde_json, chrono, sha2, similar 2, regex, walkdir, dirs, nix (unix only), sentry 0.34 (default-features off, with `backtrace`/`contexts`/`panic`/`reqwest`/`rustls`) for the [[features#Crash Reporting]] backend half.
+**Utilities**: serde/serde_json, chrono, base64, sha2, similar 2, regex, walkdir, dirs, nix (unix only), sentry 0.34 (default-features off, with `backtrace`/`contexts`/`panic`/`reqwest`/`rustls`) for the [[features#Crash Reporting]] backend half.
 
 **Dev-only**: serial_test 3 — used by [[src-tauri/src/data_paths.rs]] tests to serialize global env-var mutation across the three behavioral cases for each resolver (data dir, rules dir, Claude projects dir, Codex sessions dir) so concurrent test threads don't race.
 
