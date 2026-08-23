@@ -1,6 +1,6 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
-  "entry": ["src/web/httpTransport.ts"],
+  "entry": ["src/web-main.tsx", "src/web/httpTransport.ts"],
   "project": ["src/**/*.{ts,tsx}"],
   "ignoreExportsUsedInFile": true,
   "include": ["files", "dependencies", "exports", "types"],

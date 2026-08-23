@@ -178,11 +178,21 @@ function hasOwn(value: object, key: PropertyKey): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).length === keys.length && keys.every((key) => hasOwn(value, key));
+}
+
 function isInvokeResponse(value: unknown): value is InvokeResponse<unknown> {
   if (!isRecord(value) || typeof value.ok !== "boolean") return false;
-  if (value.ok) return hasOwn(value, "value");
-  if (value.code === "command_denied") return !hasOwn(value, "message");
-  return value.code === "command_error" && typeof value.message === "string";
+  if (value.ok) return hasExactKeys(value, ["ok", "value"]);
+  if (value.code === "command_denied") {
+    return hasExactKeys(value, ["ok", "code"]);
+  }
+  return (
+    value.code === "command_error" &&
+    typeof value.message === "string" &&
+    hasExactKeys(value, ["ok", "code", "message"])
+  );
 }
 
 export async function decodeInvokeResponse<T>(response: Response): Promise<T> {

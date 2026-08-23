@@ -8,6 +8,8 @@ The React 19 frontend is a multi-window Tauri application with custom hooks for 
 
 Each window gets its own Suspense boundary with a fallback. Per-window zoom persistence is stored in localStorage (`quill-zoom-{view}`) and supports Ctrl+/-, Ctrl+0 with a 0.5-2.0x range via Tauri's native webview zoom API, falling back to CSS `zoom` only outside Tauri. Ctrl+F is blocked to prevent the webview's native find-in-page (no search UI exists). A `ToastProvider` context wraps all views for notifications, [[src/hooks/useIntegrations.ts]] gates provider-dependent secondary windows when no provider is enabled, and [[src/windows/SessionsWindowView.tsx]] refreshes the session index on demand before loading search facets.
 
+`web.html` loads the separate browser entry, [[src/web-main.tsx]]. It installs the HTTP Tauri shim before mounting its browser root, imports neither the desktop main entry nor its mock fixture path, and does not register the desktop find, zoom, or Manage accelerators. Crash reporting and the updater are absent, leaving browser-native Ctrl+F and Ctrl+plus/minus/zero behavior intact. The entry is brand-only until the separate web shell supplies monitor bands.
+
 ### Window Routes
 
 Three Tauri windows are routed by the `?view=` URL parameter, each with its own Suspense boundary: the main widget, the consolidated Manage workspace, and the release-notes viewer.

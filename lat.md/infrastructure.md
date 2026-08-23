@@ -28,6 +28,8 @@ Production permits outbound frontend connections only to Tauri IPC and the exact
 
 `index.html` names `https://o1373069.ingest.us.sentry.io` in `connect-src` so the browser SDK can post envelopes without widening the policy to every Sentry tenant. The dev-only policy in `vite.config.ts` keeps the same origin alongside its localhost tooling exceptions. `scripts/csp.test.mjs` pins the production allowlist to both IPC endpoints and the DSN origin.
 
+`web.html` has its own HTTP CSP: `connect-src 'self'` reaches the same-origin invoke bridge and no Sentry origin appears. The web build imports neither the crash reporter nor updater, so the browser client creates no extra outbound telemetry transport.
+
 ### Backend Build
 
 Rust edition 2024 uses the pinned `rust-toolchain.toml` compiler version. The library uses Cargo's default Rust library output for the desktop binary. `build.rs` calls `tauri_build::build()`.
