@@ -26,7 +26,7 @@ A one-line tour. Each item links to its full description in [Features in depth](
 - **[Working context preservation](#working-context-preservation)** — routes large transient output into a local searchable store instead of the LLM transcript
 - **[MCP server](#mcp-server)** — hands Claude Code and Codex `search_history`, plus the context tools when preservation is on
 - **[Desktop integration](#desktop-integration)** — tray menu, in-app updater, always-on-top, a frameless resizable window, and per-window zoom
-- **[Crash reporting](#crash-reporting)** — default-on and opt-out, sending stack frames with every dynamic field stripped locally first
+- **[Crash reporting](#crash-reporting)** — off until you opt in, then sends stack frames with every dynamic field stripped locally first
 
 ## Screenshots
 
@@ -101,7 +101,7 @@ graph TB
 
     CLI[Local Claude CLI inference]
     GH[GitHub releases]
-    SENTRY[Opt-out scrubbed crash reports]
+    SENTRY[Opt-in scrubbed crash reports]
 
     CC <--> HM
     CX <--> HM
@@ -490,12 +490,13 @@ from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
 
 ### Crash reporting
 
-Default-on and opt-out, toggled by the "Help improve Quill" row at the bottom of
-**Settings → General**. It reports crashes without reporting your work.
+Off by default and opt-in, toggled by the "Help improve Quill" row at the bottom
+of **Settings → General**. Nothing is transmitted until you turn it on; once on,
+it reports crashes without reporting your work.
 
 - Both the Rust and frontend surfaces run a deny-by-default scrubber before anything leaves the process: messages, exception values, breadcrumbs, request data, user context, extras, and absolute file paths are all stripped. Only stack-frame structure plus release, environment, and runtime tags survive
 - Session replay, browser tracing, session tracking, and HTTP context capture are disabled — the reporter is a crash handler, not analytics
-- Toggling applies immediately on both surfaces: opting out flushes pending events and closes the transport, opting back in re-initializes it
+- Toggling applies immediately on both surfaces: opting in initializes the reporter, opting back out flushes pending events and closes the transport
 
 ## License
 

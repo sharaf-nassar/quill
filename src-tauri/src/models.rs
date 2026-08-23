@@ -1056,7 +1056,9 @@ impl Default for IntegrationFeatures {
 }
 
 // Runtime feature toggles for currently always-on background tasks.
-// Defaults preserve pre-Settings-window behavior (everything on).
+// Defaults preserve pre-Settings-window behavior (everything on), except
+// crash reporting: it leaves the device, so it stays off until the user
+// turns it on (constitution P11).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettings {
@@ -1074,7 +1076,7 @@ impl Default for RuntimeSettings {
             live_usage_interval_seconds: 180,
             rule_watcher_enabled: true,
             always_on_top: false,
-            crash_reporting_enabled: true,
+            crash_reporting_enabled: false,
         }
     }
 }

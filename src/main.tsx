@@ -20,12 +20,12 @@ if (import.meta.env.DEV && !("__TAURI_INTERNALS__" in window)) {
   installBrowserMock();
 }
 
-// SDK stays uninitialized until we confirm the user has not opted out — short
+// SDK stays uninitialized until the stored opt-in says otherwise — short
 // window at boot where errors aren't captured is the price of strict privacy.
 void invoke<RuntimeSettings>("get_runtime_settings")
   .then((s) => setCrashReportingEnabled(s.crashReportingEnabled))
   .catch(() => {
-    /* default to off when settings can't be read */
+    /* stay off when settings can't be read */
   });
 
 const App = React.lazy(() => import("./App"));

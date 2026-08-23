@@ -262,7 +262,11 @@ const LIVE_USAGE_ENABLED_KEY: &str = "live_usage.enabled";
 const LIVE_USAGE_INTERVAL_KEY: &str = "live_usage.interval_seconds";
 const RULE_WATCHER_ENABLED_KEY: &str = "rule_watcher.enabled";
 const ALWAYS_ON_TOP_KEY: &str = "always_on_top";
-const CRASH_REPORTING_ENABLED_KEY: &str = "crash_reporting.enabled";
+// Crash reporting is opt-in, so its key changed with the default. The
+// abandoned `crash_reporting.enabled` row is never read again: saving any
+// runtime setting persisted every field, so a `true` there records the old
+// default rather than a user's decision to transmit.
+const CRASH_REPORTING_OPT_IN_KEY: &str = "crash_reporting.opt_in";
 
 // One-time marker for the widget main window (feature 018). Its only job is to
 // seed the new always-on-top default exactly once: a widget that hides behind
@@ -3997,7 +4001,7 @@ fn load_runtime_settings(storage: &Storage) -> RuntimeSettings {
         always_on_top: read_bool_setting(storage, ALWAYS_ON_TOP_KEY, defaults.always_on_top),
         crash_reporting_enabled: read_bool_setting(
             storage,
-            CRASH_REPORTING_ENABLED_KEY,
+            CRASH_REPORTING_OPT_IN_KEY,
             defaults.crash_reporting_enabled,
         ),
     }
@@ -4024,7 +4028,7 @@ fn persist_runtime_settings(storage: &Storage, settings: &RuntimeSettings) -> Re
             bool_setting_value(settings.always_on_top),
         ),
         (
-            CRASH_REPORTING_ENABLED_KEY,
+            CRASH_REPORTING_OPT_IN_KEY,
             bool_setting_value(settings.crash_reporting_enabled),
         ),
     ])
@@ -5772,11 +5776,12 @@ pub fn run() {
             let Some(storage) = initialize_storage_or_report_fatal(app.handle()) else {
                 return Ok(());
             };
-            // Honor the crash-reporting opt-out before any other startup work
-            // so a panic during initialization respects the user's preference.
+            // Read the crash-reporting opt-in before any other startup work so
+            // a panic during initialization can only report once the user has
+            // turned reporting on.
             crash_reporting::set_enabled(read_bool_setting(
                 storage,
-                CRASH_REPORTING_ENABLED_KEY,
+                CRASH_REPORTING_OPT_IN_KEY,
                 RuntimeSettings::default().crash_reporting_enabled,
             ));
             // Clean up any runs left in "running" state from a previous crash.
@@ -7112,6 +7117,43 @@ mod tests {
 
         drop(storage);
         drop(fixture);
+    }
+
+    // @lat: [[crash-reporting-tests#Crash Reporting Test Specs#Reporting stays off until the user opts in]]
+    #[test]
+    #[serial_test::serial]
+    fn crash_reporting_requires_an_affirmative_opt_in() {
+        let data_dir = tempfile::TempDir::new().expect("create temp data dir");
+        let canonical = std::fs::canonicalize(data_dir.path()).expect("canonicalize temp dir");
+        // SAFETY: the override is process-global; `#[serial]` holds the lock.
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_DATA_DIR", &canonical);
+        }
+        let storage = Storage::init().expect("open storage on an empty data dir");
+
+        assert!(
+            !load_runtime_settings(&storage).crash_reporting_enabled,
+            "a fresh install must not transmit"
+        );
+
+        // Every pre-opt-in settings save wrote this row, so it records the old
+        // default rather than consent and must stay abandoned.
+        storage
+            .set_setting("crash_reporting.enabled", "true")
+            .expect("plant the legacy key");
+        assert!(
+            !load_runtime_settings(&storage).crash_reporting_enabled,
+            "an upgraded install must not transmit on the legacy key"
+        );
+
+        storage
+            .set_setting(CRASH_REPORTING_OPT_IN_KEY, "true")
+            .expect("record the opt-in");
+        assert!(load_runtime_settings(&storage).crash_reporting_enabled);
+
+        drop(storage);
+        drop(data_dir);
     }
 
     // @lat: [[backend#Backend#Tauri IPC Commands#Retention preview command#Retention Preview Command Test Specs#Fresh Install Previews Nothing]]

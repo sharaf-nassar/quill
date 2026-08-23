@@ -4,9 +4,9 @@
 // transcripts can all show up in panic messages or exception values. The
 // scrubber below strips dynamic content from every outgoing event and keeps
 // only the skeletal stack frame structure (function/module/line). The toggle
-// in Settings → General is the user-facing opt-out; when disabled, the
-// `ClientInitGuard` is dropped which flushes pending events and closes the
-// transport.
+// in Settings → General is the user-facing opt-in and starts off; while it is
+// off no `ClientInitGuard` exists, and turning it back off drops the guard,
+// which flushes pending events and closes the transport.
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};

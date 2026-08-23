@@ -8,7 +8,7 @@ export const RUNTIME_SETTINGS_DEFAULTS: RuntimeSettings = {
   liveUsageIntervalSeconds: 180,
   ruleWatcherEnabled: true,
   alwaysOnTop: false,
-  crashReportingEnabled: true,
+  crashReportingEnabled: false,
 };
 
 export interface UseRuntimeSettingsResult {

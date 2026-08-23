@@ -149,7 +149,7 @@ function GeneralTab({ runtime, learning }: GeneralTabProps) {
       <div className="settings-section-header">Help improve Quill</div>
       <SettingRow
         label="Help improve Quill"
-        description="Send anonymized crash reports. All session data, file paths, and prompt text are removed locally before transmission. Disable to send nothing."
+        description="Off until you turn it on: nothing leaves this device while it is off. Enabled, Quill sends anonymized crash reports — all session data, file paths, and prompt text are removed locally before transmission."
         control={
           <Toggle
             tone={runtime.settings.crashReportingEnabled ? "on" : "off"}

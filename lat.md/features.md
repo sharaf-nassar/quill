@@ -438,7 +438,7 @@ The former [[frontend#Frontend#Custom Hooks#Settings Hooks|useUiPrefs]] hook wro
 
 Always-on background tasks expose enable/interval toggles through a single `RuntimeSettings` IPC pair.
 
-[[src-tauri/src/lib.rs#get_runtime_settings]] reads `live_usage.enabled`, `live_usage.interval_seconds`, `rule_watcher.enabled`, `always_on_top`, and `crash_reporting.enabled` from SQLite. [[src-tauri/src/lib.rs#set_runtime_settings]] and the tray's Always-on-Top item both enter [[src-tauri/src/lib.rs#apply_runtime_settings]], whose nonblocking gate admits one writer, requires a live main window for a changed topmost value, applies that native request first, saves every runtime field atomically, synchronizes the tray checkmark, and emits `runtime-settings-updated` so [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]] mirrors the committed result. Concurrent IPC returns a busy error; a concurrent tray action restores its auto-toggled checkmark from committed settings without blocking the event-loop thread. The tray item's checked value is authoritative intent because it auto-toggles before its event; the backend does not invert a lagging native getter. A reported failure restores prior native, persisted, and checkitem state and emits no desired result. Tauri success does not prove compositor acknowledgement, so a platform window manager may still delay or ignore the request. Toggling `crash_reporting.enabled` calls [[src-tauri/src/crash_reporting.rs#set_enabled]] immediately; live-usage values are reread each loop, and the rule-watcher flag still takes effect at next launch because `notify` holds an OS handle.
+[[src-tauri/src/lib.rs#get_runtime_settings]] reads `live_usage.enabled`, `live_usage.interval_seconds`, `rule_watcher.enabled`, `always_on_top`, and `crash_reporting.opt_in` from SQLite. [[src-tauri/src/lib.rs#set_runtime_settings]] and the tray's Always-on-Top item both enter [[src-tauri/src/lib.rs#apply_runtime_settings]], whose nonblocking gate admits one writer, requires a live main window for a changed topmost value, applies that native request first, saves every runtime field atomically, synchronizes the tray checkmark, and emits `runtime-settings-updated` so [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]] mirrors the committed result. Concurrent IPC returns a busy error; a concurrent tray action restores its auto-toggled checkmark from committed settings without blocking the event-loop thread. The tray item's checked value is authoritative intent because it auto-toggles before its event; the backend does not invert a lagging native getter. A reported failure restores prior native, persisted, and checkitem state and emits no desired result. Tauri success does not prove compositor acknowledgement, so a platform window manager may still delay or ignore the request. Toggling `crash_reporting.opt_in` calls [[src-tauri/src/crash_reporting.rs#set_enabled]] immediately; live-usage values are reread each loop, and the rule-watcher flag still takes effect at next launch because `notify` holds an OS handle.
 
 ### MiniMax API Key Update
 
@@ -474,7 +474,7 @@ Invalid URL, unreachable, unauthorized, unsupported-version, and unexpected-resp
 
 ## Crash Reporting
 
-Default-on, user-opt-out crash reporter that ships scrubbed stack traces to Sentry without exposing any session content. Toggled via the "Help improve Quill" row at the bottom of the General settings tab.
+Opt-in crash reporter, off until the user turns it on, that ships scrubbed stack traces to Sentry without exposing any session content. Toggled via the "Help improve Quill" row at the bottom of the General settings tab.
 
 ### Production-Only Transport
 
@@ -492,13 +492,19 @@ The threat model assumes the entire payload domain is sensitive: panic messages 
 
 Frontend [[src/lib/crashReporting.ts]] and Rust [[src-tauri/src/crash_reporting.rs]] share the same DSN and scrubbing policy.
 
-Both are inert in development per [[features#Crash Reporting#Production-Only Transport]]. The Rust side stores its `ClientInitGuard` in a `OnceLock<Mutex<Option<ClientInitGuard>>>` so [[src-tauri/src/crash_reporting.rs#set_enabled]] can drop the guard on opt-out (which flushes pending events and closes the transport) and re-init on opt-in. The frontend calls `Sentry.close()` and `Sentry.init()` for the same effect; one-shot initialization is gated on the `crash_reporting.enabled` value returned by the very first `get_runtime_settings` IPC call from [[src/main.tsx]], so the SDK never sends data before the user's preference is read.
+Both are inert in development per [[features#Crash Reporting#Production-Only Transport]]. The Rust side stores its `ClientInitGuard` in a `OnceLock<Mutex<Option<ClientInitGuard>>>` so [[src-tauri/src/crash_reporting.rs#set_enabled]] can drop the guard on opt-out (which flushes pending events and closes the transport) and re-init on opt-in. The frontend calls `Sentry.close()` and `Sentry.init()` for the same effect; one-shot initialization is gated on the `crash_reporting.opt_in` value returned by the very first `get_runtime_settings` IPC call from [[src/main.tsx]], so the SDK never sends data before the user's stored opt-in is read, and a failed read leaves it off.
 
 ### Toggle Lifecycle
 
 Toggling the "Help improve Quill" row in [[src/components/settings/GeneralTab.tsx]] writes through the standard [[features#Settings Window#Runtime Settings IPC]] pipeline and applies immediately on both surfaces.
 
-[[src-tauri/src/lib.rs#set_runtime_settings]] detects a `crash_reporting_enabled` delta and calls [[src-tauri/src/crash_reporting.rs#set_enabled]] directly on the Rust side, then emits `runtime-settings-updated` carrying the resolved `RuntimeSettings`. The frontend `crashReporting` module listens for that event and calls [[src/lib/crashReporting.ts#setCrashReportingEnabled]] so the React-side SDK opens or closes its transport in lock-step. Default is on; the user-facing copy never mentions Sentry and instead emphasises that session data is removed locally before transmission.
+[[src-tauri/src/lib.rs#set_runtime_settings]] detects a `crash_reporting_enabled` delta and calls [[src-tauri/src/crash_reporting.rs#set_enabled]] directly on the Rust side, then emits `runtime-settings-updated` carrying the resolved `RuntimeSettings`. The frontend `crashReporting` module listens for that event and calls [[src/lib/crashReporting.ts#setCrashReportingEnabled]] so the React-side SDK opens or closes its transport in lock-step. The user-facing copy never mentions Sentry and instead states that nothing leaves the device while the row is off and that session data is removed locally before transmission when it is on.
+
+### Opt-in default
+
+Both the persisted default and the reset-to-defaults value are off, so no transport opens without an affirmative toggle (constitution P11).
+
+The preference moved from `crash_reporting.enabled` to `crash_reporting.opt_in`, and the abandoned key is never read again: [[src-tauri/src/lib.rs#persist_runtime_settings]] writes every runtime field on any save, so a `true` under the old key records the previous default-on behavior rather than a user's decision to transmit. An upgraded install therefore starts off and must opt in again. `RuntimeSettings::default()` ([[src-tauri/src/models.rs]]) and `RUNTIME_SETTINGS_DEFAULTS` ([[src/hooks/useRuntimeSettings.ts]]) both carry `false`, which also keeps the General tab's Reset control from re-enabling reporting.
 
 ## AppImage Desktop Integration
 

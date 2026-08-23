@@ -6,6 +6,10 @@ lat:
 
 These tests verify Rust crash events preserve privacy and use the same release identity as frontend events and uploaded artifacts.
 
+## Reporting stays off until the user opts in
+
+A fresh install and an install still carrying the abandoned `crash_reporting.enabled` row both resolve to reporting off; only a stored `crash_reporting.opt_in` turns it on.
+
 ## Shared tagged release identifier
 
 Rust prefixes the CI-injected Cargo package version with `v`, matching the GitHub tag used by the frontend SDK and source-map upload.

@@ -1,10 +1,10 @@
 // Deny-by-default crash reporter (frontend half).
 //
-// Mirrors src-tauri/src/crash_reporting.rs. The SDK is NOT initialized at
-// module load — the bootstrap in main.tsx waits for the user's preference
-// from get_runtime_settings before opting in. Toggling the setting at runtime
-// emits "runtime-settings-updated" which the listener below honors so the
-// transport closes immediately when the user opts out.
+// Mirrors src-tauri/src/crash_reporting.rs. Reporting is opt-in, and the SDK
+// is NOT initialized at module load — the bootstrap in main.tsx waits for the
+// user's stored opt-in from get_runtime_settings. Toggling the setting at
+// runtime emits "runtime-settings-updated" which the listener below honors so
+// the transport opens or closes immediately with the user's choice.
 
 import * as Sentry from "@sentry/react";
 import type { ErrorEvent, Breadcrumb } from "@sentry/react";
