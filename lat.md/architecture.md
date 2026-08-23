@@ -59,7 +59,7 @@ Neither Manage nor release-notes had any affordance at all before this, because 
 
 ## Module Map
 
-The Rust backend in [[src-tauri/src/lib.rs]] registers 89 Tauri commands and starts background tasks on launch.
+The Rust backend in [[src-tauri/src/lib.rs]] registers 92 Tauri commands and starts background tasks on launch. Four Web UI scaffold commands intentionally return a typed `not_implemented` error until their configuration, lifecycle, and pairing work lands.
 
 ### Backend Modules
 
@@ -69,6 +69,7 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 |--------|------|---------|
 | Entry point | [[src-tauri/src/lib.rs]] | IPC commands, tray, auto-updater, background tasks |
 | HTTP server | [[src-tauri/src/server.rs]] | Axum API on port 19876 for hook data ingestion |
+| Web UI server scaffold | [[src-tauri/src/web_server/mod.rs]] | Shared Axum router state and typed pre-implementation error; no listener or routes yet |
 | Storage | [[src-tauri/src/storage.rs]] | SQLite schema, migrations, queries, aggregation |
 | Sessions | [[src-tauri/src/sessions.rs]] | Tantivy full-text indexing of session transcripts |
 | Pi session format | [[src-tauri/src/pi_session.rs]] | Narrow v2/v3 message parsing and bounded header probes for search and temporary live fallback |

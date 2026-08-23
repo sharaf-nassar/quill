@@ -1519,6 +1519,15 @@ Key-value configuration and schema migration version tracking.
 
 The Tauri commands registered in [[src-tauri/src/lib.rs]] are grouped by feature.
 
+### Web UI Scaffold Commands (4)
+
+`get_web_ui_config`, `set_web_ui_config`, `get_web_ui_status`, and
+`regenerate_web_pairing_code` are registered desktop IPC commands that return a
+typed, display-safe `not_implemented` error during the scaffold.
+
+The error comes from [[src-tauri/src/web_server/mod.rs#WebUiError]]. No listener,
+settings mutation, status read, or pairing action exists yet.
+
 ### Usage and Token Commands (13)
 
 Live usage and token analytics commands back provider quota, history, breakdown, and context-savings views.

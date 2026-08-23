@@ -48,6 +48,7 @@ mod transcript_analytics;
 mod transcript_identity;
 mod transcript_watcher;
 mod tray_keepalive;
+pub mod web_server;
 mod window_chrome;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -5615,6 +5616,30 @@ async fn remove_custom_project(path: String) -> Result<(), String> {
     })
 }
 
+// Web UI configuration, lifecycle, and pairing are implemented by the
+// follow-on web-server work items. Register the command boundary now so the
+// desktop UI receives a typed, display-safe response rather than a missing
+// command error during the scaffold phase.
+#[tauri::command]
+async fn get_web_ui_config() -> Result<(), web_server::WebUiError> {
+    Err(web_server::WebUiError::not_implemented())
+}
+
+#[tauri::command]
+async fn set_web_ui_config() -> Result<(), web_server::WebUiError> {
+    Err(web_server::WebUiError::not_implemented())
+}
+
+#[tauri::command]
+async fn get_web_ui_status() -> Result<(), web_server::WebUiError> {
+    Err(web_server::WebUiError::not_implemented())
+}
+
+#[tauri::command]
+async fn regenerate_web_pairing_code() -> Result<(), web_server::WebUiError> {
+    Err(web_server::WebUiError::not_implemented())
+}
+
 #[tauri::command]
 async fn hide_window(window: tauri::WebviewWindow) {
     if let Ok(pos) = window.outer_position() {
@@ -6273,6 +6298,10 @@ pub fn run() {
             get_cpa_connection_status,
             get_runtime_settings,
             set_runtime_settings,
+            get_web_ui_config,
+            set_web_ui_config,
+            get_web_ui_status,
+            regenerate_web_pairing_code,
             compact_database,
             rebuild_model_rollup,
             // The retention commands register beside `compact_database`: one
