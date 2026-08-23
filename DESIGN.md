@@ -404,6 +404,14 @@ applies) pressed and disabled states. Focus is the global keyline:
 transparent at rest and reveal themselves on hover with the single `hover`
 fill — the plane stays quiet until you reach for it.
 
+**The Touch Target Rule.** On touch-capable web viewports, every operable
+control has a hit area of at least **44×44 CSS pixels**. Verify the rendered
+interactive rectangle, including any transparent expansion, meets both
+measurements. A compact visual control may keep its specified dimensions when a
+transparent wrapper or hit-area pseudo-element expands its tappable rectangle
+to that minimum; the expansion dispatches to the same control and does not
+overlap another control's hit area.
+
 ### Keys (icon controls)
 - **Shape:** 24×24 grid cell, 6px radius, transparent ground, `faint` glyph.
 - **States:** hover lifts the glyph to Text Hi over the `hover` fill; a
