@@ -119,7 +119,7 @@ An Axum server on port 19876 (configurable via `QUILL_PORT`) receives data from 
 
 The web-only monitor uses a same-origin invoke bridge with a default-deny read-command boundary.
 
-`POST /api/web/invoke` runs through [[src/web/httpTransport.ts]]. [[src-tauri/src/web_server/mod.rs]] owns the matching serde envelopes, exact command table, desktop config/status field names, pairing-cookie attributes, and canonical reachable-URL formatting. Success and command failures retain Tauri-style promise behavior; host/session refusals stay empty-body `403` responses before data access. The normative cross-language payloads and fixtures live in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
+`POST /api/web/invoke` runs through [[src/web/httpTransport.ts]]. [[src-tauri/src/web_server/mod.rs]] owns the matching serde envelopes, exact command table, desktop config/status field names, pairing-cookie attributes, and canonical reachable-URL formatting; the shim holds no parallel command or settings-key table. Success and command failures retain Tauri-style promise behavior; host/session refusals stay empty-body `403` responses before data access. The normative cross-language payloads and fixtures live in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
 
 There is no browser push channel in v1. Event listen/unlisten and window/webview plugin calls are client-local no-ops, while every `plugin:*` command remains denied server-side; visibility-aware polling supplies freshness.
 

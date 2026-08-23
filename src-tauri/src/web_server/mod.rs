@@ -268,10 +268,6 @@ pub fn format_reachable_urls(
     urls
 }
 
-pub fn format_bound_addr(address: SocketAddr) -> String {
-    address.to_string()
-}
-
 /// `token` is the pairing module's URL-safe HMAC session encoding.
 pub fn session_cookie(token: &str) -> String {
     format!(
@@ -394,7 +390,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            format_bound_addr(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 19878)),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 19878).to_string(),
             "[::1]:19878"
         );
     }

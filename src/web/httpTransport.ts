@@ -6,34 +6,6 @@
 export const WEB_INVOKE_PATH = "/api/web/invoke";
 export const WEB_PAIR_PATH = "/api/web/pair";
 
-export const WEB_UI_SETTING_KEYS = {
-  enabled: "web_ui.enabled",
-  port: "web_ui.port",
-  hostPolicy: "web_ui.host_policy",
-  allowlist: "web_ui.allowlist",
-  lastError: "web_ui.last_error",
-} as const;
-
-export const PERMITTED_WEB_COMMANDS = [
-  "get_activity_series",
-  "get_cached_usage_data",
-  "get_code_stats",
-  "get_code_stats_history",
-  "get_context_savings_analytics",
-  "get_cpa_connection_status",
-  "get_hook_breakdown",
-  "get_host_breakdown",
-  "get_llm_runtime_stats",
-  "get_model_usage_overview",
-  "get_project_breakdown",
-  "get_provider_statuses",
-  "get_retention_policy",
-  "get_session_breakdown",
-  "get_skill_breakdown",
-  "get_token_history",
-] as const;
-
-export type PermittedWebCommand = (typeof PERMITTED_WEB_COMMANDS)[number];
 export type WebUiHostPolicy = "all" | "allowlist";
 
 export interface InvokeRequest {
