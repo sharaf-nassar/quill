@@ -1892,6 +1892,14 @@ body {
   padding: 0 14px;
 }
 
+.wg-web-header {
+  display: flex;
+  align-items: center;
+  flex: 0 0 40px;
+  height: 40px;
+  padding: 0 14px;
+}
+
 .wg-tb-brand {
   display: flex;
   align-items: center;

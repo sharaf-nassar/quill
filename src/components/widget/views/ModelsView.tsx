@@ -358,9 +358,11 @@ function ModelsView({ range, webSurface = false }: ModelsViewProps) {
         <div className="wg-state wg-state-error">
           <span className="wg-state-lamp" aria-hidden="true" />
           <span>Model evidence unavailable</span>
-          <button type="button" className="wg-mv-retry" onClick={overview.retry}>
-            Retry
-          </button>
+          {!webSurface && (
+            <button type="button" className="wg-mv-retry" onClick={overview.retry}>
+              Retry
+            </button>
+          )}
         </div>
       </div>
     );
