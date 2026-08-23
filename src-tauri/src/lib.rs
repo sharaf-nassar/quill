@@ -48,6 +48,9 @@ mod transcript_analytics;
 mod transcript_identity;
 mod transcript_watcher;
 mod tray_keepalive;
+/// Identity-scoped web pairing credential and the HMAC sessions derived from
+/// it. Public because the web listener's request gates verify against it.
+pub mod web_pairing;
 pub mod web_server;
 mod window_chrome;
 
@@ -5640,8 +5643,14 @@ async fn get_web_ui_status() -> Result<(), web_server::WebUiError> {
 }
 
 #[tauri::command]
-async fn regenerate_web_pairing_code() -> Result<(), web_server::WebUiError> {
-    Err(web_server::WebUiError::not_implemented())
+async fn regenerate_web_pairing_code()
+-> Result<web_server::PairingCodeResponse, web_server::WebUiError> {
+    run_blocking(web_pairing::rotate_pairing_code)
+        .map(|pairing_code| web_server::PairingCodeResponse { pairing_code })
+        .map_err(|err| {
+            log::error!("Failed to rotate the web pairing credential: {err}");
+            web_server::WebUiError::pairing_unavailable()
+        })
 }
 
 #[tauri::command]

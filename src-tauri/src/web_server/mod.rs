@@ -38,6 +38,7 @@ pub struct WebUiError {
 #[serde(rename_all = "snake_case")]
 pub enum WebUiErrorCode {
     NotImplemented,
+    PairingUnavailable,
 }
 
 impl WebUiError {
@@ -45,6 +46,15 @@ impl WebUiError {
         Self {
             code: WebUiErrorCode::NotImplemented,
             message: "Web UI server is not implemented yet.",
+        }
+    }
+
+    /// The credential's own failure path stays display-safe: the underlying
+    /// filesystem error names a path and is logged, never returned.
+    pub fn pairing_unavailable() -> Self {
+        Self {
+            code: WebUiErrorCode::PairingUnavailable,
+            message: "Could not update the web pairing code.",
         }
     }
 }

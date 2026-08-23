@@ -34,6 +34,14 @@ Browser dispatch is one exact default-deny match over the monitor's cache/local-
 
 Desktop configuration serializes as `{ config: { enabled, port, host_policy, allowlist }, pairing_code }`; status serializes as `{ running, bound_addr, reachable_urls, last_error }`. Reachable URLs use concrete interface IPs, explicit ports, IPv6 brackets, and a trailing slash. Pairing sets `quill_web_session` for 30 days with `Path=/`, `HttpOnly`, and `SameSite=Strict`, omitting `Domain`, `Secure`, and `Expires` for the intentionally plain-HTTP listener. Cross-language round-trip fixtures are fixed by `specs/029-web-ui-server.md#web-transport-protocol-contract`.
 
+### Web UI pairing credential
+
+[[src-tauri/src/web_pairing.rs]] owns the browser-facing credential and the sessions derived from it: a separate 160-bit secret, base64url-encoded for display, at [[src-tauri/src/data_paths.rs#web_pairing_secret_path]] with mode 0o600.
+
+It is never `auth_secret`, which authorizes writes to `:19876` and `/api/v1/context/execute` and so is never transmitted to a browser. The path resolves through [[src-tauri/src/data_paths.rs#default_app_data_dir]], not the shared provider-contract root: nothing outside Quill reads this credential, and a dev build must not issue sessions signed with the installed app's one. Creation and rotation stage a temp file in the same directory and rename it into place, so a crash mid-rotation leaves exactly one valid secret, and a process-wide mutex around the cached value serializes two first-time callers.
+
+A session is an HMAC-SHA256 of the credential over `issued_at.nonce`, carried verbatim as the `quill_web_session` value; verification recomputes the MAC, compares it constant-time, and re-enforces the cookie's 30-day `Max-Age` against a copied cookie jar. Because every session derives from the credential, `regenerate_web_pairing_code` invalidates all of them with no session table. Pairing-code comparison is constant-time for the same reason bearer auth is.
+
 ### Authentication
 
 All endpoints require a Bearer token validated with constant-time comparison (`subtle` crate). The token is generated on first launch by [[src-tauri/src/auth.rs]] and stored at `~/.local/share/com.quilltoolkit.app/auth_secret` with mode 0o600.
@@ -2118,7 +2126,7 @@ Key filesystem locations used by the backend for storage, config, and caching.
 | `~/.config/quill/` | All | Deployed hooks, MCP server, scripts |
 | `~/.claude/` | All | Claude Code config, credentials |
 
-The app-data leaf is the active Tauri identifier, not a literal: [[src-tauri/src/data_paths.rs#app_identifier]] is the one source, and [[src-tauri/src/data_paths.rs#default_app_data_dir]] joins it onto the platform base. `usage.db`, the session index, and the legacy-rules archive all hang off that one directory, so the identity decides all of them together. `auth_secret` is the exception and resolves through [[src-tauri/src/data_paths.rs#shared_app_data_dir]] instead — it is the credential half of the provider contract, not private state.
+The app-data leaf is the active Tauri identifier, not a literal: [[src-tauri/src/data_paths.rs#app_identifier]] is the one source, and [[src-tauri/src/data_paths.rs#default_app_data_dir]] joins it onto the platform base. `usage.db`, the session index, the legacy-rules archive, and the `web_pairing_secret` credential all hang off that one directory, so the identity decides all of them together. `auth_secret` is the exception and resolves through [[src-tauri/src/data_paths.rs#shared_app_data_dir]] instead — it is the credential half of the provider contract, not private state.
 
 ### Development path isolation
 

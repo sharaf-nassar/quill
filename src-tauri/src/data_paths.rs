@@ -140,6 +140,17 @@ pub fn default_app_data_dir() -> Option<PathBuf> {
 pub fn shared_app_data_dir() -> Option<PathBuf> {
     app_data_dir_for(PRODUCTION_IDENTIFIER)
 }
+
+/// The web UI pairing credential, private to this identity.
+///
+/// No provider reads it, so it is not part of the shared contract, and a dev
+/// build must never issue browser sessions signed with the installed app's
+/// credential. It therefore hangs off [`default_app_data_dir`] rather than the
+/// [`shared_app_data_dir`] path `auth_secret` reserves for provider auth.
+pub fn web_pairing_secret_path() -> Option<PathBuf> {
+    default_app_data_dir()
+        .map(|default| resolve_data_dir_with_default(default).join("web_pairing_secret"))
+}
 const CLAUDE_PROJECTS_DIR_ENV: &str = "QUILL_CLAUDE_PROJECTS_DIR";
 const CODEX_SESSIONS_DIR_ENV: &str = "QUILL_CODEX_SESSIONS_DIR";
 const PI_SESSIONS_DIR_ENV: &str = "QUILL_PI_SESSIONS_DIR";
@@ -483,7 +494,7 @@ mod tests {
             "production is unchanged"
         );
         assert!(dev.ends_with("com.quilltoolkit.app.dev"));
-        for leaf in ["usage.db", "session-index"] {
+        for leaf in ["usage.db", "session-index", "web_pairing_secret"] {
             assert_ne!(prod.join(leaf), dev.join(leaf), "{leaf} must not be shared");
         }
     }
