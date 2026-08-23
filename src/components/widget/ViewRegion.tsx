@@ -21,7 +21,7 @@ import ModelsView from "./views/ModelsView";
 import UsageView from "./views/UsageView";
 
 interface ViewDefinition extends ViewOption {
-  render: (range: RangeType) => ReactNode;
+  render: (range: RangeType, webSurface: boolean) => ReactNode;
 }
 
 /** Only registered views reach the dropdown. */
@@ -29,12 +29,16 @@ const VIEWS: readonly ViewDefinition[] = [
   {
     id: "usage",
     label: "Usage",
-    render: (range) => <UsageView range={range} />,
+    render: (range, webSurface) => (
+      <UsageView range={range} webSurface={webSurface} />
+    ),
   },
   {
     id: "models",
     label: "Models",
-    render: (range) => <ModelsView range={range} />,
+    render: (range, webSurface) => (
+      <ModelsView range={range} webSurface={webSurface} />
+    ),
   },
   {
     id: "context",
@@ -43,7 +47,7 @@ const VIEWS: readonly ViewDefinition[] = [
   },
 ];
 
-function ViewRegion() {
+function ViewRegion({ webSurface = false }: { webSurface?: boolean }) {
   useCachedInvokeEvents();
   const [view, setView] = useState<WidgetView>("usage");
   const [range, setRange] = useState<RangeType>(() => readStoredWidgetRange());
@@ -73,7 +77,7 @@ function ViewRegion() {
         </div>
         <span />
       </div>
-      {active.render(range)}
+      {active.render(range, webSurface)}
     </section>
   );
 }

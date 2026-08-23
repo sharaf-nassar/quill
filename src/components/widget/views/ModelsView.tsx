@@ -264,9 +264,10 @@ function BandHead({ title, meta }: BandHeadProps) {
 
 export interface ModelsViewProps {
   range: RangeType;
+  webSurface?: boolean;
 }
 
-function ModelsView({ range }: ModelsViewProps) {
+function ModelsView({ range, webSurface = false }: ModelsViewProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   // The widget renders exactly one view, so a mounted Models view is by
   // definition the observable one — the hook's own visibility guard handles
@@ -523,7 +524,7 @@ function ModelsView({ range }: ModelsViewProps) {
             Retained history · {BACKFILL_LABELS[status.status]} · sources{" "}
             {formatNumber(status.processedSources)}/
             {formatNumber(status.totalSources)}
-            {backfillRetryable && (
+            {backfillRetryable && !webSurface && (
               <button
                 type="button"
                 className="wg-mv-retry"

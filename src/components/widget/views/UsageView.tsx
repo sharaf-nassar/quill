@@ -710,9 +710,10 @@ function manageAccelerator(): string {
 
 export interface UsageViewProps {
   range: RangeType;
+  webSurface?: boolean;
 }
 
-function UsageView({ range }: UsageViewProps) {
+function UsageView({ range, webSurface = false }: UsageViewProps) {
   const [mode, setMode] = useState<BreakdownMode>("sessions");
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [chartDimension, setChartDimension] = useState<WidgetChartDimension>(
@@ -1146,16 +1147,18 @@ function UsageView({ range }: UsageViewProps) {
         <span className="wg-footer-kv">
           Cache <b>{cachePercent === null ? "—" : `${cachePercent}%`}</b>
         </span>
-        <button
-          type="button"
-          className="wg-manage"
-          onClick={() => void openManageWindow()}
-        >
-          Manage
-          <span className="wg-kbd" aria-hidden="true">
-            {manageAccelerator()}
-          </span>
-        </button>
+        {!webSurface && (
+          <button
+            type="button"
+            className="wg-manage"
+            onClick={() => void openManageWindow()}
+          >
+            Manage
+            <span className="wg-kbd" aria-hidden="true">
+              {manageAccelerator()}
+            </span>
+          </button>
+        )}
       </footer>
     </>
   );

@@ -815,6 +815,7 @@ interface LimitsSectionProps {
   hasUsageSource: boolean;
   lastSyncAt: number | null;
   onRefresh: () => Promise<void>;
+  webSurface?: boolean;
 }
 
 // @lat: [[frontend#Frontend#Components#Widget Limits Band]]
@@ -825,6 +826,7 @@ function LimitsSection({
   hasUsageSource,
   lastSyncAt,
   onRefresh,
+  webSurface = false,
 }: LimitsSectionProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [expanded, setExpanded] = useState<Set<CpaProvider>>(() => new Set());
@@ -887,22 +889,24 @@ function LimitsSection({
     <section className="wg-limits wg-num" aria-label="Subscription limits">
       <div className="wg-limits-head">
         <span className="wg-limits-title">Limits</span>
-        <button
-          type="button"
-          className="wg-pill wg-pill-button"
-          data-state={syncState}
-          aria-label={`Refresh live data. ${sentence}. Last read ${elapsed} ago.`}
-          aria-busy={refreshing}
-          disabled={refreshing}
-          title={`Click to refresh · Last read ${elapsed} ago`}
-          onClick={() => void handleRefresh()}
-        >
-          <span className="wg-pill-dot" aria-hidden="true" />
-          {badge && <span aria-hidden="true">{badge}</span>}
-          <span className="wg-num" aria-hidden="true">
-            {elapsed}
-          </span>
-        </button>
+        {!webSurface && (
+          <button
+            type="button"
+            className="wg-pill wg-pill-button"
+            data-state={syncState}
+            aria-label={`Refresh live data. ${sentence}. Last read ${elapsed} ago.`}
+            aria-busy={refreshing}
+            disabled={refreshing}
+            title={`Click to refresh · Last read ${elapsed} ago`}
+            onClick={() => void handleRefresh()}
+          >
+            <span className="wg-pill-dot" aria-hidden="true" />
+            {badge && <span aria-hidden="true">{badge}</span>}
+            <span className="wg-num" aria-hidden="true">
+              {elapsed}
+            </span>
+          </button>
+        )}
       </div>
       {providerOrder.map((provider) => {
         const directRow = directByProvider.get(provider);
