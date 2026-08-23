@@ -103,7 +103,7 @@ React and TypeScript sources organized by feature domain under `src/`.
 
 ## Communication Layers
 
-Data flows through three communication channels between the system's components.
+Data flows through four communication channels between the system's components.
 
 ### Tauri IPC
 
@@ -114,6 +114,14 @@ Provider-status refresh uses `integrations-updated`, while indicator refresh use
 ### HTTP API
 
 An Axum server on port 19876 (configurable via `QUILL_PORT`) receives data from external hook scripts. Bearer token authentication with constant-time comparison. Rate-limited per endpoint type. See [[backend#HTTP API Server]].
+
+### Web UI HTTP
+
+The web-only monitor uses a same-origin invoke bridge with a default-deny read-command boundary.
+
+`POST /api/web/invoke` runs through [[src/web/httpTransport.ts]]. [[src-tauri/src/web_server/mod.rs]] owns the matching serde envelopes, exact command table, desktop config/status field names, pairing-cookie attributes, and canonical reachable-URL formatting. Success and command failures retain Tauri-style promise behavior; host/session refusals stay empty-body `403` responses before data access. The normative cross-language payloads and fixtures live in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
+
+There is no browser push channel in v1. Event listen/unlisten and window/webview plugin calls are client-local no-ops, while every `plugin:*` command remains denied server-side; visibility-aware polling supplies freshness.
 
 ### Tauri Events
 

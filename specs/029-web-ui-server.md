@@ -667,10 +667,10 @@ user-facing pairing code is a short display encoding of that secret; comparison
 is constant-time.
 
 **Session.** An HMAC-SHA256 of the secret over `(issued_at, nonce)`, carried in
-a cookie named `quill_web_session`: `HttpOnly`, `SameSite=Strict`, `Path=/`,
-30-day lifetime, `Secure` omitted because the transport is plain HTTP by design.
-Verification is constant-time. Because every session derives from the secret,
-Regenerate invalidates all of them with no session table.
+the contracted `quill_web_session` cookie with `Path=/`, `HttpOnly`,
+`SameSite=Strict`, and `Max-Age=2592000`; `Domain`, `Secure`, and `Expires` are
+omitted. Verification is constant-time. Because every session derives from the
+secret, Regenerate invalidates all of them with no session table.
 
 **In-memory only.** Resolved allowlist addresses are pinned at config-apply time
 and recomputed on restart or re-save — never persisted, so a stale DNS answer
@@ -692,29 +692,136 @@ A refusal at any applicable gate is `403` with an empty body, decided before any
 Quill data is read. The `/pair` page is inline-rendered and references no bundle
 chunk, so an unpaired peer never receives application assets.
 
-**Wire contract** (shared by `router.rs` and `httpTransport.ts` — defined once in
-the protocol-contract work item, not invented twice):
+### Web transport protocol contract
 
-- Request: `POST /api/web/invoke` `{"cmd": string, "args": object}`.
-- Success: `200` `{"ok": true, "value": <command result>}`.
-- Refused command: `403` `{"ok": false, "code": "command_denied"}`.
-- Command error: `200` `{"ok": false, "code": "command_error", "message": string}`
-  — the shim rejects the `invoke()` promise with this message, matching Tauri's
-  own error shape so existing hook error paths work unchanged.
-- Pair: `POST /api/web/pair` `{"code": string}` → `204` + `Set-Cookie`, or `403`
-  empty body.
+This subsection is the single normative Rust/TypeScript wire contract. The Rust
+types in `src-tauri/src/web_server/mod.rs` and the TypeScript types in
+`src/web/httpTransport.ts` use these names and payloads verbatim; neither side
+applies a casing conversion. Object fields are closed at the Rust boundary so a
+schema mismatch fails before command dispatch.
 
-**Events.** No push transport in v1, so `plugin:event|listen` and `unlisten` are
-client-side no-ops that return a disposer and are **denied server-side along with
-every other `plugin:*` command**. (This supersedes the earlier Technical Decision
-that permitted them server-side: with no event source, permitting them would
-grant reach without purpose.)
+#### Invoke envelope and status mapping
 
-**New Tauri commands** (desktop only, all excluded from the web allowlist):
-`get_web_ui_config`, `set_web_ui_config`, `get_web_ui_status`,
-`regenerate_web_pairing_code`. `get_web_ui_status` returns
-`{ running, bound_addr, reachable_urls, last_error }` — the field set the
-Settings UI renders, fixed in the protocol-contract item.
+`POST /api/web/invoke` accepts exactly:
+
+```json
+{"cmd":"get_provider_statuses","args":{}}
+```
+
+`cmd` is the complete Tauri invoke command string. `args` is required and must
+be a JSON object; calls without arguments send `{}`. Responses are exactly one
+of these discriminated envelopes:
+
+| HTTP status | Body | Client result |
+| --- | --- | --- |
+| `200` | `{"ok":true,"value":<command result>}` | resolve `invoke()` with `value` |
+| `200` | `{"ok":false,"code":"command_error","message":string}` | reject `invoke()` with the exact message string |
+| `403` | `{"ok":false,"code":"command_denied"}` | reject with `Command is not available in the web UI.` |
+
+Malformed JSON or a request that does not match the request shape is `400` with
+an empty body. Host, rate-limit, or session refusal remains `403` with an empty
+body and the shim rejects with `Web UI access denied.`; this is distinct from an
+authenticated command denial, whose JSON body is safe to return. Any other HTTP
+status rejects with `Web UI request failed (HTTP <status>).`, an invalid JSON or
+envelope rejects with `Web UI returned an invalid invoke response.`, and a
+network failure rejects with `Web UI is unavailable.`
+
+#### Exact permitted-command table
+
+The authenticated invoke route is default-deny. Only these complete command
+strings reach dispatch; each is a cache or local-storage read used by the
+monitor surface:
+
+| Command | Monitor use |
+| --- | --- |
+| `get_activity_series` | Session/project sparklines |
+| `get_cached_usage_data` | Pure cache-only Limits snapshot; never polls a provider |
+| `get_code_stats` | Range code totals |
+| `get_code_stats_history` | Code history and insights |
+| `get_context_savings_analytics` | Context view and Usage insight |
+| `get_cpa_connection_status` | Whether CPA is a configured usage source |
+| `get_hook_breakdown` | Hooks breakdown |
+| `get_host_breakdown` | Hosts breakdown |
+| `get_llm_runtime_stats` | Runtime totals and insights |
+| `get_model_usage_overview` | Usage chart and Models view |
+| `get_project_breakdown` | Projects readout and breakdown |
+| `get_provider_statuses` | Enabled/detected provider state |
+| `get_retention_policy` | Read-only retention disclosure |
+| `get_session_breakdown` | Sessions breakdown and live overlay |
+| `get_skill_breakdown` | Skills breakdown |
+| `get_token_history` | Token/code comparison insight |
+
+Every other command is denied, including `fetch_usage_data`,
+`refresh_usage_data`, every setter or maintenance command, and every `plugin:*`
+command. No prefix, suffix, alias, or command count participates in the check.
+
+#### Desktop config and status shapes
+
+The desktop-only commands remain excluded from the web allowlist. Their
+serialized shapes are:
+
+```text
+get_web_ui_config() -> {
+  config: {
+    enabled: boolean,
+    port: integer,
+    host_policy: "all" | "allowlist",
+    allowlist: string[]
+  },
+  pairing_code: string
+}
+
+set_web_ui_config({ config }) -> same shape as get_web_ui_config
+get_web_ui_status() -> {
+  running: boolean,
+  bound_addr: string | null,
+  reachable_urls: string[],
+  last_error: string | null
+}
+
+regenerate_web_pairing_code() -> { pairing_code: string }
+```
+
+`last_error` is status, not writable config. Persistent storage uses exactly
+`web_ui.enabled`, `web_ui.port`, `web_ui.host_policy`, `web_ui.allowlist`, and
+`web_ui.last_error`; no camelCase aliases exist.
+
+When `running` is false, `bound_addr` is `null` and `reachable_urls` is empty.
+When running, `bound_addr` is canonical `SocketAddr` text. Reachable URLs are
+server-produced from concrete local interface IP addresses, never wildcard
+bind addresses or hostname aliases: `http://<IPv4>:<port>/` or
+`http://[<IPv6>]:<port>/`. The explicit port and trailing slash are mandatory;
+values are deduplicated and sorted lexicographically before serialization.
+
+#### Pairing and session cookie
+
+`POST /api/web/pair` accepts exactly `{"code":string}`. A correct code returns
+`204` with no body and:
+
+```text
+Set-Cookie: quill_web_session=<token>; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000
+```
+
+The cookie has no `Domain`, `Secure`, or `Expires` attribute. `Secure` is omitted
+because this feature serves plain HTTP by design; `SameSite=Strict`, `HttpOnly`,
+and the root path are mandatory. A wrong code is `403` with an empty body.
+
+#### Cross-language fixtures
+
+The following values are the round-trip fixtures. Rust serde tests and the
+TypeScript exported fixtures use these payloads without field renaming:
+
+```json
+{"request":{"cmd":"get_provider_statuses","args":{}},"status":200,"response":{"ok":true,"value":[]}}
+{"request":{"cmd":"set_runtime_settings","args":{"settings":{}}},"status":403,"response":{"ok":false,"code":"command_denied"}}
+{"request":{"cmd":"get_model_usage_overview","args":{"range":"24h","provider":null}},"status":200,"response":{"ok":false,"code":"command_error","message":"Model analytics unavailable."}}
+{"request":{"code":"fixture-pair-code"},"success_status":204}
+```
+
+**Events.** No push transport exists in v1. `plugin:event|listen` and
+`plugin:event|unlisten` are client-side no-ops that return a disposer; window
+and webview plugin calls are also client-side no-ops. All are denied server-side
+along with every other `plugin:*` command.
 
 **Breaking changes:** none. The desktop path, `:19876`, `:19877`, and the dev
 `:8181` mock are untouched.

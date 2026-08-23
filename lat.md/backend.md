@@ -26,6 +26,14 @@ Both writers use WAL, foreign keys, a 30-second busy timeout, and transactional 
 
 The route set is `/api/v1/context/{index,fetch,execute,search,source,stats,purge}`. [[context-http-api-tests]] records network, auth, execution, and exact shared-store parity coverage.
 
+### Web UI protocol contract
+
+[[src-tauri/src/web_server/mod.rs]] defines the third listener's closed invoke and pairing protocol independently of the writable ingestion API.
+
+Browser dispatch is one exact default-deny match over the monitor's cache/local-storage reads; `fetch_usage_data`, `refresh_usage_data`, setters, maintenance commands, and the full `plugin:*` namespace are excluded. Command denial is a JSON `403`, while host/session refusal remains an empty-body `403` before dispatch.
+
+Desktop configuration serializes as `{ config: { enabled, port, host_policy, allowlist }, pairing_code }`; status serializes as `{ running, bound_addr, reachable_urls, last_error }`. Reachable URLs use concrete interface IPs, explicit ports, IPv6 brackets, and a trailing slash. Pairing sets `quill_web_session` for 30 days with `Path=/`, `HttpOnly`, and `SameSite=Strict`, omitting `Domain`, `Secure`, and `Expires` for the intentionally plain-HTTP listener. Cross-language round-trip fixtures are fixed by `specs/029-web-ui-server.md#web-transport-protocol-contract`.
+
 ### Authentication
 
 All endpoints require a Bearer token validated with constant-time comparison (`subtle` crate). The token is generated on first launch by [[src-tauri/src/auth.rs]] and stored at `~/.local/share/com.quilltoolkit.app/auth_secret` with mode 0o600.

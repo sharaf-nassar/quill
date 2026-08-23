@@ -46,6 +46,8 @@ Model analytics fixtures cover only `get_model_usage_overview` today; the paged 
 
 A dev-only Vite plugin in [[vite.config.ts]] (`apply: "serve"`) relaxes the strict production CSP so the browser can load Vite HMR, React Fast Refresh, and the Impeccable live client at `http://localhost:8400`. Because it is serve-only, `vite build` never runs it and the shipped CSP is untouched.
 
+The production web monitor does not use this fixture path. [[src/web/httpTransport.ts]] installs a same-origin `__TAURI_INTERNALS__` shim before shared widget imports, maps the closed invoke envelopes back to Tauri-style promise resolution/rejection, and exports the same success, command-denied, command-error, and pair fixtures as the Rust contract. Event listen/unlisten plus window/webview plugin calls are local no-ops; all other commands cross the server-side exact allowlist.
+
 ## Main Window Layout
 
 [[src/App.tsx]] is the widget shell: a freely resizable window holding [[src/components/widget/WidgetTitleBar.tsx]], a hairline, and one scrolling content column. The split-pane layout and its draggable divider were replaced by the widget redesign.
