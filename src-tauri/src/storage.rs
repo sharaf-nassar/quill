@@ -5481,6 +5481,8 @@ fn read_model_backfill_source_total_published(conn: &Connection) -> Result<bool,
     }
 }
 
+type PiLifetimeAgents = HashMap<(String, String), HashMap<String, Option<f64>>>;
+
 pub struct Storage {
     conn: Mutex<Connection>,
     db_path: PathBuf,
@@ -15764,6 +15766,142 @@ impl Storage {
         Ok(())
     }
 
+    /// Durable explicit Pi agents resolved to each visible root. A closed
+    /// lifecycle has an exact wall-clock duration; an open or recovering one
+    /// leaves runtime to the current live fold rather than claiming liveness.
+    fn pi_lifetime_agents(&self, rows: &[SessionBreakdown]) -> Result<PiLifetimeAgents, String> {
+        let roots = rows
+            .iter()
+            .filter(|row| row.provider == IntegrationProvider::Pi.as_str())
+            .filter_map(|row| {
+                crate::live_tracker::normalize_observed_hostname(&row.hostname)
+                    .map(|hostname| (hostname, row.session_id.clone()))
+            })
+            .collect::<BTreeSet<_>>();
+        if roots.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let root_values = (0..roots.len())
+            .map(|_| "(?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH RECURSIVE roots(normalized_hostname, session_id) AS (
+                 VALUES {root_values}
+             ), lineage(
+                 root_hostname, root_session_id, session_id, origin_at_ms,
+                 closed_at_ms, lifecycle_state, lineage_state, depth
+             ) AS (
+                 SELECT root.normalized_hostname, root.session_id,
+                        root.session_id, root.origin_at_ms, root.closed_at_ms,
+                        root.lifecycle_state, root.lineage_state, 0
+                 FROM roots
+                 JOIN pi_session_lifecycle AS root
+                   ON root.provider='pi'
+                  AND root.normalized_hostname=roots.normalized_hostname
+                  AND root.session_id=roots.session_id
+                  AND root.lineage_state='root'
+                 UNION ALL
+                 SELECT lineage.root_hostname, lineage.root_session_id,
+                        child.session_id, child.origin_at_ms, child.closed_at_ms,
+                        child.lifecycle_state, child.lineage_state,
+                        lineage.depth + 1
+                 FROM lineage
+                 JOIN pi_session_lifecycle AS child
+                   ON child.provider='pi'
+                  AND child.normalized_hostname=lineage.root_hostname
+                  AND child.direct_parent_session_id=lineage.session_id
+                 WHERE lineage.depth < ?
+                   AND child.lineage_state IN ('agent', 'linked')
+             )
+             SELECT root_hostname, root_session_id, session_id, origin_at_ms,
+                    closed_at_ms, lifecycle_state
+             FROM lineage
+             WHERE lineage.lineage_state='agent' AND lineage.depth > 0"
+        );
+        let mut params = Vec::<Box<dyn rusqlite::types::ToSql>>::new();
+        for (hostname, session_id) in roots {
+            params.push(Box::new(hostname));
+            params.push(Box::new(session_id));
+        }
+        params.push(Box::new(
+            i64::try_from(crate::live_tracker::MAX_PI_LINEAGE_DEPTH).unwrap_or(i64::MAX),
+        ));
+
+        let conn = self.open_view_reader()?;
+        let mut statement = conn
+            .prepare(&sql)
+            .map_err(|error| format!("Prepare Pi lifetime agents: {error}"))?;
+        let agents = statement
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|error| format!("Query Pi lifetime agents: {error}"))?;
+        let mut by_root = PiLifetimeAgents::new();
+        for agent in agents {
+            let (root, session_id, origin_at_ms, closed_at_ms, lifecycle_state) =
+                agent.map_err(|error| format!("Read Pi lifetime agent: {error}"))?;
+            let runtime_secs = (lifecycle_state == "closed")
+                .then(|| {
+                    closed_at_ms.map(|closed_at_ms| {
+                        closed_at_ms.saturating_sub(origin_at_ms).max(0) as f64 / 1_000.0
+                    })
+                })
+                .flatten();
+            by_root
+                .entry(root)
+                .or_default()
+                .insert(session_id, runtime_secs);
+        }
+        Ok(by_root)
+    }
+
+    /// Merge durable Pi lifetime agents with the current live rail. Durable
+    /// children never reappear in `observed_agents`; it is current-only.
+    fn merge_pi_lifetime_agents(
+        row: &mut SessionBreakdown,
+        durable_agents: &HashMap<String, Option<f64>>,
+    ) {
+        let prior_agent_runtime = row.agent_runtime_secs;
+        let mut runtime_by_agent = durable_agents.clone();
+        if let Some(observed_agents) = &row.observed_agents {
+            for agent in observed_agents {
+                runtime_by_agent
+                    .entry(agent.agent_id.clone())
+                    .and_modify(|runtime| {
+                        if runtime.is_none() {
+                            *runtime = agent.runtime_secs;
+                        }
+                    })
+                    .or_insert(agent.runtime_secs);
+            }
+        }
+        let agent_runtime_secs = runtime_by_agent
+            .values()
+            .copied()
+            .flatten()
+            .reduce(|total, runtime| total + runtime)
+            .or(prior_agent_runtime);
+        let family_without_agents = row
+            .active_runtime_secs
+            .map(|runtime| runtime - prior_agent_runtime.unwrap_or(0.0));
+
+        row.agent_count = i64::try_from(runtime_by_agent.len()).ok();
+        row.agent_runtime_secs = agent_runtime_secs;
+        row.active_runtime_secs = match (family_without_agents, agent_runtime_secs) {
+            (Some(family), Some(agents)) => Some(family + agents),
+            (Some(family), None) => Some(family),
+            (None, agents) => agents,
+        };
+    }
+
     /// Project lifetime runtime onto Sessions rows and their observed native
     /// agents. Only the listed session families are read. Lifetime totals stay
     /// unknown until the runtime backfill is complete; root current-turn and
@@ -15787,6 +15925,19 @@ impl Storage {
         }
         let now = query_now();
         let now_ms = now.timestamp_millis();
+        let pi_lifetime_agents = self.pi_lifetime_agents(rows)?;
+        for row in rows.iter_mut() {
+            if row.provider != IntegrationProvider::Pi.as_str() {
+                continue;
+            }
+            let Some(hostname) = crate::live_tracker::normalize_observed_hostname(&row.hostname)
+            else {
+                continue;
+            };
+            if let Some(agents) = pi_lifetime_agents.get(&(hostname, row.session_id.clone())) {
+                Self::merge_pi_lifetime_agents(row, agents);
+            }
+        }
         let mut by_chain = HashMap::<ChainKey, ChainRuntime>::new();
         let mut conn = self.open_view_reader()?;
         let tx = conn
@@ -32674,6 +32825,209 @@ mod tests {
         let agent = &row.observed_agents.as_ref().unwrap()[0];
         assert_eq!(agent.runtime_secs, Some(8.0));
         assert!(agent.runtime_active);
+        clear_env();
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Durable Pi Agent Lifetime]]
+    #[test]
+    #[serial]
+    fn durable_pi_agents_keep_lifetime_totals_after_session_end() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let now = DateTime::parse_from_rfc3339("2030-01-01T00:01:00Z")
+            .expect("runtime now")
+            .with_timezone(&Utc);
+        let now_ms = now.timestamp_millis();
+        let seed = |session_id: &str,
+                    parent: Option<&str>,
+                    lifecycle_state: &str,
+                    lineage_state: &str,
+                    origin_at_ms: i64,
+                    closed_at_ms: Option<i64>| {
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO pi_session_lifecycle (
+                         normalized_hostname, session_id, source_key,
+                         origin_at_ms, process_instance_id, current_sequence,
+                         current_occurrence_id, occurred_at_ms, lifecycle_state,
+                         direct_parent_session_id, lineage_state,
+                         reporter_protocol, reporter_version, updated_at_ms,
+                         closed_at_ms
+                     ) VALUES (
+                         'host', ?1, ?2, ?3, ?4, 1, ?5, ?3, ?6, ?7, ?8,
+                         2, 'test', ?3, ?9
+                     )",
+                    params![
+                        session_id,
+                        format!("source-{session_id}"),
+                        origin_at_ms,
+                        format!("process-{session_id}"),
+                        format!("occurrence-{session_id}"),
+                        lifecycle_state,
+                        parent,
+                        lineage_state,
+                        closed_at_ms,
+                    ],
+                )
+                .expect("seed Pi lifecycle");
+        };
+        seed("root", None, "open", "root", now_ms - 60_000, None);
+        seed(
+            "closed-parent",
+            Some("root"),
+            "closed",
+            "agent",
+            now_ms - 30_000,
+            Some(now_ms - 20_000),
+        );
+        seed(
+            "closed-child",
+            Some("closed-parent"),
+            "closed",
+            "agent",
+            now_ms - 25_000,
+            Some(now_ms - 20_000),
+        );
+        seed(
+            "live-agent",
+            Some("root"),
+            "open",
+            "agent",
+            now_ms - 8_000,
+            None,
+        );
+        seed(
+            "missing-agent",
+            Some("missing"),
+            "closed",
+            "agent",
+            now_ms - 10_000,
+            Some(now_ms - 5_000),
+        );
+        seed("foreign-root", None, "open", "root", now_ms - 10_000, None);
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE pi_session_lifecycle
+                 SET normalized_hostname='other-host'
+                 WHERE session_id='foreign-root'",
+                [],
+            )
+            .expect("move foreign root");
+        seed(
+            "cross-host-agent",
+            Some("foreign-root"),
+            "closed",
+            "agent",
+            now_ms - 10_000,
+            Some(now_ms - 5_000),
+        );
+        let mut parent = "root".to_string();
+        for depth in 1..=65 {
+            let session_id = format!("depth-{depth}");
+            seed(
+                &session_id,
+                Some(&parent),
+                "closed",
+                "agent",
+                now_ms,
+                Some(now_ms),
+            );
+            parent = session_id;
+        }
+
+        let live_agent = crate::models::ObservedSessionAgent {
+            agent_id: "live-agent".to_string(),
+            model_id: Some("gpt-5.6-sol".to_string()),
+            agent_type: Some("worker".to_string()),
+            runtime_secs: Some(8.0),
+            runtime_active: true,
+        };
+        let row = || SessionBreakdown {
+            provider: "pi".to_string(),
+            session_id: "root".to_string(),
+            parent_session_id: None,
+            pi_lineage: Some(crate::models::PiLineage::Root),
+            ephemeral: false,
+            hostname: "host".to_string(),
+            total_tokens: 0,
+            turn_count: 0,
+            first_seen: (now - chrono::Duration::minutes(1)).to_rfc3339(),
+            last_active: now.to_rfc3339(),
+            ended_at: None,
+            model_id: None,
+            project: Some("/work/quill".to_string()),
+            active_runtime_secs: Some(8.0),
+            agent_count: Some(1),
+            agent_runtime_secs: Some(8.0),
+            current_turn_runtime_secs: None,
+            current_turn_runtime_active: false,
+            runtime_as_of_ms: Some(now_ms),
+            active_runtime_rate: 1.0,
+            observed_agents: Some(vec![live_agent.clone()]),
+            live_linked_sessions: Some(Vec::new()),
+            observed_only: true,
+        };
+
+        let mut rows = [row()];
+        with_pinned_query_now(now, || {
+            storage
+                .populate_session_runtime_evidence(&mut rows)
+                .expect("merge durable and live Pi agents")
+        });
+        let merged = &rows[0];
+        assert_eq!(merged.agent_count, Some(67));
+        assert_eq!(merged.agent_runtime_secs, Some(23.0));
+        assert_eq!(merged.active_runtime_secs, Some(23.0));
+        assert_eq!(merged.active_runtime_rate, 1.0);
+        assert_eq!(
+            merged
+                .observed_agents
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|agent| agent.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["live-agent"]
+        );
+
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE pi_session_lifecycle
+                 SET lifecycle_state='closed', closed_at_ms=?1
+                 WHERE session_id='live-agent'",
+                params![now_ms],
+            )
+            .expect("end live Pi agent");
+        let mut ended = row();
+        ended.active_runtime_secs = None;
+        ended.agent_count = None;
+        ended.agent_runtime_secs = None;
+        ended.runtime_as_of_ms = None;
+        ended.active_runtime_rate = 0.0;
+        ended.observed_agents = Some(Vec::new());
+        let mut rows = [ended];
+        with_pinned_query_now(now, || {
+            storage
+                .populate_session_runtime_evidence(&mut rows)
+                .expect("preserve ended Pi agents")
+        });
+        let ended = &rows[0];
+        assert_eq!(ended.agent_count, Some(67));
+        assert_eq!(ended.agent_runtime_secs, Some(23.0));
+        assert_eq!(ended.active_runtime_secs, Some(23.0));
+        assert_eq!(ended.active_runtime_rate, 0.0);
+        assert_eq!(ended.observed_agents, Some(Vec::new()));
+
         clear_env();
     }
 

@@ -117,6 +117,12 @@ An active explicit Pi agent keeps its otherwise-idle parent live and rankable, s
 
 Native runtime enrichment preserves pushed Pi agent totals and per-agent baselines so storage coverage cannot erase the live fold before IPC serialization.
 
+## Durable Pi Agent Lifetime
+
+Durable Pi direct-parent edges preserve closed-agent lifetime totals without recreating the live agent rail.
+
+Edges use the live resolver's 64-edge, cycle, missing-parent, and cross-host exclusions. Closed descendants contribute their `origin_at_ms`-to-`closed_at_ms` lifetime count and runtime after `SessionEnd`; current live descendants union by session id without double-counting and remain the only entries in `observed_agents`.
+
 ## Pushed Lineage Proof
 
 Pushed root, linked, and unresolved states remain distinct in the live overlay, including the unresolved reason and the linked parent's stable id.

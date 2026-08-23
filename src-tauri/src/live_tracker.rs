@@ -231,7 +231,7 @@ fn advance(slot: &mut DateTime<Utc>, timestamp: DateTime<Utc>) -> bool {
     newer
 }
 
-const MAX_PI_LINEAGE_DEPTH: usize = 64;
+pub(crate) const MAX_PI_LINEAGE_DEPTH: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PiRootResolution {
