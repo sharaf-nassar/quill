@@ -51,3 +51,43 @@ for run in 1 2 3; do
 Median: **624 ms**. Observed range: **591-714 ms**. This is startup-path
 evidence for the migration and backup on the pinned audit-window corpus, not a
 claim about slower disks or databases larger than this fixture.
+
+## Search index schema rebuild
+
+Measured 2026-08-24 with the ignored Rust measurement test
+`sessions::tests::measure_session_index_schema_rebuild_on_pinned_corpus`.
+Tantivy schema 8 adds the `custom_type` field, so the first open after upgrade
+removes the index directory and reindexes every document. The timed interval
+starts before `SessionIndex::open_or_create` reopens a schema-7 directory and
+ends after the wipe, recreate, legacy-cleanup pass, full reindex, and reader
+reload complete.
+
+The same audit-window manifest and SHA-256 pin the corpus. Its document count
+is every entry that becomes a search document — `entries - tool_results` =
+**14,030** across 80 sessions — of which the **655** observed `custom_message`
+entries carry the new `custom_type` field. The seeded schema-7 index directory
+is 1,844,108 bytes. The test asserts the manifest hash and the post-rebuild
+`custom_type:subagent-notify` hit count before reporting a result.
+
+Environment matches the migration measurement above. Reindexing uses the shared
+15 MB single-worker test opener, while production opens 50 MB with three writer
+workers, so this is a conservative upper bound.
+
+Command:
+
+```bash
+for run in 1 2 3; do
+  cargo test measure_session_index_schema_rebuild_on_pinned_corpus -- --ignored --nocapture
+ done
+```
+
+| Run | Wall time |
+| --- | ---: |
+| 1 | 3419 ms |
+| 2 | 3317 ms |
+| 3 | 3378 ms |
+
+Median: **3378 ms**. Observed range: **3317-3419 ms**. Combined with the
+migration median above, one first launch on this corpus spends about **4.0 s**
+on schema work before search is fully populated. Transcript parsing during that
+sweep is ordinary startup-scan cost and is not attributed to the schema bump.

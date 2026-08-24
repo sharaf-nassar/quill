@@ -64,7 +64,7 @@ An absolute project filter matches exact indexed cwd identity, so projects with 
 
 ## Search Schema Rebuild
 
-Opening an index from schema version 6 removes its old contents and records version 7 so stored metadata and cwd filtering are available after reindexing.
+Opening an index from schema version 7 removes its old contents and records version 8 so stored metadata, cwd filtering, and the `custom_type` field are available after reindexing.
 
 ## Provider Safe Cleanup
 

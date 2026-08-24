@@ -2237,6 +2237,7 @@ async fn post_session_messages(
             tool_actions: Vec::new(),
             parent_uuid: message.parent_uuid.clone(),
             cwd: payload.cwd.clone(),
+            custom_type: None,
         })
         .collect();
 
@@ -2314,8 +2315,13 @@ async fn get_session_search(
         .cloned()
         .unwrap_or_else(|| "relevance".to_string());
 
-    let result =
-        tokio::task::block_in_place(|| idx.search(&query, &filters, &sort_by, page, page_size));
+    let result = tokio::task::block_in_place(|| {
+        idx.search(&query, &filters, &sort_by, page, page_size)
+            .map(|mut results| {
+                sessions::attach_session_names(Some(state.storage), &mut results);
+                results
+            })
+    });
 
     match result {
         Ok(results) => {
@@ -2396,8 +2402,13 @@ async fn get_session_context_api(
         None => IntegrationProvider::Claude,
     };
 
-    let result =
-        tokio::task::block_in_place(|| idx.get_context(provider, &session_id, &message_id, window));
+    let result = tokio::task::block_in_place(|| {
+        idx.get_context(provider, &session_id, &message_id, window)
+            .map(|mut context| {
+                sessions::attach_context_session_name(Some(state.storage), &mut context);
+                context
+            })
+    });
 
     match result {
         Ok(context) => (StatusCode::OK, Json(serde_json::json!(context))),

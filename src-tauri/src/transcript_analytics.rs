@@ -1719,6 +1719,7 @@ fn pi_optional_usage_dimension(
 }
 
 const PI_STOP_REASON_MAX_BYTES: usize = 256;
+const PI_SESSION_NAME_MAX_BYTES: usize = 512;
 
 fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> String {
     let end = value
@@ -1828,6 +1829,21 @@ fn pi_thinking_level_setting_events(
             })
         })
         .collect()
+}
+
+/// The session's current display name: the last `session_info` name by source
+/// ordinal. A rename converges on reparse, and a cleared or blank name clears
+/// the stored value.
+fn pi_session_name(session: &crate::pi_session::PiSession) -> Option<String> {
+    session
+        .session_infos
+        .iter()
+        .max_by_key(|entry| entry.source_ordinal)?
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| bounded_utf8_prefix(name, PI_SESSION_NAME_MAX_BYTES))
 }
 
 fn pi_lineage_fields(
@@ -2158,36 +2174,47 @@ fn parse_transcript_analytics_source_bytes(
     let records = parse_jsonl_records(contents);
     drop(bytes);
     let source_key = source.source_key.clone();
-    let (native_identity, diagnostics, extracted, setting_events, pi_evidence) = if source.provider
-        == IntegrationProvider::Pi
-    {
-        let session = crate::pi_session::parse_pi_session_records(
-            records
-                .iter()
-                .map(|record| (record.ordinal, record.value.clone())),
-        )
-        .map_err(|error| TranscriptAnalyticsError::PiSession(error.to_string()))?
-        .ok_or_else(|| TranscriptAnalyticsError::PiSession("missing session header".into()))?;
-        let native_identity = resolve_pi_native_identity(&session)?;
-        let mut diagnostics = TranscriptRecordDiagnostics::default();
-        let pi_evidence =
-            build_pi_persisted_evidence(&session, &source_key, hostname, &mut diagnostics)?;
-        let setting_events =
-            pi_thinking_level_setting_events(&session, &source_key, &native_identity)?;
-        let extracted = crate::sessions::extract_pi_session(&source.canonical_path, session);
-        (
-            native_identity,
-            diagnostics,
-            extracted,
-            setting_events,
-            Some(pi_evidence),
-        )
-    } else {
-        let (native_identity, diagnostics) = resolve_native_identity(source, &records)?;
-        let extracted =
-            extract_messages_from_jsonl_records(source.provider, &source.canonical_path, &records);
-        (native_identity, diagnostics, extracted, Vec::new(), None)
-    };
+    let (native_identity, diagnostics, extracted, setting_events, session_name, pi_evidence) =
+        if source.provider == IntegrationProvider::Pi {
+            let session = crate::pi_session::parse_pi_session_records(
+                records
+                    .iter()
+                    .map(|record| (record.ordinal, record.value.clone())),
+            )
+            .map_err(|error| TranscriptAnalyticsError::PiSession(error.to_string()))?
+            .ok_or_else(|| TranscriptAnalyticsError::PiSession("missing session header".into()))?;
+            let native_identity = resolve_pi_native_identity(&session)?;
+            let mut diagnostics = TranscriptRecordDiagnostics::default();
+            let pi_evidence =
+                build_pi_persisted_evidence(&session, &source_key, hostname, &mut diagnostics)?;
+            let setting_events =
+                pi_thinking_level_setting_events(&session, &source_key, &native_identity)?;
+            let session_name = pi_session_name(&session);
+            let extracted = crate::sessions::extract_pi_session(&source.canonical_path, session);
+            (
+                native_identity,
+                diagnostics,
+                extracted,
+                setting_events,
+                session_name,
+                Some(pi_evidence),
+            )
+        } else {
+            let (native_identity, diagnostics) = resolve_native_identity(source, &records)?;
+            let extracted = extract_messages_from_jsonl_records(
+                source.provider,
+                &source.canonical_path,
+                &records,
+            );
+            (
+                native_identity,
+                diagnostics,
+                extracted,
+                Vec::new(),
+                None,
+                None,
+            )
+        };
     let mut native_event_ordinals = HashMap::<String, usize>::new();
     let session_events = extracted
         .events
@@ -2284,7 +2311,7 @@ fn parse_transcript_analytics_source_bytes(
             is_sidechain: native_identity.is_sidechain,
             agent_id: native_identity.agent_id.clone(),
             project,
-            session_name: None,
+            session_name,
             cwd,
             hostname: hostname.to_owned(),
             mtime_ns: stable_stat.mtime_ns(),
@@ -2984,6 +3011,203 @@ mod tests {
             "source replacement clears its prior setting evidence"
         );
         clear_env();
+    }
+
+    /// Build one Pi source out of `lines` so name and neutrality specs share
+    /// the same identity and fingerprint handling.
+    fn pi_source_from_lines(
+        dir: &Path,
+        session_id: &str,
+        lines: &[serde_json::Value],
+    ) -> DiscoveredRetainedJsonlSource {
+        let path = dir.join(format!("{session_id}.jsonl"));
+        let body = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        std::fs::write(&path, jsonl_body(&body)).expect("write Pi source");
+        set_mtime_ns(&path, FIXED_MTIME_NS);
+        DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: source_root_key(IntegrationProvider::Pi),
+            source_key: crate::storage::pi_source_key(TEST_HOSTNAME, session_id)
+                .expect("canonical Pi source key"),
+            filesystem_path: path.clone(),
+            canonical_path: path,
+            layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
+        }
+    }
+
+    fn pi_session_header(session_id: &str) -> serde_json::Value {
+        json!({
+            "type": "session",
+            "version": 3,
+            "id": session_id,
+            "timestamp": "2026-08-14T08:00:00.000Z",
+            "cwd": "/work/quill"
+        })
+    }
+
+    // @lat: [[session-search-tests#Session Search Test Specs#Pi Session Name Capture]]
+    #[test]
+    #[serial]
+    fn pi_session_name_takes_the_last_info_entry_and_clears_when_emptied() {
+        clear_env();
+        let data_dir = TempDir::new().expect("data directory");
+        let transcript_dir = TempDir::new().expect("transcript directory");
+        let session_id = "pi-session-name";
+        let named = [
+            pi_session_header(session_id),
+            json!({
+                "type": "session_info",
+                "id": "info-first",
+                "parentId": null,
+                "timestamp": "2026-08-14T08:00:01.000Z",
+                "name": "First name"
+            }),
+            json!({
+                "type": "message",
+                "id": "prompt",
+                "parentId": "info-first",
+                "timestamp": "2026-08-14T08:00:02.000Z",
+                "message": {"role": "user", "content": "prompt"}
+            }),
+            json!({
+                "type": "session_info",
+                "id": "info-latest",
+                "parentId": "prompt",
+                "timestamp": "2026-08-14T08:00:03.000Z",
+                "name": "Renamed session"
+            }),
+        ];
+        let source = pi_source_from_lines(transcript_dir.path(), session_id, &named);
+        let storage = init_storage_in(&data_dir);
+        let generation = storage
+            .begin_transcript_analytics_generation(IntegrationProvider::Pi, source.source_root_key)
+            .expect("begin Pi name generation");
+        let snapshot = stamp_analytics_root(
+            parse_transcript_analytics_source(&source, TEST_HOSTNAME).expect("parse named source"),
+            session_id,
+            generation,
+        )
+        .expect("stamp named source");
+        assert_eq!(
+            snapshot.source.session_name.as_deref(),
+            Some("Renamed session"),
+            "the last session_info by source ordinal wins"
+        );
+        storage
+            .replace_transcript_analytics_snapshot(&snapshot)
+            .expect("persist named source");
+        let stored_name = || {
+            rusqlite::Connection::open(storage.database_path())
+                .expect("open registry reader")
+                .query_row(
+                    "SELECT session_name FROM transcript_analytics_sources
+                     WHERE provider = 'pi' AND source_key = ?1",
+                    rusqlite::params![source.source_key],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .expect("read persisted session name")
+        };
+        assert_eq!(stored_name(), Some("Renamed session".to_owned()));
+
+        let mut cleared = named.to_vec();
+        cleared[3] = json!({
+            "type": "session_info",
+            "id": "info-cleared",
+            "parentId": "prompt",
+            "timestamp": "2026-08-14T08:00:04.000Z",
+            "name": ""
+        });
+        let cleared_source = pi_source_from_lines(transcript_dir.path(), session_id, &cleared);
+        let generation = storage
+            .begin_transcript_analytics_generation(
+                IntegrationProvider::Pi,
+                cleared_source.source_root_key,
+            )
+            .expect("begin cleared name generation");
+        let cleared_snapshot = stamp_analytics_root(
+            parse_transcript_analytics_source(&cleared_source, TEST_HOSTNAME)
+                .expect("parse cleared source"),
+            session_id,
+            generation,
+        )
+        .expect("stamp cleared source");
+        assert_eq!(cleared_snapshot.source.session_name, None);
+        storage
+            .replace_transcript_analytics_snapshot(&cleared_snapshot)
+            .expect("persist cleared source");
+        assert_eq!(stored_name(), None, "a cleared name clears the registry");
+        clear_env();
+    }
+
+    // @lat: [[session-search-tests#Session Search Test Specs#Injected Context Analytics Neutrality]]
+    #[test]
+    fn pi_custom_messages_leave_runtime_and_turn_evidence_unchanged() {
+        let transcript_dir = TempDir::new().expect("transcript directory");
+        let lines_for = |session_id: &str, injected: bool| {
+            let mut lines = vec![
+                pi_session_header(session_id),
+                json!({
+                    "type": "message",
+                    "id": "prompt",
+                    "parentId": null,
+                    "timestamp": "2026-08-14T08:00:01.000Z",
+                    "message": {"role": "user", "content": "prompt"}
+                }),
+                json!({
+                    "type": "message",
+                    "id": "answer",
+                    "parentId": "prompt",
+                    "timestamp": "2026-08-14T08:00:05.000Z",
+                    "message": {"role": "assistant", "content": "answer"}
+                }),
+            ];
+            if injected {
+                lines.insert(
+                    2,
+                    json!({
+                        "type": "custom_message",
+                        "id": "reminder",
+                        "parentId": "prompt",
+                        "timestamp": "2026-08-14T08:00:02.000Z",
+                        "customType": "lat-reminder",
+                        "content": "injected reminder",
+                        "display": false
+                    }),
+                );
+            }
+            lines
+        };
+
+        let evidence = |name: &str, injected: bool| {
+            let source =
+                pi_source_from_lines(transcript_dir.path(), name, &lines_for(name, injected));
+            let parsed =
+                parse_transcript_analytics_source(&source, TEST_HOSTNAME).expect("parse Pi source");
+            (
+                parsed
+                    .snapshot
+                    .session_events
+                    .iter()
+                    .map(|event| (event.timestamp.clone(), event.kind, event.uuid.clone()))
+                    .collect::<Vec<_>>(),
+                parsed
+                    .snapshot
+                    .response_times
+                    .iter()
+                    .map(|row| (row.timestamp.clone(), row.response_secs, row.idle_secs))
+                    .collect::<Vec<_>>(),
+                parsed.snapshot.tool_actions.len(),
+            )
+        };
+
+        assert_eq!(
+            evidence("pi-injected-context", true),
+            evidence("pi-plain-context", false),
+            "injected context emits no session, runtime, or tool evidence"
+        );
     }
 
     // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Remaining Analytics Evidence Foundation]]
@@ -4413,6 +4637,7 @@ mod tests {
             }],
             parent_uuid: Some("parent-uuid".to_owned()),
             cwd: Some("/work/quill".to_owned()),
+            custom_type: None,
         }
     }
 

@@ -68,7 +68,7 @@ The active value is the latest `(timestamp, source_ordinal)` at or before an ass
 
 Later Pi analytics producers remain explicitly empty on the pinned parity corpus.
 
-`reasoning_duration_ms`, tool `is_error`/`details_json`/`result_image_count`/`duration_ms`, and session name remain `None` or empty while existing runtime, tool, skill, thinking-event, and setting extraction stays unchanged. `transcript_analytics::tests::remaining_pi_analytics_evidence_foundation_stays_empty` pins the positive parity-corpus thinking and setting evidence plus the remaining NULL fields.
+`reasoning_duration_ms` and tool `is_error`/`details_json`/`result_image_count`/`duration_ms` remain `None` while existing runtime, tool, skill, thinking-event, and setting extraction stays unchanged. The corpus carries no `session_info` entry, so its `session_name` stays NULL as unobserved evidence rather than an empty name. `transcript_analytics::tests::remaining_pi_analytics_evidence_foundation_stays_empty` pins the positive parity-corpus thinking and setting evidence plus the remaining NULL fields.
 
 ## Native Usage Migration
 

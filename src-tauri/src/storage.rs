@@ -6067,6 +6067,63 @@ impl Storage {
         Ok(sources)
     }
 
+    /// Look up persisted display names for the sessions a search response is
+    /// about to return. Callers pass one deduplicated batch per response, so a
+    /// page of hits costs a bounded number of indexed reads instead of one
+    /// query per hit.
+    pub(crate) fn transcript_session_names(
+        &self,
+        sessions: &[(IntegrationProvider, String)],
+    ) -> HashMap<(IntegrationProvider, String), String> {
+        // SQLite's default variable limit is 999; this stays far below it.
+        const LOOKUP_CHUNK: usize = 200;
+
+        let mut seen = HashSet::new();
+        let wanted = sessions
+            .iter()
+            .filter(|(provider, session_id)| seen.insert((*provider, session_id.as_str())))
+            .collect::<Vec<_>>();
+        let mut names = HashMap::new();
+        let conn = self.conn.lock().unwrap();
+        for chunk in wanted.chunks(LOOKUP_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT provider, analytics_session_id, session_name
+                 FROM transcript_analytics_sources
+                 WHERE session_name IS NOT NULL
+                   AND analytics_session_id IN ({placeholders})"
+            );
+            let params = chunk
+                .iter()
+                .map(|(_, session_id)| session_id as &dyn rusqlite::types::ToSql)
+                .collect::<Vec<_>>();
+            let rows = conn.prepare_cached(&sql).and_then(|mut stmt| {
+                stmt.query_map(params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            });
+            match rows {
+                Ok(rows) => {
+                    for (provider, session_id, name) in rows {
+                        let Ok(provider) = provider.parse::<IntegrationProvider>() else {
+                            continue;
+                        };
+                        names.insert((provider, session_id), name);
+                    }
+                }
+                Err(error) => log::warn!("Session name lookup failed: {error}"),
+            }
+        }
+        names
+    }
+
     /// Advance inventory state for a source whose last-good snapshot is still
     /// authoritative. A content-hash match may refresh only the fast
     /// fingerprint; no child analytics rows are deleted or inserted.
@@ -23212,6 +23269,124 @@ mod tests {
             (4, None)
         );
         drop(storage);
+        clear_env();
+    }
+
+    // @lat: [[session-search-tests#Session Search Test Specs#Session Name Response Enrichment]]
+    #[test]
+    #[serial]
+    fn session_name_enrichment_uses_one_bounded_registry_lookup() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        {
+            let conn = storage.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO transcript_analytics_sources (
+                         provider, source_key, source_root_key, source_path,
+                         source_session_id, analytics_session_id, chain_id,
+                         session_name, seen_generation, processing_status,
+                         source_kind
+                     ) VALUES (?1, ?2, 'pi:sessions', ?3, ?4, ?4, ?4, ?5, 1, 'ok',
+                               'transcript')",
+                )
+                .expect("prepare registry seed");
+            stmt.execute(params![
+                "pi",
+                "pi:host:named",
+                "/sessions/named.jsonl",
+                "named-session",
+                "Renamed session",
+            ])
+            .expect("seed named Pi source");
+            stmt.execute(params![
+                "pi",
+                "pi:host:anonymous",
+                "/sessions/anonymous.jsonl",
+                "anonymous-session",
+                None::<String>,
+            ])
+            .expect("seed unnamed Pi source");
+            stmt.execute(params![
+                "claude",
+                "claude:host:same-id",
+                "/projects/same-id.jsonl",
+                "named-session",
+                "Claude session",
+            ])
+            .expect("seed same-id Claude source");
+        }
+
+        let hit = |provider: IntegrationProvider, session_id: &str| crate::sessions::SearchHit {
+            provider,
+            message_id: format!("{session_id}-message"),
+            session_id: session_id.to_owned(),
+            parent_session_id: None,
+            content: String::new(),
+            snippet: String::new(),
+            role: "user".to_owned(),
+            project: "quill".to_owned(),
+            session_name: None,
+            host: "host".to_owned(),
+            timestamp: "2026-08-24T00:00:00Z".to_owned(),
+            git_branch: String::new(),
+            tools_used: String::new(),
+            files_modified: String::new(),
+            code_changes: String::new(),
+            commands_run: String::new(),
+            tool_details: String::new(),
+            score: 1.0,
+        };
+        let mut results = crate::sessions::SearchResults {
+            hits: vec![
+                hit(IntegrationProvider::Pi, "named-session"),
+                hit(IntegrationProvider::Pi, "named-session"),
+                hit(IntegrationProvider::Pi, "anonymous-session"),
+                hit(IntegrationProvider::Pi, "missing-session"),
+                hit(IntegrationProvider::Claude, "named-session"),
+            ],
+            total_hits: 5,
+            query_time_ms: 1,
+        };
+        crate::sessions::attach_session_names(Some(&storage), &mut results);
+        assert_eq!(
+            results
+                .hits
+                .iter()
+                .map(|hit| hit.session_name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("Renamed session"),
+                Some("Renamed session"),
+                None,
+                None,
+                Some("Claude session"),
+            ],
+            "names resolve per provider and session, and stay None when absent"
+        );
+
+        let mut context = crate::sessions::SessionContext {
+            provider: IntegrationProvider::Pi,
+            session_id: "named-session".to_owned(),
+            project: "quill".to_owned(),
+            session_name: None,
+            messages: Vec::new(),
+        };
+        crate::sessions::attach_context_session_name(Some(&storage), &mut context);
+        assert_eq!(context.session_name.as_deref(), Some("Renamed session"));
+        let mut oversized = (0..250)
+            .map(|index| (IntegrationProvider::Pi, format!("absent-{index:03}")))
+            .collect::<Vec<_>>();
+        oversized.push((IntegrationProvider::Pi, "named-session".to_owned()));
+        assert_eq!(
+            storage
+                .transcript_session_names(&oversized)
+                .get(&(IntegrationProvider::Pi, "named-session".to_owned()))
+                .map(String::as_str),
+            Some("Renamed session"),
+            "a batch larger than one query chunk resolves without dropping its tail"
+        );
         clear_env();
     }
 

@@ -72,6 +72,34 @@ pub(crate) struct PiSummaryEntry {
     pub(crate) value: Value,
 }
 
+/// A `session_info` entry restating the session's display name. Pi appends a
+/// new entry on every rename, and a cleared name arrives as an absent or empty
+/// `name`.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PiSessionInfoEntry {
+    #[serde(flatten)]
+    pub(crate) base: PiSessionEntryBase,
+    pub(crate) name: Option<String>,
+    #[serde(skip)]
+    pub(crate) source_ordinal: u64,
+}
+
+/// Extension-injected context that participates in the LLM conversation.
+/// `display` governs Pi's own TUI rendering only, so hidden entries are still
+/// evidence of what shaped the session.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PiCustomMessageEntry {
+    #[serde(flatten)]
+    pub(crate) base: PiSessionEntryBase,
+    pub(crate) custom_type: String,
+    #[serde(default)]
+    pub(crate) content: String,
+    #[serde(skip)]
+    pub(crate) source_ordinal: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PiThinkingLevelChangeEntry {
@@ -90,6 +118,8 @@ pub(crate) struct PiSession {
     pub(crate) tracking_entries: Vec<PiTrackingEntry>,
     pub(crate) summary_entries: Vec<PiSummaryEntry>,
     pub(crate) thinking_level_changes: Vec<PiThinkingLevelChangeEntry>,
+    pub(crate) session_infos: Vec<PiSessionInfoEntry>,
+    pub(crate) custom_messages: Vec<PiCustomMessageEntry>,
 }
 
 #[derive(Debug)]
@@ -202,6 +232,8 @@ pub(crate) fn parse_pi_session_records(
     let mut tracking_entries = Vec::new();
     let mut summary_entries = Vec::new();
     let mut thinking_level_changes = Vec::new();
+    let mut session_infos = Vec::new();
+    let mut custom_messages = Vec::new();
     for (source_ordinal, value) in records {
         match value.get("type").and_then(Value::as_str) {
             Some("message") => {
@@ -239,6 +271,18 @@ pub(crate) fn parse_pi_session_records(
                 if let Ok(mut entry) = serde_json::from_value::<PiThinkingLevelChangeEntry>(value) {
                     entry.source_ordinal = source_ordinal;
                     thinking_level_changes.push(entry);
+                }
+            }
+            Some("session_info") => {
+                if let Ok(mut entry) = serde_json::from_value::<PiSessionInfoEntry>(value) {
+                    entry.source_ordinal = source_ordinal;
+                    session_infos.push(entry);
+                }
+            }
+            Some("custom_message") => {
+                if let Ok(mut entry) = serde_json::from_value::<PiCustomMessageEntry>(value) {
+                    entry.source_ordinal = source_ordinal;
+                    custom_messages.push(entry);
                 }
             }
             Some("custom")
@@ -282,6 +326,8 @@ pub(crate) fn parse_pi_session_records(
         tracking_entries,
         summary_entries,
         thinking_level_changes,
+        session_infos,
+        custom_messages,
     }))
 }
 
@@ -335,6 +381,19 @@ mod tests {
         assert_eq!(session.thinking_level_changes[0].base.id, "thinking");
         assert_eq!(session.thinking_level_changes[0].thinking_level, "high");
         assert_eq!(session.thinking_level_changes[0].source_ordinal, 3);
+        assert_eq!(
+            session
+                .session_infos
+                .iter()
+                .map(|entry| (entry.source_ordinal, entry.name.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![(10, Some("First name")), (12, Some("Latest name"))]
+        );
+        assert_eq!(session.custom_messages.len(), 1);
+        assert_eq!(session.custom_messages[0].base.id, "injected");
+        assert_eq!(session.custom_messages[0].custom_type, "lat-reminder");
+        assert_eq!(session.custom_messages[0].content, "injected reminder");
+        assert_eq!(session.custom_messages[0].source_ordinal, 11);
     }
 
     // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#V2 Hook Messages]]

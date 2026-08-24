@@ -21,6 +21,9 @@ const CLAUDE_SOURCE_ROOT_KEY: &str = "claude:projects";
 const CODEX_SOURCE_ROOT_KEY: &str = "codex:sessions";
 const PI_SOURCE_ROOT_KEY: &str = "pi:sessions";
 const ROOT_DIAGNOSTIC_MAX_CHARS: usize = 240;
+/// Search role for Pi `custom_message` entries: extension-injected context
+/// that shaped the conversation without being a turn of it.
+const PI_CUSTOM_MESSAGE_ROLE: &str = "custom_message";
 pub const COMPACT_SEARCH_MAX_BYTES: usize = 32 * 1024;
 
 /// One provider-owned filesystem root that may contain retained transcripts.
@@ -1084,6 +1087,7 @@ pub struct SessionSchema {
     pub commands_run: Field,
     pub tool_details: Field,
     pub display_text: Field,
+    pub custom_type: Field,
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,7 +1137,7 @@ pub struct SessionIndex {
 }
 
 impl SessionIndex {
-    const SCHEMA_VERSION: u32 = 7;
+    const SCHEMA_VERSION: u32 = 8;
     const PRODUCTION_WRITER_HEAP_BYTES: usize = 50_000_000;
     #[cfg(test)]
     const TEST_WRITER_HEAP_BYTES: usize = 15_000_000;
@@ -1236,6 +1240,13 @@ impl SessionIndex {
                     IndexRecordOption::Basic,
                 )),
             ),
+            (
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.role, PI_CUSTOM_MESSAGE_ROLE),
+                    IndexRecordOption::Basic,
+                )),
+            ),
         ]);
 
         {
@@ -1265,6 +1276,7 @@ impl SessionIndex {
         let parent_session_id = builder.add_text_field("parent_session_id", STRING | STORED);
         let role = builder.add_text_field("role", STRING | STORED);
         let git_branch = builder.add_text_field("git_branch", STRING | STORED);
+        let custom_type = builder.add_text_field("custom_type", STRING | STORED);
 
         // TEXT | STORED fields (tokenized, full-text searchable, stored)
         let content = builder.add_text_field("content", TEXT | STORED);
@@ -1309,6 +1321,7 @@ impl SessionIndex {
             commands_run,
             tool_details,
             display_text,
+            custom_type,
         };
 
         (schema, fields)
@@ -1412,6 +1425,9 @@ impl SessionIndex {
         }
         doc.add_text(self.fields.content, &msg.content);
         doc.add_text(self.fields.role, &msg.role);
+        if let Some(custom_type) = msg.custom_type.as_deref().filter(|value| !value.is_empty()) {
+            doc.add_text(self.fields.custom_type, custom_type);
+        }
         doc.add_text(self.fields.git_branch, &msg.git_branch);
         doc.add_text(self.fields.tools_used, msg.tools_used.join(" "));
         doc.add_text(self.fields.files_modified, msg.files_modified.join(" "));
@@ -2071,6 +2087,13 @@ impl SessionIndex {
                         IndexRecordOption::Basic,
                     )),
                 ),
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(f.role, PI_CUSTOM_MESSAGE_ROLE),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
             ])),
         ));
 
@@ -2267,6 +2290,7 @@ impl SessionIndex {
                 snippet: snippet_html,
                 role: get_text(f.role),
                 project: get_facet_str(f.project),
+                session_name: None,
                 host: get_facet_str(f.host),
                 timestamp,
                 git_branch: get_text(f.git_branch),
@@ -2409,6 +2433,7 @@ impl SessionIndex {
             provider,
             session_id: session_id.to_string(),
             project: project_name,
+            session_name: None,
             messages: context_messages,
         })
     }
@@ -2428,6 +2453,9 @@ pub struct SearchHit {
     pub snippet: String,
     pub role: String,
     pub project: String,
+    /// Display name the provider gave this session, when one is persisted.
+    /// Filled from the analytics registry after the index query returns.
+    pub session_name: Option<String>,
     pub host: String,
     pub timestamp: String,
     pub git_branch: String,
@@ -2464,6 +2492,10 @@ impl SearchResults {
                 "snippet": truncate(&hit.snippet, 2_048),
                 "role": truncate(&hit.role, 32),
                 "project": truncate(&hit.project, 512),
+                "session_name": hit
+                    .session_name
+                    .as_deref()
+                    .map(|name| truncate(name, 512)),
                 "host": truncate(&hit.host, 512),
                 "timestamp": truncate(&hit.timestamp, 64),
                 "git_branch": truncate(&hit.git_branch, 512),
@@ -2535,6 +2567,8 @@ pub struct SessionContext {
     pub provider: IntegrationProvider,
     pub session_id: String,
     pub project: String,
+    /// Display name the provider gave this session, when one is persisted.
+    pub session_name: Option<String>,
     pub messages: Vec<ContextMessage>,
 }
 
@@ -2646,6 +2680,9 @@ pub struct ExtractedMessage {
     /// top-level `cwd` field on each JSONL row; Codex reads it once from
     /// `session_meta.payload.cwd`. None if not present in the transcript.
     pub cwd: Option<String>,
+    /// Pi's `customType` for injected-context messages (role
+    /// `custom_message`). None for every conversation message.
+    pub custom_type: Option<String>,
 }
 
 pub struct ExtractedSession {
@@ -3816,6 +3853,7 @@ fn make_tool_message(
         // Synthetic Codex tool message — no sub-agent attribution applies.
         parent_uuid: None,
         cwd,
+        custom_type: None,
     }
 }
 
@@ -3910,8 +3948,20 @@ pub(crate) fn extract_pi_session(
     let mut messages: Vec<ExtractedMessage> = Vec::new();
     let mut events = Vec::new();
     let mut tool_use_map: HashMap<String, ToolUseEntry> = HashMap::new();
+    // Injected context is its own entry type, so it is merged back by source
+    // ordinal to keep search documents and context windows in file order.
+    let mut custom_messages = session.custom_messages.into_iter().peekable();
 
     for entry in session.entries {
+        while custom_messages
+            .peek()
+            .is_some_and(|custom| custom.source_ordinal < entry.source_ordinal)
+        {
+            let custom = custom_messages.next().expect("peeked custom message");
+            if let Some(message) = pi_custom_message(custom, &session_id, &cwd, &mut seen) {
+                messages.push(message);
+            }
+        }
         if !seen.insert(entry.base.id.clone()) {
             continue;
         }
@@ -4137,7 +4187,13 @@ pub(crate) fn extract_pi_session(
             tool_actions,
             parent_uuid: entry.base.parent_id,
             cwd: Some(cwd.clone()),
+            custom_type: None,
         });
+    }
+    for custom in custom_messages {
+        if let Some(message) = pi_custom_message(custom, &session_id, &cwd, &mut seen) {
+            messages.push(message);
+        }
     }
 
     ExtractedSession {
@@ -4149,6 +4205,39 @@ pub(crate) fn extract_pi_session(
         events,
         hook_invocations: Vec::new(),
     }
+}
+
+/// Turn one Pi `custom_message` entry into a search document. It carries no
+/// tool metadata and emits no runtime event, so injected context stays out of
+/// turn, response-time, and tool analytics. `display` is Pi's TUI concern and
+/// never gates indexing.
+fn pi_custom_message(
+    entry: crate::pi_session::PiCustomMessageEntry,
+    session_id: &str,
+    cwd: &str,
+    seen: &mut HashSet<String>,
+) -> Option<ExtractedMessage> {
+    if !seen.insert(entry.base.id.clone()) || entry.content.trim().is_empty() {
+        return None;
+    }
+    Some(ExtractedMessage {
+        uuid: entry.base.id,
+        session_id: session_id.to_owned(),
+        parent_session_id: None,
+        role: PI_CUSTOM_MESSAGE_ROLE.to_string(),
+        content: truncate(&entry.content, 10_240),
+        timestamp: entry.base.timestamp,
+        git_branch: String::new(),
+        tools_used: Vec::new(),
+        files_modified: Vec::new(),
+        code_changes: Vec::new(),
+        commands_run: Vec::new(),
+        tool_details: Vec::new(),
+        tool_actions: Vec::new(),
+        parent_uuid: entry.base.parent_id,
+        cwd: Some(cwd.to_owned()),
+        custom_type: Some(entry.custom_type),
+    })
 }
 
 fn build_pi_tool_summary(
@@ -4683,6 +4772,7 @@ fn extract_claude_messages_from_jsonl_records(
             tool_actions,
             parent_uuid,
             cwd: cwd.clone(),
+            custom_type: None,
         });
     }
 
@@ -4864,6 +4954,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                     tool_actions: Vec::new(),
                     parent_uuid: None,
                     cwd: cwd.clone(),
+                    custom_type: None,
                 });
             }
             "response_item" => {
@@ -4914,6 +5005,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             tool_actions: Vec::new(),
                             parent_uuid: None,
                             cwd: cwd.clone(),
+                            custom_type: None,
                         });
                     }
                     "agent_message" => {
@@ -4955,6 +5047,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             tool_actions: Vec::new(),
                             parent_uuid: None,
                             cwd: cwd.clone(),
+                            custom_type: None,
                         });
                     }
                     "function_call" => {
@@ -5335,6 +5428,38 @@ fn find_codex_session_path_in(
 /// Wrapper for managed Tauri state.
 pub struct SessionIndexState(pub Arc<SessionIndex>);
 
+/// Attach persisted session display names to a page of hits with one bounded
+/// registry read. Sessions without a persisted name stay `None`.
+pub(crate) fn attach_session_names(
+    storage: Option<&crate::storage::Storage>,
+    results: &mut SearchResults,
+) {
+    let Some(storage) = storage else { return };
+    if results.hits.is_empty() {
+        return;
+    }
+    let wanted = results
+        .hits
+        .iter()
+        .map(|hit| (hit.provider, hit.session_id.clone()))
+        .collect::<Vec<_>>();
+    let names = storage.transcript_session_names(&wanted);
+    for hit in &mut results.hits {
+        hit.session_name = names.get(&(hit.provider, hit.session_id.clone())).cloned();
+    }
+}
+
+/// Attach the persisted session display name to one context response.
+pub(crate) fn attach_context_session_name(
+    storage: Option<&crate::storage::Storage>,
+    context: &mut SessionContext,
+) {
+    let Some(storage) = storage else { return };
+    context.session_name = storage
+        .transcript_session_names(&[(context.provider, context.session_id.clone())])
+        .remove(&(context.provider, context.session_id.clone()));
+}
+
 #[tauri::command]
 pub async fn search_sessions(
     query: String,
@@ -5346,7 +5471,11 @@ pub async fn search_sessions(
 ) -> Result<SearchResults, String> {
     let idx = state.0.clone();
     let sort = sort_by.unwrap_or_else(|| "relevance".to_string());
-    crate::run_blocking(move || idx.search(&query, &filters, &sort, page, page_size))
+    crate::run_blocking(move || {
+        let mut results = idx.search(&query, &filters, &sort, page, page_size)?;
+        attach_session_names(crate::STORAGE.get(), &mut results);
+        Ok(results)
+    })
 }
 
 #[tauri::command]
@@ -5359,7 +5488,11 @@ pub async fn get_session_context(
 ) -> Result<SessionContext, String> {
     let idx = state.0.clone();
     let w = window.unwrap_or(5) as usize;
-    crate::run_blocking(move || idx.get_context(provider, &session_id, &around_message_id, w))
+    crate::run_blocking(move || {
+        let mut context = idx.get_context(provider, &session_id, &around_message_id, w)?;
+        attach_context_session_name(crate::STORAGE.get(), &mut context);
+        Ok(context)
+    })
 }
 
 #[tauri::command]
@@ -6227,6 +6360,7 @@ mod tests {
             tool_actions: Vec::new(),
             parent_uuid: None,
             cwd: None,
+            custom_type: None,
         };
         index
             .replace_session_docs_batch(
@@ -6292,29 +6426,177 @@ mod tests {
         );
     }
 
+    // @lat: [[session-search-tests#Session Search Test Specs#Injected Context Search]]
+    #[test]
+    fn pi_custom_messages_index_with_their_custom_type_and_emit_no_events() {
+        let transcript = [
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": "pi-injected",
+                "timestamp": "2026-08-14T08:00:00Z",
+                "cwd": "/work/quill"
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "prompt",
+                "parentId": null,
+                "timestamp": "2026-08-14T08:00:01Z",
+                "message": {"role": "user", "content": "conversation-needle"}
+            }),
+            serde_json::json!({
+                "type": "custom_message",
+                "id": "hidden-notify",
+                "parentId": "prompt",
+                "timestamp": "2026-08-14T08:00:02Z",
+                "customType": "subagent-notify",
+                "content": "hidden-injected-needle",
+                "display": false
+            }),
+            serde_json::json!({
+                "type": "custom",
+                "id": "non-context",
+                "parentId": "hidden-notify",
+                "timestamp": "2026-08-14T08:00:03Z",
+                "customType": "quill",
+                "data": {"note": "excluded-custom-needle"}
+            }),
+            serde_json::json!({
+                "type": "custom",
+                "id": "tracking",
+                "parentId": "non-context",
+                "timestamp": "2026-08-14T08:00:04Z",
+                "customType": "quill-tracking",
+                "data": {
+                    "schema": crate::pi_tracking::PI_PROTOCOL_V2_TRACKING_SCHEMA,
+                    "reporter": {
+                        "protocol": crate::pi_tracking::PI_PROTOCOL_V2,
+                        "version": crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION,
+                        "quill_build": crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD,
+                        "capability_digest":
+                            crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST,
+                    },
+                    "event_uuid": "tracking-excluded-needle",
+                    "event": "session_start",
+                    "provider": "pi",
+                    "normalized_host": "host",
+                    "session_id": "pi-injected",
+                    "process_instance_id": "process-1",
+                    "sequence": 1,
+                    "origin_at": "2026-08-14T08:00:04Z",
+                    "occurred_at": "2026-08-14T08:00:04Z",
+                    "delivery_source": "live",
+                    "reason": "startup",
+                    "lineage": {"kind": "root"}
+                }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "answer",
+                "parentId": "tracking",
+                "timestamp": "2026-08-14T08:00:05Z",
+                "message": {"role": "assistant", "content": "answer"}
+            }),
+        ]
+        .map(|line| line.to_string())
+        .join("\n");
+
+        let extracted = extract_messages_from_jsonl_contents(
+            IntegrationProvider::Pi,
+            Path::new("session.jsonl"),
+            &transcript,
+        );
+        assert_eq!(
+            extracted
+                .messages
+                .iter()
+                .map(|message| (
+                    message.uuid.as_str(),
+                    message.role.as_str(),
+                    message.custom_type.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("prompt", "user", None),
+                ("hidden-notify", "custom_message", Some("subagent-notify")),
+                ("answer", "assistant", None),
+            ],
+            "injected context indexes in source order with its custom type"
+        );
+        assert!(
+            extracted
+                .events
+                .iter()
+                .all(|event| event.uuid.as_deref() != Some("hidden-notify")),
+            "injected context emits no session or runtime event"
+        );
+
+        let temp = TempDir::new().expect("tempdir");
+        let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("open index");
+        index
+            .replace_session_docs_batch(
+                IntegrationProvider::Pi,
+                "pi-injected",
+                "quill",
+                "host",
+                &extracted.messages,
+            )
+            .expect("index Pi session");
+        index.reader.reload().expect("reload index");
+
+        let hits = |query: &str| {
+            index
+                .search(query, &SearchFilters::default(), "relevance", 0, 10)
+                .expect("search index")
+                .hits
+        };
+        let injected = hits("hidden-injected-needle");
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].role, "custom_message");
+        assert_eq!(injected[0].message_id, "hidden-notify");
+        assert_eq!(
+            hits("custom_type:subagent-notify")
+                .iter()
+                .map(|hit| hit.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hidden-notify"],
+            "customType is searchable metadata"
+        );
+        assert!(
+            hits("excluded-custom-needle").is_empty(),
+            "non-context custom entries stay out of search"
+        );
+        assert!(
+            hits("tracking-excluded-needle").is_empty(),
+            "quill-tracking entries stay out of search"
+        );
+        assert_eq!(hits("conversation-needle").len(), 1);
+    }
+
     // @lat: [[session-search-tests#Session Search Test Specs#Legacy Pi Role Cleanup]]
     #[test]
     fn opening_index_removes_only_legacy_pi_non_conversation_documents() {
         let temp = TempDir::new().expect("tempdir");
+        let make_message = |uuid: &str, role: &str| ExtractedMessage {
+            uuid: uuid.to_string(),
+            session_id: uuid.to_string(),
+            parent_session_id: None,
+            role: role.to_string(),
+            content: uuid.to_string(),
+            timestamp: "2026-08-14T08:00:01Z".to_string(),
+            git_branch: String::new(),
+            tools_used: Vec::new(),
+            files_modified: Vec::new(),
+            code_changes: Vec::new(),
+            commands_run: Vec::new(),
+            tool_details: Vec::new(),
+            tool_actions: Vec::new(),
+            parent_uuid: None,
+            cwd: None,
+            custom_type: None,
+        };
         {
             let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("open index");
-            let make_message = |uuid: &str, role: &str| ExtractedMessage {
-                uuid: uuid.to_string(),
-                session_id: uuid.to_string(),
-                parent_session_id: None,
-                role: role.to_string(),
-                content: uuid.to_string(),
-                timestamp: "2026-08-14T08:00:01Z".to_string(),
-                git_branch: String::new(),
-                tools_used: Vec::new(),
-                files_modified: Vec::new(),
-                code_changes: Vec::new(),
-                commands_run: Vec::new(),
-                tool_details: Vec::new(),
-                tool_actions: Vec::new(),
-                parent_uuid: None,
-                cwd: None,
-            };
             index
                 .replace_session_docs_batch(
                     IntegrationProvider::Pi,
@@ -6335,6 +6617,15 @@ mod tests {
                 .expect("index Pi tool result");
             index
                 .replace_session_docs_batch(
+                    IntegrationProvider::Pi,
+                    "pi-injected",
+                    "project",
+                    "host",
+                    &[make_message("pi-injected", PI_CUSTOM_MESSAGE_ROLE)],
+                )
+                .expect("index Pi injected context");
+            index
+                .replace_session_docs_batch(
                     IntegrationProvider::Claude,
                     "claude-custom",
                     "project",
@@ -6350,16 +6641,38 @@ mod tests {
         .expect("reset cleanup state");
 
         let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("reopen index");
-        let facets = index.get_facets().expect("facets");
-        let count = |provider: &str| {
-            facets
+        let provider_count = |index: &SessionIndex, provider: &str| {
+            index
+                .get_facets()
+                .expect("facets")
                 .providers
                 .iter()
                 .find(|facet| facet.name == provider)
                 .map(|facet| facet.count)
         };
-        assert_eq!(count("pi"), Some(1));
-        assert_eq!(count("claude"), Some(1));
+        assert_eq!(
+            provider_count(&index, "pi"),
+            Some(2),
+            "cleanup keeps Pi conversation and injected-context documents"
+        );
+        assert_eq!(provider_count(&index, "claude"), Some(1));
+        index
+            .replace_session_docs_batch(
+                IntegrationProvider::Pi,
+                "pi-late-result",
+                "project",
+                "host",
+                &[make_message("pi-late-result", "toolResult")],
+            )
+            .expect("index later Pi tool result");
+        drop(index);
+
+        let reopened = SessionIndex::open_or_create_for_tests(temp.path()).expect("reopen again");
+        assert_eq!(
+            provider_count(&reopened, "pi"),
+            Some(3),
+            "the one-time cleanup does not run again on a later open"
+        );
     }
 
     // @lat: [[session-search-tests#Session Search Test Specs#Compact AI Results]]
@@ -6374,6 +6687,7 @@ mod tests {
             snippet: "matching snippet ".repeat(1_000),
             role: "assistant".to_string(),
             project: "quill".to_string(),
+            session_name: Some("named session".to_string()),
             host: "host".to_string(),
             timestamp: "2026-08-14T08:00:01Z".to_string(),
             git_branch: "main".to_string(),
@@ -6396,6 +6710,10 @@ mod tests {
         assert!(encoded.len() <= 32 * 1024);
         assert!(!hits.is_empty());
         assert!(hits.iter().all(|hit| hit.get("content").is_none()));
+        assert!(
+            hits.iter()
+                .all(|hit| hit["session_name"] == "named session")
+        );
         assert_eq!(compact["truncated"], true);
     }
 
@@ -6447,11 +6765,127 @@ mod tests {
         assert_eq!(result.hits[0].message_id, "message-a");
     }
 
+    // @lat: [[session-search-tests#Session Search Test Specs#Schema Rebuild Measurement]]
+    #[test]
+    #[ignore = "reproducible index rebuild wall-time measurement"]
+    fn measure_session_index_schema_rebuild_on_pinned_corpus() {
+        const MANIFEST: &str = "pi-analytics-migration-v1\nsessions=80\nentries=30700\nassistant_messages=12685\ntool_results=16670\n";
+        const MANIFEST_SHA256: &str =
+            "0489da2b94fe813d785f8b5bc4ed2f871b3f0732cde6aab5334c55788f9f673e";
+        const SESSIONS: usize = 80;
+        // Every audit-window entry that becomes a search document: assistant
+        // messages plus the non-assistant, non-tool-result remainder.
+        const DOCUMENTS: usize = 30_700 - 16_670;
+        // `custom_message` entries observed in the same window; they carry the
+        // schema-8 `custom_type` field this rebuild exists for.
+        const INJECTED_CONTEXT: usize = 655;
+        const PER_SESSION: usize = DOCUMENTS.div_ceil(SESSIONS);
+
+        use sha2::Digest;
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(MANIFEST)),
+            MANIFEST_SHA256
+        );
+        let temp = TempDir::new().expect("tempdir");
+        let corpus = (0..DOCUMENTS)
+            .map(|index| {
+                let injected = index < INJECTED_CONTEXT;
+                ExtractedMessage {
+                    uuid: format!("message-{index:05}"),
+                    session_id: format!("session-{:03}", index / PER_SESSION),
+                    parent_session_id: None,
+                    role: if injected {
+                        PI_CUSTOM_MESSAGE_ROLE.to_string()
+                    } else {
+                        "assistant".to_string()
+                    },
+                    content: format!(
+                        "measured rebuild document {index} with enough prose to tokenize \
+                         like a real transcript entry rather than a single term"
+                    ),
+                    timestamp: "2026-08-24T00:00:00Z".to_string(),
+                    git_branch: "main".to_string(),
+                    tools_used: vec!["bash".to_string()],
+                    files_modified: vec![format!("/work/quill/src/file-{index:05}.rs")],
+                    code_changes: Vec::new(),
+                    commands_run: vec![format!("$ cargo test case-{index:05}")],
+                    tool_details: Vec::new(),
+                    tool_actions: Vec::new(),
+                    parent_uuid: None,
+                    cwd: Some("/work/quill".to_string()),
+                    custom_type: injected.then(|| "subagent-notify".to_string()),
+                }
+            })
+            .collect::<Vec<_>>();
+        // One writer and one commit for the whole sweep, exactly as
+        // `startup_scan` reindexes after a schema bump.
+        let index_corpus = |index: &SessionIndex| {
+            let writer = index.writer.lock().unwrap();
+            for message in &corpus {
+                index
+                    .add_message_to_writer(
+                        &writer,
+                        IntegrationProvider::Pi,
+                        message,
+                        "quill",
+                        "host",
+                    )
+                    .expect("index corpus document");
+            }
+            drop(writer);
+            index
+                .writer
+                .lock()
+                .unwrap()
+                .commit()
+                .expect("commit corpus");
+        };
+        {
+            let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("seed index");
+            index_corpus(&index);
+        }
+        let bytes_before = fs::read_dir(temp.path())
+            .expect("read seeded index")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|metadata| metadata.len())
+            .sum::<u64>();
+        fs::write(
+            temp.path().join("schema_version.txt"),
+            (SessionIndex::SCHEMA_VERSION - 1).to_string(),
+        )
+        .expect("pin pre-upgrade schema version");
+
+        let started = std::time::Instant::now();
+        let rebuilt = SessionIndex::open_or_create_for_tests(temp.path()).expect("rebuild index");
+        index_corpus(&rebuilt);
+        rebuilt.reader.reload().expect("reload rebuilt index");
+        let wall_time = started.elapsed();
+
+        assert_eq!(
+            rebuilt
+                .search(
+                    "custom_type:subagent-notify",
+                    &SearchFilters::default(),
+                    "relevance",
+                    0,
+                    1
+                )
+                .expect("search rebuilt index")
+                .total_hits,
+            INJECTED_CONTEXT as u64
+        );
+        eprintln!(
+            "index-rebuild-measurement manifest_sha256={MANIFEST_SHA256} sessions={SESSIONS} documents={DOCUMENTS} injected_context={INJECTED_CONTEXT} bytes_before={bytes_before} wall_time_ms={}",
+            wall_time.as_millis()
+        );
+    }
+
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Search Schema Rebuild]]
     #[test]
     fn search_schema_change_rebuilds_existing_index() {
         let temp = TempDir::new().expect("tempdir");
-        fs::write(temp.path().join("schema_version.txt"), "6").expect("write old version");
+        fs::write(temp.path().join("schema_version.txt"), "7").expect("write old version");
         let obsolete = temp.path().join("obsolete-index-file");
         fs::write(&obsolete, "old schema").expect("write old index marker");
 
@@ -6459,7 +6893,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(temp.path().join("schema_version.txt")).expect("read version"),
-            "7"
+            "8"
         );
         assert!(!obsolete.exists(), "old schema contents must be removed");
     }
@@ -6485,6 +6919,7 @@ mod tests {
             tool_actions: Vec::new(),
             parent_uuid: None,
             cwd: None,
+            custom_type: None,
         };
         index
             .replace_session_docs_batch(
