@@ -17,20 +17,9 @@ before Tauri can package it. The uncompressed chunk warning limit is 550 kB.
 TypeScript uses strict mode, ESNext modules, and bundler resolution. See
 `vite.config.ts` and `tsconfig.json`.
 
-`npm run build:web` invokes Vite's `web` mode, emitting an isolated `dist-web/`
-from `web.html` only. That mode keeps the browser bundle out of desktop Sentry
-upload and sourcemap handling. Tauri runs it before its dev server and desktop
-bundle builds; `dist-web/` remains generated and ignored.
+`npm run build:web` invokes Vite's `web` mode, emitting an isolated `dist-web/` from `web.html` only. It loads [[src/web-main.tsx]], not `src/main.tsx`, so the emitted browser graph contains neither Manage nor Release Notes chunks and never initializes desktop crash reporting or the updater. Web mode stays outside desktop Sentry upload and sourcemap handling. Tauri runs it before its dev server and desktop bundle builds; `dist-web/` remains generated and ignored.
 
-Web mode also writes a build manifest, which is the oracle for what the listener
-serves: `scripts/web-bundle-isolation.test.mjs` walks the entry's transitive
-chunk graph and asserts the emitted files are exactly that graph. The manifest
-lands in `dist-web/.vite/`, a path [[src-tauri/src/web_server/assets.rs]] does
-not route.
-
-[[src-tauri/src/web_server/assets.rs]] embeds `dist-web/` at compile time, so
-the directory must exist before any `cargo` command runs. `README.md` says to
-build it once in a fresh clone; the Tauri lifecycle commands and CI already do.
+Web mode writes `dist-web/.vite/manifest.json`. [[src-tauri/src/web_server/assets.rs]] embeds the directory at compile time in release builds and reads it from disk in debug builds, but routes only `/` and `/assets/*`, never the manifest. `scripts/web-bundle-isolation.test.mjs` treats the manifest's transitive `web.html` graph as the served-asset oracle. The folder must exist before every Cargo compile; `README.md`, Tauri lifecycle commands, and CI establish that build order.
 
 #### Crash Transport CSP
 
@@ -38,7 +27,7 @@ Production permits outbound frontend connections only to Tauri IPC and the exact
 
 `index.html` names `https://o1373069.ingest.us.sentry.io` in `connect-src` so the browser SDK can post envelopes without widening the policy to every Sentry tenant. The dev-only policy in `vite.config.ts` keeps the same origin alongside its localhost tooling exceptions. `scripts/csp.test.mjs` pins the desktop policy byte-for-byte and keeps its Vite build on the default `index.html` entry.
 
-`web.html` has its own HTTP CSP: `connect-src 'self'` reaches the same-origin invoke bridge and no Sentry origin appears. `scripts/csp.test.mjs` pins that policy separately and verifies Vite's web mode emits `dist-web/` from `web.html`. The web build imports neither the crash reporter nor updater, so the browser client creates no extra outbound telemetry transport.
+`web.html` has its own HTTP CSP: `default-src 'self'`, local script/style/image/font sources, and `connect-src 'self'` for the same-origin invoke bridge. It has no Tauri IPC or Sentry origin. `scripts/csp.test.mjs` pins this policy separately and verifies the `web.html` Vite configuration. The web build imports neither the crash reporter nor updater, so the browser client creates no extra outbound telemetry transport; the server-rendered pairing page separately hash-pins its one inline script.
 
 ### Backend Build
 

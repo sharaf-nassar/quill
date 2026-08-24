@@ -28,11 +28,13 @@ The route set is `/api/v1/context/{index,fetch,execute,search,source,stats,purge
 
 ### Web UI protocol contract
 
-[[src-tauri/src/web_server/mod.rs]] defines the third listener's closed invoke and pairing protocol independently of the writable ingestion API.
+[[src-tauri/src/web_server/mod.rs]] defines the third listener's closed invoke and pairing protocol, separate from writable ingestion.
 
-Browser dispatch is one exact default-deny match over the monitor's cache/local-storage reads, owned by [[src-tauri/src/web_allowlist.rs#is_permitted_command]]; `fetch_usage_data`, `refresh_usage_data`, retry/backfill and maintenance commands, every setter, and the full `plugin:*` namespace are excluded. Each permitted arm carries the storage read it resolves to, matching is on the complete command string so no prefix, suffix, or alias widens it, and nothing is keyed on a command count. Command denial is a JSON `403`, while host/session refusal remains an empty-body `403` before dispatch.
+The listener is disabled by default; its `web_ui.*` configuration, live status, and pairing-code rotation remain desktop IPC rather than HTTP endpoints.
 
-Desktop configuration serializes as `{ config: { enabled, port, host_policy, allowlist }, pairing_code }`; status serializes as `{ running, bound_addr, reachable_urls, last_error }`. Reachable URLs use concrete interface IPs, explicit ports, IPv6 brackets, and a trailing slash. Pairing sets `quill_web_session` for 30 days with `Path=/`, `HttpOnly`, and `SameSite=Strict`, omitting `Domain`, `Secure`, and `Expires` for the intentionally plain-HTTP listener. Cross-language round-trip fixtures are fixed by `specs/029-web-ui-server.md#web-transport-protocol-contract`.
+[[src/web/httpTransport.ts]] sends the exact `{ cmd, args }` envelope to `POST /api/web/invoke` and maps the closed response envelopes back to Tauri-style promise resolution or rejection. [[src-tauri/src/web_allowlist.rs#is_permitted_command]] is the only command boundary: its exact default-deny match permits the sixteen cache/local-storage monitor reads and excludes `fetch_usage_data`, `refresh_usage_data`, retry/backfill and maintenance commands, every setter, and every `plugin:*` command. No prefix, suffix, alias, or command count widens that boundary. An authenticated command denial is a JSON `403`; peer, budget, and session refusals are empty-body `403`s before dispatch.
+
+Desktop configuration serializes as `{ config: { enabled, port, host_policy, allowlist }, pairing_code }`; status serializes as `{ running, bound_addr, reachable_urls, last_error }`. Reachable URLs use concrete interface IPs, explicit ports, IPv6 brackets, and a trailing slash. Pairing sets `quill_web_session` for 30 days with `Path=/`, `HttpOnly`, and `SameSite=Strict`, omitting `Domain`, `Secure`, and `Expires` for the intentionally plain-HTTP listener. Cross-language payloads and round-trip fixtures are normative in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
 
 ### Web UI pairing credential
 
@@ -109,8 +111,7 @@ as proof that a firewall permits external traffic.
 fallback, so no route can be mounted outside the peer, budget, size, and time
 bounds.
 
-Refusals are an empty-body `403` decided before routing, which is what makes
-"not a partial render" hold for pages, assets, and invokes alike.
+Peer-policy, request-budget, and session refusals are empty-body `403`s decided before a route reads Quill data, which makes "not a partial render" hold for pages, assets, and invokes. Malformed invokes remain empty-body `400`s, oversized bodies `413`s, and a timed-out request `408`.
 
 Client identity is the accepted socket's address delivered through Axum
 `ConnectInfo`, never the `Host` header and never reverse DNS. Hostname
@@ -138,10 +139,7 @@ ten seconds.
 [[src-tauri/src/web_server/router.rs]] mounts the three request classes, and
 mounting is what enforces them.
 
-`GET /pair` and `POST /api/web/pair` are the only public routes; the invoke
-route and the router's fallback sit behind
-[[src-tauri/src/web_server/gates.rs#require_session]], so an unrouted path and
-an asset path are refused on the same terms as a data read.
+`GET /pair` and `POST /api/web/pair` are the only public routes, though both still cross the peer filter and per-peer budgets. The document, `/assets/*`, invoke route, and fallback share [[src-tauri/src/web_server/gates.rs#require_session]]: an unpaired request is an empty-body `403`, while a paired request outside the monitor asset graph is a plain `404`.
 
 The pairing page is rendered by the server rather than served from the bundle,
 so an unpaired browser can bootstrap without receiving an application chunk. It
@@ -177,10 +175,7 @@ the desktop bundle builds from `index.html` into `dist/` and the monitor bundle
 builds from `web.html` into `dist-web/`, and only the latter is embedded, so no
 desktop-only chunk exists in the folder to reach.
 
-Release builds embed `dist-web/`; debug builds read it from disk per request,
-which is what lets `npm run tauri -- dev` serve a bundle Vite rebuilt after the
-Rust binary was compiled. The folder must exist when the crate compiles — a
-compile error naming the path beats a binary that silently serves nothing.
+Release builds embed `dist-web/`; debug builds read it from disk per request, which lets `npm run tauri -- dev` serve a bundle Vite rebuilt after the Rust binary was compiled. The folder must exist when the crate compiles; [[infrastructure#Infrastructure#Build Configuration#Frontend Build]] records the required build order.
 
 The monitor surface is one document with no client-side router, so the SPA
 fallback set is exactly `/`; every other path resolves against real files under
@@ -1686,15 +1681,9 @@ The Tauri commands registered in [[src-tauri/src/lib.rs]] are grouped by feature
 
 ### Web UI Commands (4)
 
-Four desktop IPC commands expose Web UI configuration, listener status, and
-pairing-code rotation.
+The 93 entries in [[src-tauri/src/lib.rs]]'s `tauri::generate_handler!` include four desktop-only Web UI commands: configuration read/write, live listener status, and pairing-code rotation.
 
-`set_web_ui_config` delegates to the serialized listener controller before
-returning the final config-plus-pairing envelope; status reflects the live
-listener rather than only the persisted enable flag. Expected validation, bind,
-rollback, storage, and pairing failures use
-[[src-tauri/src/web_server/mod.rs#WebUiError]] as one typed display-safe
-boundary.
+`set_web_ui_config` delegates to the serialized listener controller before returning the final config-plus-pairing envelope; status reflects the live listener rather than only the persisted enable flag. Expected validation, bind, rollback, storage, and pairing failures use [[src-tauri/src/web_server/mod.rs#WebUiError]] as one typed display-safe boundary.
 
 ### Usage and Token Commands (14)
 

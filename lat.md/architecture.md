@@ -59,7 +59,9 @@ Neither Manage nor release-notes had any affordance at all before this, because 
 
 ## Module Map
 
-The Rust backend in [[src-tauri/src/lib.rs]] registers 93 Tauri commands and starts background tasks on launch. The Web UI controller is managed during setup, but its storage read and listener startup run asynchronously so window creation never waits on a bind.
+The `tauri::generate_handler!` list in [[src-tauri/src/lib.rs]] contains 93 registered Tauri commands.
+
+It starts background tasks on launch. The Web UI controller is managed during setup, but its storage read and listener startup run asynchronously so window creation never waits on a bind.
 
 ### Backend Modules
 
@@ -120,15 +122,19 @@ An Axum server on port 19876 (configurable via `QUILL_PORT`) receives data from 
 
 ### Web UI HTTP
 
-The web-only monitor uses a same-origin invoke bridge with a default-deny read-command boundary.
+The optional web-only monitor is Quill's third Axum listener, separate from ingestion and context listeners.
 
-`POST /api/web/invoke` runs through [[src/web/httpTransport.ts]]. [[src-tauri/src/web_server/mod.rs]] owns the matching serde envelopes, desktop config/status field names, pairing-cookie attributes, and canonical reachable-URL formatting, while [[src-tauri/src/web_allowlist.rs]] owns the exact permitted-command table. The shim holds no parallel command or settings-key table. Success and command failures retain Tauri-style promise behavior; host/session refusals stay empty-body `403` responses before data access. The normative cross-language payloads and fixtures live in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
+It starts disabled; its default configuration binds `127.0.0.1:19878` until `host_policy=all` or a non-loopback allowlist entry requests `0.0.0.0`. Ingestion remains on `:19876`; the context listener remains loopback `:19877`.
 
-[[src-tauri/src/web_server/gates.rs]] wraps every route in the gates the three request classes share: socket-peer authorization against a pinned allowlist, per-peer request budgets, a connection cap, a body cap, and a request timeout. It refuses with an empty-body `403` before routing, so no gate decision depends on a header the client controls.
+Its request classes make bootstrap explicit: `GET /pair` and `POST /api/web/pair` are public but peer-filtered and rate-limited; `/`, `/assets/*`, and `POST /api/web/invoke` also require a live session cookie. The inline pairing page carries no app asset and uses a hash-pinned script CSP. A paired miss outside the monitor asset graph is `404`; an unpaired asset, invoke, or fallback request is an empty-body `403` before any Quill read.
 
-There is no browser push channel in v1. Event listen/unlisten and window/webview plugin calls are client-local no-ops, while every `plugin:*` command remains denied server-side. [[src/web/useWebMonitorData.ts]] supplies freshness with a visibility-aware 55-second poll plus focus refresh; its ordinary isolated 20-sample qualification recorded 55.056 seconds p95 against the 60-second budget.
+[[src/web/httpTransport.ts]] sends the closed invoke envelope to `POST /api/web/invoke`. [[src-tauri/src/web_server/mod.rs]] owns matching serde envelopes, desktop config/status field names, pairing-cookie attributes, and reachable-URL formatting; [[src-tauri/src/web_allowlist.rs]] owns the one exact default-deny table. Only sixteen monitor reads reach the shared desktop implementations. The shim owns neither a second command table nor settings keys: command failures retain Tauri-style promise behavior, and `plugin:*` remains server-denied even though browser event/window/webview calls are client-local no-ops. The normative cross-language payloads and fixtures live in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
 
-[[src-tauri/src/web_server/controller.rs]] owns the listener independently of the ingestion and context servers. It serializes runtime config transitions, binds loopback until policy admits a non-local host, performs different-port bind-before-swap and same-port stop-bind-rollback sequencing, and persists startup bind errors. `running` and `bound_addr` prove only local listener state; reachable URL candidates do not claim firewall reachability.
+[[src-tauri/src/web_server/gates.rs]] identifies callers only by accepted socket peer, never `Host` or reverse DNS. It forward-resolves hostname allowlist entries when committed, pins those addresses until restart or re-save, fails closed on an empty or failed resolution, and lets loopback bypass only peer filtering. Per-peer general and pairing budgets, a bounded peer table, an eight-connection listener, 1 MiB body cap, and ten-second request timeout constrain every route. Peer, budget, and session refusal is an empty-body `403` before route data access.
+
+[[src-tauri/src/web_pairing.rs]] keeps a separate identity-scoped 160-bit credential, never the ingestion bearer secret. Pairing compares it constant-time and issues an HMAC session cookie; regenerating it invalidates every browser session. [[src-tauri/src/web_server/controller.rs]] serializes enable, disable, and reconfiguration: different-port changes bind, persist, swap, then retire; same-port address changes stop, bind, and rebind the old listener if bind or persistence fails. Startup failures persist a display-safe error. `running` and `bound_addr` prove only a local listener; reachable URL candidates do not claim firewall reachability.
+
+There is no browser push channel in v1. [[src/web/useWebMonitorData.ts]] provides freshness with visibility-aware 55-second polling plus focus refresh; its ordinary isolated 20-sample qualification recorded 55.056 seconds p95 against the 60-second budget.
 
 ### Tauri Events
 
