@@ -71,7 +71,7 @@ export interface UseWebUiSettingsResult {
    * persisted and running.
    */
   error: WebUiError | null;
-  save: (next: WebUiConfig) => Promise<void>;
+  save: (next: WebUiConfig) => Promise<WebUiError | null>;
   regeneratePairingCode: () => Promise<void>;
 }
 
@@ -144,6 +144,7 @@ export function useWebUiSettings(): UseWebUiSettingsResult {
     }
     setError(failure);
     setSaving(false);
+    return failure;
   }, []);
 
   const regeneratePairingCode = useCallback(async () => {

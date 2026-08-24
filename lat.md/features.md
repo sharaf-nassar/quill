@@ -439,9 +439,15 @@ while the row shows why it was refused.
 
 Host acceptance is a radio group rather than a toggle strip: both modes carry
 their own exposure copy so the accept-all consequence is readable before it is
-chosen, and choosing it is the explicit act P11 requires. The pairing row shows
-the code with a Regenerate action and states that regenerating signs out every
-paired browser and that the code is never the credential the agents report with.
+chosen, and choosing it is the explicit act P11 requires.
+[[src/components/settings/AllowlistEditor.tsx]] lives in that fieldset. Its form
+submits each unparsed candidate through `set_web_ui_config`, renders the
+backend's `invalid_allowlist_entry` and `too_many_allowlist_entries` failures
+beside the input, and renders only the canonical sorted list returned by Rust.
+The native form and per-row Remove buttons keep adding and removal keyboard
+operable. The pairing row shows the code with a Regenerate action and states
+that regenerating signs out every paired browser and that the code is never the
+credential the agents report with.
 
 The listener readout separates *bound* from *reachable*. It reports the socket
 Quill actually holds (`127.0.0.1:<port>` or `0.0.0.0:<port>`) and the

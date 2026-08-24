@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useWebUiSettings } from "../../hooks/useWebUiSettings";
 import type { WebUiHostPolicy } from "../../web/httpTransport";
+import AllowlistEditor from "./AllowlistEditor";
 import SettingRow from "./SettingRow";
 import Toggle from "./Toggle";
 
@@ -179,6 +180,7 @@ function WebTab() {
             </span>
           </span>
         </label>
+        <AllowlistEditor config={config} disabled={busy} save={save} />
       </fieldset>
 
       <div className="settings-section-header">Pairing</div>
