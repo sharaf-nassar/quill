@@ -3939,6 +3939,15 @@ pub(crate) fn extract_pi_session(
                                         .is_some_and(|text| !text.trim().is_empty())
                             })
                         });
+                let has_thinking =
+                    content
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|blocks| {
+                            blocks.iter().any(|block| {
+                                block.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("thinking")
+                            })
+                        });
                 let has_tool =
                     content
                         .and_then(serde_json::Value::as_array)
@@ -3949,6 +3958,7 @@ pub(crate) fn extract_pi_session(
                             })
                         });
                 [
+                    has_thinking.then_some(SessionEventKind::AsstThinking),
                     has_text.then_some(SessionEventKind::AsstText),
                     has_tool.then_some(SessionEventKind::AsstToolUse),
                 ]
@@ -5864,6 +5874,73 @@ mod tests {
                 .iter()
                 .all(|message| message.session_id == "pi-session"
                     && message.cwd.as_deref() == Some("/work/quill"))
+        );
+    }
+
+    // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#Retained Thinking Event Classification]]
+    #[test]
+    fn pi_retained_thinking_events_are_ordered_and_keep_thinking_only_messages() {
+        let transcript = [
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": "pi-thinking-events",
+                "timestamp": "2026-08-14T08:00:00Z",
+                "cwd": "/work/quill"
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "mixed",
+                "parentId": null,
+                "timestamp": "2026-08-14T08:00:01Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": ""},
+                        {"type": "text", "text": "answer"},
+                        {"type": "toolCall", "id": "call", "name": "read", "arguments": {}}
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "thinking-only",
+                "parentId": "mixed",
+                "timestamp": "2026-08-14T08:00:02Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "only"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|entry| entry.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let extracted = extract_messages_from_jsonl_contents(
+            IntegrationProvider::Pi,
+            Path::new("session.jsonl"),
+            &transcript,
+        );
+
+        assert_eq!(
+            extracted
+                .events
+                .iter()
+                .map(|event| (event.source_ordinal, event.event_ordinal, event.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 0, SessionEventKind::AsstThinking),
+                (1, 1, SessionEventKind::AsstText),
+                (1, 2, SessionEventKind::AsstToolUse),
+                (2, 0, SessionEventKind::AsstThinking),
+            ]
+        );
+        assert_eq!(
+            extracted.messages.len(),
+            1,
+            "thinking-only entries stay out of search while entering retained events"
         );
     }
 

@@ -10,7 +10,13 @@ These tests pin the shared persisted Pi parser used by search indexing and sourc
 
 V3 parsing retains native message, model-change, and summary evidence with original source order.
 
-Headers and entries preserve identity, cwd, timestamps, ids, parent links, model values, and usage needed by indexing and snapshots. Compaction and branch-summary entries keep their exact JSON value for retained analytics without becoming conversation messages.
+Headers and entries preserve identity, cwd, timestamps, ids, parent links, model values, and usage needed by indexing and snapshots. Compaction and branch-summary entries keep their exact JSON value for retained analytics without becoming conversation messages. `thinking_level_change` entries retain their `thinkingLevel` and source ordinal; `pi_session::tests::parses_v3_header_and_message_entries` pins that shape.
+
+## Retained Thinking Event Classification
+
+Retained Pi assistant blocks emit `asst_thinking` before text and tool-use siblings, including empty blocks. A thinking-only entry stays out of search but remains a runtime event.
+
+`sessions::tests::pi_retained_thinking_events_are_ordered_and_keep_thinking_only_messages` pins event ordering and the thinking-only exception.
 
 ## V2 Hook Messages
 

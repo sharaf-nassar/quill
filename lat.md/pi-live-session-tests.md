@@ -71,7 +71,9 @@ Pi runtime traffic charges contained messages, accepts 4,000 messages per minute
 
 ## Pi Runtime Message Mapping
 
-Pi turn, input, and tool execution types map to canonical runtime events while the unavailable thinking event remains an explicit rejected gap.
+Pi turn, input, and tool execution types map to canonical runtime events. Live `/sessions/messages` keeps rejecting `asst_thinking`; retained reconciliation owns Pi thinking evidence.
+
+`server::observed_subagent_tests::pi_session_message_types_map_without_thinking_events` pins the live mapping and rejection.
 
 ## Split Turn Response Pairing
 

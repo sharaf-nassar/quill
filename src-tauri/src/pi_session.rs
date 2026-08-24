@@ -72,6 +72,16 @@ pub(crate) struct PiSummaryEntry {
     pub(crate) value: Value,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PiThinkingLevelChangeEntry {
+    #[serde(flatten)]
+    pub(crate) base: PiSessionEntryBase,
+    pub(crate) thinking_level: String,
+    #[serde(skip)]
+    pub(crate) source_ordinal: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PiSession {
     pub(crate) header: PiSessionHeader,
@@ -79,6 +89,7 @@ pub(crate) struct PiSession {
     pub(crate) model_changes: Vec<PiModelChangeEntry>,
     pub(crate) tracking_entries: Vec<PiTrackingEntry>,
     pub(crate) summary_entries: Vec<PiSummaryEntry>,
+    pub(crate) thinking_level_changes: Vec<PiThinkingLevelChangeEntry>,
 }
 
 #[derive(Debug)]
@@ -190,6 +201,7 @@ pub(crate) fn parse_pi_session_records(
     let mut model_changes = Vec::new();
     let mut tracking_entries = Vec::new();
     let mut summary_entries = Vec::new();
+    let mut thinking_level_changes = Vec::new();
     for (source_ordinal, value) in records {
         match value.get("type").and_then(Value::as_str) {
             Some("message") => {
@@ -221,6 +233,12 @@ pub(crate) fn parse_pi_session_records(
                         },
                         value,
                     });
+                }
+            }
+            Some("thinking_level_change") => {
+                if let Ok(mut entry) = serde_json::from_value::<PiThinkingLevelChangeEntry>(value) {
+                    entry.source_ordinal = source_ordinal;
+                    thinking_level_changes.push(entry);
                 }
             }
             Some("custom")
@@ -263,6 +281,7 @@ pub(crate) fn parse_pi_session_records(
         model_changes,
         tracking_entries,
         summary_entries,
+        thinking_level_changes,
     }))
 }
 
@@ -312,6 +331,10 @@ mod tests {
             session.summary_entries[1].kind,
             super::PiSummaryKind::BranchSummary
         );
+        assert_eq!(session.thinking_level_changes.len(), 1);
+        assert_eq!(session.thinking_level_changes[0].base.id, "thinking");
+        assert_eq!(session.thinking_level_changes[0].thinking_level, "high");
+        assert_eq!(session.thinking_level_changes[0].source_ordinal, 3);
     }
 
     // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#V2 Hook Messages]]

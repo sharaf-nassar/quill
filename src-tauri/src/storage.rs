@@ -36422,16 +36422,6 @@ mod tests {
             .expect("count replayed Pi events"),
             4
         );
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM session_events
-                 WHERE provider = 'pi' AND kind = 'asst_thinking'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("count Pi thinking events"),
-            0
-        );
         drop(conn);
 
         let stats = with_pinned_query_now(

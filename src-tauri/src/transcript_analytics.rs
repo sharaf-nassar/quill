@@ -1804,6 +1804,32 @@ fn pi_event_kind_name(kind: &crate::models::PiProtocolV2EventKind) -> &'static s
     }
 }
 
+fn pi_thinking_level_setting_events(
+    session: &crate::pi_session::PiSession,
+    source_key: &str,
+    native: &NativeChainIdentity,
+) -> Result<Vec<OwnedSessionSettingEvent>, TranscriptAnalyticsError> {
+    session
+        .thinking_level_changes
+        .iter()
+        .map(|entry| {
+            pi_timestamp_ms(&entry.base.timestamp)?;
+            Ok(OwnedSessionSettingEvent {
+                provider: IntegrationProvider::Pi,
+                source_key: source_key.to_owned(),
+                session_id: native.chain_id.clone(),
+                chain_id: native.chain_id.clone(),
+                parent_chain_id: native.parent_chain_id.clone(),
+                source_ordinal: i64::try_from(entry.source_ordinal)
+                    .map_err(|_| TranscriptAnalyticsError::PiSourceIdentity)?,
+                timestamp: entry.base.timestamp.clone(),
+                setting: "thinking_level".to_owned(),
+                value: entry.thinking_level.clone(),
+            })
+        })
+        .collect()
+}
+
 fn pi_lineage_fields(
     lineage: &crate::models::PiProtocolV2Lineage,
     session_id: &str,
@@ -2132,7 +2158,7 @@ fn parse_transcript_analytics_source_bytes(
     let records = parse_jsonl_records(contents);
     drop(bytes);
     let source_key = source.source_key.clone();
-    let (native_identity, diagnostics, extracted, pi_evidence) = if source.provider
+    let (native_identity, diagnostics, extracted, setting_events, pi_evidence) = if source.provider
         == IntegrationProvider::Pi
     {
         let session = crate::pi_session::parse_pi_session_records(
@@ -2146,13 +2172,21 @@ fn parse_transcript_analytics_source_bytes(
         let mut diagnostics = TranscriptRecordDiagnostics::default();
         let pi_evidence =
             build_pi_persisted_evidence(&session, &source_key, hostname, &mut diagnostics)?;
+        let setting_events =
+            pi_thinking_level_setting_events(&session, &source_key, &native_identity)?;
         let extracted = crate::sessions::extract_pi_session(&source.canonical_path, session);
-        (native_identity, diagnostics, extracted, Some(pi_evidence))
+        (
+            native_identity,
+            diagnostics,
+            extracted,
+            setting_events,
+            Some(pi_evidence),
+        )
     } else {
         let (native_identity, diagnostics) = resolve_native_identity(source, &records)?;
         let extracted =
             extract_messages_from_jsonl_records(source.provider, &source.canonical_path, &records);
-        (native_identity, diagnostics, extracted, None)
+        (native_identity, diagnostics, extracted, Vec::new(), None)
     };
     let mut native_event_ordinals = HashMap::<String, usize>::new();
     let session_events = extracted
@@ -2263,7 +2297,7 @@ fn parse_transcript_analytics_source_bytes(
         tool_actions,
         skill_usages,
         hook_invocations,
-        setting_events: Vec::new(),
+        setting_events,
         pi_evidence,
     };
     Ok(ParsedTranscriptAnalyticsSource {
@@ -2729,6 +2763,229 @@ mod tests {
         clear_env();
     }
 
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Pi Thinking Events And Setting Timeline]]
+    #[test]
+    #[serial]
+    fn pi_thinking_level_changes_replace_atomically_and_order_by_timestamp_ordinal() {
+        clear_env();
+        let data_dir = TempDir::new().expect("data directory");
+        let transcript_dir = TempDir::new().expect("transcript directory");
+        let session_id = "pi-thinking-level";
+        let path = transcript_dir.path().join("pi-thinking-level.jsonl");
+        let lines = [
+            json!({
+                "type": "session",
+                "version": 3,
+                "id": session_id,
+                "timestamp": "2026-08-14T08:00:00.000Z",
+                "cwd": "/work/quill"
+            }),
+            json!({
+                "type": "message",
+                "id": "prompt",
+                "parentId": null,
+                "timestamp": "2026-08-14T08:00:00.000Z",
+                "message": {"role": "user", "content": "prompt"}
+            }),
+            json!({
+                "type": "message",
+                "id": "before",
+                "parentId": "prompt",
+                "timestamp": "2026-08-14T08:00:01.000Z",
+                "message": {"role": "assistant", "content": "before"}
+            }),
+            json!({
+                "type": "thinking_level_change",
+                "id": "off",
+                "parentId": "before",
+                "timestamp": "2026-08-14T08:00:02.000Z",
+                "thinkingLevel": "off"
+            }),
+            json!({
+                "type": "thinking_level_change",
+                "id": "xhigh-first",
+                "parentId": "off",
+                "timestamp": "2026-08-14T08:00:02.000Z",
+                "thinkingLevel": "xhigh"
+            }),
+            json!({
+                "type": "message",
+                "id": "same-time",
+                "parentId": "xhigh-first",
+                "timestamp": "2026-08-14T08:00:02.000Z",
+                "message": {"role": "assistant", "content": "same time"}
+            }),
+            json!({
+                "type": "thinking_level_change",
+                "id": "xhigh-repeat",
+                "parentId": "same-time",
+                "timestamp": "2026-08-14T08:00:03.000Z",
+                "thinkingLevel": "xhigh"
+            }),
+            json!({
+                "type": "message",
+                "id": "after",
+                "parentId": "xhigh-repeat",
+                "timestamp": "2026-08-14T08:00:04.000Z",
+                "message": {"role": "assistant", "content": "after"}
+            }),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+        std::fs::write(&path, jsonl_body(&lines)).expect("write Pi timeline");
+        set_mtime_ns(&path, FIXED_MTIME_NS);
+        let source = DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: source_root_key(IntegrationProvider::Pi),
+            source_key: crate::storage::pi_source_key(TEST_HOSTNAME, session_id)
+                .expect("canonical Pi source key"),
+            filesystem_path: path.clone(),
+            canonical_path: path,
+            layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
+        };
+        let storage = init_storage_in(&data_dir);
+        let generation = storage
+            .begin_transcript_analytics_generation(IntegrationProvider::Pi, source.source_root_key)
+            .expect("begin Pi generation");
+        let snapshot = stamp_analytics_root(
+            parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+                .expect("parse Pi thinking timeline"),
+            session_id,
+            generation,
+        )
+        .expect("stamp Pi thinking timeline");
+        assert_eq!(
+            snapshot
+                .setting_events
+                .iter()
+                .map(|row| (row.source_ordinal, row.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "off"), (4, "xhigh"), (6, "xhigh")]
+        );
+        storage
+            .replace_transcript_analytics_snapshot(&snapshot)
+            .expect("persist Pi thinking timeline");
+
+        let conn = rusqlite::Connection::open(storage.database_path())
+            .expect("open Pi setting timeline reader");
+        let active_level = |timestamp: &str, source_ordinal: i64| {
+            conn.query_row(
+                "SELECT value
+                 FROM session_setting_events
+                 WHERE provider = 'pi' AND source_key = ?1
+                   AND setting = 'thinking_level'
+                   AND (timestamp < ?2
+                        OR (timestamp = ?2 AND source_ordinal <= ?3))
+                 ORDER BY timestamp DESC, source_ordinal DESC
+                 LIMIT 1",
+                rusqlite::params![source.source_key, timestamp, source_ordinal],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .expect("read active thinking level")
+        };
+        assert_eq!(
+            active_level("2026-08-14T08:00:01.000Z", 2),
+            None,
+            "state before first source observation is unobserved"
+        );
+        assert_eq!(
+            active_level("2026-08-14T08:00:02.000Z", 3),
+            Some("off".to_owned())
+        );
+        assert_eq!(
+            active_level("2026-08-14T08:00:02.000Z", 5),
+            Some("xhigh".to_owned())
+        );
+        assert_eq!(
+            active_level("2026-08-14T08:00:04.000Z", 7),
+            Some("xhigh".to_owned())
+        );
+        let persisted = conn
+            .prepare(
+                "SELECT source_ordinal, value
+                 FROM session_setting_events
+                 WHERE provider = 'pi' AND source_key = ?1
+                 ORDER BY source_ordinal",
+            )
+            .expect("prepare Pi setting timeline")
+            .query_map(rusqlite::params![source.source_key], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query Pi setting timeline")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect Pi setting timeline");
+        let expected_settings = vec![
+            (3, "off".to_owned()),
+            (4, "xhigh".to_owned()),
+            (6, "xhigh".to_owned()),
+        ];
+        assert_eq!(persisted, expected_settings);
+        drop(conn);
+
+        let mut failed_replacement = snapshot.clone();
+        failed_replacement.setting_events[0].value = "changed".to_owned();
+        failed_replacement.source.mtime_ns = failed_replacement.source.mtime_ns.saturating_add(1);
+        let trigger_conn = rusqlite::Connection::open(storage.database_path())
+            .expect("open Pi atomic replacement trigger");
+        trigger_conn
+            .execute_batch(
+                "CREATE TRIGGER fail_pi_setting_replacement
+                 BEFORE UPDATE ON transcript_analytics_sources
+                 WHEN NEW.provider = 'pi'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'late Pi setting replacement failure');
+                 END;",
+            )
+            .expect("arm Pi setting replacement failure");
+        assert!(
+            storage
+                .replace_transcript_analytics_snapshot(&failed_replacement)
+                .is_err(),
+            "a final registry failure must roll back setting replacement"
+        );
+        trigger_conn
+            .execute_batch("DROP TRIGGER fail_pi_setting_replacement;")
+            .expect("disarm Pi setting replacement failure");
+        let preserved = rusqlite::Connection::open(storage.database_path())
+            .expect("open Pi atomic replacement reader")
+            .prepare(
+                "SELECT source_ordinal, value
+                 FROM session_setting_events
+                 WHERE provider = 'pi' AND source_key = ?1
+                 ORDER BY source_ordinal",
+            )
+            .expect("prepare preserved Pi settings")
+            .query_map(rusqlite::params![source.source_key], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query preserved Pi settings")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect preserved Pi settings");
+        assert_eq!(preserved, expected_settings);
+
+        let mut replacement = snapshot;
+        replacement.setting_events.clear();
+        storage
+            .replace_transcript_analytics_snapshot(&replacement)
+            .expect("replace Pi source without setting events");
+        assert_eq!(
+            rusqlite::Connection::open(storage.database_path())
+                .expect("open Pi replacement reader")
+                .query_row(
+                    "SELECT COUNT(*) FROM session_setting_events
+                     WHERE provider = 'pi' AND source_key = ?1",
+                    rusqlite::params![source.source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count replaced setting events"),
+            0,
+            "source replacement clears its prior setting evidence"
+        );
+        clear_env();
+    }
+
     // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Remaining Analytics Evidence Foundation]]
     #[test]
     fn remaining_pi_analytics_evidence_foundation_stays_empty() {
@@ -2750,7 +3007,23 @@ mod tests {
         let parsed = parse_transcript_analytics_source(&source, TEST_HOSTNAME)
             .expect("parse persisted Pi session");
         assert_eq!(parsed.snapshot.source.session_name, None);
-        assert!(parsed.snapshot.setting_events.is_empty());
+        assert_eq!(
+            parsed
+                .snapshot
+                .setting_events
+                .iter()
+                .map(|row| row.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["off", "xhigh"]
+        );
+        assert!(
+            parsed
+                .snapshot
+                .session_events
+                .iter()
+                .any(|event| event.kind == SessionEventKind::AsstThinking),
+            "retained Pi thinking blocks must produce timeline evidence"
+        );
         assert!(parsed.snapshot.tool_actions.iter().all(|row| {
             row.is_error.is_none()
                 && row.details_json.is_none()

@@ -58,11 +58,17 @@ Summary spend enters every token aggregate while turn counters remain assistant-
 
 `transcript_analytics::tests::pi_summary_usage_reconciles_without_turn_inflation` replaces the same pinned source twice and proves five observations reconcile to three turns plus two summaries. Raw observations, model hourly rows, token snapshots, provider token stats, model overview totals, and session history all report 2,032 tokens. Only assistant rows enter token, model, or segment turn counters; the model-less compaction remains 1,300 unattributed tokens.
 
+## Pi Thinking Events And Setting Timeline
+
+Retained Pi thinking blocks emit ordered `asst_thinking` events, while `thinking_level_change` records become source-owned `thinking_level` rows.
+
+The active value is the latest `(timestamp, source_ordinal)` at or before an assistant record; state before its first observation is NULL, and repeated levels remain separate rows. `sessions::tests::pi_retained_thinking_events_are_ordered_and_keep_thinking_only_messages` pins event ordering, and `transcript_analytics::tests::pi_thinking_level_changes_replace_atomically_and_order_by_timestamp_ordinal` pins retained parsing, atomic replacement, and the lookup rule.
+
 ## Remaining Analytics Evidence Foundation
 
 Later Pi analytics producers remain explicitly empty on the pinned parity corpus.
 
-`reasoning_duration_ms`, tool `is_error`/`details_json`/`result_image_count`/`duration_ms`, setting events, and session name remain `None` or empty while existing runtime, tool, and skill extraction stays unchanged.
+`reasoning_duration_ms`, tool `is_error`/`details_json`/`result_image_count`/`duration_ms`, and session name remain `None` or empty while existing runtime, tool, skill, thinking-event, and setting extraction stays unchanged. `transcript_analytics::tests::remaining_pi_analytics_evidence_foundation_stays_empty` pins the positive parity-corpus thinking and setting evidence plus the remaining NULL fields.
 
 ## Native Usage Migration
 
