@@ -103,6 +103,36 @@ clears it. `get_web_ui_status` reports the live task separately from config:
 URLs, and the latest startup or runtime error. It never treats a wildcard bind
 as proof that a firewall permits external traffic.
 
+### Web UI request gates
+
+[[src-tauri/src/web_server/gates.rs]] wraps every browser route, including the
+fallback, so no route can be mounted outside the peer, budget, size, and time
+bounds.
+
+Refusals are an empty-body `403` decided before routing, which is what makes
+"not a partial render" hold for pages, assets, and invokes alike.
+
+Client identity is the accepted socket's address delivered through Axum
+`ConnectInfo`, never the `Host` header and never reverse DNS. Hostname
+allowlist entries are forward-resolved once when the controller commits a
+configuration and pinned until the next restart or re-save; resolution failure,
+timeout, or an empty answer pins nothing and therefore denies. Pinning follows
+the durable commit, so a failed transition keeps the previous policy. The
+default state is deny-all, and loopback bypasses host filtering only — the
+authenticated class still verifies a `quill_web_session` cookie through
+[[src-tauri/src/web_pairing.rs#verify_session]].
+
+Budgets are per peer over a size-capped table rather than the one global deque
+per endpoint that guards `:19876`, because a single hostile client must not be
+able to starve every other. The general class allows 120 requests per minute;
+the pairing class carries its own stricter window on top of it. The peer table
+evicts its least recently active entry at its cap, since an unbounded peer map
+is itself the denial-of-service. A bounded listener takes a semaphore permit
+before `accept` and releases it when the connection's IO drops, so at most eight
+live connections exist and an idle keep-alive socket still costs its slot.
+Bodies are capped at 1 MiB and a whole request, gates included, is bounded at
+ten seconds.
+
 ### Authentication
 
 All endpoints require a Bearer token validated with constant-time comparison (`subtle` crate). The token is generated on first launch by [[src-tauri/src/auth.rs]] and stored at `~/.local/share/com.quilltoolkit.app/auth_secret` with mode 0o600.

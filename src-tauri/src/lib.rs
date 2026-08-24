@@ -5829,7 +5829,7 @@ pub fn run() {
                 return Ok(());
             };
             let web_listener = Arc::new(web_server::controller::WebListenerController::new(
-                Arc::new(web_server::WebServerState),
+                Arc::new(web_server::WebServerState::default()),
             ));
             app.manage(Arc::clone(&web_listener));
             tauri::async_runtime::spawn(async move {

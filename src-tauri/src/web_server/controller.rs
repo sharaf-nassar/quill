@@ -17,7 +17,9 @@ use crate::{
     web_config::{load_web_ui_config, save_web_ui_config, validate_web_ui_config},
     web_server::{
         WEB_UI_LAST_ERROR_KEY, WebServerState, WebUiConfig, WebUiError, WebUiHostPolicy,
-        WebUiStatus, format_reachable_urls, router,
+        WebUiStatus, format_reachable_urls,
+        gates::{BoundedListener, WebPeer},
+        router,
     },
 };
 
@@ -146,7 +148,7 @@ impl WebListenerController {
         };
 
         if current.addr == target {
-            let saved = persist_config(storage, candidate)?;
+            let saved = self.persist_config(storage, candidate).await?;
             state.config = saved.clone();
             state.load_error = None;
             clear_last_error(storage, &mut state);
@@ -180,6 +182,7 @@ impl WebListenerController {
             }
         };
         state.config = config.clone();
+        self.router_state.gates.pin_allowlist(&config).await;
 
         if config.enabled {
             let target = bind_address(&config);
@@ -208,7 +211,7 @@ impl WebListenerController {
             Ok(listener) => listener,
             Err(error) => return Err(record_runtime_error(state, error)),
         };
-        let saved = match persist_config(storage, candidate) {
+        let saved = match self.persist_config(storage, candidate).await {
             Ok(saved) => saved,
             Err(error) => {
                 listener.shutdown().await;
@@ -228,7 +231,7 @@ impl WebListenerController {
         storage: &Storage,
         candidate: WebUiConfig,
     ) -> Result<WebUiConfig, WebUiError> {
-        let saved = persist_config(storage, candidate)?;
+        let saved = self.persist_config(storage, candidate).await?;
         let old = state.listener.take();
         state.config = saved.clone();
         state.load_error = None;
@@ -252,7 +255,7 @@ impl WebListenerController {
             Ok(listener) => listener,
             Err(error) => return Err(record_runtime_error(state, error)),
         };
-        let saved = match persist_config(storage, candidate) {
+        let saved = match self.persist_config(storage, candidate).await {
             Ok(saved) => saved,
             Err(error) => {
                 replacement.shutdown().await;
@@ -292,7 +295,7 @@ impl WebListenerController {
                 return Err(self.restore_previous(state, old_target, error).await);
             }
         };
-        let saved = match persist_config(storage, candidate) {
+        let saved = match self.persist_config(storage, candidate).await {
             Ok(saved) => saved,
             Err(error) => {
                 replacement.shutdown().await;
@@ -346,11 +349,16 @@ impl WebListenerController {
         let app = router(Arc::clone(&self.router_state));
         let (shutdown, shutdown_requested) = oneshot::channel();
         let task = tokio::spawn(async move {
-            if let Err(error) = axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_requested.await;
-                })
-                .await
+            // `ConnectInfo` is the gates' only client identity, and the bounded
+            // listener is what caps live connections.
+            if let Err(error) = axum::serve(
+                BoundedListener::new(listener),
+                app.into_make_service_with_connect_info::<WebPeer>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_requested.await;
+            })
+            .await
             {
                 log::error!("Web UI listener stopped: {error}");
             }
@@ -371,6 +379,20 @@ impl WebListenerController {
             state.listener = None;
             state.last_error = Some("The Web UI listener stopped unexpectedly.".to_string());
         }
+    }
+
+    /// Persist a validated candidate and, once it is durable, pin the
+    /// addresses its allowlist resolves to. Pinning follows the commit so a
+    /// failed transition leaves the previous policy in force.
+    async fn persist_config(
+        &self,
+        storage: &Storage,
+        config: WebUiConfig,
+    ) -> Result<WebUiConfig, WebUiError> {
+        let saved = tokio::task::block_in_place(|| save_web_ui_config(storage, config))
+            .map_err(WebUiError::from)?;
+        self.router_state.gates.pin_allowlist(&saved).await;
+        Ok(saved)
     }
 
     #[cfg(test)]
@@ -423,10 +445,6 @@ fn allowlist_entry_is_loopback(entry: &str) -> bool {
         IpAddr::V4(address) => prefix >= 8 && address.octets()[0] == 127,
         IpAddr::V6(address) => prefix == 128 && address.is_loopback(),
     }
-}
-
-fn persist_config(storage: &Storage, config: WebUiConfig) -> Result<WebUiConfig, WebUiError> {
-    tokio::task::block_in_place(|| save_web_ui_config(storage, config)).map_err(WebUiError::from)
 }
 
 fn read_last_error(storage: &Storage) -> Option<String> {
@@ -521,7 +539,7 @@ mod tests {
         let port = free_port();
         save_web_ui_config(&storage, config(false, port, WebUiHostPolicy::Allowlist))
             .expect("save disabled config");
-        let controller = WebListenerController::new(Arc::new(WebServerState));
+        let controller = WebListenerController::new(Arc::new(WebServerState::default()));
 
         controller.initialize(&storage).await;
 
@@ -536,7 +554,7 @@ mod tests {
         let storage = storage(&temp);
         let old_port = free_port();
         let new_port = free_port();
-        let controller = WebListenerController::new(Arc::new(WebServerState));
+        let controller = WebListenerController::new(Arc::new(WebServerState::default()));
         let old_config = controller
             .apply_config(&storage, config(true, old_port, WebUiHostPolicy::Allowlist))
             .await
@@ -570,7 +588,7 @@ mod tests {
         let temp = TempDir::new().expect("temp data directory");
         let storage = storage(&temp);
         let port = free_port();
-        let controller = WebListenerController::new(Arc::new(WebServerState));
+        let controller = WebListenerController::new(Arc::new(WebServerState::default()));
         let old_config = controller
             .apply_config(&storage, config(true, port, WebUiHostPolicy::Allowlist))
             .await

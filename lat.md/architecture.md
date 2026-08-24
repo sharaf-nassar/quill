@@ -124,6 +124,8 @@ The web-only monitor uses a same-origin invoke bridge with a default-deny read-c
 
 `POST /api/web/invoke` runs through [[src/web/httpTransport.ts]]. [[src-tauri/src/web_server/mod.rs]] owns the matching serde envelopes, desktop config/status field names, pairing-cookie attributes, and canonical reachable-URL formatting, while [[src-tauri/src/web_allowlist.rs]] owns the exact permitted-command table. The shim holds no parallel command or settings-key table. Success and command failures retain Tauri-style promise behavior; host/session refusals stay empty-body `403` responses before data access. The normative cross-language payloads and fixtures live in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
 
+[[src-tauri/src/web_server/gates.rs]] wraps every route in the gates the three request classes share: socket-peer authorization against a pinned allowlist, per-peer request budgets, a connection cap, a body cap, and a request timeout. It refuses with an empty-body `403` before routing, so no gate decision depends on a header the client controls.
+
 There is no browser push channel in v1. Event listen/unlisten and window/webview plugin calls are client-local no-ops, while every `plugin:*` command remains denied server-side; visibility-aware polling supplies freshness.
 
 [[src-tauri/src/web_server/controller.rs]] owns the listener independently of the ingestion and context servers. It serializes runtime config transitions, binds loopback until policy admits a non-local host, performs different-port bind-before-swap and same-port stop-bind-rollback sequencing, and persists startup bind errors. `running` and `bound_addr` prove only local listener state; reachable URL candidates do not claim firewall reachability.

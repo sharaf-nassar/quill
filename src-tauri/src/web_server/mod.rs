@@ -17,18 +17,22 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 pub mod controller;
+pub mod gates;
 
 /// State shared by all web UI routes.
-///
-/// Fields are added by the controller, credential, and request-gate work items.
-#[derive(Clone, Default)]
-pub struct WebServerState;
+#[derive(Default)]
+pub struct WebServerState {
+    pub gates: gates::RequestGates,
+}
 
 /// Build the web UI router from its shared state.
 ///
-/// No routes are mounted until their request-gate and transport contracts land.
+/// Routes are mounted by the transport contract's own work item; every one of
+/// them lands inside [[src-tauri/src/web_server/gates.rs#apply_request_gates]],
+/// so no route can be added outside the peer, budget, size, and time bounds.
 pub fn router(state: Arc<WebServerState>) -> Router {
-    Router::new().with_state(state)
+    let routes = Router::new().with_state(Arc::clone(&state));
+    gates::apply_request_gates(routes, state)
 }
 
 /// Typed, display-safe error returned by desktop Web UI commands.

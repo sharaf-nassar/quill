@@ -12,6 +12,33 @@ The permitted table admits exactly the sixteen monitor reads and refuses everyth
 
 Refusals cover unknown names, every registered setter and mutation, `fetch_usage_data`, `refresh_usage_data`, retry/backfill and maintenance commands, the whole `plugin:*` namespace, and prefix, suffix, whitespace, or case variants of a permitted name.
 
+## Host denial precedes any data
+
+A peer outside the pinned allowlist receives an empty-body `403` on the public,
+pairing, and authenticated route classes and on unrouted paths, so no handler
+runs and no Quill bytes are written.
+
+An allowed peer reaches the public class. An empty allowlist and an allowlist
+whose only entry fails to resolve both admit nobody but loopback, and loopback's
+exemption covers host filtering only — the authenticated class still refuses it
+without a session. A resolved hostname entry admits exactly the addresses it
+pinned, and only `host_policy=all` skips the pinned set.
+
+## Request classes carry bounded per-peer budgets
+
+Each peer gets its own sliding windows: 120 general requests per minute and a
+stricter separate pairing window.
+
+Exhausting one class neither borrows from nor grants capacity in the other, one
+peer's exhaustion does not affect another, and the tracked-peer table never
+exceeds its cap however many peers appear.
+
+## Connection and body caps bound one client
+
+The listener serves at most eight live connections; a further connection waits
+unserved until one is released, then completes. A request body over the size cap
+is refused rather than read.
+
 ## Disabled listener owns no socket
 
 Loading a disabled configuration leaves `running=false`, returns no bound
