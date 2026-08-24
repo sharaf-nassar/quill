@@ -32,7 +32,7 @@ use crate::{
     web_allowlist::is_permitted_command,
     web_pairing,
     web_server::{
-        InvokeRequest, InvokeResponse, PairRequest, WebServerState,
+        InvokeRequest, InvokeResponse, PairRequest, WebServerState, assets,
         gates::{enforce_pairing_budget, refused, require_session},
         session_cookie,
     },
@@ -50,6 +50,7 @@ pub fn routes(state: Arc<WebServerState>) -> Router {
     );
     let authenticated = Router::new()
         .route("/api/web/invoke", post(invoke))
+        .merge(assets::routes())
         .fallback(unserved)
         .layer(middleware::from_fn(require_session))
         .with_state(state);
@@ -121,8 +122,8 @@ async fn invoke(State(state): State<Arc<WebServerState>>, body: Bytes) -> Respon
     })
 }
 
-/// This router mounts no assets, so an authenticated request for anything else
-/// is a plain miss rather than a refusal.
+/// A path outside the invoke route and the bundle's own asset graph is a plain
+/// miss rather than a refusal, because the caller already proved it is paired.
 async fn unserved() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }

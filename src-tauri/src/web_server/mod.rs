@@ -16,6 +16,7 @@ use axum::Router;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
+pub mod assets;
 pub mod controller;
 pub mod gates;
 pub mod router;

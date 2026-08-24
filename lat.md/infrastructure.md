@@ -22,6 +22,16 @@ from `web.html` only. That mode keeps the browser bundle out of desktop Sentry
 upload and sourcemap handling. Tauri runs it before its dev server and desktop
 bundle builds; `dist-web/` remains generated and ignored.
 
+Web mode also writes a build manifest, which is the oracle for what the listener
+serves: `scripts/web-bundle-isolation.test.mjs` walks the entry's transitive
+chunk graph and asserts the emitted files are exactly that graph. The manifest
+lands in `dist-web/.vite/`, a path [[src-tauri/src/web_server/assets.rs]] does
+not route.
+
+[[src-tauri/src/web_server/assets.rs]] embeds `dist-web/` at compile time, so
+the directory must exist before any `cargo` command runs. `README.md` says to
+build it once in a fresh clone; the Tauri lifecycle commands and CI already do.
+
 #### Crash Transport CSP
 
 Production permits outbound frontend connections only to Tauri IPC and the exact HTTPS origin derived from the crash reporter DSN.

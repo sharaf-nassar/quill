@@ -76,6 +76,11 @@ export default defineConfig(({ mode }) => {
         ? {
             outDir: "dist-web",
             rollupOptions: { input: "web.html" },
+            // The manifest is the oracle for what the web listener embeds:
+            // it names the entry's whole transitive chunk graph, so a test can
+            // prove the served asset set is that graph and nothing else. It
+            // lands in `.vite/`, which the listener does not route.
+            manifest: true,
           }
         : {}),
     },

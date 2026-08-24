@@ -163,8 +163,33 @@ its live tracker from the Tauri handle held in
 [[src-tauri/src/web_server/mod.rs#WebServerState]], which is what makes the
 browser's overlay the desktop's overlay. A malformed envelope or argument shape
 is an empty-body `400`, a command failure is `200` with the command's own
-display-safe message, and this router mounts no assets, so an authenticated
-request for anything else is a plain `404`.
+display-safe message, and a path outside the invoke route and the bundle's asset
+graph is a plain `404`.
+
+### Web UI bundle serving
+
+[[src-tauri/src/web_server/assets.rs]] serves the browser bundle inside the
+authenticated request class, so an unpaired peer is refused on the document and
+on every asset path.
+
+Isolation from the Manage and Release Notes chunks is structural, not filtered:
+the desktop bundle builds from `index.html` into `dist/` and the monitor bundle
+builds from `web.html` into `dist-web/`, and only the latter is embedded, so no
+desktop-only chunk exists in the folder to reach.
+
+Release builds embed `dist-web/`; debug builds read it from disk per request,
+which is what lets `npm run tauri -- dev` serve a bundle Vite rebuilt after the
+Rust binary was compiled. The folder must exist when the crate compiles — a
+compile error naming the path beats a binary that silently serves nothing.
+
+The monitor surface is one document with no client-side router, so the SPA
+fallback set is exactly `/`; every other path resolves against real files under
+`assets/` and otherwise falls through to `404`. Nothing outside `assets/`,
+including the Vite manifest, is addressable, and a browser cannot reach the
+entry document by asking for an arbitrary path. Traversal needs no check of its
+own: the release lookup is an exact key match against the embedded set, and the
+debug lookup canonicalizes the candidate and refuses anything outside the
+folder.
 
 ### Authentication
 

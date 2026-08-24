@@ -299,7 +299,10 @@ npm run build:web
 ```
 
 `npm run tauri -- dev` and `npm run tauri -- build` run this first, so no
-manual asset build is needed before development or packaging.
+manual asset build is needed before development or packaging. The Rust crate
+embeds this directory, so a bare `cargo` command in a fresh clone needs it to
+exist: run `npm run build:web` once before `cargo check`, `cargo clippy`, or
+`cargo test`.
 
 This loads `src-tauri/tauri.dev.conf.json`, so a dev run identifies as
 `com.quilltoolkit.app.dev` and keeps its database, auth secret, session index,

@@ -36,6 +36,15 @@ The pairing page carries its own policy pinning its one inline script by hash,
 states no Quill data, and references no bundle chunk, so an unpaired browser can
 bootstrap without receiving application assets.
 
+## Only the isolated monitor bundle is servable
+
+The web bundle's served asset set is exactly the transitive chunk graph of the
+`web.html` entry, which is the entry the build emits.
+
+No chunk key, source module, chunk name, or emitted filename in that graph names
+a Manage or Release Notes module, and the build directory holds no file outside
+the graph, so no desktop-only chunk is present to be served.
+
 ## Request classes carry bounded per-peer budgets
 
 Each peer gets its own sliding windows: 120 general requests per minute and a
