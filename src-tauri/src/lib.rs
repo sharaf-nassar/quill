@@ -48,6 +48,7 @@ mod transcript_analytics;
 mod transcript_identity;
 mod transcript_watcher;
 mod tray_keepalive;
+mod web_config;
 /// Identity-scoped web pairing credential and the HMAC sessions derived from
 /// it. Public because the web listener's request gates verify against it.
 pub mod web_pairing;
@@ -5623,18 +5624,25 @@ async fn remove_custom_project(path: String) -> Result<(), String> {
     })
 }
 
-// Web UI configuration, lifecycle, and pairing are implemented by the
-// follow-on web-server work items. Register the command boundary now so the
-// desktop UI receives a typed, display-safe response rather than a missing
-// command error during the scaffold phase.
+// Pairing owns the final `WebUiConfigResponse` envelope. Until that module
+// lands, these commands intentionally return only the durable config rather
+// than inventing an empty pairing code.
 #[tauri::command]
-async fn get_web_ui_config() -> Result<(), web_server::WebUiError> {
-    Err(web_server::WebUiError::not_implemented())
+async fn get_web_ui_config() -> Result<web_server::WebUiConfig, web_config::WebUiConfigError> {
+    let storage = get_storage().map_err(|error| {
+        web_config::WebUiConfigError::storage("Read Web UI configuration", error)
+    })?;
+    tokio::task::block_in_place(move || web_config::load_web_ui_config(storage))
 }
 
 #[tauri::command]
-async fn set_web_ui_config() -> Result<(), web_server::WebUiError> {
-    Err(web_server::WebUiError::not_implemented())
+async fn set_web_ui_config(
+    config: web_server::WebUiConfig,
+) -> Result<web_server::WebUiConfig, web_config::WebUiConfigError> {
+    let storage = get_storage().map_err(|error| {
+        web_config::WebUiConfigError::storage("Save Web UI configuration", error)
+    })?;
+    tokio::task::block_in_place(move || web_config::save_web_ui_config(storage, config))
 }
 
 #[tauri::command]

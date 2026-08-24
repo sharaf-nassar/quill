@@ -42,6 +42,45 @@ It is never `auth_secret`, which authorizes writes to `:19876` and `/api/v1/cont
 
 A session is an HMAC-SHA256 of the credential over `issued_at.nonce`, carried verbatim as the `quill_web_session` value; verification recomputes the MAC, compares it constant-time, and re-enforces the cookie's 30-day `Max-Age` against a copied cookie jar. Because every session derives from the credential, `regenerate_web_pairing_code` invalidates all of them with no session table. Pairing-code comparison is constant-time for the same reason bearer auth is.
 
+### Web UI configuration
+
+[[src-tauri/src/web_config.rs]] owns the four writable `web_ui.*` settings
+rows. Absent values resolve to safe defaults; no migration or schema bump is
+needed.
+
+The defaults are `enabled=false`, `port=19878`, `host_policy=allowlist`, and
+`allowlist=[]`. `web_ui.last_error` is listener status rather than writable
+configuration; absent means `null`.
+
+The config commands read related keys while the storage lock is held, validate
+before calling `set_settings_atomically`, then write all four rows in its one
+SQLite transaction. A rejected port, collision, or allowlist candidate cannot
+partially persist or replace the previous config. Until the pairing module
+lands, `get_web_ui_config` and `set_web_ui_config` temporarily return the
+inner `WebUiConfig`; pairing upgrades them to the protocol's final response
+shape instead of emitting an invented empty code.
+
+`port` must be 1024–65535 and cannot equal the resolved `QUILL_PORT` or
+`QUILL_CONTEXT_PORT`. The allowlist accepts IPv4/IPv6 literals, canonical CIDR
+networks, or RFC-1123 hostnames; wildcards, malformed entries, and more than
+64 entries fail at the settings boundary. Accepted entries trim surrounding
+space, lowercase hostnames, normalize IP/CIDR spelling, sort, and deduplicate.
+
+#### Web UI Config Test Specs
+
+These specs pin canonical persistence and the typed rejection boundary.
+
+##### Canonical grammar and atomic persistence
+
+A valid config must round-trip through the four dotted rows with its canonical,
+deduplicated allowlist. A rejected later candidate must leave that persisted
+config unchanged.
+
+##### Rejected inputs
+
+Wildcard, malformed IP/CIDR/hostname, entry 65, privileged port, and either
+resolved Quill listener collision must return a typed display-safe error.
+
 ### Authentication
 
 All endpoints require a Bearer token validated with constant-time comparison (`subtle` crate). The token is generated on first launch by [[src-tauri/src/auth.rs]] and stored at `~/.local/share/com.quilltoolkit.app/auth_secret` with mode 0o600.

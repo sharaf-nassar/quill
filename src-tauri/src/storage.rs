@@ -16327,6 +16327,27 @@ impl Storage {
         Ok(result)
     }
 
+    /// Read related settings while holding the storage lock so a concurrent
+    /// [`Self::set_settings_atomically`] cannot expose a partial config.
+    pub(crate) fn get_settings(
+        &self,
+        keys: &[&str],
+    ) -> Result<BTreeMap<String, Option<String>>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare_cached("SELECT value FROM settings WHERE key = ?1")
+            .map_err(|error| format!("Prepare settings read: {error}"))?;
+        let mut settings = BTreeMap::new();
+        for key in keys {
+            let value = stmt
+                .query_row(params![key], |row| row.get(0))
+                .optional()
+                .map_err(|error| format!("Read setting {key}: {error}"))?;
+            settings.insert((*key).to_string(), value);
+        }
+        Ok(settings)
+    }
+
     #[cfg(test)]
     pub(crate) fn upsert_pi_live_session(
         &self,
