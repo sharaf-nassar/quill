@@ -348,9 +348,10 @@ cross-dimension hits are marked. Line references were verified against source.
   added instead. The desktop process remains the sole producer of upstream
   provider traffic, so viewer count cannot multiply egress or burn quota.
 - **Live updates: visibility-aware polling, no SSE or WebSocket in v1.** Reuses
-  the existing `cachedInvokeStore.refreshStaleSubscribers()` seam at 60s with an
+  the existing `cachedInvokeStore.refreshStaleSubscribers()` seam at 55s with an
   immediate refresh on focus. Budget: data visible in the desktop widget appears
-  in the browser within 60s p95. A push transport is a later upgrade if that
+  in the browser within 60s p95. The cadence was qualified by the recorded
+  20-sample measurement below; a push transport is a later upgrade if that
   budget proves wrong.
 - **Separate Vite entry (`web.html` + `web-main.tsx`)** that installs the HTTP
   transport *before* importing shared widget code and never imports
@@ -855,11 +856,119 @@ verified by hand and recorded in the implementing bead:
 | 6 | Pairing code entry succeeds; session survives reload (refusal and invalidation are automated above) |
 | 7 | 360px–430px viewports: no clip, no horizontal scroll, hit areas meet the new `DESIGN.md` rule |
 
-**P10 freshness measurement.** A recorded procedure, not a claim: write a known
-token count on the desktop, timestamp it, poll the browser DOM for the value,
-record delta; 20 samples; pass when p95 ≤ 60s. Note the existing cache TTL is 45s
-with 5s coalescing (`cachedInvokeStore`), so the poll cadence is tuned against
-this measurement rather than assumed.
+**P10 freshness measurement.** Qualification run `quill-j76f.19`, attempt 1,
+executed on 2026-08-24 UTC. Pass criterion: nearest-rank p95 of 20 unselected
+samples ≤ 60 seconds, measured from immediately before the desktop ingestion
+request to the first browser-DOM observation of that sample's exact project name
+and token count.
+
+### Reproducible freshness procedure
+
+1. Stop production Quill and verify ports 19876, 19877, 19878, and 8181 are
+   free. Record the host environment before starting the sequence.
+2. Create an isolated HOME, XDG roots, Quill data/rules roots, and empty
+   Claude/Codex/Pi session roots. Start a private Xvfb display and D-Bus session.
+   Set `QUILL_DEMO_MODE=1`, point every `QUILL_*_DIR` at those roots, set
+   `QUILL_DEV_INTEGRATIONS=0`, and launch only with `npm run tauri -- dev`.
+   The resulting Tauri identity must be `com.quilltoolkit.app.dev`.
+3. While the isolated desktop is stopped, preconfigure only that development
+   database: one provider enabled, `web_ui.enabled=true`, port 19878,
+   `host_policy=allowlist`, and an empty allowlist (loopback-only). Restart with
+   the same `npm run tauri -- dev` command. Do not touch production state.
+4. Launch a separate Chrome process with a freshly cleared user-data directory,
+   headless mode, and its own loopback CDP port. Pair it through `/pair`, then
+   leave the monitor visible at `/` with the default 1H Usage/Sessions view.
+   Do not resize or move the desktop window.
+5. For each sample, POST one unique `TokenReportPayload` through the development
+   desktop's authenticated `POST /api/v1/tokens` path. Use a unique session and
+   cwd leaf plus a known input-token value; timestamp immediately before the
+   request. Poll the browser DOM every 100ms until one `.wg-row` contains that
+   cwd leaf and the exact `Total session tokens N` ARIA label. Record the write,
+   ingest-acceptance, and DOM timestamps plus monotonic elapsed time.
+6. Run 20 samples consecutively without discarding, reordering, or retrying any
+   sample. Sort only for the nearest-rank calculation:
+   `sorted[ceil(0.95 * 20) - 1]`.
+7. If p95 exceeds 60 seconds, change only `WEB_POLL_MS`, rebuild the web bundle,
+   clear the isolated browser profile, and run one new complete 20-sample
+   sequence. Preserve the first sequence as evidence.
+
+### Qualification environment
+
+| Field | Recorded value |
+| --- | --- |
+| Initial preflight | Production Quill stopped; ports 19876, 19877, 19878, 8181 free; load 7.27 / 6.56 / 9.70 on 64 logical cores |
+| Sequence preflight | 2026-08-24T04:04:28Z; load 8.38 / 12.49 / 11.78; 7 runnable tasks |
+| Host | Ubuntu 24.04.4 LTS; Linux 7.0.0-29-generic x86_64 |
+| CPU | AMD Ryzen Threadripper 3970X 32-Core Processor; 64 logical cores |
+| Memory | 125 GiB total, 20 GiB used, 2.9 GiB free, 104 GiB buff/cache, 105 GiB available |
+| Swap | 63 GiB total, 5.8 GiB used, 58 GiB free |
+| Highest CPU processes | `containerd` 127%, `dockerd` 114%, `scribe-client` 106% and 73.6%, Pi processes 57.9%, 39.5%, 32.6%, 18.8%, 15.7%, 9.3%, and 6.8%, Chrome 9.6%, `apps.plugin` 8.6%, `gnome-shell` 7.5%, `netdata` 6.2% |
+| Toolchain | Node 25.8.2; npm 11.11.1; rustc/cargo 1.95.0; tauri-cli 2.10.0 |
+| Browser | Chrome 151.0.7922.75; isolated profile `/tmp/quill-web-freshness-quill-j76f.19-attempt1/chrome-profile`; CDP 9231 |
+| Desktop isolation | Private Xvfb `:96` and D-Bus; isolated HOME/XDG roots under `/tmp/quill-web-freshness-quill-j76f.19-attempt1`; live display/window geometry untouched |
+| App identity and launch | `com.quilltoolkit.app.dev`; `npm run tauri -- dev`; `QUILL_DEV_INTEGRATIONS=0` |
+| Listener configuration | Ingestion 19876; context 19877 disabled; web UI 19878 loopback; Vite 8181 |
+| Cache configuration | 45,000ms TTL; 5,000ms coalescing; initial 60,000ms web poll |
+| Source revision before cadence adjustment | `44680769c6d15e2e39ba488b4eb16abe23af9202` |
+
+### Initial sequence — 60-second poll
+
+No sample was discarded. Nearest-rank p95 was **60.0768s**, exceeding the
+60-second budget by 0.0768s (min 59.9204s, max 60.0786s).
+
+| # | Token | Write UTC | Ingest accepted UTC | Browser DOM UTC | Delta (s) |
+|---:|---:|---|---|---|---:|
+| 1 | 901 | 2026-08-24T04:05:26.435Z | 2026-08-24T04:05:26.441Z | 2026-08-24T04:06:26.492Z | 60.0565 |
+| 2 | 902 | 2026-08-24T04:06:26.492Z | 2026-08-24T04:06:26.497Z | 2026-08-24T04:07:26.480Z | 59.9884 |
+| 3 | 903 | 2026-08-24T04:07:26.481Z | 2026-08-24T04:07:26.515Z | 2026-08-24T04:08:26.457Z | 59.9766 |
+| 4 | 904 | 2026-08-24T04:08:26.457Z | 2026-08-24T04:08:26.462Z | 2026-08-24T04:09:26.493Z | 60.0357 |
+| 5 | 905 | 2026-08-24T04:09:26.493Z | 2026-08-24T04:09:26.497Z | 2026-08-24T04:10:26.414Z | 59.9204 |
+| 6 | 906 | 2026-08-24T04:10:26.414Z | 2026-08-24T04:10:26.421Z | 2026-08-24T04:11:26.492Z | 60.0786 |
+| 7 | 907 | 2026-08-24T04:11:26.493Z | 2026-08-24T04:11:26.500Z | 2026-08-24T04:12:26.420Z | 59.9279 |
+| 8 | 908 | 2026-08-24T04:12:26.421Z | 2026-08-24T04:12:26.424Z | 2026-08-24T04:13:26.461Z | 60.0405 |
+| 9 | 909 | 2026-08-24T04:13:26.461Z | 2026-08-24T04:13:26.468Z | 2026-08-24T04:14:26.466Z | 60.0047 |
+| 10 | 910 | 2026-08-24T04:14:26.466Z | 2026-08-24T04:14:26.473Z | 2026-08-24T04:15:26.477Z | 60.0115 |
+| 11 | 911 | 2026-08-24T04:15:26.478Z | 2026-08-24T04:15:26.496Z | 2026-08-24T04:16:26.416Z | 59.9381 |
+| 12 | 912 | 2026-08-24T04:16:26.416Z | 2026-08-24T04:16:26.420Z | 2026-08-24T04:17:26.461Z | 60.0453 |
+| 13 | 913 | 2026-08-24T04:17:26.461Z | 2026-08-24T04:17:26.468Z | 2026-08-24T04:18:26.423Z | 59.9621 |
+| 14 | 914 | 2026-08-24T04:18:26.423Z | 2026-08-24T04:18:26.428Z | 2026-08-24T04:19:26.500Z | 60.0768 |
+| 15 | 915 | 2026-08-24T04:19:26.500Z | 2026-08-24T04:19:26.509Z | 2026-08-24T04:20:26.425Z | 59.9247 |
+| 16 | 916 | 2026-08-24T04:20:26.425Z | 2026-08-24T04:20:26.432Z | 2026-08-24T04:21:26.454Z | 60.0289 |
+| 17 | 917 | 2026-08-24T04:21:26.454Z | 2026-08-24T04:21:26.474Z | 2026-08-24T04:22:26.501Z | 60.0473 |
+| 18 | 918 | 2026-08-24T04:22:26.502Z | 2026-08-24T04:22:26.512Z | 2026-08-24T04:23:26.473Z | 59.9713 |
+| 19 | 919 | 2026-08-24T04:23:26.473Z | 2026-08-24T04:23:26.480Z | 2026-08-24T04:24:26.462Z | 59.9893 |
+| 20 | 920 | 2026-08-24T04:24:26.462Z | 2026-08-24T04:24:26.466Z | 2026-08-24T04:25:26.461Z | 59.9990 |
+
+Per the procedure, the only product adjustment was
+`WEB_POLL_MS: 60_000 → 55_000` in `src/web/useWebMonitorData.ts`.
+
+### Final qualifying sequence — 55-second poll
+
+No sample was discarded. Final nearest-rank p95 was **55.0560s**, passing the
+60-second budget with 4.9440s margin (min 54.9256s, max 55.0730s).
+
+| # | Token | Write UTC | Ingest accepted UTC | Browser DOM UTC | Delta (s) |
+|---:|---:|---|---|---|---:|
+| 1 | 921 | 2026-08-24T04:25:55.251Z | 2026-08-24T04:25:55.258Z | 2026-08-24T04:26:50.280Z | 55.0297 |
+| 2 | 922 | 2026-08-24T04:26:50.281Z | 2026-08-24T04:26:50.287Z | 2026-08-24T04:27:45.223Z | 54.9427 |
+| 3 | 923 | 2026-08-24T04:27:45.223Z | 2026-08-24T04:27:45.231Z | 2026-08-24T04:28:40.220Z | 54.9970 |
+| 4 | 924 | 2026-08-24T04:28:40.221Z | 2026-08-24T04:28:40.225Z | 2026-08-24T04:29:35.293Z | 55.0730 |
+| 5 | 925 | 2026-08-24T04:29:35.294Z | 2026-08-24T04:29:35.298Z | 2026-08-24T04:30:30.265Z | 54.9717 |
+| 6 | 926 | 2026-08-24T04:30:30.265Z | 2026-08-24T04:30:30.271Z | 2026-08-24T04:31:25.306Z | 55.0409 |
+| 7 | 927 | 2026-08-24T04:31:25.306Z | 2026-08-24T04:31:25.311Z | 2026-08-24T04:32:20.239Z | 54.9325 |
+| 8 | 928 | 2026-08-24T04:32:20.239Z | 2026-08-24T04:32:20.246Z | 2026-08-24T04:33:15.295Z | 55.0560 |
+| 9 | 929 | 2026-08-24T04:33:15.295Z | 2026-08-24T04:33:15.303Z | 2026-08-24T04:34:10.290Z | 54.9949 |
+| 10 | 930 | 2026-08-24T04:34:10.290Z | 2026-08-24T04:34:10.293Z | 2026-08-24T04:35:05.239Z | 54.9485 |
+| 11 | 931 | 2026-08-24T04:35:05.239Z | 2026-08-24T04:35:05.246Z | 2026-08-24T04:36:00.288Z | 55.0494 |
+| 12 | 932 | 2026-08-24T04:36:00.288Z | 2026-08-24T04:36:00.293Z | 2026-08-24T04:36:55.250Z | 54.9619 |
+| 13 | 933 | 2026-08-24T04:36:55.250Z | 2026-08-24T04:36:55.257Z | 2026-08-24T04:37:50.296Z | 55.0462 |
+| 14 | 934 | 2026-08-24T04:37:50.296Z | 2026-08-24T04:37:50.304Z | 2026-08-24T04:38:45.332Z | 55.0356 |
+| 15 | 935 | 2026-08-24T04:38:45.332Z | 2026-08-24T04:38:45.337Z | 2026-08-24T04:39:40.272Z | 54.9399 |
+| 16 | 936 | 2026-08-24T04:39:40.272Z | 2026-08-24T04:39:40.279Z | 2026-08-24T04:40:35.293Z | 55.0208 |
+| 17 | 937 | 2026-08-24T04:40:35.293Z | 2026-08-24T04:40:35.300Z | 2026-08-24T04:41:30.219Z | 54.9256 |
+| 18 | 938 | 2026-08-24T04:41:30.219Z | 2026-08-24T04:41:30.226Z | 2026-08-24T04:42:25.232Z | 55.0133 |
+| 19 | 939 | 2026-08-24T04:42:25.232Z | 2026-08-24T04:42:25.236Z | 2026-08-24T04:43:20.277Z | 55.0455 |
+| 20 | 940 | 2026-08-24T04:43:20.278Z | 2026-08-24T04:43:20.284Z | 2026-08-24T04:44:15.328Z | 55.0503 |
 
 **P6 gates**, all must be green: `npm run typecheck`, `npm run lint`,
 `npm test`, `npm run knip`, `cargo fmt --check`, `cargo clippy --all-targets -D
@@ -965,7 +1074,7 @@ the protocol contract):**
   unchanged.
 - **Web shell and monitor data** — `WebShell.tsx` (brand-only header, no context
   menu, palette, or ⌘M) and `useWebMonitorData.ts` (cached usage/status supply
-  plus visibility-aware 60s polling through
+  plus visibility-aware 55s polling through
   `cachedInvokeStore.refreshStaleSubscribers()`, immediate refresh on focus).
   Depends on the web entry and the web-surface props. Acceptance: the browser
   renders live desktop-matching values; the empty state states a provider must

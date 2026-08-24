@@ -4,7 +4,7 @@ import { cachedInvokeStore } from "../hooks/cachedInvokeStore";
 import { useCachedInvoke } from "../hooks/useCachedInvoke";
 import type { CpaConnectionStatus, ProviderStatus, UsageData } from "../types";
 
-const WEB_POLL_MS = 60_000;
+const WEB_POLL_MS = 55_000;
 
 export interface WebMonitorData {
   usageData: UsageData | null;

@@ -126,7 +126,7 @@ The web-only monitor uses a same-origin invoke bridge with a default-deny read-c
 
 [[src-tauri/src/web_server/gates.rs]] wraps every route in the gates the three request classes share: socket-peer authorization against a pinned allowlist, per-peer request budgets, a connection cap, a body cap, and a request timeout. It refuses with an empty-body `403` before routing, so no gate decision depends on a header the client controls.
 
-There is no browser push channel in v1. Event listen/unlisten and window/webview plugin calls are client-local no-ops, while every `plugin:*` command remains denied server-side; visibility-aware polling supplies freshness.
+There is no browser push channel in v1. Event listen/unlisten and window/webview plugin calls are client-local no-ops, while every `plugin:*` command remains denied server-side. [[src/web/useWebMonitorData.ts]] supplies freshness with a visibility-aware 55-second poll plus focus refresh; its ordinary isolated 20-sample qualification recorded 55.056 seconds p95 against the 60-second budget.
 
 [[src-tauri/src/web_server/controller.rs]] owns the listener independently of the ingestion and context servers. It serializes runtime config transitions, binds loopback until policy admits a non-local host, performs different-port bind-before-swap and same-port stop-bind-rollback sequencing, and persists startup bind errors. `running` and `bound_addr` prove only local listener state; reachable URL candidates do not claim firewall reachability.
 
