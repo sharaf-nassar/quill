@@ -354,8 +354,9 @@ fn session_is_live(request: &Request) -> bool {
         .is_some_and(|(_, token)| crate::web_pairing::verify_session(token.trim()))
 }
 
-/// The one refusal shape: no body, no header, nothing read.
-fn refused() -> Response {
+/// The one refusal shape, shared with the routes: no body, no header, nothing
+/// read.
+pub(super) fn refused() -> Response {
     StatusCode::FORBIDDEN.into_response()
 }
 

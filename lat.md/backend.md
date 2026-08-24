@@ -133,6 +133,39 @@ live connections exist and an idle keep-alive socket still costs its slot.
 Bodies are capped at 1 MiB and a whole request, gates included, is bounded at
 ten seconds.
 
+### Web UI routes
+
+[[src-tauri/src/web_server/router.rs]] mounts the three request classes, and
+mounting is what enforces them.
+
+`GET /pair` and `POST /api/web/pair` are the only public routes; the invoke
+route and the router's fallback sit behind
+[[src-tauri/src/web_server/gates.rs#require_session]], so an unrouted path and
+an asset path are refused on the same terms as a data read.
+
+The pairing page is rendered by the server rather than served from the bundle,
+so an unpaired browser can bootstrap without receiving an application chunk. It
+carries its own `Content-Security-Policy` that pins its one inline script by
+sha256 hash, keeping the bundle's `script-src` guarantee with no chunk to load.
+[[src-tauri/src/web_server/router.rs#pair]] refuses a body that is not the
+contracted request exactly as it refuses a wrong code, because answering them
+differently would say which half failed; a correct code returns `204` with the
+contracted session cookie.
+
+[[src-tauri/src/web_server/router.rs#invoke]] decides admission from
+[[src-tauri/src/web_allowlist.rs#is_permitted_command]] before it decodes any
+arguments, so a denied command reveals no argument shape. Permitted commands
+decode into one closed `WebCommand` enum keyed on the complete command string,
+whose fields are the desktop command's own parameters under Tauri's camelCase
+argument convention, and each arm calls the same desktop implementation the app
+window calls rather than a second read path. `get_session_breakdown` resolves
+its live tracker from the Tauri handle held in
+[[src-tauri/src/web_server/mod.rs#WebServerState]], which is what makes the
+browser's overlay the desktop's overlay. A malformed envelope or argument shape
+is an empty-body `400`, a command failure is `200` with the command's own
+display-safe message, and this router mounts no assets, so an authenticated
+request for anything else is a plain `404`.
+
 ### Authentication
 
 All endpoints require a Bearer token validated with constant-time comparison (`subtle` crate). The token is generated on first launch by [[src-tauri/src/auth.rs]] and stored at `~/.local/share/com.quilltoolkit.app/auth_secret` with mode 0o600.

@@ -18,21 +18,26 @@ use serde_json::{Map, Value};
 
 pub mod controller;
 pub mod gates;
+pub mod router;
 
 /// State shared by all web UI routes.
+///
+/// `app` is absent only where no Tauri runtime exists; the running listener is
+/// always constructed with the handle so browser reads resolve the same
+/// managed state the desktop window reads.
 #[derive(Default)]
 pub struct WebServerState {
     pub gates: gates::RequestGates,
+    pub app: Option<tauri::AppHandle>,
 }
 
 /// Build the web UI router from its shared state.
 ///
-/// Routes are mounted by the transport contract's own work item; every one of
-/// them lands inside [[src-tauri/src/web_server/gates.rs#apply_request_gates]],
-/// so no route can be added outside the peer, budget, size, and time bounds.
+/// Every route lands inside
+/// [[src-tauri/src/web_server/gates.rs#apply_request_gates]], so no route can
+/// be added outside the peer, budget, size, and time bounds.
 pub fn router(state: Arc<WebServerState>) -> Router {
-    let routes = Router::new().with_state(Arc::clone(&state));
-    gates::apply_request_gates(routes, state)
+    gates::apply_request_gates(router::routes(Arc::clone(&state)), state)
 }
 
 /// Typed, display-safe error returned by desktop Web UI commands.

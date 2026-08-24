@@ -24,6 +24,18 @@ exemption covers host filtering only — the authenticated class still refuses i
 without a session. A resolved hostname entry admits exactly the addresses it
 pinned, and only `host_policy=all` skips the pinned set.
 
+## Unpaired access reaches only the pairing bootstrap
+
+Without a session cookie a peer receives the pairing page and nothing else.
+
+The root document, asset paths, the invoke route, and unrouted paths are all
+empty-body `403`, and a pairing request whose body is not the contracted shape
+is refused exactly like a wrong code.
+
+The pairing page carries its own policy pinning its one inline script by hash,
+states no Quill data, and references no bundle chunk, so an unpaired browser can
+bootstrap without receiving application assets.
+
 ## Request classes carry bounded per-peer budgets
 
 Each peer gets its own sliding windows: 120 general requests per minute and a
