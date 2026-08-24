@@ -60,6 +60,8 @@ const MAX_PI_TRACK_REQUESTS: usize = 4_000;
 const MAX_PI_TRACK_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_CONTENT_LEN: usize = 1_000_000;
+const MAX_REMOTE_EVIDENCE_LEN: usize = 10_240;
+const MAX_RESULT_IMAGE_COUNT: i64 = MAX_REMOTE_EVIDENCE_LEN as i64;
 // Must match MAX_MESSAGES_PER_REQUEST in the deployed Claude session-sync bridge.
 const MAX_MESSAGES_PER_REQUEST: usize = 500;
 const REMOTE_ASSISTANT_TOOL_USE_TYPE: &str = "assistant_tool_use";
@@ -1260,6 +1262,14 @@ fn resolve_remote_message_identity<'a>(
     }
 }
 
+fn remote_tool_category(tool_name: &str) -> &'static str {
+    match tool_name.to_ascii_lowercase().as_str() {
+        "edit" | "write" | "multiedit" | "notebookedit" | "apply_patch" => "code_change",
+        "bash" | "exec_command" | "write_stdin" => "command",
+        _ => "tool_detail",
+    }
+}
+
 fn persist_remote_session_analytics(
     storage: &Storage,
     payload: &SessionMessagesPayload,
@@ -1267,6 +1277,7 @@ fn persist_remote_session_analytics(
     let live_messages = payload
         .messages
         .iter()
+        .filter(|message| message.role != "custom_message")
         .map(|message| {
             let identity = resolve_remote_message_identity(&payload.session_id, message)
                 .map_err(str::to_string)?;
@@ -1296,6 +1307,29 @@ fn persist_remote_session_analytics(
             });
         }
     }
+    let tool_actions = payload
+        .messages
+        .iter()
+        .flat_map(|message| {
+            message
+                .tools_used
+                .iter()
+                .enumerate()
+                .map(
+                    move |(ordinal, tool_name)| crate::storage::LiveToolActionInput {
+                        action_key: format!("{}:{ordinal}", message.uuid),
+                        message_id: message.uuid.as_str(),
+                        tool_name,
+                        category: remote_tool_category(tool_name),
+                        summary: tool_name,
+                        timestamp: message.timestamp.as_str(),
+                        is_error: message.is_error,
+                        details_json: message.details_json.as_deref(),
+                        result_image_count: message.result_image_count,
+                    },
+                )
+        })
+        .collect::<Vec<_>>();
     storage.store_live_session_analytics(
         payload.provider,
         &payload.session_id,
@@ -1307,6 +1341,7 @@ fn persist_remote_session_analytics(
         crate::storage::LiveSessionAnalyticsRows {
             messages: &live_messages,
             session_events: &rt_events,
+            tool_actions: &tool_actions,
             hook_invocations: &[],
         },
     )
@@ -1349,6 +1384,9 @@ fn remote_session_event_kinds(
     provider: IntegrationProvider,
     message: &SessionMessagePayload,
 ) -> Result<Vec<sessions::SessionEventKind>, String> {
+    if message.role == "custom_message" {
+        return Ok(Vec::new());
+    }
     let pi_kind = if provider == IntegrationProvider::Pi {
         match message.msg_type.as_str() {
             "input" | "turn_start" => Some(("user", sessions::SessionEventKind::UserText)),
@@ -2073,7 +2111,10 @@ fn validate_session_messages_payload(payload: &mut SessionMessagesPayload) -> Re
         if !message_ids.insert(stable_id) {
             return Err("Duplicate message uuid".to_string());
         }
-        if !matches!(message.role.as_str(), "user" | "assistant") {
+        if !matches!(
+            message.role.as_str(),
+            "user" | "assistant" | "custom_message"
+        ) {
             return Err("Invalid message role".to_string());
         }
         if message.timestamp.len() > MAX_STRING_LEN
@@ -2081,8 +2122,58 @@ fn validate_session_messages_payload(payload: &mut SessionMessagesPayload) -> Re
         {
             return Err("Invalid message timestamp".to_string());
         }
-        if message.content.len() > MAX_CONTENT_LEN {
-            return Err("Message content too long".to_string());
+        let is_custom_message = message.role == "custom_message";
+        let content_limit = if is_custom_message {
+            MAX_REMOTE_EVIDENCE_LEN
+        } else {
+            MAX_CONTENT_LEN
+        };
+        if message.content.len() > content_limit {
+            return Err(if is_custom_message {
+                "Custom message content too long".to_string()
+            } else {
+                "Message content too long".to_string()
+            });
+        }
+        if is_custom_message && message.content.trim().is_empty() {
+            return Err("Invalid custom message content".to_string());
+        }
+        if message.custom_type.as_ref().is_some_and(|custom_type| {
+            custom_type.trim().is_empty() || custom_type.len() > MAX_REMOTE_EVIDENCE_LEN
+        }) {
+            return Err("Invalid message custom_type".to_string());
+        }
+        if !is_custom_message && message.custom_type.is_some() {
+            return Err("custom_type requires custom_message role".to_string());
+        }
+        if message.tools_used.iter().any(|tool_name| {
+            tool_name.trim().is_empty()
+                || tool_name.trim() != tool_name
+                || tool_name.len() > MAX_STRING_LEN
+        }) {
+            return Err("Invalid message tool name".to_string());
+        }
+        let has_tool_evidence = message.details_json.is_some()
+            || message.is_error.is_some()
+            || message.result_image_count.is_some();
+        if is_custom_message && (!message.tools_used.is_empty() || has_tool_evidence) {
+            return Err("Custom messages cannot carry tool evidence".to_string());
+        }
+        if has_tool_evidence && message.tools_used.len() != 1 {
+            return Err("Tool evidence requires exactly one tool name".to_string());
+        }
+        if message.details_json.as_ref().is_some_and(|details| {
+            details.len() > MAX_REMOTE_EVIDENCE_LEN
+                || !serde_json::from_str::<serde_json::Value>(details)
+                    .is_ok_and(|value| value.is_object())
+        }) {
+            return Err("Invalid message details_json".to_string());
+        }
+        if message
+            .result_image_count
+            .is_some_and(|count| !(0..=MAX_RESULT_IMAGE_COUNT).contains(&count))
+        {
+            return Err("Invalid message result_image_count".to_string());
         }
         resolve_remote_message_identity(&payload.session_id, message).map_err(str::to_string)?;
         remote_session_event_kinds(payload.provider, message)?;
@@ -2100,6 +2191,33 @@ fn validate_session_messages_payload(payload: &mut SessionMessagesPayload) -> Re
         }
     }
     Ok(())
+}
+
+fn extract_remote_session_messages(
+    payload: &SessionMessagesPayload,
+) -> Vec<sessions::ExtractedMessage> {
+    payload
+        .messages
+        .iter()
+        .map(|message| sessions::ExtractedMessage {
+            uuid: message.uuid.clone(),
+            session_id: payload.session_id.clone(),
+            parent_session_id: None,
+            role: message.role.clone(),
+            content: message.content.clone(),
+            timestamp: message.timestamp.clone(),
+            git_branch: payload.git_branch.clone().unwrap_or_default(),
+            tools_used: message.tools_used.clone(),
+            files_modified: message.files_modified.clone(),
+            code_changes: Vec::new(),
+            commands_run: Vec::new(),
+            tool_details: Vec::new(),
+            tool_actions: Vec::new(),
+            parent_uuid: message.parent_uuid.clone(),
+            cwd: payload.cwd.clone(),
+            custom_type: message.custom_type.clone(),
+        })
+        .collect()
 }
 
 async fn post_session_messages(
@@ -2218,28 +2336,7 @@ async fn post_session_messages(
 
     // Search indexing is independent and best effort. The response above is
     // gated only by the committed SQLite analytics transaction.
-    let extracted: Vec<sessions::ExtractedMessage> = payload
-        .messages
-        .iter()
-        .map(|message| sessions::ExtractedMessage {
-            uuid: message.uuid.clone(),
-            session_id: payload.session_id.clone(),
-            parent_session_id: None,
-            role: message.role.clone(),
-            content: message.content.clone(),
-            timestamp: message.timestamp.clone(),
-            git_branch: payload.git_branch.clone().unwrap_or_default(),
-            tools_used: message.tools_used.clone(),
-            files_modified: message.files_modified.clone(),
-            code_changes: Vec::new(),
-            commands_run: Vec::new(),
-            tool_details: Vec::new(),
-            tool_actions: Vec::new(),
-            parent_uuid: message.parent_uuid.clone(),
-            cwd: payload.cwd.clone(),
-            custom_type: None,
-        })
-        .collect();
+    let extracted = extract_remote_session_messages(&payload);
 
     if let Some(idx) = &state.session_index {
         index_session_messages_in_background(
@@ -3091,6 +3188,177 @@ mod observed_subagent_tests {
         }))
         .expect("deserialize unsupported Pi thinking message");
         assert!(remote_session_event_kinds(IntegrationProvider::Pi, &thinking).is_err());
+        let mut thinking_payload: SessionMessagesPayload =
+            serde_json::from_value(serde_json::json!({
+                "provider": "pi",
+                "host": "host",
+                "session_id": "session-1",
+                "project": "quill",
+                "messages": [serde_json::json!({
+                    "uuid": "thinking-1",
+                    "type": "assistant",
+                    "timestamp": "2026-08-14T08:00:00Z",
+                    "content": "",
+                    "role": "assistant",
+                    "event_kinds": ["asst_thinking"]
+                })]
+            }))
+            .expect("deserialize Pi thinking payload");
+        assert_eq!(
+            validate_session_messages_payload(&mut thinking_payload),
+            Err("Pi does not expose thinking runtime events".to_string())
+        );
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Remote Message Evidence Wire]]
+    #[test]
+    fn remote_session_message_evidence_is_bounded_and_durable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let database = temp.path().join("usage.db");
+        let storage = Storage::init_at(database.clone(), false).expect("init storage");
+        let index = sessions::SessionIndex::open_or_create_for_tests(&temp.path().join("index"))
+            .expect("open index");
+        let mut payload: SessionMessagesPayload = serde_json::from_value(serde_json::json!({
+            "provider": "claude",
+            "host": "remote-host",
+            "session_id": "remote-session",
+            "project": "quill",
+            "messages": [
+                {
+                    "uuid": "custom-1",
+                    "type": "custom_message",
+                    "timestamp": "2026-08-24T08:00:00Z",
+                    "content": "remote injected context",
+                    "role": "custom_message",
+                    "custom_type": "subagent-notify"
+                },
+                {
+                    "uuid": "tool-1",
+                    "type": "assistant_tool_use",
+                    "timestamp": "2026-08-24T08:00:01Z",
+                    "content": "",
+                    "role": "assistant",
+                    "tools_used": ["Bash"],
+                    "details_json": "{\"exit\":1}",
+                    "is_error": true,
+                    "result_image_count": 2
+                },
+                {
+                    "uuid": "legacy-tool-1",
+                    "type": "assistant_tool_use",
+                    "timestamp": "2026-08-24T08:00:02Z",
+                    "content": "",
+                    "role": "assistant",
+                    "tools_used": ["Bash"]
+                }
+            ]
+        }))
+        .expect("deserialize remote payload");
+
+        validate_session_messages_payload(&mut payload).expect("validate remote payload");
+        assert_eq!(payload.messages[2].details_json, None);
+        assert_eq!(payload.messages[2].is_error, None);
+        assert_eq!(payload.messages[2].result_image_count, None);
+        persist_remote_session_analytics(&storage, &payload).expect("persist remote evidence");
+
+        let extracted = extract_remote_session_messages(&payload);
+        index
+            .append_messages_batch(
+                payload.provider,
+                &payload.project,
+                &payload.host,
+                &extracted,
+            )
+            .expect("index remote messages");
+        index.reader.reload().expect("reload index");
+        let hits = index
+            .search(
+                "remote injected context",
+                &sessions::SearchFilters {
+                    provider: Some(IntegrationProvider::Claude),
+                    ..sessions::SearchFilters::default()
+                },
+                "relevance",
+                0,
+                10,
+            )
+            .expect("search custom message");
+        assert_eq!(hits.total_hits, 1);
+        assert_eq!(hits.hits[0].role, "custom_message");
+        assert_eq!(
+            index
+                .search(
+                    "custom_type:subagent-notify",
+                    &sessions::SearchFilters::default(),
+                    "relevance",
+                    0,
+                    10,
+                )
+                .expect("search custom type")
+                .total_hits,
+            1
+        );
+
+        let connection = rusqlite::Connection::open(&database).expect("open database");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_events WHERE uuid = 'custom-1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count custom events"),
+            0
+        );
+        let evidence: (Option<String>, Option<i64>, Option<String>, Option<i64>) = connection
+            .query_row(
+                "SELECT source_key, is_error, details_json, result_image_count
+                 FROM tool_actions WHERE action_key = 'tool-1:0'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read durable tool evidence");
+        assert_eq!(evidence.0, None);
+        assert_eq!(evidence.1, Some(1));
+        assert_eq!(evidence.2.as_deref(), Some(r#"{"exit":1}"#));
+        assert_eq!(evidence.3, Some(2));
+        let old_client_evidence: (Option<i64>, Option<String>, Option<i64>) = connection
+            .query_row(
+                "SELECT is_error, details_json, result_image_count
+                 FROM tool_actions WHERE action_key = 'legacy-tool-1:0'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read old-client tool evidence");
+        assert_eq!(old_client_evidence, (None, None, None));
+
+        let mut oversized_custom = payload.clone();
+        oversized_custom.messages[0].content = "x".repeat(MAX_REMOTE_EVIDENCE_LEN + 1);
+        assert_eq!(
+            validate_session_messages_payload(&mut oversized_custom),
+            Err("Custom message content too long".to_string())
+        );
+        let mut malformed_details = payload.clone();
+        malformed_details.messages[1].details_json = Some("[]".to_string());
+        assert_eq!(
+            validate_session_messages_payload(&mut malformed_details),
+            Err("Invalid message details_json".to_string())
+        );
+        let mut oversized_details = payload.clone();
+        oversized_details.messages[1].details_json = Some(format!(
+            r#"{{"detail":"{}"}}"#,
+            "x".repeat(MAX_REMOTE_EVIDENCE_LEN)
+        ));
+        assert_eq!(
+            validate_session_messages_payload(&mut oversized_details),
+            Err("Invalid message details_json".to_string())
+        );
+        let mut invalid_image_count = payload;
+        invalid_image_count.messages[1].result_image_count = Some(MAX_RESULT_IMAGE_COUNT + 1);
+        assert_eq!(
+            validate_session_messages_payload(&mut invalid_image_count),
+            Err("Invalid message result_image_count".to_string())
+        );
     }
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Pi Runtime Hostname]]

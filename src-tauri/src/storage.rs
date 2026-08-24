@@ -641,11 +641,26 @@ pub(crate) struct LiveSessionEventInput<'a> {
     pub(crate) kind: crate::sessions::SessionEventKind,
 }
 
+/// One flattened remote tool action committed with a live batch.
+#[derive(Clone)]
+pub(crate) struct LiveToolActionInput<'a> {
+    pub(crate) action_key: String,
+    pub(crate) message_id: &'a str,
+    pub(crate) tool_name: &'a str,
+    pub(crate) category: &'a str,
+    pub(crate) summary: &'a str,
+    pub(crate) timestamp: &'a str,
+    pub(crate) is_error: Option<bool>,
+    pub(crate) details_json: Option<&'a str>,
+    pub(crate) result_image_count: Option<i64>,
+}
+
 /// Complete live analytics batch committed beside its origin mapping.
 #[derive(Clone, Copy)]
 pub(crate) struct LiveSessionAnalyticsRows<'a> {
     pub(crate) messages: &'a [LiveSessionMessageInput<'a>],
     pub(crate) session_events: &'a [LiveSessionEventInput<'a>],
+    pub(crate) tool_actions: &'a [LiveToolActionInput<'a>],
     pub(crate) hook_invocations: &'a [HookInvocationInput<'a>],
 }
 
@@ -20114,6 +20129,7 @@ impl Storage {
                 LiveSessionAnalyticsRows {
                     messages: &[],
                     session_events: &[],
+                    tool_actions: &[],
                     hook_invocations: std::slice::from_ref(&invocation),
                 },
             )
@@ -20198,6 +20214,31 @@ impl Storage {
                 || (0..count).any(|ordinal| !event_identities.contains(&(*message_id, ordinal)))
             {
                 return Err("Live runtime event ordinals must be contiguous".to_string());
+            }
+        }
+        let mut tool_action_keys = HashSet::with_capacity(rows.tool_actions.len());
+        for action in rows.tool_actions {
+            let Some(message) = message_by_id.get(action.message_id) else {
+                return Err("Live tool actions require a stable message id".to_string());
+            };
+            if action.action_key.trim().is_empty()
+                || action.tool_name.trim().is_empty()
+                || action.category.trim().is_empty()
+                || action.summary.trim().is_empty()
+                || action.timestamp != message.timestamp
+                || !tool_action_keys.insert(action.action_key.as_str())
+            {
+                return Err("Live tool action identity is incomplete or inconsistent".to_string());
+            }
+            if action.details_json.is_some_and(|details| {
+                details.len() > 10_240
+                    || !serde_json::from_str::<serde_json::Value>(details)
+                        .is_ok_and(|value| value.is_object())
+            }) {
+                return Err("Live tool action details are invalid".to_string());
+            }
+            if action.result_image_count.is_some_and(|count| count < 0) {
+                return Err("Live tool action image count is invalid".to_string());
             }
         }
         if rows.hook_invocations.iter().any(|invocation| {
@@ -20528,6 +20569,54 @@ impl Storage {
                         ),
                     });
                 }
+            }
+        }
+
+        if !rows.tool_actions.is_empty() {
+            let mut statement = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO tool_actions (
+                         provider, source_key, action_key, message_id,
+                         session_id, chain_id, parent_chain_id, tool_name,
+                         category, file_path, summary, full_input, full_output,
+                         is_error, details_json, result_image_count, duration_ms,
+                         timestamp, is_sidechain, agent_id, parent_uuid,
+                         lines_added, lines_removed
+                     ) VALUES (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10,
+                         NULL, NULL, ?11, ?12, ?13, NULL, ?14, ?15, ?16,
+                         ?17, NULL, NULL
+                     )",
+                )
+                .map_err(|e| format!("Prepare live tool actions: {e}"))?;
+            for action in rows.tool_actions {
+                let message = message_by_id
+                    .get(action.message_id)
+                    .expect("validated live tool action message identity");
+                let details_json = (action.category != TOOL_DETAIL_CATEGORY)
+                    .then_some(action.details_json)
+                    .flatten();
+                statement
+                    .execute(params![
+                        provider.as_str(),
+                        source_key,
+                        action.action_key,
+                        action.message_id,
+                        session_id,
+                        message.chain_id,
+                        message.parent_chain_id,
+                        action.tool_name,
+                        action.category,
+                        action.summary,
+                        action.is_error.map(i64::from),
+                        details_json,
+                        action.result_image_count,
+                        action.timestamp,
+                        i64::from(message.is_sidechain),
+                        message.agent_id,
+                        message.parent_uuid,
+                    ])
+                    .map_err(|e| format!("Insert live tool action: {e}"))?;
             }
         }
 
@@ -28236,6 +28325,7 @@ mod tests {
                 LiveSessionAnalyticsRows {
                     messages: &messages,
                     session_events: &events,
+                    tool_actions: &[],
                     hook_invocations: &[],
                 },
             )
@@ -31402,6 +31492,7 @@ mod tests {
                 LiveSessionAnalyticsRows {
                     messages: &messages,
                     session_events: &events,
+                    tool_actions: &[],
                     hook_invocations: &[],
                 },
             )
@@ -36222,6 +36313,7 @@ mod tests {
                     LiveSessionAnalyticsRows {
                         messages: &messages,
                         session_events: &events,
+                        tool_actions: &[],
                         hook_invocations: &[],
                     },
                 )
@@ -36489,6 +36581,7 @@ mod tests {
                 LiveSessionAnalyticsRows {
                     messages: &messages,
                     session_events: &events,
+                    tool_actions: &[],
                     hook_invocations: &[],
                 },
             )
@@ -36505,6 +36598,7 @@ mod tests {
                 LiveSessionAnalyticsRows {
                     messages: &messages,
                     session_events: &events,
+                    tool_actions: &[],
                     hook_invocations: &[],
                 },
             )
@@ -36559,6 +36653,7 @@ mod tests {
                 LiveSessionAnalyticsRows {
                     messages: &crash_messages,
                     session_events: &crash_events,
+                    tool_actions: &[],
                     hook_invocations: &[],
                 },
             )
@@ -36656,6 +36751,7 @@ mod tests {
                     LiveSessionAnalyticsRows {
                         messages: &messages,
                         session_events: &events,
+                        tool_actions: &[],
                         hook_invocations: &[],
                     },
                 )

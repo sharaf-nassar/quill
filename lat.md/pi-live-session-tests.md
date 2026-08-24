@@ -73,7 +73,20 @@ Pi runtime traffic charges contained messages, accepts 4,000 messages per minute
 
 Pi turn, input, and tool execution types map to canonical runtime events. Live `/sessions/messages` keeps rejecting `asst_thinking`; retained reconciliation owns Pi thinking evidence.
 
-`server::observed_subagent_tests::pi_session_message_types_map_without_thinking_events` pins the live mapping and rejection.
+`server::observed_subagent_tests::pi_session_message_types_map_without_thinking_events` pins the live mapping and rejection through the row validator.
+
+## Remote Message Evidence Wire
+
+Remote `/sessions/messages` accepts bounded evidence without creating context runtime events.
+
+`custom_message` rows carry optional `custom_type`; one flattened remote tool
+row retains bounded object `details_json`, nullable `is_error`, and bounded
+image count. Old envelopes write NULL evidence. Invalid or oversized custom
+content, details, or image counts reject in row validation.
+
+`server::observed_subagent_tests::remote_session_message_evidence_is_bounded_and_durable`
+pins role admission, indexing, source-less persistence, NULL old-envelope
+semantics, and typed bound/shape rejection.
 
 ## Split Turn Response Pairing
 

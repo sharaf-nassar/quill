@@ -1140,6 +1140,16 @@ pub struct SessionMessagePayload {
     pub is_sidechain: Option<bool>,
     #[serde(default)]
     pub parent_uuid: Option<String>,
+    /// Pi's injected-context type for `role: "custom_message"`.
+    #[serde(default)]
+    pub custom_type: Option<String>,
+    /// Bounded result metadata from the originating tool action.
+    #[serde(default)]
+    pub details_json: Option<String>,
+    #[serde(default)]
+    pub is_error: Option<bool>,
+    #[serde(default)]
+    pub result_image_count: Option<i64>,
 }
 
 /// Batch of messages pushed via the HTTP API

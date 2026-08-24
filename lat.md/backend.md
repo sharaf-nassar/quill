@@ -231,6 +231,28 @@ The HTTP API exposes 16 endpoints for token ingestion, context savings, learning
 
 Each endpoint validates input (length limits, range checks, type validation) before processing. Provider-aware payloads default legacy callers to `claude`, while new Claude and Codex hooks send explicit provider tags for telemetry and session ingestion. Hook-facing observation and session-ingest POSTs acknowledge after validation and finish SQLite/Tantivy work on background blocking tasks so CLI hooks do not wait on local indexing. Local hook scripts treat receipt of response headers as the success boundary and use a short 1.5-second local timeout, which keeps the CLI path tolerant of slow response teardown without waiting on background indexing.
 
+#### Remote session evidence wire
+
+`POST /api/v1/sessions/messages` is an additive, opt-in remote-sync wire.
+
+Older clients omit `custom_type`, `details_json`, `is_error`, and
+`result_image_count` and persist NULL tool evidence. A `custom_message` row
+carries 10 KiB-bounded content and optional bounded `custom_type`; it indexes
+with that role and metadata but creates no runtime event. A flattened tool row
+with exactly one `tools_used` name persists object-only 10 KiB `details_json`,
+nullable error state, and image count in `tool_actions`; `tool_detail` keeps
+its existing payload carve-out while retaining error and image evidence.
+Malformed, oversized, ambiguous, or negative row values reject before any
+mutation. Non-Pi remote writes remain source-less; Pi retains its existing
+host-qualified live source.
+
+These fields are intentionally included only when the user has enabled the
+existing remote-sync path. They are additional off-device payload content, so
+remote-sync remains the user-controlled opt-in transmission boundary required
+by constitution P11; local transcript parsing remains authoritative on the
+originating machine. `server::observed_subagent_tests::remote_session_message_evidence_is_bounded_and_durable`
+pins the envelope, storage, and old-client behavior.
+
 `/api/v1/pi/track` uses its own 4,000-request sliding window after shared bearer auth, the 1 MiB body bound, the integration-enabled gate, that window, and demo-mode gating. It accepts only transactional protocol-2 lifecycle envelopes, treats reporter/build/capability metadata as descriptive, commits before live mutation, and returns typed `400`, `401`, `409`, `429`, and `503` outcomes. Older protocol-2 providers therefore continue after desktop upgrades without reinstall or reload. Demo mode and bad auth ingest nothing. Pi session files supply model, usage, activity, agent rails, and source-owned response times through persisted reconciliation; `/sessions/messages` no longer receives Pi runtime acceleration.
 
 ### Maintenance quiesce
@@ -1382,7 +1404,7 @@ Recognized `SKILL.md` loads derived during the same Session Indexing extraction 
 
 [[src-tauri/src/sessions.rs#extract_skill_accesses_from_tool_action]] recognizes five ingest shapes: Codex `exec_command` calls that read a `SKILL.md` path with `cat`/`head`/`tail`/etc., Claude `Read` calls against a `SKILL.md` path, Claude `Skill` tool calls, and Pi's lowercase `read` and `bash` spellings of the first two. Pi has no `Skill` tool, so reading the file is the only way one of its skill loads is ever observable. The `Skill` arm normalizes the `skill` input via [[src-tauri/src/sessions.rs#skill_access_from_skill_tool_input]] by stripping any `plugin:` prefix so Claude rows merge with Codex's bare folder names (e.g. Claude `superpowers:using-superpowers` collapses onto Codex `using-superpowers`), and synthesizes a `skill://<raw>` path that preserves the original identifier for forensic drilldowns without colliding with filesystem paths.
 
-`cwd` and `hostname` are populated in source-owned snapshots: Claude pulls `cwd` from each record's top-level field, Codex threads session-level `cwd` through every tool message in [[src-tauri/src/sessions.rs#ExtractedMessage]], and reconciliation captures the local hostname once per source. Pi takes both from its notify payload instead, since it has no retained source to capture them from. The HTTP message-ingest path still leaves skill usage empty because its flattened payload has no tool-action detail — which is exactly why Pi's rows come from the notify parse rather than from the pushed messages.
+`cwd` and `hostname` are populated in source-owned snapshots: Claude pulls `cwd` from each record's top-level field, Codex threads session-level `cwd` through every tool message in [[src-tauri/src/sessions.rs#ExtractedMessage]], and reconciliation captures the local hostname once per source. Pi takes both from its notify payload instead, since it has no retained source to capture them from. The HTTP message-ingest path writes bounded source-less tool-result evidence for one flattened tool name, but it still emits no skill usage because that payload contains no tool input or skill path; Pi's complete rows remain notify-derived.
 
 #### Hook Invocations
 
@@ -2208,7 +2230,7 @@ The shared Claude candidate walker descends through the complete `<projectSlug>/
 
 The HTTP API also accepts provider-tagged notify and direct message ingestion. Local Claude full-transcript sync is Stop-scoped, while direct message ingestion still appends atomically for incremental remote updates. Project filters keep display-name facet matching for the UI and accept an exact absolute cwd for MCP callers; exact cwd identity separates same-named directories. BM25 scoring plus snippet generation power the shared search UI with provider filters and badges. The default search response retains full stored content for the desktop UI; `view=compact` omits it, returns snippet-and-identity hits, and stops before the serialized response exceeds 32 KiB for model-facing clients.
 
-[[src-tauri/src/sessions.rs#validate_retained_notify_source]] validates one `notify` path against only its configured provider root, canonical containment, and supported layout without walking transcript history. Quill admits a canonical source to model and transcript reconciliation before session-keyed search coalescing; a resolvable path that fails the stricter retained-source policy still coalesces for search only, preserving the indexing contract. Direct message payloads append Tantivy documents and atomically store source-less runtime rows plus recorded live origin through [[src-tauri/src/storage.rs#Storage#store_live_session_analytics]].
+[[src-tauri/src/sessions.rs#validate_retained_notify_source]] validates one `notify` path against only its configured provider root, canonical containment, and supported layout without walking transcript history. Quill admits a canonical source to model and transcript reconciliation before session-keyed search coalescing; a resolvable path that fails the stricter retained-source policy still coalesces for search only, preserving the indexing contract. Direct message payloads append Tantivy documents and atomically store source-less runtime rows plus recorded live origin through [[src-tauri/src/storage.rs#Storage#store_live_session_analytics]]. Additive injected-context rows index without runtime events; flattened remote tool rows also store bounded evidence through that transaction.
 
 ### Search Scoring
 
