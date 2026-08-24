@@ -1118,9 +1118,6 @@ pub struct IndexState {
     /// Provider-native session id last extracted from each indexed file.
     #[serde(default)]
     file_session_ids: HashMap<String, String>,
-    /// One-time in-place removal of legacy Pi tool-result/custom-role documents.
-    #[serde(default)]
-    pi_conversation_cleanup_complete: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,68 +1198,14 @@ impl SessionIndex {
 
         let _ = std::fs::write(&version_path, Self::SCHEMA_VERSION.to_string());
 
-        let session_index = Self {
+        Ok(Self {
             index,
             fields,
             writer: Arc::new(Mutex::new(writer)),
             reader,
             index_dir: index_dir.to_path_buf(),
             state: Mutex::new(state),
-        };
-        session_index.cleanup_legacy_pi_non_conversation_documents()?;
-        Ok(session_index)
-    }
-
-    fn cleanup_legacy_pi_non_conversation_documents(&self) -> Result<(), String> {
-        if self.state.lock().unwrap().pi_conversation_cleanup_complete {
-            return Ok(());
-        }
-
-        let legacy_pi_roles = BooleanQuery::new(vec![
-            (
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.provider, IntegrationProvider::Pi.as_str()),
-                    IndexRecordOption::Basic,
-                )),
-            ),
-            (
-                Occur::MustNot,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.role, "user"),
-                    IndexRecordOption::Basic,
-                )),
-            ),
-            (
-                Occur::MustNot,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.role, "assistant"),
-                    IndexRecordOption::Basic,
-                )),
-            ),
-            (
-                Occur::MustNot,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.role, PI_CUSTOM_MESSAGE_ROLE),
-                    IndexRecordOption::Basic,
-                )),
-            ),
-        ]);
-
-        {
-            let mut writer = self.writer.lock().unwrap();
-            writer
-                .delete_query(Box::new(legacy_pi_roles))
-                .map_err(|error| format!("Delete legacy Pi search documents: {error}"))?;
-            writer
-                .commit()
-                .map_err(|error| format!("Commit legacy Pi search cleanup: {error}"))?;
-        }
-        self.reader
-            .reload()
-            .map_err(|error| format!("Reload legacy Pi search cleanup: {error}"))?;
-        self.state.lock().unwrap().pi_conversation_cleanup_complete = true;
-        self.save_state()
+        })
     }
 
     /// Build the Tantivy schema.
@@ -6571,108 +6514,6 @@ mod tests {
             "quill-tracking entries stay out of search"
         );
         assert_eq!(hits("conversation-needle").len(), 1);
-    }
-
-    // @lat: [[session-search-tests#Session Search Test Specs#Legacy Pi Role Cleanup]]
-    #[test]
-    fn opening_index_removes_only_legacy_pi_non_conversation_documents() {
-        let temp = TempDir::new().expect("tempdir");
-        let make_message = |uuid: &str, role: &str| ExtractedMessage {
-            uuid: uuid.to_string(),
-            session_id: uuid.to_string(),
-            parent_session_id: None,
-            role: role.to_string(),
-            content: uuid.to_string(),
-            timestamp: "2026-08-14T08:00:01Z".to_string(),
-            git_branch: String::new(),
-            tools_used: Vec::new(),
-            files_modified: Vec::new(),
-            code_changes: Vec::new(),
-            commands_run: Vec::new(),
-            tool_details: Vec::new(),
-            tool_actions: Vec::new(),
-            parent_uuid: None,
-            cwd: None,
-            custom_type: None,
-        };
-        {
-            let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("open index");
-            index
-                .replace_session_docs_batch(
-                    IntegrationProvider::Pi,
-                    "pi-user",
-                    "project",
-                    "host",
-                    &[make_message("pi-user", "user")],
-                )
-                .expect("index Pi user");
-            index
-                .replace_session_docs_batch(
-                    IntegrationProvider::Pi,
-                    "pi-result",
-                    "project",
-                    "host",
-                    &[make_message("pi-result", "toolResult")],
-                )
-                .expect("index Pi tool result");
-            index
-                .replace_session_docs_batch(
-                    IntegrationProvider::Pi,
-                    "pi-injected",
-                    "project",
-                    "host",
-                    &[make_message("pi-injected", PI_CUSTOM_MESSAGE_ROLE)],
-                )
-                .expect("index Pi injected context");
-            index
-                .replace_session_docs_batch(
-                    IntegrationProvider::Claude,
-                    "claude-custom",
-                    "project",
-                    "host",
-                    &[make_message("claude-custom", "custom")],
-                )
-                .expect("index Claude custom role");
-        }
-        fs::write(
-            temp.path().join("index_state.json"),
-            r#"{"file_mtimes":{},"file_session_ids":{},"pi_conversation_cleanup_complete":false}"#,
-        )
-        .expect("reset cleanup state");
-
-        let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("reopen index");
-        let provider_count = |index: &SessionIndex, provider: &str| {
-            index
-                .get_facets()
-                .expect("facets")
-                .providers
-                .iter()
-                .find(|facet| facet.name == provider)
-                .map(|facet| facet.count)
-        };
-        assert_eq!(
-            provider_count(&index, "pi"),
-            Some(2),
-            "cleanup keeps Pi conversation and injected-context documents"
-        );
-        assert_eq!(provider_count(&index, "claude"), Some(1));
-        index
-            .replace_session_docs_batch(
-                IntegrationProvider::Pi,
-                "pi-late-result",
-                "project",
-                "host",
-                &[make_message("pi-late-result", "toolResult")],
-            )
-            .expect("index later Pi tool result");
-        drop(index);
-
-        let reopened = SessionIndex::open_or_create_for_tests(temp.path()).expect("reopen again");
-        assert_eq!(
-            provider_count(&reopened, "pi"),
-            Some(3),
-            "the one-time cleanup does not run again on a later open"
-        );
     }
 
     // @lat: [[session-search-tests#Session Search Test Specs#Compact AI Results]]

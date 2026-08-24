@@ -42,12 +42,6 @@ Search hits and session context carry a nullable `session_name` joined from the 
 
 Lookups are deduplicated per response and chunked, so a page costs a bounded number of indexed reads and a batch wider than one chunk keeps its tail. `storage::tests::session_name_enrichment_uses_one_bounded_registry_lookup` pins per-provider resolution, absent names staying NULL, and the chunk boundary.
 
-## Legacy Pi Role Cleanup
-
-Opening an existing index deletes only Pi documents with non-conversation roles while preserving Pi conversation messages, Pi `custom_message` documents, and documents from other providers.
-
-The cleanup is one-time: a later open leaves a newly indexed legacy document alone. `sessions::tests::opening_index_removes_only_legacy_pi_non_conversation_documents` pins both.
-
 ## Schema Rebuild Measurement
 
 The schema-8 rebuild cost is measured on the pinned audit-window corpus rather than asserted.
