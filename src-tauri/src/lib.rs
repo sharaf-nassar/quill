@@ -65,8 +65,8 @@ use models::{
     ModelSessionsResponse, ModelUsageOverviewResponse, ProjectBreakdown, ProjectTokens,
     ProviderErrorKind, ProviderStatus, RuntimeSettings, SessionBreakdown, SessionCodeStats,
     SessionModelHistoryResponse, SessionRef, SessionStats, SkillBreakdown, SkillProjectBreakdown,
-    StatusIndicatorState, TokenDataPoint, TokenStats, ToolCount, UsageBucket, UsageData,
-    UsageProviderError, UsageSource,
+    StatusIndicatorState, TokenDataPoint, TokenStats, ToolCount, TurnOutcomesResponse, UsageBucket,
+    UsageData, UsageProviderError, UsageSource,
 };
 use rand::RngCore;
 use rollup_backfill::{
@@ -3274,7 +3274,7 @@ fn normalize_model_sessions_limit(
 }
 
 /// Return the usage-frequency Models overview from one retained-evidence snapshot.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (4)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
 #[tauri::command]
 async fn get_model_usage_overview(
     range: String,
@@ -3314,8 +3314,49 @@ async fn get_model_usage_overview(
     result
 }
 
+/// Aggregate turn outcomes per session, per model, and per time window.
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
+#[tauri::command]
+async fn get_turn_outcomes(
+    range: String,
+    provider: Option<String>,
+) -> Result<TurnOutcomesResponse, ModelAnalyticsError> {
+    let started_at = std::time::Instant::now();
+    let range = ModelRange::try_from(range.as_str())?;
+    let provider = validate_model_analytics_provider(provider)?;
+    let range_for_log = range.as_str();
+    let provider_for_log = provider.clone();
+    let storage = get_storage().map_err(|error| {
+        model_analytics_storage_error("Turn outcome storage unavailable", error)
+    })?;
+
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        storage.get_turn_outcomes(range, provider.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(model_analytics_storage_error(
+            "Failed to read turn outcomes",
+            error,
+        )),
+        Err(error) => Err(model_analytics_storage_error(
+            "Turn outcome blocking task failed",
+            error,
+        )),
+    };
+    log_analytics_command_timing(
+        "get_turn_outcomes",
+        range_for_log,
+        provider_for_log.as_deref(),
+        "miss",
+        started_at,
+    );
+    result
+}
+
 /// Page sessions that contain one exact provider-qualified raw model identity.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (4)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
 #[tauri::command]
 async fn get_model_sessions(
     range: String,
@@ -3355,7 +3396,7 @@ async fn get_model_sessions(
 }
 
 /// Return chain-separated model history for one provider-owned session.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (4)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
 #[tauri::command]
 async fn get_session_model_history(
     provider: String,
@@ -3389,7 +3430,7 @@ async fn get_session_model_history(
 }
 
 /// Start a fresh retained-history generation unless one is already scheduled.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (4)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
 #[tauri::command]
 async fn retry_model_history_backfill(
     app_handle: tauri::AppHandle,
@@ -3560,6 +3601,7 @@ async fn get_session_breakdown(
             provider,
         )?;
         storage.populate_session_runtime_evidence(&mut rows)?;
+        storage.populate_session_analytics_evidence(&mut rows, &range)?;
         Ok(rows)
     })
 }
@@ -6334,6 +6376,7 @@ pub fn run() {
             get_usage_history,
             get_snapshot_count,
             get_model_usage_overview,
+            get_turn_outcomes,
             get_model_sessions,
             get_session_model_history,
             retry_model_history_backfill,
@@ -6462,6 +6505,8 @@ mod tests {
             ended_at: None,
             model_id: None,
             project: None,
+            session_name: None,
+            failed_tool_calls: None,
             active_runtime_secs: None,
             agent_count: None,
             agent_runtime_secs: None,

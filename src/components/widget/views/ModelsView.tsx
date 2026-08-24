@@ -312,6 +312,12 @@ function ModelsView({ range, webSurface = false }: ModelsViewProps) {
       ? `top ${ranked.length} of ${formatNumber(totalModels)}`
       : `${formatNumber(totalModels)} ${totalModels === 1 ? "model" : "models"}`;
 
+  // Compaction/branch-summary spend has no model identity, so it gets its own
+  // reconciling entry beneath the ranked rows — never a pseudo-model row with
+  // a swatch and never silently folded into a model's figure.
+  const summaryUsage = data?.summaryUsage ?? null;
+  const showSummaries = summaryUsage !== null && summaryUsage.observations > 0;
+
   const coverage =
     data?.totals.coveragePercent === null ||
     data?.totals.coveragePercent === undefined
@@ -500,6 +506,26 @@ function ModelsView({ range, webSurface = false }: ModelsViewProps) {
               );
             })}
           </ul>
+        )}
+
+        {showSummaries && (
+          <div
+            className="wg-mv-summaries"
+            role="note"
+            title={`${formatNumber(summaryUsage.observations)} compaction or branch-summary ${
+              summaryUsage.observations === 1 ? "call" : "calls"
+            } burned tokens without a model identity. Counted in range totals as its own bucket, never as a model.`}
+          >
+            <span className="wg-mv-summaries-label">
+              Summaries (unattributed)
+            </span>
+            <span className="wg-mv-summaries-count wg-num">
+              {formatNumber(summaryUsage.observations)}
+            </span>
+            <span className="wg-mv-tokens wg-num">
+              {formatTokenCount(summaryUsage.totalTokens)}
+            </span>
+          </div>
         )}
 
         {/* Coverage is attributed tokens over all token-bearing observations.

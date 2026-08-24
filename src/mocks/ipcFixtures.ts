@@ -39,6 +39,8 @@ import type {
   ToolCount,
   TokenDataPoint,
   TokenStats,
+  TurnOutcomeCounts,
+  TurnOutcomesResponse,
   UsageData,
 } from "../types";
 import type {
@@ -334,12 +336,12 @@ const projectBreakdown: ProjectBreakdown[] = [
 ];
 
 const sessionBreakdown: SessionBreakdown[] = [
-  { provider: "claude", session_id: "a1b2c3d4", parent_session_id: null, hostname: "mbp.local", total_tokens: 142_900, turn_count: 96, first_seen: iso(23 * H), last_active: iso(4 * M), ended_at: null, model_id: "claude-opus-4-6", project: "instrumentation-observability-control-plane", active_runtime_secs: 4_823, agent_count: 5, agent_runtime_secs: 4_212, current_turn_runtime_secs: 41, current_turn_runtime_active: true, runtime_as_of_ms: now - 500, active_runtime_rate: 2, observed_agents: [{ agent_id: "agent-opus-a", model_id: "claude-opus-4-6", agent_type: null, runtime_secs: 3_840, runtime_active: true }, { agent_id: "agent-opus-b", model_id: "claude-opus-4-6", agent_type: null, runtime_secs: 272, runtime_active: false }, { agent_id: "agent-sonnet", model_id: "claude-sonnet-4-6", agent_type: null, runtime_secs: null, runtime_active: true }], live_linked_sessions: null, observed_only: false },
-  { provider: "pi", session_id: "pi-root", parent_session_id: null, pi_lineage: { kind: "root" }, hostname: "mbp", total_tokens: 12_480, turn_count: 8, first_seen: iso(38 * M), last_active: iso(M / 3), ended_at: null, model_id: "claude-sonnet-5", project: "quill", active_runtime_secs: 1_260, agent_count: 2, agent_runtime_secs: 420, current_turn_runtime_secs: null, current_turn_runtime_active: false, runtime_as_of_ms: now, active_runtime_rate: 2, observed_agents: [{ agent_id: "pi-review", model_id: "claude-opus-5", agent_type: "reviewer", runtime_secs: 240, runtime_active: true }, { agent_id: "pi-research", model_id: "gpt-5.6-sol", agent_type: "researcher", runtime_secs: 180, runtime_active: true }], live_linked_sessions: [], observed_only: false },
-  { provider: "codex", session_id: "e5f6a7b8", parent_session_id: null, hostname: "mbp.local", total_tokens: 88_400, turn_count: 71, first_seen: iso(20 * H), last_active: iso(2 * H), ended_at: null, model_id: "gpt-5.6-terra", project: "stable-api", active_runtime_secs: 7_260, agent_count: 3, agent_runtime_secs: 5_400, current_turn_runtime_secs: null, current_turn_runtime_active: false, runtime_as_of_ms: now - 2 * H, active_runtime_rate: 0, observed_agents: [], live_linked_sessions: null, observed_only: false },
-  { provider: "claude", session_id: "c9d0e1f2", parent_session_id: null, hostname: "devbox", total_tokens: 51_200, turn_count: 44, first_seen: iso(2 * D), last_active: iso(28 * H), ended_at: null, model_id: null, project: "marketing-site", active_runtime_secs: null, agent_count: null, agent_runtime_secs: null, current_turn_runtime_secs: null, current_turn_runtime_active: false, runtime_as_of_ms: null, active_runtime_rate: 0, observed_agents: null, live_linked_sessions: null, observed_only: false },
-  { provider: "claude", session_id: "b7c8d9e0", parent_session_id: null, hostname: "mbp.local", total_tokens: 33_800, turn_count: 29, first_seen: iso(130 * D), last_active: iso(128 * D), ended_at: null, model_id: null, project: "quill", active_runtime_secs: 8_400, agent_count: 0, agent_runtime_secs: 0, current_turn_runtime_secs: null, current_turn_runtime_active: false, runtime_as_of_ms: now - 128 * D, active_runtime_rate: 0, observed_agents: [], live_linked_sessions: null, observed_only: false },
-  { provider: "codex", session_id: "f1a2b3c4", parent_session_id: null, hostname: "mbp.local", total_tokens: 0, turn_count: 0, first_seen: iso(3 * M), last_active: iso(M), ended_at: null, model_id: "gpt-5.6-sol", project: "/home/mamba/work/poe", active_runtime_secs: 155, agent_count: null, agent_runtime_secs: null, current_turn_runtime_secs: 51, current_turn_runtime_active: true, runtime_as_of_ms: now - 250, active_runtime_rate: 2, observed_agents: [{ agent_id: "agent-sol", model_id: "gpt-5.6-sol", agent_type: null, runtime_secs: 86, runtime_active: true }, { agent_id: "agent-terra", model_id: "gpt-5.6-terra", agent_type: null, runtime_secs: 31, runtime_active: false }], live_linked_sessions: null, observed_only: true },
+  { provider: "claude", session_id: "a1b2c3d4", parent_session_id: null, hostname: "mbp.local", total_tokens: 142_900, turn_count: 96, first_seen: iso(23 * H), last_active: iso(4 * M), ended_at: null, model_id: "claude-opus-4-6", project: "instrumentation-observability-control-plane", session_name: null, failed_tool_calls: null, active_runtime_secs: 4_823, agent_count: 5, agent_runtime_secs: 4_212, current_turn_runtime_secs: 41, current_turn_runtime_active: true, runtime_as_of_ms: now - 500, active_runtime_rate: 2, observed_agents: [{ agent_id: "agent-opus-a", model_id: "claude-opus-4-6", agent_type: null, runtime_secs: 3_840, runtime_active: true }, { agent_id: "agent-opus-b", model_id: "claude-opus-4-6", agent_type: null, runtime_secs: 272, runtime_active: false }, { agent_id: "agent-sonnet", model_id: "claude-sonnet-4-6", agent_type: null, runtime_secs: null, runtime_active: true }], live_linked_sessions: null, observed_only: false },
+  { provider: "pi", session_id: "pi-root", parent_session_id: null, pi_lineage: { kind: "root" }, hostname: "mbp", total_tokens: 12_480, turn_count: 8, first_seen: iso(38 * M), last_active: iso(M / 3), ended_at: null, model_id: "claude-sonnet-5", project: "quill", session_name: "Pi analytics audit", failed_tool_calls: 1, active_runtime_secs: 1_260, agent_count: 2, agent_runtime_secs: 420, current_turn_runtime_secs: null, current_turn_runtime_active: false, runtime_as_of_ms: now, active_runtime_rate: 2, observed_agents: [{ agent_id: "pi-review", model_id: "claude-opus-5", agent_type: "reviewer", runtime_secs: 240, runtime_active: true }, { agent_id: "pi-research", model_id: "gpt-5.6-sol", agent_type: "researcher", runtime_secs: 180, runtime_active: true }], live_linked_sessions: [], observed_only: false },
+  { provider: "codex", session_id: "e5f6a7b8", parent_session_id: null, hostname: "mbp.local", total_tokens: 88_400, turn_count: 71, first_seen: iso(20 * H), last_active: iso(2 * H), ended_at: null, model_id: "gpt-5.6-terra", project: "stable-api", session_name: null, failed_tool_calls: null, active_runtime_secs: 7_260, agent_count: 3, agent_runtime_secs: 5_400, current_turn_runtime_secs: null, current_turn_runtime_active: false, runtime_as_of_ms: now - 2 * H, active_runtime_rate: 0, observed_agents: [], live_linked_sessions: null, observed_only: false },
+  { provider: "claude", session_id: "c9d0e1f2", parent_session_id: null, hostname: "devbox", total_tokens: 51_200, turn_count: 44, first_seen: iso(2 * D), last_active: iso(28 * H), ended_at: null, model_id: null, project: "marketing-site", session_name: null, failed_tool_calls: null, active_runtime_secs: null, agent_count: null, agent_runtime_secs: null, current_turn_runtime_secs: null, current_turn_runtime_active: false, runtime_as_of_ms: null, active_runtime_rate: 0, observed_agents: null, live_linked_sessions: null, observed_only: false },
+  { provider: "claude", session_id: "b7c8d9e0", parent_session_id: null, hostname: "mbp.local", total_tokens: 33_800, turn_count: 29, first_seen: iso(130 * D), last_active: iso(128 * D), ended_at: null, model_id: null, project: "quill", session_name: null, failed_tool_calls: null, active_runtime_secs: 8_400, agent_count: 0, agent_runtime_secs: 0, current_turn_runtime_secs: null, current_turn_runtime_active: false, runtime_as_of_ms: now - 128 * D, active_runtime_rate: 0, observed_agents: [], live_linked_sessions: null, observed_only: false },
+  { provider: "codex", session_id: "f1a2b3c4", parent_session_id: null, hostname: "mbp.local", total_tokens: 0, turn_count: 0, first_seen: iso(3 * M), last_active: iso(M), ended_at: null, model_id: "gpt-5.6-sol", project: "/home/mamba/work/poe", session_name: null, failed_tool_calls: null, active_runtime_secs: 155, agent_count: null, agent_runtime_secs: null, current_turn_runtime_secs: 51, current_turn_runtime_active: true, runtime_as_of_ms: now - 250, active_runtime_rate: 2, observed_agents: [{ agent_id: "agent-sol", model_id: "gpt-5.6-sol", agent_type: null, runtime_secs: 86, runtime_active: true }, { agent_id: "agent-terra", model_id: "gpt-5.6-terra", agent_type: null, runtime_secs: 31, runtime_active: false }], live_linked_sessions: null, observed_only: true },
 ];
 
 const marketingSessionBreakdown: SessionBreakdown[] = [
@@ -353,6 +355,8 @@ const marketingSessionBreakdown: SessionBreakdown[] = [
     first_seen: iso(78 * M),
     last_active: iso(8 * 1000),
     ended_at: null,
+    session_name: null,
+    failed_tool_calls: null,
     model_id: "claude-opus-4-6",
     project: "quill",
     active_runtime_secs: 5_480,
@@ -381,6 +385,8 @@ const marketingSessionBreakdown: SessionBreakdown[] = [
     first_seen: iso(64 * M),
     last_active: iso(12 * 1000),
     ended_at: null,
+    session_name: null,
+    failed_tool_calls: null,
     model_id: "anthropic/claude-fable-5",
     project: "agent-orchestrator",
     active_runtime_secs: 4_140,
@@ -407,6 +413,8 @@ const marketingSessionBreakdown: SessionBreakdown[] = [
     first_seen: iso(52 * M),
     last_active: iso(18 * 1000),
     ended_at: null,
+    session_name: null,
+    failed_tool_calls: null,
     model_id: "gpt-5.6-terra",
     project: "gateway",
     active_runtime_secs: 3_260,
@@ -553,6 +561,7 @@ const searchResults: SearchResults = {
       snippet: "The <mark>parser</mark> dropped quoted flags when it split the command.",
       role: "assistant",
       project: "quill",
+      session_name: "Parser quote fix",
       host: "demo-workstation",
       git_branch: "fix/parser-quotes",
       timestamp: iso(18 * M),
@@ -572,6 +581,7 @@ const searchResults: SearchResults = {
       snippet: "I replaced the <mark>parser</mark> fallback with the schema-owned decoder.",
       role: "assistant",
       project: "gateway",
+      session_name: null,
       host: "demo-workstation",
       git_branch: "refactor/schema-decoder",
       timestamp: iso(52 * M),
@@ -591,6 +601,7 @@ const searchResults: SearchResults = {
       snippet: "The date <mark>parser</mark> now preserves timezone offsets at minute precision.",
       role: "assistant",
       project: "pipeline",
+      session_name: "Date offset audit",
       host: "demo-workstation",
       git_branch: "test/date-offsets",
       timestamp: iso(95 * M),
@@ -623,6 +634,7 @@ const searchContext: SessionContext = {
   provider: "claude",
   session_id: "a1b2c3d4",
   project: "quill",
+  session_name: "Parser quote fix",
   messages: [
     {
       message_id: "context-user",
@@ -1990,6 +2002,9 @@ function createModelUsageOverviewFixture(
       distinctModels: modelAggregates.size,
       multiModelSessions,
     },
+    // Fixture observations carry no compaction/branch-summary rows, so the
+    // summaries band stays absent rather than inventing spend.
+    summaryUsage: { observations: 0, totalTokens: 0 },
     runningNow,
     models,
     activity: {
@@ -2009,6 +2024,48 @@ function createModelUsageOverviewFixture(
       parentTop: delegationTop(parentAttributedByModel),
       subagentTop: delegationTop(subagentAttributedByModel),
     },
+  };
+}
+
+// Outcome evidence exists only for Pi turns today; one aborted turn and one
+// provider error keep the aggregation shape renderable without a dashboard.
+function createTurnOutcomesFixture(
+  args: Record<string, unknown> | undefined,
+): TurnOutcomesResponse {
+  const range = readModelRange(args);
+  const provider = readModelProvider(args?.provider);
+  const counts: TurnOutcomeCounts = {
+    stopReasonTurns: 8,
+    abortedTurns: 1,
+    errorStopTurns: 1,
+    truncatedTurns: 0,
+    errorEvidenceTurns: 8,
+    erroredTurns: 1,
+  };
+  const empty = provider !== null && provider !== "pi";
+  const zero: TurnOutcomeCounts = {
+    stopReasonTurns: 0,
+    abortedTurns: 0,
+    errorStopTurns: 0,
+    truncatedTurns: 0,
+    errorEvidenceTurns: 0,
+    erroredTurns: 0,
+  };
+  return {
+    generatedAt: new Date(now).toISOString(),
+    range,
+    provider,
+    bucketSeconds: ACTIVITY_BUCKET_SECONDS[range],
+    totals: empty ? zero : counts,
+    sessions: empty
+      ? []
+      : [{ provider: "pi", sessionId: "pi-root", counts }],
+    models: empty
+      ? []
+      : [{ provider: "pi", modelId: "claude-sonnet-5", counts }],
+    windows: empty
+      ? []
+      : [{ windowStart: new Date(now - 2 * H).toISOString(), counts }],
   };
 }
 
@@ -2556,6 +2613,7 @@ const fixtures: Record<string, FixtureHandler> = {
   get_context_savings_analytics: () => contextSavings,
   // session model analytics
   get_model_usage_overview: (args) => createModelUsageOverviewFixture(args),
+  get_turn_outcomes: (args) => createTurnOutcomesFixture(args),
   retry_model_history_backfill: () => retryModelHistoryBackfillFixture(),
   // learning
   get_learned_rules: () => learnedRules,

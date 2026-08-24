@@ -175,6 +175,10 @@ export interface SessionBreakdown {
   live_linked_sessions: ObservedLinkedSession[] | null;
   /** True until retained token metrics arrive for a current-boot observed root. */
   observed_only: boolean;
+  /** Provider-recorded session display name; null when never named. */
+  session_name: string | null;
+  /** Range-scoped failed tool calls; null when no error evidence exists. */
+  failed_tool_calls: number | null;
 }
 
 export interface ObservedSessionAgent {
@@ -611,6 +615,8 @@ export interface SearchHit {
 	snippet: string;
 	role: string;
 	project: string;
+	/** Provider-recorded session display name; null when never named. */
+	session_name: string | null;
 	host: string;
 	git_branch: string;
 	timestamp: string;
@@ -654,6 +660,8 @@ export interface SessionContext {
   messages: ContextMessage[];
   session_id: string;
   project: string;
+  /** Provider-recorded session display name; null when never named. */
+  session_name: string | null;
 }
 
 // Analytics redesign types
@@ -815,6 +823,13 @@ export interface ModelDelegation {
   subagentTop: ModelDelegationTop | null;
 }
 
+/** Compaction/branch-summary spend with no model identity, shown as the
+ * "Summaries (unattributed)" band entry — never a model row. */
+export interface ModelSummaryUsage {
+  observations: number;
+  totalTokens: number;
+}
+
 export interface ModelUsageOverviewResponse {
   generatedAt: string;
   range: ModelRange;
@@ -824,12 +839,57 @@ export interface ModelUsageOverviewResponse {
   backfill: ModelBackfillStatus;
   buildingIndex?: boolean;
   totals: ModelUsageOverviewTotals;
+  summaryUsage: ModelSummaryUsage;
   runningNow: ModelRunningNowEntry[];
   models: ModelUsageOverviewRow[];
   activity: ModelActivity;
   projectMatrix: ModelProjectMatrixRow[];
   combinations: ModelCombinations;
   delegation: ModelDelegation;
+}
+
+/** Outcome tallies over turn rows with recorded evidence; rows without a
+ * stop reason or error flag never enter a denominator. */
+export interface TurnOutcomeCounts {
+  /** Denominator: turns carrying a NOT NULL stop reason. */
+  stopReasonTurns: number;
+  abortedTurns: number;
+  errorStopTurns: number;
+  truncatedTurns: number;
+  /** Denominator: turns carrying a measured error flag. */
+  errorEvidenceTurns: number;
+  erroredTurns: number;
+}
+
+export interface SessionTurnOutcomes {
+  provider: string;
+  sessionId: string;
+  counts: TurnOutcomeCounts;
+}
+
+export interface ModelTurnOutcomes {
+  provider: string;
+  /** Null groups outcome evidence recorded before any model attribution. */
+  modelId: string | null;
+  counts: TurnOutcomeCounts;
+}
+
+export interface WindowTurnOutcomes {
+  windowStart: string;
+  counts: TurnOutcomeCounts;
+}
+
+/** `get_turn_outcomes` response: one evidence set partitioned per session,
+ * per model, and per fixed window, each summing back to `totals`. */
+export interface TurnOutcomesResponse {
+  generatedAt: string;
+  range: ModelRange;
+  provider: string | null;
+  bucketSeconds: number;
+  totals: TurnOutcomeCounts;
+  sessions: SessionTurnOutcomes[];
+  models: ModelTurnOutcomes[];
+  windows: WindowTurnOutcomes[];
 }
 
 export type RollupBackfillTarget = "model" | "runtime";

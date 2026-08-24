@@ -3189,6 +3189,37 @@ body {
   color: var(--label);
 }
 
+/* ─── Summaries (unattributed) — compaction/branch-summary spend ───
+   A reconciling band entry, not a model row: no swatch, no track, no chip.
+   A soft hairline separates it from the ranked rows so the token column
+   still reads on the shared axis while the entry stays visibly non-model. */
+.wg-mv-summaries {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: var(--space-sm);
+  padding-top: var(--space-sm);
+  border-top: 1px solid var(--line-soft);
+}
+
+.wg-mv-summaries-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wg-mv-summaries-count {
+  font-size: 10px;
+  font-weight: 450;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
 /* ─── Honesty lines — coverage gap, retained-history state ─── */
 .wg-mv-note {
   display: flex;

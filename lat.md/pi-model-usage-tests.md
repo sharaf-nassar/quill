@@ -70,6 +70,24 @@ Later Pi analytics producers remain explicitly empty on the pinned parity corpus
 
 `reasoning_duration_ms` and tool `is_error`/`details_json`/`result_image_count`/`duration_ms` remain `None` while existing runtime, tool, skill, thinking-event, and setting extraction stays unchanged. The corpus carries no `session_info` entry, so its `session_name` stays NULL as unobserved evidence rather than an empty name. `transcript_analytics::tests::remaining_pi_analytics_evidence_foundation_stays_empty` pins the positive parity-corpus thinking and setting evidence plus the remaining NULL fields.
 
+## Summary Usage Read Surface
+
+The models overview exposes unattributed summary spend as its own reconciling bucket, never a model row.
+
+`storage::tests::model_overview_summary_usage_reports_unattributed_summary_spend` pins `summary_usage` counting one model-less summary observation with its tokens, that spend staying inside `total_tokens` while never joining attribution, turn counts, or the per-model rows, attributed rows plus the bucket reconciling the corpus total, and the provider filter scoping the bucket.
+
+## Turn Outcome Aggregation
+
+`get_turn_outcomes` aggregates persisted stop-reason and error-flag evidence per session, per attributed model, and per fixed window with NOT NULL denominators.
+
+`storage::tests::turn_outcome_aggregation_uses_not_null_denominators` pins aborted/error/length counts against a stop-reason denominator that excludes NULL rows, the separate error-flag denominator, a factual null-model bucket for pre-attribution evidence, every grouping summing back to totals, evidence-free windows being omitted, summary rows staying out entirely, and the provider filter returning empty groupings.
+
+## Session Breakdown Analytics Evidence
+
+Sessions rows carry the registry session name and the range-scoped failed tool-call count as nullable joined evidence.
+
+`storage::tests::session_breakdown_joins_names_and_tool_failure_counts` pins `populate_session_analytics_evidence` resolving a named Pi registry row, measured failures counting only in-range `is_error = 1` tool rows, all-success sessions reading a real zero, and sessions without error evidence staying NULL rather than zero.
+
 ## Native Usage Migration
 
 Opening a schema-42 database adds nullable event identity and five native cost fields, preserves existing observations, creates the Pi-only dedupe index, and records schema 43 once.

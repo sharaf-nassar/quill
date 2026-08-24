@@ -85,16 +85,17 @@ use crate::models::{
     ModelBackfillState, ModelBackfillStatus, ModelBackfillTrigger, ModelIdentity,
     ModelOverviewActivity, ModelOverviewActivitySeries, ModelOverviewCombinations,
     ModelOverviewDelegation, ModelOverviewDelegationTop, ModelOverviewPair,
-    ModelOverviewProjectCell, ModelOverviewProjectRow, ModelOverviewRow, ModelOverviewTotals,
-    ModelOverviewUnattributedActivitySeries, ModelRange, ModelRunningNow, ModelSessionRow,
-    ModelSessionsResponse, ModelTokenScope, ModelUsageOverviewResponse, ObservationPayload,
-    ObservationSummary, PiLineage, PiProtocolV2DeliverySource, PiProtocolV2Envelope,
-    PiProtocolV2EventKind, PiProtocolV2Lineage, PiProtocolV2Outcome, PiRecoveringSession,
-    ProjectBreakdown, ProjectTokens, RunInferenceCall, RunInferenceConfinement,
-    RunInferenceSummary, SessionBreakdown, SessionCodeStats, SessionModelChain,
-    SessionModelChainKind, SessionModelHistoryResponse, SessionModelSegment, SessionRef,
-    SessionStats, SkillBreakdown, SkillProjectBreakdown, TokenDataPoint, TokenReportPayload,
-    TokenStats, ToolCount, UsageBucket, UsageSource,
+    ModelOverviewProjectCell, ModelOverviewProjectRow, ModelOverviewRow, ModelOverviewSummaryUsage,
+    ModelOverviewTotals, ModelOverviewUnattributedActivitySeries, ModelRange, ModelRunningNow,
+    ModelSessionRow, ModelSessionsResponse, ModelTokenScope, ModelTurnOutcomes,
+    ModelUsageOverviewResponse, ObservationPayload, ObservationSummary, PiLineage,
+    PiProtocolV2DeliverySource, PiProtocolV2Envelope, PiProtocolV2EventKind, PiProtocolV2Lineage,
+    PiProtocolV2Outcome, PiRecoveringSession, ProjectBreakdown, ProjectTokens, RunInferenceCall,
+    RunInferenceConfinement, RunInferenceSummary, SessionBreakdown, SessionCodeStats,
+    SessionModelChain, SessionModelChainKind, SessionModelHistoryResponse, SessionModelSegment,
+    SessionRef, SessionStats, SessionTurnOutcomes, SkillBreakdown, SkillProjectBreakdown,
+    TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, TurnOutcomeCounts,
+    TurnOutcomesResponse, UsageBucket, UsageSource, WindowTurnOutcomes,
 };
 
 /// Highest migration this build knows how to apply. Every migration gate is a
@@ -11733,6 +11734,40 @@ impl Storage {
             )
             .map_err(|error| format!("Query model overview totals: {error}"))?;
 
+        // Compaction/branch-summary spend with no model attribution, read from
+        // raw rows in both rollup modes: hourly rows cannot split token
+        // amounts by observation kind. Summary rows whose raw evidence was
+        // retention-pruned stay inside `totals` through the rollup but leave
+        // this bucket, so the band covers retained summaries only.
+        let summary_usage = tx
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(
+                            COALESCE(observation.input_tokens, 0)
+                            + COALESCE(observation.output_tokens, 0)
+                            + COALESCE(observation.cache_creation_tokens, 0)
+                            + COALESCE(observation.cache_read_tokens, 0)
+                        ), 0)
+                 FROM model_usage_observations AS observation
+                      INDEXED BY idx_model_observations_observed_provider
+                 JOIN active_model_read_sources AS source
+                   ON source.provider = observation.provider
+                  AND source.source_key = observation.source_key
+                 WHERE observation.observed_at_ms >= ?1
+                   AND observation.observed_at_ms < ?2
+                   AND observation.observation_kind = 'summary'
+                   AND observation.derived_model_id IS NULL
+                   AND (?3 IS NULL OR observation.provider = ?3)",
+                params![range_start_ms, range_end_ms, provider],
+                |row| {
+                    Ok(ModelOverviewSummaryUsage {
+                        observations: row.get(0)?,
+                        total_tokens: row.get(1)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("Query model overview summary usage: {error}"))?;
+
         // This time-range grouping is deliberately pinned: bounded ANALYZE
         // otherwise substitutes the derived-model skip-scan even though this
         // query neither filters nor groups on derived model identity.
@@ -12763,6 +12798,7 @@ impl Storage {
                 distinct_models: totals_row.distinct_models,
                 multi_model_sessions,
             },
+            summary_usage,
             running_now,
             models,
             activity: ModelOverviewActivity {
@@ -12781,6 +12817,156 @@ impl Storage {
             delegation,
         };
         Ok(response)
+    }
+
+    /// Aggregate turn outcomes (stop reasons and error flags) per session,
+    /// per attributed model, and per fixed time window over one range.
+    ///
+    /// Outcome columns live only on raw observations, so this reads the raw
+    /// range directly; rows without outcome evidence never enter a
+    /// denominator, and outcome evidence pruned with its raw rows simply
+    /// leaves the aggregation. Every grouping partitions the same rows, so
+    /// sessions, models, and windows each sum back to `totals`.
+    pub(crate) fn get_turn_outcomes(
+        &self,
+        range: ModelRange,
+        provider: Option<&str>,
+    ) -> Result<TurnOutcomesResponse, String> {
+        let range_end_ms = query_now().timestamp_millis();
+        let range_millis = model_range_duration(range).num_milliseconds();
+        let range_start_ms = range_end_ms
+            .checked_sub(range_millis)
+            .ok_or_else(|| "Turn outcome range boundary overflow".to_string())?;
+        let generated_at = model_observation_millis_to_rfc3339(range_end_ms, "range_end")?;
+        let bucket_seconds = model_overview_bucket_seconds(range);
+        let bucket_millis = bucket_seconds
+            .checked_mul(1_000)
+            .ok_or_else(|| "Turn outcome bucket width overflow".to_string())?;
+
+        let conn = self.open_view_reader()?;
+        let mut statement = conn
+            .prepare_cached(&format!(
+                "SELECT observation.provider,
+                        observation.analytics_session_id,
+                        observation.derived_model_id,
+                        (observation.observed_at_ms - ?1) / ?3 AS bucket_index,
+                        COUNT(observation.stop_reason),
+                        COUNT(CASE WHEN observation.stop_reason = 'aborted'
+                                   THEN 1 END),
+                        COUNT(CASE WHEN observation.stop_reason = 'error'
+                                   THEN 1 END),
+                        COUNT(CASE WHEN observation.stop_reason = 'length'
+                                   THEN 1 END),
+                        COUNT(observation.had_error),
+                        COUNT(CASE WHEN observation.had_error = 1 THEN 1 END)
+                 FROM model_usage_observations AS observation
+                      INDEXED BY idx_model_observations_observed_provider
+                 JOIN model_observation_sources AS source
+                   ON source.provider = observation.provider
+                  AND source.source_key = observation.source_key
+                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                   AND observation.observed_at_ms >= ?1
+                   AND observation.observed_at_ms < ?2
+                   AND observation.observation_kind = 'turn'
+                   AND (observation.stop_reason IS NOT NULL
+                        OR observation.had_error IS NOT NULL)
+                   AND (?4 IS NULL OR observation.provider = ?4)
+                 GROUP BY observation.provider COLLATE BINARY,
+                          observation.analytics_session_id COLLATE BINARY,
+                          observation.derived_model_id COLLATE BINARY,
+                          bucket_index"
+            ))
+            .map_err(|error| format!("Prepare turn outcome aggregation: {error}"))?;
+        let grouped = statement
+            .query_map(
+                params![range_start_ms, range_end_ms, bucket_millis, provider],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        TurnOutcomeCounts {
+                            stop_reason_turns: row.get(4)?,
+                            aborted_turns: row.get(5)?,
+                            error_stop_turns: row.get(6)?,
+                            truncated_turns: row.get(7)?,
+                            error_evidence_turns: row.get(8)?,
+                            errored_turns: row.get(9)?,
+                        },
+                    ))
+                },
+            )
+            .map_err(|error| format!("Query turn outcome aggregation: {error}"))?;
+
+        fn add_counts(total: &mut TurnOutcomeCounts, part: &TurnOutcomeCounts) {
+            total.stop_reason_turns += part.stop_reason_turns;
+            total.aborted_turns += part.aborted_turns;
+            total.error_stop_turns += part.error_stop_turns;
+            total.truncated_turns += part.truncated_turns;
+            total.error_evidence_turns += part.error_evidence_turns;
+            total.errored_turns += part.errored_turns;
+        }
+
+        let mut totals = TurnOutcomeCounts::default();
+        let mut sessions = BTreeMap::<(String, String), TurnOutcomeCounts>::new();
+        let mut models = BTreeMap::<(String, Option<String>), TurnOutcomeCounts>::new();
+        let mut windows = BTreeMap::<i64, TurnOutcomeCounts>::new();
+        for row in grouped {
+            let (row_provider, session_id, model_id, bucket_index, counts) =
+                row.map_err(|error| format!("Read turn outcome row: {error}"))?;
+            add_counts(&mut totals, &counts);
+            add_counts(
+                sessions
+                    .entry((row_provider.clone(), session_id))
+                    .or_default(),
+                &counts,
+            );
+            add_counts(models.entry((row_provider, model_id)).or_default(), &counts);
+            add_counts(windows.entry(bucket_index).or_default(), &counts);
+        }
+
+        let windows = windows
+            .into_iter()
+            .map(|(bucket_index, counts)| {
+                let window_offset = bucket_index
+                    .checked_mul(bucket_millis)
+                    .and_then(|offset| range_start_ms.checked_add(offset))
+                    .ok_or_else(|| "Turn outcome window start overflow".to_string())?;
+                Ok(WindowTurnOutcomes {
+                    window_start: model_observation_millis_to_rfc3339(
+                        window_offset,
+                        "window_start",
+                    )?,
+                    counts,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        Ok(TurnOutcomesResponse {
+            generated_at,
+            range,
+            provider: provider.map(str::to_owned),
+            bucket_seconds,
+            totals,
+            sessions: sessions
+                .into_iter()
+                .map(|((provider, session_id), counts)| SessionTurnOutcomes {
+                    provider,
+                    session_id,
+                    counts,
+                })
+                .collect(),
+            models: models
+                .into_iter()
+                .map(|((provider, model_id), counts)| ModelTurnOutcomes {
+                    provider,
+                    model_id,
+                    counts,
+                })
+                .collect(),
+            windows,
+        })
     }
 
     /// Page in-range sessions containing one exact provider-qualified model.
@@ -16085,6 +16271,8 @@ impl Storage {
                     ended_at: None,
                     model_id: row.get(13)?,
                     project: row.get(7)?,
+                    session_name: None,
+                    failed_tool_calls: None,
                     active_runtime_secs: None,
                     agent_count: None,
                     agent_runtime_secs: None,
@@ -16104,6 +16292,88 @@ impl Storage {
             results.push(row.map_err(|e| format!("Row error: {e}"))?);
         }
         Ok(results)
+    }
+
+    /// Join nullable analytics evidence onto final Sessions rows: the
+    /// registry-persisted session display name and the range-scoped failed
+    /// tool-call count. Runs after the live overlay so live-only rows are
+    /// enriched too. Sessions without `is_error` evidence stay NULL —
+    /// unmeasured is not zero failures.
+    pub(crate) fn populate_session_analytics_evidence(
+        &self,
+        rows: &mut [SessionBreakdown],
+        range: &str,
+    ) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let names = self.transcript_session_names(
+            &rows
+                .iter()
+                .filter_map(|row| {
+                    row.provider
+                        .parse::<IntegrationProvider>()
+                        .ok()
+                        .map(|provider| (provider, row.session_id.clone()))
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // SQLite's default variable limit is 999; this stays far below it.
+        const LOOKUP_CHUNK: usize = 200;
+        let mut seen = HashSet::new();
+        let session_ids = rows
+            .iter()
+            .filter(|row| seen.insert(row.session_id.as_str()))
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>();
+        let range_from = range_from_timestamp(range);
+        let mut failures = HashMap::<(String, String), i64>::new();
+        let conn = self.open_view_reader()?;
+        for chunk in session_ids.chunks(LOOKUP_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT provider, session_id,
+                        COUNT(CASE WHEN is_error = 1 THEN 1 END)
+                 FROM tool_actions
+                 WHERE session_id IN ({placeholders})
+                   AND is_error IS NOT NULL
+                   AND julianday(timestamp) >= julianday(?)
+                 GROUP BY provider, session_id"
+            );
+            let mut params = chunk
+                .iter()
+                .map(|session_id| session_id as &dyn rusqlite::types::ToSql)
+                .collect::<Vec<_>>();
+            params.push(&range_from);
+            let mut statement = conn
+                .prepare_cached(&sql)
+                .map_err(|e| format!("Prepare session tool failures: {e}"))?;
+            let chunk_rows = statement
+                .query_map(params.as_slice(), |row| {
+                    Ok((
+                        (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|e| format!("Query session tool failures: {e}"))?;
+            for row in chunk_rows {
+                let (key, failed) = row.map_err(|e| format!("Session tool failure row: {e}"))?;
+                failures.insert(key, failed);
+            }
+        }
+
+        for row in rows {
+            if let Ok(provider) = row.provider.parse::<IntegrationProvider>() {
+                row.session_name = names.get(&(provider, row.session_id.clone())).cloned();
+            }
+            row.failed_tool_calls = failures
+                .get(&(row.provider.clone(), row.session_id.clone()))
+                .copied();
+        }
+        Ok(())
     }
 
     pub(crate) fn populate_session_terminal_evidence(
@@ -30247,6 +30517,433 @@ mod tests {
         clear_env();
     }
 
+    /// Seed one raw observation with explicit kind, model, and outcome
+    /// evidence for the read-surface aggregation tests.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_outcome_observation(
+        storage: &Storage,
+        source_key: &str,
+        record_key: &str,
+        ordinal: i64,
+        session_id: &str,
+        kind: &str,
+        model_id: Option<&str>,
+        observed_at_ms: i64,
+        input_tokens: i64,
+        stop_reason: Option<&str>,
+        had_error: Option<i64>,
+    ) {
+        let conn = storage.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO model_observation_sources (
+                 provider, source_key, source_root_key, source_path,
+                 source_session_id, analytics_session_id, chain_id,
+                 is_sidechain, seen_generation, processing_status,
+                 observation_count
+             ) VALUES ('pi', ?1, ?1, ?1, ?2, ?2, ?2, 0, 1, 'ok', 1)",
+            params![source_key, session_id],
+        )
+        .expect("seed outcome source");
+        conn.execute(
+            "INSERT INTO model_usage_observations (
+                 provider, source_key, source_record_key, source_ordinal,
+                 observation_kind, source_session_id, analytics_session_id,
+                 chain_id, raw_model_id, derived_model_id, is_sidechain,
+                 observed_at_ms, input_tokens, stop_reason, had_error,
+                 model_evidence, token_evidence
+             ) VALUES ('pi', ?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6, ?6, 0, ?7, ?8,
+                       ?9, ?10, ?11, 'direct')",
+            params![
+                source_key,
+                record_key,
+                ordinal,
+                kind,
+                session_id,
+                model_id,
+                observed_at_ms,
+                input_tokens,
+                stop_reason,
+                had_error,
+                if model_id.is_some() {
+                    "explicit"
+                } else {
+                    "missing"
+                },
+            ],
+        )
+        .expect("seed outcome observation");
+    }
+
+    /// Break: without a dedicated bucket the overview counted summary spend
+    /// inside `total_tokens` but gave the reader no way to see which share
+    /// was compaction/branch-summary work, so per-model figures could not
+    /// visibly reconcile against the range total.
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Summary Usage Read Surface]]
+    #[test]
+    #[serial]
+    fn model_overview_summary_usage_reports_unattributed_summary_spend() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let range_end = DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z")
+            .expect("range end")
+            .with_timezone(&Utc);
+        let at = |minutes: i64| (range_end - TimeDelta::minutes(minutes)).timestamp_millis();
+
+        seed_outcome_observation(
+            &storage,
+            "pi-src",
+            "turn-0",
+            0,
+            "pi-sess",
+            "turn",
+            Some("claude-sonnet-5"),
+            at(30),
+            500,
+            Some("stop"),
+            Some(0),
+        );
+        seed_outcome_observation(
+            &storage,
+            "pi-src",
+            "pi_summary_v1:7:compact-1",
+            1,
+            "pi-sess",
+            "summary",
+            None,
+            at(20),
+            1_300,
+            None,
+            None,
+        );
+
+        let overview = storage
+            .get_model_usage_overview_uncached(ModelRange::OneHour, None, range_end)
+            .expect("overview");
+        assert_eq!(overview.summary_usage.observations, 1);
+        assert_eq!(overview.summary_usage.total_tokens, 1_300);
+        assert_eq!(
+            overview.totals.total_tokens, 1_800,
+            "summary spend stays inside the range total"
+        );
+        assert_eq!(
+            overview.totals.attributed_tokens, 500,
+            "summary spend never joins model attribution"
+        );
+        assert_eq!(overview.totals.turns, 1, "a summary is not a turn");
+        assert_eq!(
+            overview.models.len(),
+            1,
+            "the summary bucket must not appear as a model row"
+        );
+        assert_eq!(overview.models[0].identity.model_id, "claude-sonnet-5");
+        assert_eq!(
+            overview.totals.attributed_tokens + overview.summary_usage.total_tokens,
+            overview.totals.total_tokens,
+            "attributed rows plus the summaries bucket reconcile this corpus"
+        );
+
+        let filtered = storage
+            .get_model_usage_overview_uncached(ModelRange::OneHour, Some("claude"), range_end)
+            .expect("filtered overview");
+        assert_eq!(
+            filtered.summary_usage.observations, 0,
+            "the provider filter scopes the summaries bucket too"
+        );
+        clear_env();
+    }
+
+    /// Break: outcome evidence existed on raw rows after migration 48, but no
+    /// query path aggregated it, so interruption and provider-error rates
+    /// were unqueryable and NULL-evidence rows risked being counted as
+    /// success by any ad-hoc reader.
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Turn Outcome Aggregation]]
+    #[test]
+    #[serial]
+    fn turn_outcome_aggregation_uses_not_null_denominators() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let range_end = DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z")
+            .expect("range end")
+            .with_timezone(&Utc);
+        let at = |minutes: i64| (range_end - TimeDelta::minutes(minutes)).timestamp_millis();
+
+        // sess-a / model-a, one shared bucket: clean stop, then an abort.
+        for (record, minutes, stop, had_error) in [
+            ("turn-0", 55, Some("stop"), Some(0)),
+            ("turn-1", 54, Some("aborted"), Some(0)),
+        ] {
+            seed_outcome_observation(
+                &storage,
+                "src-a",
+                record,
+                0,
+                "sess-a",
+                "turn",
+                Some("model-a"),
+                at(minutes),
+                10,
+                stop,
+                had_error,
+            );
+        }
+        // sess-b, later bucket: a provider error, a truncated turn, and one
+        // pre-attribution turn whose only evidence is the error flag.
+        seed_outcome_observation(
+            &storage,
+            "src-b",
+            "turn-0",
+            0,
+            "sess-b",
+            "turn",
+            Some("model-b"),
+            at(10),
+            10,
+            Some("error"),
+            Some(1),
+        );
+        seed_outcome_observation(
+            &storage,
+            "src-b",
+            "turn-1",
+            1,
+            "sess-b",
+            "turn",
+            Some("model-b"),
+            at(9),
+            10,
+            Some("length"),
+            Some(0),
+        );
+        seed_outcome_observation(
+            &storage,
+            "src-b",
+            "turn-2",
+            2,
+            "sess-b",
+            "turn",
+            None,
+            at(8),
+            10,
+            None,
+            Some(0),
+        );
+        // Rows that must stay out of every figure: a turn without outcome
+        // evidence and a summary observation.
+        seed_outcome_observation(
+            &storage,
+            "src-b",
+            "turn-3",
+            3,
+            "sess-b",
+            "turn",
+            Some("model-b"),
+            at(7),
+            10,
+            None,
+            None,
+        );
+        seed_outcome_observation(
+            &storage,
+            "src-b",
+            "pi_summary_v1:6:c-1",
+            4,
+            "sess-b",
+            "summary",
+            None,
+            at(6),
+            1_000,
+            None,
+            None,
+        );
+
+        let outcomes = with_pinned_query_now(range_end, || {
+            storage.get_turn_outcomes(ModelRange::OneHour, None)
+        })
+        .expect("turn outcomes");
+        assert_eq!(outcomes.bucket_seconds, 300);
+        assert_eq!(
+            outcomes.totals,
+            TurnOutcomeCounts {
+                stop_reason_turns: 4,
+                aborted_turns: 1,
+                error_stop_turns: 1,
+                truncated_turns: 1,
+                error_evidence_turns: 5,
+                errored_turns: 1,
+            },
+            "NULL outcome evidence must stay out of every denominator"
+        );
+
+        let session = |session_id: &str| {
+            outcomes
+                .sessions
+                .iter()
+                .find(|row| row.session_id == session_id)
+                .unwrap_or_else(|| panic!("{session_id} outcome row"))
+                .counts
+        };
+        assert_eq!(session("sess-a").aborted_turns, 1);
+        assert_eq!(session("sess-a").stop_reason_turns, 2);
+        assert_eq!(session("sess-b").error_stop_turns, 1);
+        assert_eq!(session("sess-b").truncated_turns, 1);
+        assert_eq!(session("sess-b").error_evidence_turns, 3);
+
+        let model_ids = outcomes
+            .models
+            .iter()
+            .map(|row| row.model_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model_ids,
+            vec![None, Some("model-a"), Some("model-b")],
+            "pre-attribution outcome evidence stays a factual null-model bucket"
+        );
+
+        for grouping in [
+            outcomes
+                .sessions
+                .iter()
+                .map(|row| row.counts)
+                .collect::<Vec<_>>(),
+            outcomes
+                .models
+                .iter()
+                .map(|row| row.counts)
+                .collect::<Vec<_>>(),
+            outcomes
+                .windows
+                .iter()
+                .map(|row| row.counts)
+                .collect::<Vec<_>>(),
+        ] {
+            let mut sum = TurnOutcomeCounts::default();
+            for counts in grouping {
+                sum.stop_reason_turns += counts.stop_reason_turns;
+                sum.aborted_turns += counts.aborted_turns;
+                sum.error_stop_turns += counts.error_stop_turns;
+                sum.truncated_turns += counts.truncated_turns;
+                sum.error_evidence_turns += counts.error_evidence_turns;
+                sum.errored_turns += counts.errored_turns;
+            }
+            assert_eq!(sum, outcomes.totals, "every grouping sums to totals");
+        }
+        assert_eq!(
+            outcomes.windows.len(),
+            2,
+            "windows without outcome evidence are omitted, not zero rows"
+        );
+        assert!(
+            outcomes.windows[0].window_start < outcomes.windows[1].window_start,
+            "windows are ordered by start"
+        );
+
+        let filtered = with_pinned_query_now(range_end, || {
+            storage.get_turn_outcomes(ModelRange::OneHour, Some("claude"))
+        })
+        .expect("filtered outcomes");
+        assert_eq!(filtered.totals, TurnOutcomeCounts::default());
+        assert!(filtered.sessions.is_empty());
+        clear_env();
+    }
+
+    /// Break: Sessions rows exposed no registry display name and no tool
+    /// failure evidence, so a named Pi session could not be recognized in the
+    /// breakdown and failed tool calls were indistinguishable from successes.
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Session Breakdown Analytics Evidence]]
+    #[test]
+    #[serial]
+    fn session_breakdown_joins_names_and_tool_failure_counts() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let now = Utc::now();
+        let recent = (now - TimeDelta::minutes(5)).to_rfc3339();
+
+        for session_id in ["named-with-failures", "clean-tools", "no-evidence"] {
+            seed_token_snapshot(&storage, "pi", session_id, "host-a", &recent);
+        }
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO transcript_analytics_sources (
+                     provider, source_key, source_root_key, source_path,
+                     source_session_id, analytics_session_id, chain_id,
+                     session_name, seen_generation, processing_status,
+                     source_kind
+                 ) VALUES ('pi', 'pi:host:named', 'pi:sessions',
+                           '/sessions/named.jsonl', 'named-with-failures',
+                           'named-with-failures', 'named-with-failures',
+                           'Retention audit', 1, 'ok', 'transcript')",
+                [],
+            )
+            .expect("seed named registry row");
+            let mut tool = conn
+                .prepare(
+                    "INSERT INTO tool_actions (
+                         provider, action_key, message_id, session_id,
+                         chain_id, tool_name, category, summary, timestamp,
+                         is_error
+                     ) VALUES ('pi', ?1, ?1, ?2, ?2, 'bash', 'command', 's',
+                               ?3, ?4)",
+                )
+                .expect("prepare tool seed");
+            // Two failures, one success, and one legacy row without evidence.
+            for (message, session_id, is_error) in [
+                ("m1", "named-with-failures", Some(1)),
+                ("m2", "named-with-failures", Some(1)),
+                ("m3", "named-with-failures", Some(0)),
+                ("m4", "clean-tools", Some(0)),
+                ("m5", "no-evidence", None::<i64>),
+            ] {
+                tool.execute(params![message, session_id, recent, is_error])
+                    .expect("seed tool action");
+            }
+            // An old failure outside the range must not leak into the count.
+            tool.execute(params![
+                "m6",
+                "named-with-failures",
+                (now - TimeDelta::days(9)).to_rfc3339(),
+                Some(1)
+            ])
+            .expect("seed out-of-range tool action");
+        }
+
+        let mut rows = storage
+            .get_session_breakdown("24h", None, None, Some(10))
+            .expect("read session breakdown");
+        storage
+            .populate_session_analytics_evidence(&mut rows, "24h")
+            .expect("populate analytics evidence");
+        let row = |session_id: &str| {
+            rows.iter()
+                .find(|row| row.session_id == session_id)
+                .unwrap_or_else(|| panic!("{session_id} row present"))
+        };
+
+        let named = row("named-with-failures");
+        assert_eq!(named.session_name.as_deref(), Some("Retention audit"));
+        assert_eq!(
+            named.failed_tool_calls,
+            Some(2),
+            "only in-range measured failures count"
+        );
+        let clean = row("clean-tools");
+        assert_eq!(clean.session_name, None);
+        assert_eq!(
+            clean.failed_tool_calls,
+            Some(0),
+            "measured zero failures is a real zero"
+        );
+        let unmeasured = row("no-evidence");
+        assert_eq!(
+            unmeasured.failed_tool_calls, None,
+            "no error evidence stays NULL, never zero"
+        );
+        clear_env();
+    }
+
     #[test]
     #[serial]
     fn get_model_usage_overview_aggregates_reach_primary_and_combinations() {
@@ -34083,6 +34780,8 @@ mod tests {
             ended_at: None,
             model_id: None,
             project: None,
+            session_name: None,
+            failed_tool_calls: None,
             active_runtime_secs: None,
             agent_count: None,
             agent_runtime_secs: None,
@@ -34164,6 +34863,8 @@ mod tests {
             ended_at: None,
             model_id: None,
             project: Some("/work/quill".to_string()),
+            session_name: None,
+            failed_tool_calls: None,
             active_runtime_secs: Some(8.0),
             agent_count: Some(1),
             agent_runtime_secs: Some(8.0),
@@ -34335,6 +35036,8 @@ mod tests {
             ended_at: None,
             model_id: None,
             project: Some("/work/quill".to_string()),
+            session_name: None,
+            failed_tool_calls: None,
             active_runtime_secs: Some(8.0),
             agent_count: Some(1),
             agent_runtime_secs: Some(8.0),
@@ -36378,6 +37081,8 @@ mod tests {
             ended_at: None,
             model_id: None,
             project: None,
+            session_name: None,
+            failed_tool_calls: None,
             active_runtime_secs: None,
             agent_count: None,
             agent_runtime_secs: None,
@@ -36471,6 +37176,8 @@ mod tests {
             ended_at: None,
             model_id: None,
             project: None,
+            session_name: None,
+            failed_tool_calls: None,
             active_runtime_secs: None,
             agent_count: None,
             agent_runtime_secs: None,
@@ -37539,6 +38246,8 @@ mod tests {
             ended_at: None,
             model_id: None,
             project: None,
+            session_name: None,
+            failed_tool_calls: None,
             active_runtime_secs: None,
             agent_count: None,
             agent_runtime_secs: None,

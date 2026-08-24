@@ -490,6 +490,12 @@ pub struct SessionBreakdown {
     /// Activity newer than this terminal marker reopens the session.
     pub ended_at: Option<String>,
     pub project: Option<String>,
+    /// Display name the provider gave this session, joined from the
+    /// analytics registry. Null when no name was ever recorded.
+    pub session_name: Option<String>,
+    /// Range-scoped failed tool calls (`is_error = 1`). Null when no tool
+    /// row in range carries error evidence — unmeasured, not zero.
+    pub failed_tool_calls: Option<i64>,
     /// The session's own model: the retained primary model ranked from its
     /// recorded usage, replaced by the live fold's own model when the fold
     /// knows one (newer evidence). Null when neither source names a model.
@@ -1835,6 +1841,16 @@ pub struct ModelOverviewDelegation {
     pub subagent_top: Option<ModelOverviewDelegationTop>,
 }
 
+/// Range-scoped compaction/branch-summary spend with no model identity.
+/// Rendered as the "Summaries (unattributed)" band entry, never a model row,
+/// so per-model figures visibly reconcile against range totals.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewSummaryUsage {
+    pub observations: i64,
+    pub total_tokens: i64,
+}
+
 /// Complete usage-frequency overview for the redesigned Models tab.
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -1847,12 +1863,79 @@ pub struct ModelUsageOverviewResponse {
     pub backfill: ModelBackfillStatus,
     pub building_index: bool,
     pub totals: ModelOverviewTotals,
+    pub summary_usage: ModelOverviewSummaryUsage,
     pub running_now: Vec<ModelRunningNow>,
     pub models: Vec<ModelOverviewRow>,
     pub activity: ModelOverviewActivity,
     pub project_matrix: Vec<ModelOverviewProjectRow>,
     pub combinations: ModelOverviewCombinations,
     pub delegation: ModelOverviewDelegation,
+}
+
+// --- Turn outcome aggregation (spec 030 story 3) ---
+
+/// Outcome tallies over retained turn observations. Rows without persisted
+/// outcome evidence stay out of every figure: `stop_reason_turns` counts only
+/// NOT NULL stop reasons and `error_evidence_turns` only NOT NULL error
+/// flags, so providers that do not supply the fields never read as success.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnOutcomeCounts {
+    /// Denominator for stop-reason rates: turns with a recorded stop reason.
+    pub stop_reason_turns: i64,
+    /// Interrupted turns (`stop_reason = 'aborted'`).
+    pub aborted_turns: i64,
+    /// Provider-error stops (`stop_reason = 'error'`).
+    pub error_stop_turns: i64,
+    /// Truncated turns (`stop_reason = 'length'`).
+    pub truncated_turns: i64,
+    /// Denominator for error rates: turns with a measured error flag.
+    pub error_evidence_turns: i64,
+    /// Turns whose message carried an `errorMessage` (`had_error = 1`).
+    pub errored_turns: i64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTurnOutcomes {
+    pub provider: String,
+    pub session_id: String,
+    pub counts: TurnOutcomeCounts,
+}
+
+/// Per-attributed-model outcome tallies. `model_id` is `None` for outcome
+/// evidence recorded before any model attribution existed — a factual
+/// unattributed bucket, never a synthesized identity.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTurnOutcomes {
+    pub provider: String,
+    pub model_id: Option<String>,
+    pub counts: TurnOutcomeCounts,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowTurnOutcomes {
+    pub window_start: String,
+    pub counts: TurnOutcomeCounts,
+}
+
+/// Dedicated outcome aggregation over one range: the same evidence rows
+/// partitioned per session, per model, and per fixed time window, so each
+/// grouping sums back to `totals`. Windows with no outcome evidence are
+/// omitted rather than reported as zero-denominator rows.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnOutcomesResponse {
+    pub generated_at: String,
+    pub range: ModelRange,
+    pub provider: Option<String>,
+    pub bucket_seconds: i64,
+    pub totals: TurnOutcomeCounts,
+    pub sessions: Vec<SessionTurnOutcomes>,
+    pub models: Vec<ModelTurnOutcomes>,
+    pub windows: Vec<WindowTurnOutcomes>,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
