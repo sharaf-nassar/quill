@@ -87,6 +87,11 @@ pub(crate) struct NormalizedObservation {
     /// [`apply_carry_forward_attribution`] after adapter parsing. Raw model
     /// evidence stays untouched so stored evidence remains replayable.
     derived_model_id: Option<String>,
+    reasoning_tokens: Option<i64>,
+    stop_reason: Option<String>,
+    had_error: Option<bool>,
+    tokens_before: Option<i64>,
+    reasoning_duration_ms: Option<i64>,
 }
 
 /// Observation fields that cannot contradict model or token attribution.
@@ -121,6 +126,11 @@ impl NormalizedObservation {
             model_attribution,
             token_attribution,
             derived_model_id: None,
+            reasoning_tokens: None,
+            stop_reason: None,
+            had_error: None,
+            tokens_before: None,
+            reasoning_duration_ms: None,
         }
     }
 
@@ -156,6 +166,26 @@ impl NormalizedObservation {
         self.token_attribution.dimensions().cache_read_tokens()
     }
 
+    pub(crate) fn reasoning_tokens(&self) -> Option<i64> {
+        self.reasoning_tokens
+    }
+
+    pub(crate) fn stop_reason(&self) -> Option<&str> {
+        self.stop_reason.as_deref()
+    }
+
+    pub(crate) fn had_error(&self) -> Option<bool> {
+        self.had_error
+    }
+
+    pub(crate) fn tokens_before(&self) -> Option<i64> {
+        self.tokens_before
+    }
+
+    pub(crate) fn reasoning_duration_ms(&self) -> Option<i64> {
+        self.reasoning_duration_ms
+    }
+
     pub(crate) fn token_evidence(&self) -> TokenEvidence {
         self.token_attribution.evidence()
     }
@@ -166,16 +196,19 @@ impl NormalizedObservation {
 pub(crate) enum ObservationKind {
     Turn,
     Token,
+    Summary,
 }
 
 impl ObservationKind {
     const TURN: &'static str = "turn";
     const TOKEN: &'static str = "token";
+    const SUMMARY: &'static str = "summary";
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Turn => Self::TURN,
             Self::Token => Self::TOKEN,
+            Self::Summary => Self::SUMMARY,
         }
     }
 }

@@ -4,7 +4,47 @@ lat:
 ---
 # Pi Model Usage Test Specs
 
-Pi usage tests pin persisted-session reconciliation, canonical ownership, and the schema-46 cut-over.
+Pi usage tests pin persisted-session reconciliation, canonical ownership, and the forward-only analytics schema cut-overs through migration 48.
+
+## Analytics Capture Migration
+
+Migration 48 installs the provider-neutral analytics evidence foundation without populating later Pi producers.
+
+Opening a schema-47 database first publishes a verified schema-47 backup, then rebuilds `model_usage_observations` with the `turn`/`token`/`summary` CHECK while preserving row ids, values, the source-record uniqueness constraint, and all seven named indexes. It adds nullable reasoning/outcome/savings/duration evidence, nullable tool error/detail/image/duration evidence, `session_setting_events`, and nullable transcript-source `session_name`, then rearms `transcript_analytics_reingest_pending` and records version 48 once.
+
+The migration test inserts old-shape model, tool, and source rows before opening the real migration path. It proves old rows remain byte-accountable, summary rows and unknown stop-reason text are accepted, other observation kinds remain rejected, additive columns start NULL, setting identity is unique by `(provider, source_key, setting, source_ordinal)`, and reopen does not re-enter migration 48.
+
+## Analytics Migration Backup Preflight And Recovery
+
+Migration backup, disk preflight, retry, and manual restore share one version-parameterized recovery contract.
+
+Every destructive schema migration uses the same `VACUUM INTO` backup path and verification routine. Before backup or rebuild, free space must be at least twice the current database file size; an unreadable or insufficient probe fails before DDL. Schema 47 publishes to `/absolute/path/to/usage.db.schema-47.backup`, including committed WAL state, and verifies `PRAGMA quick_check`, exact schema version, file fsync, atomic rename, directory fsync, and a second post-publish verification.
+
+A failed table rebuild rolls its transaction back to schema 47 with every row intact. Removing the injected blocker resumes migration against the verified backup. The recovery test also replaces the database with that backup and proves startup reapplies migration 48 without data loss.
+
+Restore and verify with Quill stopped:
+
+```bash
+rm -f /absolute/path/to/usage.db-wal /absolute/path/to/usage.db-shm
+cp /absolute/path/to/usage.db.schema-47.backup /absolute/path/to/usage.db
+sqlite3 /absolute/path/to/usage.db 'PRAGMA quick_check; SELECT MAX(version) FROM schema_version;'
+```
+
+Expected output before restart is `ok` and `47`; restarting Quill reapplies migration 48 and retains the verified schema-47 backup.
+
+## Analytics Migration Measurement
+
+The migration wall-time measurement uses one hash-pinned audit-window corpus.
+
+`storage::tests::measure_analytics_capture_migration_on_pinned_corpus` is explicitly invoked over SHA-256 `0489da2b94fe813d785f8b5bc4ed2f871b3f0732cde6aab5334c55788f9f673e`: 80 sessions, 30,700 entries, 12,685 model observations, and 16,670 tool rows in an 18,751,488-byte schema-47 database.
+
+Three controlled local runs measured 714 ms, 624 ms, and 591 ms from `Storage::init_at` entry through verified backup, migration, index recreation, and startup-index repair; median 624 ms. Environment, command, scope, and limitations are recorded in `specs/030-pi-analytics-migration-measurement.md`.
+
+## Analytics Evidence Foundation Starts Empty
+
+Retained Pi parsing leaves every later-producer evidence slot explicitly empty.
+
+`reasoning_tokens`, `stop_reason`, `had_error`, `tokens_before`, `reasoning_duration_ms`, tool `is_error`/`details_json`/`result_image_count`/`duration_ms`, setting events, and session name all remain `None` or empty on the pinned Pi parity corpus. Existing usage, runtime, tool, and skill extraction remains unchanged.
 
 ## Native Usage Migration
 
@@ -28,11 +68,13 @@ cp /absolute/path/to/usage.db.schema-45.backup /absolute/path/to/usage.db
 sqlite3 /absolute/path/to/usage.db 'PRAGMA quick_check; SELECT MAX(version) FROM schema_version;'
 ```
 
-Expected output is `ok` and `45`; restarting Quill reapplies migration 46 and retains the verified schema-45 backup.
+Expected output is `ok` and `45`; restarting Quill reapplies migrations 46-48 and retains the verified schema-45 backup.
 
 ## Persisted Source Atomic Replacement
 
-One persisted Pi snapshot replaces every source-owned runtime, tool, receipt, token, usage, rollup, and registry row in one SQLite transaction.
+One persisted Pi snapshot replaces every source-owned evidence family in one SQLite transaction.
+
+The generic snapshot writer binds runtime, tool, setting, receipt, token, usage, rollup, and registry rows, including the new nullable model/tool fields and registry session name. The retention watermark still filters only runtime events, tool actions, and Pi usage, so setting rows remain unpruned until source replacement or source deletion.
 
 Lifecycle evidence participates only when present and ordered after the committed lifecycle already stored for that session.
 

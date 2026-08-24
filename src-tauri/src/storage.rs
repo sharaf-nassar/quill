@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use crate::integrations::IntegrationProvider;
 use crate::model_usage::{
     CompletedModelSourceRoot, ModelUsageDiagnostic, NormalizedObservation, NormalizedSource,
-    SourceProcessingStatus,
+    ObservationKind, SourceProcessingStatus,
 };
 use crate::retention::{
     RETENTION_LAST_RUN_KEY, RETENTION_WATERMARK_KEY, RETENTION_WINDOW_DAYS_KEY,
@@ -102,7 +102,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 47;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 48;
 
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
@@ -567,6 +567,7 @@ pub(crate) struct StoredTranscriptAnalyticsSource {
     pub(crate) agent_id: Option<String>,
     pub(crate) is_sidechain: bool,
     pub(crate) project: Option<String>,
+    pub(crate) session_name: Option<String>,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) hostname: Option<String>,
     pub(crate) mtime_ns: Option<i64>,
@@ -817,21 +818,23 @@ fn evidence_weighted_score(
     (score, state)
 }
 
-fn schema_45_backup_path(path: &Path) -> PathBuf {
+const SCHEMA_MIGRATION_SPACE_MULTIPLIER: u64 = 2;
+
+fn schema_backup_path(path: &Path, version: i32) -> PathBuf {
     let mut backup = path.as_os_str().to_os_string();
-    backup.push(".schema-45.backup");
+    backup.push(format!(".schema-{version}.backup"));
     PathBuf::from(backup)
 }
 
-fn verify_schema_45_backup(path: &Path) -> Result<(), String> {
+fn verify_schema_backup(path: &Path, expected_version: i32) -> Result<(), String> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|error| format!("Open schema-45 backup for verification: {error}"))?;
+        .map_err(|error| format!("Open schema-{expected_version} backup: {error}"))?;
     let quick_check = conn
         .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
-        .map_err(|error| format!("Verify schema-45 backup integrity: {error}"))?;
+        .map_err(|error| format!("Verify schema-{expected_version} backup integrity: {error}"))?;
     if quick_check != "ok" {
         return Err(format!(
-            "Schema-45 backup quick_check failed: {quick_check}"
+            "Schema-{expected_version} backup quick_check failed: {quick_check}"
         ));
     }
     let version = conn
@@ -840,45 +843,71 @@ fn verify_schema_45_backup(path: &Path) -> Result<(), String> {
             [],
             |row| row.get::<_, i32>(0),
         )
-        .map_err(|error| format!("Verify schema-45 backup version: {error}"))?;
-    if version != 45 {
-        return Err(format!("Schema-45 backup has schema version {version}"));
+        .map_err(|error| format!("Verify schema-{expected_version} backup version: {error}"))?;
+    if version != expected_version {
+        return Err(format!(
+            "Schema-{expected_version} backup has schema version {version}"
+        ));
     }
     Ok(())
 }
 
-fn ensure_schema_45_backup(conn: &Connection, path: &Path) -> Result<PathBuf, String> {
-    let backup = schema_45_backup_path(path);
+fn preflight_schema_migration_with_probe(
+    path: &Path,
+    available_space: impl FnOnce(&Path) -> Result<u64, String>,
+) -> Result<(), String> {
+    let bytes = std::fs::metadata(path)
+        .map_err(|error| format!("Inspect database before schema migration: {error}"))?
+        .len();
+    let required_bytes = bytes.saturating_mul(SCHEMA_MIGRATION_SPACE_MULTIPLIER);
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let available_bytes = available_space(directory)?;
+    if available_bytes < required_bytes {
+        return Err(format!(
+            "Insufficient free disk space for schema migration: need {required_bytes} bytes, have {available_bytes} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_schema_backup(
+    conn: &Connection,
+    path: &Path,
+    expected_version: i32,
+) -> Result<PathBuf, String> {
+    preflight_schema_migration_with_probe(path, available_disk_space)?;
+    let backup = schema_backup_path(path, expected_version);
     if backup.exists() {
-        if verify_schema_45_backup(&backup).is_ok() {
+        if verify_schema_backup(&backup, expected_version).is_ok() {
             return Ok(backup);
         }
         std::fs::remove_file(&backup)
-            .map_err(|error| format!("Remove invalid schema-45 backup: {error}"))?;
+            .map_err(|error| format!("Remove invalid schema-{expected_version} backup: {error}"))?;
     }
     let mut temporary = backup.as_os_str().to_os_string();
     temporary.push(".building");
     let temporary = PathBuf::from(temporary);
     if temporary.exists() {
-        std::fs::remove_file(&temporary)
-            .map_err(|error| format!("Remove interrupted schema-45 backup: {error}"))?;
+        std::fs::remove_file(&temporary).map_err(|error| {
+            format!("Remove interrupted schema-{expected_version} backup: {error}")
+        })?;
     }
 
     conn.execute("VACUUM INTO ?1", params![temporary.to_string_lossy()])
-        .map_err(|error| format!("Create schema-45 SQLite backup: {error}"))?;
-    verify_schema_45_backup(&temporary)?;
+        .map_err(|error| format!("Create schema-{expected_version} SQLite backup: {error}"))?;
+    verify_schema_backup(&temporary, expected_version)?;
     std::fs::File::open(&temporary)
         .and_then(|file| file.sync_all())
-        .map_err(|error| format!("Sync schema-45 backup: {error}"))?;
+        .map_err(|error| format!("Sync schema-{expected_version} backup: {error}"))?;
     std::fs::rename(&temporary, &backup)
-        .map_err(|error| format!("Publish schema-45 backup: {error}"))?;
+        .map_err(|error| format!("Publish schema-{expected_version} backup: {error}"))?;
     #[cfg(unix)]
     if let Some(parent) = backup.parent() {
         std::fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("Sync schema-45 backup directory: {error}"))?;
+            .map_err(|error| format!("Sync schema-{expected_version} backup directory: {error}"))?;
     }
-    verify_schema_45_backup(&backup)?;
+    verify_schema_backup(&backup, expected_version)?;
     Ok(backup)
 }
 
@@ -4228,7 +4257,7 @@ fn bump_rollup_generation_in_transaction(tx: &rusqlite::Transaction<'_>) -> Resu
 /// Insert one owner's `tool_actions` rows, returning `(suppressed,
 /// non_conforming)` for the watermark filter's two outcomes.
 ///
-/// Both owned writers — the five-table snapshot and Pi's two-table
+/// Both owned writers — the six-table snapshot and Pi's two-table
 /// replacement — insert through here, so the retention filter and the
 /// `tool_detail` payload carve-out cannot drift apart between them. The
 /// statement is prepared once outside the loop and `INSERT OR IGNORE` matches
@@ -4247,11 +4276,12 @@ fn insert_owned_tool_actions_in_transaction(
                  provider, source_key, action_key, message_id,
                  session_id, chain_id, parent_chain_id, tool_name,
                  category, file_path, summary, full_input, full_output,
+                 is_error, details_json, result_image_count, duration_ms,
                  timestamp, is_sidechain, agent_id, parent_uuid,
                  lines_added, lines_removed
              ) VALUES (
                  ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                 ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
              )",
         )
         .map_err(|e| format!("Prepare owned tool actions: {e}"))?;
@@ -4272,10 +4302,14 @@ fn insert_owned_tool_actions_in_transaction(
         // `tool_actions` rows with no category filter. New locals, so `row` is
         // untouched and `ToolAction.full_input` still reaches the in-memory
         // skill-access extractor.
-        let (full_input, full_output) = if row.category == TOOL_DETAIL_CATEGORY {
-            (None, None)
+        let (full_input, full_output, details_json) = if row.category == TOOL_DETAIL_CATEGORY {
+            (None, None, None)
         } else {
-            (row.full_input.as_deref(), row.full_output.as_deref())
+            (
+                row.full_input.as_deref(),
+                row.full_output.as_deref(),
+                row.details_json.as_deref(),
+            )
         };
         statement
             .execute(params![
@@ -4292,6 +4326,10 @@ fn insert_owned_tool_actions_in_transaction(
                 row.summary,
                 full_input,
                 full_output,
+                row.is_error.map(i64::from),
+                details_json,
+                row.result_image_count,
+                row.duration_ms,
                 row.timestamp,
                 i64::from(row.is_sidechain),
                 row.agent_id,
@@ -5980,9 +6018,9 @@ impl Storage {
             .prepare_cached(
                 "SELECT source_key, source_root_key, source_path,
                         source_session_id, analytics_session_id, chain_id,
-                        parent_chain_id, agent_id, is_sidechain, project, cwd,
-                        hostname, mtime_ns, size_bytes, content_sha256,
-                        seen_generation, processing_status, last_attempt_at_ms,
+                        parent_chain_id, agent_id, is_sidechain, project,
+                        session_name, cwd, hostname, mtime_ns, size_bytes,
+                        content_sha256, seen_generation, processing_status, last_attempt_at_ms,
                         last_success_at_ms, last_error, suppressed_sha256,
                         suppressed_at_ms
                  FROM transcript_analytics_sources
@@ -6004,18 +6042,19 @@ impl Storage {
                     agent_id: row.get(7)?,
                     is_sidechain: row.get::<_, i64>(8)? != 0,
                     project: row.get(9)?,
-                    cwd: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
-                    hostname: row.get(11)?,
-                    mtime_ns: row.get(12)?,
-                    size_bytes: row.get(13)?,
-                    content_sha256: row.get(14)?,
-                    seen_generation: row.get(15)?,
-                    processing_status: row.get(16)?,
-                    last_attempt_at_ms: row.get(17)?,
-                    last_success_at_ms: row.get(18)?,
-                    last_error: row.get(19)?,
-                    suppressed_sha256: row.get(20)?,
-                    suppressed_at_ms: row.get(21)?,
+                    session_name: row.get(10)?,
+                    cwd: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+                    hostname: row.get(12)?,
+                    mtime_ns: row.get(13)?,
+                    size_bytes: row.get(14)?,
+                    content_sha256: row.get(15)?,
+                    seen_generation: row.get(16)?,
+                    processing_status: row.get(17)?,
+                    last_attempt_at_ms: row.get(18)?,
+                    last_success_at_ms: row.get(19)?,
+                    last_error: row.get(20)?,
+                    suppressed_sha256: row.get(21)?,
+                    suppressed_at_ms: row.get(22)?,
                 })
             })
             .map_err(|error| format!("Read transcript source root inventory: {error}"))?;
@@ -6311,6 +6350,7 @@ impl Storage {
                 "tool_actions",
                 "skill_usages",
                 "hook_invocations",
+                "session_setting_events",
             ] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE provider=?1 AND source_key=?2"),
@@ -6432,6 +6472,10 @@ impl Storage {
                 .hook_invocations
                 .iter()
                 .all(|r| r.provider == source.provider && r.source_key == source.source_key)
+            && snapshot
+                .setting_events
+                .iter()
+                .all(|r| r.provider == source.provider && r.source_key == source.source_key)
             && snapshot.pi_evidence.as_ref().is_none_or(|evidence| {
                 source.provider == IntegrationProvider::Pi
                     && evidence.receipts.iter().all(|row| {
@@ -6460,6 +6504,7 @@ impl Storage {
             "tool_actions",
             "skill_usages",
             "hook_invocations",
+            "session_setting_events",
         ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE provider=?1 AND source_key=?2"),
@@ -6562,7 +6607,7 @@ impl Storage {
         let mut non_conforming_session_events = 0_u64;
         {
             // Every owned identity here IS the table's dedupe key, so a
-            // repeat is benign and must not roll back the whole five-table
+            // repeat is benign and must not roll back the whole six-table
             // snapshot: one assistant message can legitimately emit two
             // identical skill accesses (same `message.uuid`, same skill,
             // same timestamp) or repeat a `tool_use_id`. `INSERT OR IGNORE`
@@ -6686,6 +6731,32 @@ impl Storage {
                 watermark.as_deref(),
             )?;
         insert_owned_skill_usages_in_transaction(&tx, &snapshot.skill_usages)?;
+        {
+            let mut setting_stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO session_setting_events (
+                         provider, source_key, session_id, chain_id,
+                         parent_chain_id, source_ordinal, timestamp, setting,
+                         value
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .map_err(|e| format!("Prepare session setting events: {e}"))?;
+            for row in &snapshot.setting_events {
+                setting_stmt
+                    .execute(params![
+                        row.provider.as_str(),
+                        row.source_key,
+                        row.session_id,
+                        row.chain_id,
+                        row.parent_chain_id,
+                        row.source_ordinal,
+                        row.timestamp,
+                        row.setting,
+                        row.value,
+                    ])
+                    .map_err(|e| format!("Insert session setting event: {e}"))?;
+            }
+        }
         if let Some(evidence) = &snapshot.pi_evidence {
             let accepted_at_ms = Utc::now().timestamp_millis();
             for receipt in &evidence.receipts {
@@ -6792,13 +6863,16 @@ impl Storage {
                          raw_model_id, derived_model_id, cwd, hostname,
                          is_sidechain, observed_at_ms, input_tokens,
                          output_tokens, cache_creation_tokens,
-                         cache_read_tokens, model_evidence, token_evidence,
-                         event_uuid, input_cost, output_cost, cache_read_cost,
+                         cache_read_tokens, reasoning_tokens, stop_reason,
+                         had_error, tokens_before, reasoning_duration_ms,
+                         model_evidence, token_evidence, event_uuid,
+                         input_cost, output_cost, cache_read_cost,
                          cache_write_cost, total_cost
                      ) VALUES (
                          'pi', ?1, ?2, ?3, 'turn', ?4, ?4, ?4, ?5,
                          ?6, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13,
-                         'explicit', 'direct', ?5, ?14, ?15, ?16, ?17, ?18
+                         ?14, ?15, ?16, ?17, ?18, 'explicit', 'direct', ?5,
+                         ?19, ?20, ?21, ?22, ?23
                      )",
                     params![
                         source.source_key,
@@ -6814,6 +6888,11 @@ impl Storage {
                         row.output_tokens,
                         row.cache_creation_tokens,
                         row.cache_read_tokens,
+                        row.reasoning_tokens,
+                        row.stop_reason,
+                        row.had_error.map(i64::from),
+                        row.tokens_before,
+                        row.reasoning_duration_ms,
                         row.input_cost,
                         row.output_cost,
                         row.cache_read_cost,
@@ -6940,13 +7019,13 @@ impl Storage {
                 "INSERT INTO transcript_analytics_sources (
                      provider, source_key, source_root_key, source_path,
                      source_session_id, analytics_session_id, chain_id,
-                     parent_chain_id, agent_id, is_sidechain, project, cwd,
-                     hostname, mtime_ns, size_bytes, content_sha256,
-                     seen_generation, processing_status, last_attempt_at_ms,
-                     last_success_at_ms, source_kind
+                     parent_chain_id, agent_id, is_sidechain, project,
+                     session_name, cwd, hostname, mtime_ns, size_bytes,
+                     content_sha256, seen_generation, processing_status,
+                     last_attempt_at_ms, last_success_at_ms, source_kind
                  ) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                     ?12, ?13, ?14, ?15, ?16, ?17, 'ok', ?18, ?18,
+                     ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'ok', ?19, ?19,
                      'transcript'
                  )
                  ON CONFLICT(provider, source_key) DO UPDATE SET
@@ -6959,6 +7038,7 @@ impl Storage {
                      agent_id = excluded.agent_id,
                      is_sidechain = excluded.is_sidechain,
                      project = excluded.project,
+                     session_name = excluded.session_name,
                      cwd = excluded.cwd,
                      hostname = excluded.hostname,
                      mtime_ns = excluded.mtime_ns,
@@ -6986,6 +7066,7 @@ impl Storage {
                     source.agent_id,
                     i64::from(source.is_sidechain),
                     source_project,
+                    source.session_name,
                     source_cwd,
                     source.hostname,
                     source.mtime_ns,
@@ -7210,6 +7291,7 @@ impl Storage {
             ));
         }
         let requires_schema_45_backup = (1..46).contains(&current_version);
+        let requires_schema_47_backup = (1..48).contains(&current_version);
 
         // Migration 1: add cwd column to token_snapshots
         if current_version < 1 {
@@ -9778,7 +9860,7 @@ impl Storage {
         // existed before this open are first advanced to schema 45, then
         // backed up here so no migration-46 DDL can precede the verified copy.
         if requires_schema_45_backup {
-            ensure_schema_45_backup(&conn, &path)?;
+            ensure_schema_backup(&conn, &path, 45)?;
         }
         if current_version < 46 {
             let tx = conn
@@ -10071,6 +10153,229 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 47: {e}"))?;
             tx.commit()
                 .map_err(|e| format!("Migration 47 commit: {e}"))?;
+        }
+
+        // Migration 48 establishes the complete provider-neutral evidence
+        // shape before any Pi producer begins populating it. The CHECK change
+        // requires a transactional table rebuild; every existing row and
+        // named index is verified before the version record can commit.
+        if requires_schema_47_backup {
+            ensure_schema_backup(&conn, &path, 47)?;
+        }
+        if current_version < 48 {
+            if ObservationKind::Summary.as_str() != "summary" {
+                return Err("Migration 48 summary observation spelling drifted".to_string());
+            }
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 48 begin: {e}"))?;
+            let rows_before = tx
+                .query_row("SELECT COUNT(*) FROM model_usage_observations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|e| format!("Migration 48 count source observations: {e}"))?;
+            tx.execute_batch(
+                "CREATE TABLE model_usage_observations_v48 (
+                     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                     provider              TEXT NOT NULL,
+                     source_key            TEXT NOT NULL,
+                     source_record_key     TEXT NOT NULL,
+                     source_ordinal        INTEGER NOT NULL,
+                     observation_kind      TEXT NOT NULL,
+                     source_session_id     TEXT NOT NULL,
+                     analytics_session_id  TEXT NOT NULL,
+                     chain_id              TEXT NOT NULL,
+                     parent_chain_id       TEXT,
+                     agent_id              TEXT,
+                     turn_id               TEXT,
+                     raw_model_id          TEXT,
+                     derived_model_id      TEXT,
+                     cwd                   TEXT,
+                     hostname              TEXT,
+                     is_sidechain          INTEGER NOT NULL,
+                     observed_at_ms        INTEGER NOT NULL,
+                     input_tokens          INTEGER,
+                     output_tokens         INTEGER,
+                     cache_creation_tokens INTEGER,
+                     cache_read_tokens     INTEGER,
+                     reasoning_tokens      INTEGER,
+                     stop_reason           TEXT,
+                     had_error             INTEGER,
+                     tokens_before         INTEGER,
+                     reasoning_duration_ms INTEGER,
+                     model_evidence        TEXT NOT NULL,
+                     token_evidence        TEXT NOT NULL,
+                     event_uuid            TEXT,
+                     input_cost            REAL,
+                     output_cost           REAL,
+                     cache_read_cost       REAL,
+                     cache_write_cost      REAL,
+                     total_cost            REAL,
+                     UNIQUE(provider, source_key, source_record_key),
+                     CHECK(source_ordinal >= 0),
+                     CHECK(observation_kind IN ('turn', 'token', 'summary')),
+                     CHECK(is_sidechain IN (0, 1)),
+                     CHECK(observed_at_ms >= 0),
+                     CHECK(input_tokens IS NULL
+                           OR input_tokens BETWEEN 0 AND 100000000),
+                     CHECK(output_tokens IS NULL
+                           OR output_tokens BETWEEN 0 AND 100000000),
+                     CHECK(cache_creation_tokens IS NULL
+                           OR cache_creation_tokens BETWEEN 0 AND 100000000),
+                     CHECK(cache_read_tokens IS NULL
+                           OR cache_read_tokens BETWEEN 0 AND 100000000),
+                     CHECK(reasoning_tokens IS NULL
+                           OR reasoning_tokens BETWEEN 0 AND 100000000),
+                     CHECK(had_error IS NULL OR had_error IN (0, 1)),
+                     CHECK(tokens_before IS NULL
+                           OR tokens_before BETWEEN 0 AND 100000000),
+                     CHECK(reasoning_duration_ms IS NULL
+                           OR reasoning_duration_ms >= 0),
+                     CHECK(model_evidence IN ('explicit', 'missing', 'invalid')),
+                     CHECK(token_evidence IN
+                           ('direct', 'cumulative_delta', 'unavailable')),
+                     CHECK(input_cost IS NULL OR input_cost >= 0),
+                     CHECK(output_cost IS NULL OR output_cost >= 0),
+                     CHECK(cache_read_cost IS NULL OR cache_read_cost >= 0),
+                     CHECK(cache_write_cost IS NULL OR cache_write_cost >= 0),
+                     CHECK(total_cost IS NULL OR total_cost >= 0)
+                 );
+                 INSERT INTO model_usage_observations_v48 (
+                     id, provider, source_key, source_record_key,
+                     source_ordinal, observation_kind, source_session_id,
+                     analytics_session_id, chain_id, parent_chain_id,
+                     agent_id, turn_id, raw_model_id, derived_model_id, cwd,
+                     hostname, is_sidechain, observed_at_ms, input_tokens,
+                     output_tokens, cache_creation_tokens, cache_read_tokens,
+                     model_evidence, token_evidence, event_uuid, input_cost,
+                     output_cost, cache_read_cost, cache_write_cost, total_cost
+                 )
+                 SELECT id, provider, source_key, source_record_key,
+                        source_ordinal, observation_kind, source_session_id,
+                        analytics_session_id, chain_id, parent_chain_id,
+                        agent_id, turn_id, raw_model_id, derived_model_id, cwd,
+                        hostname, is_sidechain, observed_at_ms, input_tokens,
+                        output_tokens, cache_creation_tokens, cache_read_tokens,
+                        model_evidence, token_evidence, event_uuid, input_cost,
+                        output_cost, cache_read_cost, cache_write_cost, total_cost
+                 FROM model_usage_observations;",
+            )
+            .map_err(|e| format!("Migration 48 rebuild model observations: {e}"))?;
+            let rows_after = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM model_usage_observations_v48",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| format!("Migration 48 count rebuilt observations: {e}"))?;
+            if rows_after != rows_before {
+                return Err(format!(
+                    "Migration 48 observation row count changed from {rows_before} to {rows_after}"
+                ));
+            }
+            tx.execute_batch(
+                "DROP TABLE model_usage_observations;
+                 ALTER TABLE model_usage_observations_v48
+                     RENAME TO model_usage_observations;
+                 CREATE INDEX idx_model_observations_observed_provider
+                     ON model_usage_observations(observed_at_ms, provider);
+                 CREATE INDEX idx_model_observations_model_time
+                     ON model_usage_observations(
+                         provider, raw_model_id, observed_at_ms
+                     );
+                 CREATE INDEX idx_model_observations_session_time
+                     ON model_usage_observations(
+                         provider, analytics_session_id, observed_at_ms
+                     );
+                 CREATE INDEX idx_model_observations_chain_time
+                     ON model_usage_observations(
+                         provider, analytics_session_id, chain_id,
+                         observed_at_ms, source_ordinal
+                     );
+                 CREATE INDEX idx_model_observations_source
+                     ON model_usage_observations(provider, source_key);
+                 CREATE INDEX idx_model_observations_derived_model_time
+                     ON model_usage_observations(
+                         provider, derived_model_id, observed_at_ms
+                     );
+                 CREATE UNIQUE INDEX uidx_model_observations_pi_event_uuid
+                     ON model_usage_observations(
+                         hostname, analytics_session_id, event_uuid
+                     ) WHERE provider = 'pi' AND event_uuid IS NOT NULL;",
+            )
+            .map_err(|e| format!("Migration 48 rebuild observation indexes: {e}"))?;
+            for (column, definition) in [
+                (
+                    "is_error",
+                    "INTEGER CHECK(is_error IS NULL OR is_error IN (0, 1))",
+                ),
+                ("details_json", "TEXT"),
+                (
+                    "result_image_count",
+                    "INTEGER CHECK(result_image_count IS NULL OR result_image_count >= 0)",
+                ),
+                (
+                    "duration_ms",
+                    "INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0)",
+                ),
+            ] {
+                if !table_has_column(&tx, "tool_actions", column) {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE tool_actions ADD COLUMN {column} {definition};"
+                    ))
+                    .map_err(|e| format!("Migration 48 add tool_actions.{column}: {e}"))?;
+                }
+            }
+            if !table_has_column(&tx, "transcript_analytics_sources", "session_name") {
+                tx.execute_batch(
+                    "ALTER TABLE transcript_analytics_sources
+                     ADD COLUMN session_name TEXT;",
+                )
+                .map_err(|e| format!("Migration 48 add transcript session name: {e}"))?;
+            }
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS session_setting_events (
+                     provider        TEXT NOT NULL,
+                     source_key      TEXT NOT NULL CHECK(length(source_key) > 0),
+                     session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
+                     chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
+                     parent_chain_id TEXT,
+                     source_ordinal  INTEGER NOT NULL CHECK(source_ordinal >= 0),
+                     timestamp       TEXT NOT NULL,
+                     setting         TEXT NOT NULL CHECK(length(setting) > 0),
+                     value           TEXT NOT NULL,
+                     UNIQUE(provider, source_key, setting, source_ordinal)
+                 );
+                 INSERT OR REPLACE INTO settings(key, value)
+                     VALUES ('transcript_analytics_reingest_pending', '1');",
+            )
+            .map_err(|e| format!("Migration 48 analytics evidence schema: {e}"))?;
+            let index_count = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index'
+                       AND name IN (
+                           'idx_model_observations_observed_provider',
+                           'idx_model_observations_model_time',
+                           'idx_model_observations_session_time',
+                           'idx_model_observations_chain_time',
+                           'idx_model_observations_source',
+                           'idx_model_observations_derived_model_time',
+                           'uidx_model_observations_pi_event_uuid'
+                       )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| format!("Migration 48 verify observation indexes: {e}"))?;
+            if index_count != 7 {
+                return Err(format!(
+                    "Migration 48 restored {index_count} of 7 model observation indexes"
+                ));
+            }
+            tx.execute("INSERT INTO schema_version (version) VALUES (48)", [])
+                .map_err(|e| format!("Failed to record migration 48: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 48 commit: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -13529,11 +13834,12 @@ impl Storage {
                         cwd, hostname,
                         is_sidechain, observed_at_ms, input_tokens,
                         output_tokens, cache_creation_tokens, cache_read_tokens,
-                        model_evidence, token_evidence
+                        reasoning_tokens, stop_reason, had_error, tokens_before,
+                        reasoning_duration_ms, model_evidence, token_evidence
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                         ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                        ?22, ?23
+                        ?22, ?23, ?24, ?25, ?26, ?27, ?28
                      )",
                 )
                 .map_err(|error| format!("Prepare model source observation insert: {error}"))?;
@@ -13562,6 +13868,11 @@ impl Storage {
                     observation.output_tokens(),
                     observation.cache_creation_tokens(),
                     observation.cache_read_tokens(),
+                    observation.reasoning_tokens(),
+                    observation.stop_reason(),
+                    observation.had_error().map(i64::from),
+                    observation.tokens_before(),
+                    observation.reasoning_duration_ms(),
                     observation.model_evidence().as_str(),
                     observation.token_evidence().as_str(),
                 ])
@@ -21730,6 +22041,114 @@ mod tests {
         }
     }
 
+    fn rewind_analytics_capture_migration(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE model_usage_observations_v47 (
+                 id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                 provider              TEXT NOT NULL,
+                 source_key            TEXT NOT NULL,
+                 source_record_key     TEXT NOT NULL,
+                 source_ordinal        INTEGER NOT NULL,
+                 observation_kind      TEXT NOT NULL,
+                 source_session_id     TEXT NOT NULL,
+                 analytics_session_id  TEXT NOT NULL,
+                 chain_id              TEXT NOT NULL,
+                 parent_chain_id       TEXT,
+                 agent_id              TEXT,
+                 turn_id               TEXT,
+                 raw_model_id          TEXT,
+                 derived_model_id      TEXT,
+                 cwd                   TEXT,
+                 hostname              TEXT,
+                 is_sidechain          INTEGER NOT NULL,
+                 observed_at_ms        INTEGER NOT NULL,
+                 input_tokens          INTEGER,
+                 output_tokens         INTEGER,
+                 cache_creation_tokens INTEGER,
+                 cache_read_tokens     INTEGER,
+                 model_evidence        TEXT NOT NULL,
+                 token_evidence        TEXT NOT NULL,
+                 event_uuid            TEXT,
+                 input_cost            REAL CHECK(input_cost IS NULL OR input_cost >= 0),
+                 output_cost           REAL CHECK(output_cost IS NULL OR output_cost >= 0),
+                 cache_read_cost       REAL CHECK(cache_read_cost IS NULL OR cache_read_cost >= 0),
+                 cache_write_cost      REAL CHECK(cache_write_cost IS NULL OR cache_write_cost >= 0),
+                 total_cost            REAL CHECK(total_cost IS NULL OR total_cost >= 0),
+                 UNIQUE(provider, source_key, source_record_key),
+                 CHECK(source_ordinal >= 0),
+                 CHECK(observation_kind IN ('turn', 'token')),
+                 CHECK(is_sidechain IN (0, 1)),
+                 CHECK(observed_at_ms >= 0),
+                 CHECK(input_tokens IS NULL
+                       OR input_tokens BETWEEN 0 AND 100000000),
+                 CHECK(output_tokens IS NULL
+                       OR output_tokens BETWEEN 0 AND 100000000),
+                 CHECK(cache_creation_tokens IS NULL
+                       OR cache_creation_tokens BETWEEN 0 AND 100000000),
+                 CHECK(cache_read_tokens IS NULL
+                       OR cache_read_tokens BETWEEN 0 AND 100000000),
+                 CHECK(model_evidence IN ('explicit', 'missing', 'invalid')),
+                 CHECK(token_evidence IN
+                       ('direct', 'cumulative_delta', 'unavailable'))
+             );
+             INSERT INTO model_usage_observations_v47 (
+                 id, provider, source_key, source_record_key, source_ordinal,
+                 observation_kind, source_session_id, analytics_session_id,
+                 chain_id, parent_chain_id, agent_id, turn_id, raw_model_id,
+                 derived_model_id, cwd, hostname, is_sidechain,
+                 observed_at_ms, input_tokens, output_tokens,
+                 cache_creation_tokens, cache_read_tokens, model_evidence,
+                 token_evidence, event_uuid, input_cost, output_cost,
+                 cache_read_cost, cache_write_cost, total_cost
+             )
+             SELECT id, provider, source_key, source_record_key,
+                    source_ordinal, observation_kind, source_session_id,
+                    analytics_session_id, chain_id, parent_chain_id, agent_id,
+                    turn_id, raw_model_id, derived_model_id, cwd, hostname,
+                    is_sidechain, observed_at_ms, input_tokens, output_tokens,
+                    cache_creation_tokens, cache_read_tokens, model_evidence,
+                    token_evidence, event_uuid, input_cost, output_cost,
+                    cache_read_cost, cache_write_cost, total_cost
+             FROM model_usage_observations;
+             DROP TABLE model_usage_observations;
+             ALTER TABLE model_usage_observations_v47
+                 RENAME TO model_usage_observations;
+             CREATE INDEX idx_model_observations_observed_provider
+                 ON model_usage_observations(observed_at_ms, provider);
+             CREATE INDEX idx_model_observations_model_time
+                 ON model_usage_observations(
+                     provider, raw_model_id, observed_at_ms
+                 );
+             CREATE INDEX idx_model_observations_session_time
+                 ON model_usage_observations(
+                     provider, analytics_session_id, observed_at_ms
+                 );
+             CREATE INDEX idx_model_observations_chain_time
+                 ON model_usage_observations(
+                     provider, analytics_session_id, chain_id,
+                     observed_at_ms, source_ordinal
+                 );
+             CREATE INDEX idx_model_observations_source
+                 ON model_usage_observations(provider, source_key);
+             CREATE INDEX idx_model_observations_derived_model_time
+                 ON model_usage_observations(
+                     provider, derived_model_id, observed_at_ms
+                 );
+             CREATE UNIQUE INDEX uidx_model_observations_pi_event_uuid
+                 ON model_usage_observations(
+                     hostname, analytics_session_id, event_uuid
+                 ) WHERE provider = 'pi' AND event_uuid IS NOT NULL;
+             DROP TABLE session_setting_events;
+             ALTER TABLE tool_actions DROP COLUMN is_error;
+             ALTER TABLE tool_actions DROP COLUMN details_json;
+             ALTER TABLE tool_actions DROP COLUMN result_image_count;
+             ALTER TABLE tool_actions DROP COLUMN duration_ms;
+             ALTER TABLE transcript_analytics_sources DROP COLUMN session_name;
+             DELETE FROM schema_version WHERE version = 48;",
+        )
+        .expect("rewind analytics capture migration");
+    }
+
     // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Canonical Source Identity]]
     #[test]
     fn pi_source_keys_are_host_qualified_and_unambiguous() {
@@ -22022,6 +22441,478 @@ mod tests {
         clear_env();
     }
 
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Analytics Capture Migration]]
+    #[test]
+    #[serial]
+    fn migration_48_preserves_rows_indexes_and_adds_evidence_schema() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let db = dir.path().join("usage.db");
+        let storage = Storage::init_at(db.clone(), false).expect("create current database");
+        {
+            let conn = storage.conn.lock().unwrap();
+            rewind_analytics_capture_migration(&conn);
+            conn.execute_batch(
+                "INSERT INTO model_usage_observations (
+                     id, provider, source_key, source_record_key,
+                     source_ordinal, observation_kind, source_session_id,
+                     analytics_session_id, chain_id, turn_id, raw_model_id,
+                     derived_model_id, hostname, is_sidechain, observed_at_ms,
+                     input_tokens, output_tokens, model_evidence,
+                     token_evidence, event_uuid, total_cost
+                 ) VALUES
+                     (41, 'pi', 'source-a', 'record-turn', 1, 'turn',
+                      'session-a', 'session-a', 'session-a', 'turn-a',
+                      'anthropic/model-a', 'anthropic/model-a', 'host-a', 0,
+                      1000, 11, 7, 'explicit', 'direct', 'event-a', 0.5),
+                     (42, 'claude', 'source-b', 'record-token', 2, 'token',
+                      'session-b', 'session-b', 'session-b', NULL, NULL, NULL,
+                      'host-b', 0, 2000, 13, 9, 'missing', 'direct', NULL,
+                      NULL);
+                 INSERT INTO tool_actions (
+                     provider, source_key, action_key, message_id, session_id,
+                     chain_id, tool_name, category, summary, timestamp,
+                     is_sidechain
+                 ) VALUES (
+                     'pi', 'source-a', 'action-a', 'message-a', 'session-a',
+                     'session-a', 'read', 'read', 'seed tool',
+                     '2026-08-24T00:00:00.000Z', 0
+                 );
+                 INSERT INTO transcript_analytics_sources (
+                     provider, source_key, source_root_key, source_path,
+                     source_session_id, analytics_session_id, chain_id,
+                     is_sidechain, hostname, seen_generation,
+                     processing_status, source_kind
+                 ) VALUES (
+                     'pi', 'source-a', 'pi:sessions', '/tmp/source-a.jsonl',
+                     'session-a', 'session-a', 'session-a', 0, 'host-a', 1,
+                     'ok', 'transcript'
+                 );",
+            )
+            .expect("seed schema-47 evidence");
+        }
+        drop(storage);
+
+        let migrated = Storage::init_at(db.clone(), false).expect("migrate schema 47");
+        let conn = migrated.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get::<_, i32>(0),
+            )
+            .expect("read migrated schema"),
+            48
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*), MIN(id), MAX(id), SUM(input_tokens),
+                        SUM(output_tokens)
+                 FROM model_usage_observations
+                 WHERE source_key IN ('source-a', 'source-b')",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .expect("read preserved observations"),
+            (2, 41, 42, 24, 16)
+        );
+        for index in [
+            "idx_model_observations_observed_provider",
+            "idx_model_observations_model_time",
+            "idx_model_observations_session_time",
+            "idx_model_observations_chain_time",
+            "idx_model_observations_source",
+            "idx_model_observations_derived_model_time",
+            "uidx_model_observations_pi_event_uuid",
+        ] {
+            assert!(index_present(&conn, index), "missing rebuilt index {index}");
+        }
+        conn.execute(
+            "INSERT INTO model_usage_observations (
+                 provider, source_key, source_record_key, source_ordinal,
+                 observation_kind, source_session_id, analytics_session_id,
+                 chain_id, is_sidechain, observed_at_ms, model_evidence,
+                 token_evidence, reasoning_tokens, stop_reason, had_error,
+                 tokens_before, reasoning_duration_ms
+             ) VALUES (
+                 'pi', 'source-summary', 'record-summary', 0, 'summary',
+                 'session-summary', 'session-summary', 'session-summary', 0,
+                 3000, 'missing', 'direct', 5, 'future-stop', 1, 100, 25
+             )",
+            [],
+        )
+        .expect("summary kind and evidence columns must be accepted");
+        assert!(
+            conn.execute(
+                "INSERT INTO model_usage_observations (
+                     provider, source_key, source_record_key, source_ordinal,
+                     observation_kind, source_session_id,
+                     analytics_session_id, chain_id, is_sidechain,
+                     observed_at_ms, model_evidence, token_evidence
+                 ) VALUES (
+                     'pi', 'source-invalid', 'record-invalid', 0, 'future',
+                     'session-invalid', 'session-invalid', 'session-invalid',
+                     0, 4000, 'missing', 'direct'
+                 )",
+                [],
+            )
+            .is_err(),
+            "the rebuilt CHECK must remain closed outside turn/token/summary"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT is_error, details_json, result_image_count, duration_ms
+                 FROM tool_actions WHERE action_key = 'action-a'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .expect("read migrated tool evidence"),
+            (None, None, None, None)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT session_name FROM transcript_analytics_sources
+                 WHERE source_key = 'source-a'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .expect("read migrated session name"),
+            None
+        );
+        conn.execute(
+            "INSERT INTO session_setting_events (
+                 provider, source_key, session_id, chain_id, source_ordinal,
+                 timestamp, setting, value
+             ) VALUES (
+                 'pi', 'source-a', 'session-a', 'session-a', 3,
+                 '2026-08-24T00:00:01.000Z', 'thinking_level', 'xhigh'
+             )",
+            [],
+        )
+        .expect("insert setting evidence");
+        assert!(
+            conn.execute(
+                "INSERT INTO session_setting_events (
+                     provider, source_key, session_id, chain_id,
+                     source_ordinal, timestamp, setting, value
+                 ) VALUES (
+                     'pi', 'source-a', 'session-a', 'session-a', 3,
+                     '2026-08-24T00:00:02.000Z', 'thinking_level', 'off'
+                 )",
+                [],
+            )
+            .is_err(),
+            "setting identity must dedupe by source, setting, and ordinal"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings
+                 WHERE key = 'transcript_analytics_reingest_pending'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read reingest marker"),
+            "1"
+        );
+        drop(conn);
+        drop(migrated);
+
+        let backup = schema_backup_path(&db, 47);
+        verify_schema_backup(&backup, 47).expect("verify schema-47 backup");
+        let reopened = Storage::init_at(db, false).expect("reopen migrated database");
+        assert_eq!(
+            reopened
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_version WHERE version = 48",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count migration 48 records"),
+            1
+        );
+        clear_env();
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Analytics Migration Backup Preflight And Recovery]]
+    #[test]
+    #[serial]
+    fn migration_48_preflight_failure_and_restore_keep_schema_47_recoverable() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let db = dir.path().join("usage.db");
+        let storage = Storage::init_at(db.clone(), false).expect("create current database");
+        {
+            let conn = storage.conn.lock().unwrap();
+            rewind_analytics_capture_migration(&conn);
+            conn.execute(
+                "INSERT INTO model_usage_observations (
+                     provider, source_key, source_record_key, source_ordinal,
+                     observation_kind, source_session_id,
+                     analytics_session_id, chain_id, is_sidechain,
+                     observed_at_ms, input_tokens, model_evidence,
+                     token_evidence
+                 ) VALUES (
+                     'pi', 'recovery-source', 'recovery-record', 0, 'turn',
+                     'recovery-session', 'recovery-session',
+                     'recovery-session', 0, 1, 17, 'missing', 'direct'
+                 )",
+                [],
+            )
+            .expect("seed recovery row");
+        }
+        drop(storage);
+
+        let file_bytes = std::fs::metadata(&db).expect("database metadata").len();
+        let error = preflight_schema_migration_with_probe(&db, |_| {
+            Ok(file_bytes
+                .saturating_mul(SCHEMA_MIGRATION_SPACE_MULTIPLIER)
+                .saturating_sub(1))
+        })
+        .expect_err("starved preflight must refuse migration");
+        assert!(error.contains("Insufficient free disk space for schema migration"));
+
+        let backup = {
+            let conn = Connection::open(&db).expect("open schema-47 database");
+            ensure_schema_backup(&conn, &db, 47).expect("publish schema-47 backup")
+        };
+        {
+            let conn = Connection::open(&db).expect("open failure fixture");
+            conn.execute_batch("CREATE TABLE model_usage_observations_v48(blocker INTEGER);")
+                .expect("block rebuild table creation");
+        }
+        let error = Storage::init_at(db.clone(), false)
+            .err()
+            .expect("blocked rebuild must fail");
+        assert!(
+            error.contains("Migration 48 rebuild model observations"),
+            "unexpected migration failure: {error}"
+        );
+        {
+            let conn = Connection::open(&db).expect("inspect rolled-back schema");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                    [],
+                    |row| row.get::<_, i32>(0),
+                )
+                .expect("read rolled-back version"),
+                47
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT input_tokens FROM model_usage_observations
+                     WHERE source_key = 'recovery-source'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read last-good row"),
+                17
+            );
+            conn.execute_batch("DROP TABLE model_usage_observations_v48;")
+                .expect("remove rebuild blocker");
+        }
+        let migrated = Storage::init_at(db.clone(), false).expect("resume migration");
+        assert_eq!(
+            migrated
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT input_tokens FROM model_usage_observations
+                     WHERE source_key = 'recovery-source'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read resumed row"),
+            17
+        );
+        drop(migrated);
+
+        for suffix in ["", "-wal", "-shm"] {
+            let artifact = PathBuf::from(format!("{}{suffix}", db.display()));
+            if artifact.exists() {
+                std::fs::remove_file(artifact).expect("remove migrated artifact");
+            }
+        }
+        std::fs::copy(&backup, &db).expect("restore schema-47 backup");
+        let restored = Storage::init_at(db, false).expect("migrate restored backup");
+        assert_eq!(
+            restored
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT input_tokens FROM model_usage_observations
+                     WHERE source_key = 'recovery-source'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read restored row"),
+            17
+        );
+        clear_env();
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Analytics Migration Measurement]]
+    #[test]
+    #[ignore = "reproducible migration wall-time measurement"]
+    #[serial]
+    fn measure_analytics_capture_migration_on_pinned_corpus() {
+        const MANIFEST: &str = "pi-analytics-migration-v1\nsessions=80\nentries=30700\nassistant_messages=12685\ntool_results=16670\n";
+        const MANIFEST_SHA256: &str =
+            "0489da2b94fe813d785f8b5bc4ed2f871b3f0732cde6aab5334c55788f9f673e";
+        const SESSIONS: usize = 80;
+        const OBSERVATIONS: usize = 12_685;
+        const TOOL_ACTIONS: usize = 16_670;
+
+        assert_eq!(format!("{:x}", Sha256::digest(MANIFEST)), MANIFEST_SHA256);
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let db = dir.path().join("usage.db");
+        let storage = Storage::init_at(db.clone(), false).expect("create current database");
+        {
+            let mut conn = storage.conn.lock().unwrap();
+            rewind_analytics_capture_migration(&conn);
+            let tx = conn.transaction().expect("begin corpus seed");
+            {
+                let mut source_stmt = tx
+                    .prepare_cached(
+                        "INSERT INTO transcript_analytics_sources (
+                             provider, source_key, source_root_key, source_path,
+                             source_session_id, analytics_session_id, chain_id,
+                             is_sidechain, hostname, seen_generation,
+                             processing_status, source_kind
+                         ) VALUES (
+                             'pi', ?1, 'pi:sessions', ?2, ?3, ?3, ?3, 0,
+                             'migration-host', 1, 'ok', 'transcript'
+                         )",
+                    )
+                    .expect("prepare source seed");
+                for index in 0..SESSIONS {
+                    source_stmt
+                        .execute(params![
+                            format!("migration-source-{index:03}"),
+                            format!("/corpus/session-{index:03}.jsonl"),
+                            format!("migration-session-{index:03}"),
+                        ])
+                        .expect("seed source");
+                }
+            }
+            {
+                let mut observation_stmt = tx
+                    .prepare_cached(
+                        "INSERT INTO model_usage_observations (
+                             provider, source_key, source_record_key,
+                             source_ordinal, observation_kind,
+                             source_session_id, analytics_session_id, chain_id,
+                             turn_id, raw_model_id, derived_model_id, hostname,
+                             is_sidechain, observed_at_ms, input_tokens,
+                             output_tokens, cache_creation_tokens,
+                             cache_read_tokens, model_evidence, token_evidence,
+                             event_uuid, total_cost
+                         ) VALUES (
+                             'pi', ?1, ?2, ?3, 'turn', ?4, ?4, ?4, ?2,
+                             'anthropic/claude-sonnet-4-5',
+                             'anthropic/claude-sonnet-4-5', 'migration-host',
+                             0, ?5, ?6, ?7, ?8, ?9, 'explicit', 'direct', ?2,
+                             ?10
+                         )",
+                    )
+                    .expect("prepare observation seed");
+                for index in 0..OBSERVATIONS {
+                    let session = index % SESSIONS;
+                    observation_stmt
+                        .execute(params![
+                            format!("migration-source-{session:03}"),
+                            format!("migration-turn-{index:05}"),
+                            i64::try_from(index).unwrap(),
+                            format!("migration-session-{session:03}"),
+                            1_750_000_000_000_i64 + i64::try_from(index).unwrap(),
+                            1_000_i64 + i64::try_from(index % 500).unwrap(),
+                            200_i64 + i64::try_from(index % 100).unwrap(),
+                            i64::try_from(index % 50).unwrap(),
+                            i64::try_from(index % 300).unwrap(),
+                            (index % 100) as f64 / 100.0,
+                        ])
+                        .expect("seed observation");
+                }
+            }
+            {
+                let mut tool_stmt = tx
+                    .prepare_cached(
+                        "INSERT INTO tool_actions (
+                             provider, source_key, action_key, message_id,
+                             session_id, chain_id, tool_name, category,
+                             summary, timestamp, is_sidechain
+                         ) VALUES (
+                             'pi', ?1, ?2, ?3, ?4, ?4, 'read', 'read',
+                             'migration tool result', ?5, 0
+                         )",
+                    )
+                    .expect("prepare tool seed");
+                for index in 0..TOOL_ACTIONS {
+                    let session = index % SESSIONS;
+                    tool_stmt
+                        .execute(params![
+                            format!("migration-source-{session:03}"),
+                            format!("migration-tool-{index:05}"),
+                            format!("migration-message-{index:05}"),
+                            format!("migration-session-{session:03}"),
+                            format!("2026-08-24T{:02}:{:02}:00.000Z", index % 24, index % 60),
+                        ])
+                        .expect("seed tool action");
+                }
+            }
+            tx.commit().expect("commit corpus seed");
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .expect("checkpoint corpus");
+        }
+        drop(storage);
+
+        let bytes_before = std::fs::metadata(&db).expect("corpus metadata").len();
+        let started = Instant::now();
+        let migrated = Storage::init_at(db, false).expect("measure migration");
+        let wall_time = started.elapsed();
+        let conn = migrated.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM model_usage_observations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count measured observations"),
+            i64::try_from(OBSERVATIONS).unwrap()
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM tool_actions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count measured tool actions"),
+            i64::try_from(TOOL_ACTIONS).unwrap()
+        );
+        eprintln!(
+            "analytics-migration-measurement manifest_sha256={MANIFEST_SHA256} sessions={SESSIONS} entries=30700 observations={OBSERVATIONS} tool_actions={TOOL_ACTIONS} bytes_before={bytes_before} wall_time_ms={}",
+            wall_time.as_millis()
+        );
+        clear_env();
+    }
+
     // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Schema 45 Backup And Ownership Migration]]
     #[test]
     #[serial]
@@ -22032,6 +22923,7 @@ mod tests {
         let storage = Storage::init_at(db.clone(), false).expect("create current database");
         {
             let conn = storage.conn.lock().unwrap();
+            rewind_analytics_capture_migration(&conn);
             conn.execute_batch(
                 "DROP TABLE pi_event_receipts;
                  DROP TABLE pi_session_lifecycle;
@@ -22073,7 +22965,7 @@ mod tests {
         assert!(std::fs::metadata(&wal).expect("schema-45 WAL exists").len() > 0);
         drop(storage);
 
-        let backup = schema_45_backup_path(&db);
+        let backup = schema_backup_path(&db, 45);
         let building = PathBuf::from(format!("{}.building", backup.display()));
         std::fs::write(&building, b"interrupted backup").expect("seed interrupted backup");
         let migrated = Storage::init_at(db.clone(), false).expect("migrate schema 45");
@@ -22089,7 +22981,7 @@ mod tests {
                     |row| row.get::<_, i32>(0),
                 )
                 .expect("read migrated schema"),
-            47
+            48
         );
         drop(migrated);
         let reopened = Storage::init_at(db.clone(), false).expect("reopen migrated database");
@@ -22169,7 +23061,7 @@ mod tests {
                     |row| row.get::<_, i32>(0),
                 )
                 .expect("read resumed schema"),
-            47
+            48
         );
         clear_env();
     }
@@ -27118,6 +28010,7 @@ mod tests {
         let storage = init_storage_in(&dir);
         {
             let conn = storage.conn.lock().unwrap();
+            rewind_analytics_capture_migration(&conn);
             conn.execute_batch(
                 "INSERT INTO model_usage_observations (
                      provider, source_key, source_record_key, source_ordinal,
@@ -27171,7 +28064,7 @@ mod tests {
                 |row| row.get::<_, i32>(0),
             )
             .expect("read schema version"),
-            47
+            48
         );
         for column in [
             "event_uuid",
@@ -29272,16 +30165,17 @@ mod tests {
     /// fixtures stamp each with the same marker token, so a replacement that
     /// only partially landed is visible as a changed marker set and not only
     /// as a changed row count.
-    const OWNED_MARKER_COLUMNS: [(&str, &str); 5] = [
+    const OWNED_MARKER_COLUMNS: [(&str, &str); 6] = [
         ("session_events", "agent_id"),
         ("response_times", "agent_id"),
         ("tool_actions", "agent_id"),
         ("skill_usages", "tool_name"),
         ("hook_invocations", "tool_name"),
+        ("session_setting_events", "value"),
     ];
 
     /// Identity of one retained transcript source plus the shape of the
-    /// five-table snapshot it owns. Bundled so the fixture builders stay
+    /// six-table snapshot it owns. Bundled so the fixture builders stay
     /// single-argument as the owned identity grows.
     #[derive(Clone, Copy)]
     struct TranscriptSourceSpec<'a> {
@@ -29308,6 +30202,7 @@ mod tests {
                 is_sidechain: false,
                 agent_id: None,
                 project: None,
+                session_name: Some(format!("{} session", self.marker)),
                 cwd: None,
                 hostname: "fixture-host".to_string(),
                 mtime_ns: 1_000,
@@ -29317,7 +30212,7 @@ mod tests {
             }
         }
 
-        /// A snapshot holding `rows` rows in each of the five owned tables.
+        /// A snapshot holding `rows` rows in each of the six owned tables.
         /// Dedupe keys embed the marker so consecutive snapshots of one
         /// source produce distinguishable row sets.
         fn snapshot(&self) -> TranscriptAnalyticsSnapshot {
@@ -29377,6 +30272,10 @@ mod tests {
                         summary: format!("{marker} summary {index}"),
                         full_input: None,
                         full_output: None,
+                        is_error: Some(index % 2 != 0),
+                        details_json: Some(format!(r#"{{"marker":"{marker}-{index}"}}"#)),
+                        result_image_count: Some(i64::try_from(index).unwrap()),
+                        duration_ms: Some(i64::try_from(index + 1).unwrap()),
                         lines_added: None,
                         lines_removed: None,
                         timestamp: at(index),
@@ -29423,12 +30322,27 @@ mod tests {
                         message_id: None,
                     })
                     .collect(),
+                setting_events: (0..self.rows)
+                    .map(
+                        |index| crate::transcript_analytics::OwnedSessionSettingEvent {
+                            provider,
+                            source_key: source_key.clone(),
+                            session_id: session_id.clone(),
+                            chain_id: session_id.clone(),
+                            parent_chain_id: None,
+                            source_ordinal: i64::try_from(index).unwrap(),
+                            timestamp: at(index),
+                            setting: "fixture-setting".to_string(),
+                            value: marker.clone(),
+                        },
+                    )
+                    .collect(),
                 pi_evidence: None,
             }
         }
     }
 
-    /// Write one source's five-table snapshot through the real replacement
+    /// Write one source's six-table snapshot through the real replacement
     /// path and assert it landed, so tests start from persisted evidence
     /// rather than hand-inserted rows.
     fn seed_transcript_source(storage: &Storage, spec: &TranscriptSourceSpec<'_>) {
@@ -29442,7 +30356,7 @@ mod tests {
         );
     }
 
-    /// The same five-table snapshot the spec describes, with one row per
+    /// The same six-table snapshot the spec describes, with one row per
     /// supplied timestamp in every table.
     ///
     /// The insert filter is a per-row timestamp decision, so its fixtures have
@@ -29512,6 +30426,17 @@ mod tests {
                 .enumerate()
                 .map(
                     |(index, row)| crate::transcript_analytics::OwnedHookInvocation {
+                        timestamp: stamp(index),
+                        ..row
+                    },
+                )
+                .collect(),
+            setting_events: base
+                .setting_events
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, row)| crate::transcript_analytics::OwnedSessionSettingEvent {
                         timestamp: stamp(index),
                         ..row
                     },
@@ -29628,7 +30553,7 @@ mod tests {
         .expect("read registry mtime")
     }
 
-    /// A five-table replacement is one transaction: a snapshot that fails on
+    /// A six-table replacement is one transaction: a snapshot that fails on
     /// the registry upsert must leave every prior row of that source intact,
     /// and a valid empty snapshot must clear only its own source.
     // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Owned Snapshot Replacement Atomicity]]
@@ -29691,7 +30616,7 @@ mod tests {
         assert_eq!(
             owned_source_rows(&storage, target.provider, target.source_key),
             before,
-            "a failed replacement must roll back all five owned tables"
+            "a failed replacement must roll back all six owned tables"
         );
         assert_eq!(
             owned_source_rows(&storage, sibling.provider, sibling.source_key),
@@ -29733,8 +30658,8 @@ mod tests {
     }
 
     /// The payload carve-out is invisible in a row count, so it needs its own
-    /// assertion: the `tool_detail` row must still be there, and only its two
-    /// payload columns may have been dropped.
+    /// assertion: the `tool_detail` row must still be there, and only its
+    /// three payload columns may have been dropped.
     // @lat: [[backend#Backend#Database#tool_detail payload carve-out#Tool Detail Payload Test Specs#Tool Detail Rows Land Without Payloads]]
     #[test]
     #[serial]
@@ -29766,6 +30691,10 @@ mod tests {
                         category: categories[index].to_string(),
                         full_input: Some(format!("{{\"in\":{index}}}")),
                         full_output: Some(format!("out-{index}")),
+                        is_error: Some(index == 0),
+                        details_json: Some(format!("{{\"detail\":{index}}}")),
+                        result_image_count: Some(i64::try_from(index).unwrap()),
+                        duration_ms: Some(i64::try_from(index + 10).unwrap()),
                         ..row
                     },
                 )
@@ -29783,11 +30712,21 @@ mod tests {
             "the carve-out must not change whether the replacement succeeds"
         );
 
-        let stored: Vec<(String, Option<String>, Option<String>)> = {
+        type StoredToolEvidence = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let stored: Vec<StoredToolEvidence> = {
             let conn = storage.conn.lock().unwrap();
             let mut statement = conn
                 .prepare(
-                    "SELECT category, full_input, full_output
+                    "SELECT category, full_input, full_output, details_json,
+                            is_error, result_image_count, duration_ms
                      FROM tool_actions
                      WHERE provider = ?1 AND source_key = ?2
                      ORDER BY action_key",
@@ -29795,7 +30734,15 @@ mod tests {
                 .expect("prepare payload read-back");
             statement
                 .query_map(params![spec.provider.as_str(), spec.source_key], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
                 })
                 .expect("query payload read-back")
                 .collect::<Result<Vec<_>, _>>()
@@ -29805,19 +30752,35 @@ mod tests {
         assert_eq!(
             stored,
             vec![
-                ("tool_detail".to_string(), None, None),
+                (
+                    "tool_detail".to_string(),
+                    None,
+                    None,
+                    None,
+                    Some(1),
+                    Some(0),
+                    Some(10),
+                ),
                 (
                     "code_change".to_string(),
                     Some("{\"in\":1}".to_string()),
                     Some("out-1".to_string()),
+                    Some("{\"detail\":1}".to_string()),
+                    Some(0),
+                    Some(1),
+                    Some(11),
                 ),
                 (
                     "command".to_string(),
                     Some("{\"in\":2}".to_string()),
                     Some("out-2".to_string()),
+                    Some("{\"detail\":2}".to_string()),
+                    Some(0),
+                    Some(2),
+                    Some(12),
                 ),
             ],
-            "only the tool_detail row may lose its payloads, and it must still \
+            "only the tool_detail row may lose its three payloads, and it must still \
              be present — the subagent breakdown counts tool_actions rows with \
              no category filter"
         );
@@ -29885,21 +30848,71 @@ mod tests {
                 "{table} must hold only the post-cutoff rows"
             );
         }
-        for table in ["response_times", "skill_usages", "hook_invocations"] {
+        for table in [
+            "response_times",
+            "skill_usages",
+            "hook_invocations",
+            "session_setting_events",
+        ] {
             assert_eq!(
                 owned_timestamps(&storage, spec.provider, spec.source_key, table),
                 timestamps,
                 "{table} is not a retention target and must keep full history"
             );
         }
+        let tool_evidence = {
+            let conn = storage.conn.lock().unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT action_key, is_error, details_json,
+                            result_image_count, duration_ms
+                     FROM tool_actions
+                     WHERE provider = ?1 AND source_key = ?2
+                     ORDER BY action_key",
+                )
+                .expect("prepare filtered tool evidence read");
+            statement
+                .query_map(params![spec.provider.as_str(), spec.source_key], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                })
+                .expect("query filtered tool evidence")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect filtered tool evidence")
+        };
+        assert_eq!(
+            tool_evidence,
+            vec![
+                (
+                    "wm-action-2".to_string(),
+                    Some(0),
+                    Some("{\"marker\":\"wm-2\"}".to_string()),
+                    Some(2),
+                    Some(3),
+                ),
+                (
+                    "wm-action-3".to_string(),
+                    Some(1),
+                    Some("{\"marker\":\"wm-3\"}".to_string()),
+                    Some(3),
+                    Some(4),
+                ),
+            ],
+            "new tool evidence must follow its owning row through watermark filtering"
+        );
 
         // The source has to stay registered and reconcilable, so the registry
         // row is written exactly as an unfiltered replacement would write it.
-        let registry: (String, i64, i64, String, i64) = {
+        let registry: (String, Option<String>, i64, i64, String, i64) = {
             let conn = storage.conn.lock().unwrap();
             conn.query_row(
-                "SELECT processing_status, mtime_ns, size_bytes, content_sha256,
-                        seen_generation
+                "SELECT processing_status, session_name, mtime_ns, size_bytes,
+                        content_sha256, seen_generation
                  FROM transcript_analytics_sources
                  WHERE provider = ?1 AND source_key = ?2",
                 params![spec.provider.as_str(), spec.source_key],
@@ -29910,6 +30923,7 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
@@ -29920,6 +30934,7 @@ mod tests {
             registry,
             (
                 "ok".to_string(),
+                expected.session_name.clone(),
                 expected.mtime_ns,
                 expected.size_bytes,
                 expected.content_sha256.clone(),
@@ -30028,6 +31043,10 @@ mod tests {
                 summary: format!("{marker} summary"),
                 full_input: None,
                 full_output: None,
+                is_error: None,
+                details_json: None,
+                result_image_count: None,
+                duration_ms: None,
                 lines_added: None,
                 lines_removed: None,
                 timestamp: timestamp.to_string(),

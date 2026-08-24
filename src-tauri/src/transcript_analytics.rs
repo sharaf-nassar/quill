@@ -98,6 +98,7 @@ pub(crate) struct TranscriptAnalyticsSourceState {
     pub(crate) is_sidechain: bool,
     pub(crate) agent_id: Option<String>,
     pub(crate) project: Option<String>,
+    pub(crate) session_name: Option<String>,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) hostname: String,
     pub(crate) mtime_ns: i64,
@@ -152,6 +153,10 @@ pub(crate) struct OwnedToolAction {
     pub(crate) summary: String,
     pub(crate) full_input: Option<String>,
     pub(crate) full_output: Option<String>,
+    pub(crate) is_error: Option<bool>,
+    pub(crate) details_json: Option<String>,
+    pub(crate) result_image_count: Option<i64>,
+    pub(crate) duration_ms: Option<i64>,
     pub(crate) lines_added: Option<i64>,
     pub(crate) lines_removed: Option<i64>,
     pub(crate) timestamp: String,
@@ -229,6 +234,10 @@ pub(crate) fn owned_tool_rows(
                 summary: action.summary.clone(),
                 full_input: action.full_input.clone(),
                 full_output: action.full_output.clone(),
+                is_error: None,
+                details_json: None,
+                result_image_count: None,
+                duration_ms: None,
                 lines_added: action.lines_added,
                 lines_removed: action.lines_removed,
                 timestamp: action.timestamp.clone(),
@@ -280,6 +289,19 @@ pub(crate) struct OwnedHookInvocation {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct OwnedSessionSettingEvent {
+    pub(crate) provider: IntegrationProvider,
+    pub(crate) source_key: String,
+    pub(crate) session_id: String,
+    pub(crate) chain_id: String,
+    pub(crate) parent_chain_id: Option<String>,
+    pub(crate) source_ordinal: i64,
+    pub(crate) timestamp: String,
+    pub(crate) setting: String,
+    pub(crate) value: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct TranscriptAnalyticsSnapshot {
     pub(crate) source: TranscriptAnalyticsSourceState,
     pub(crate) session_events: Vec<OwnedSessionEvent>,
@@ -287,6 +309,7 @@ pub(crate) struct TranscriptAnalyticsSnapshot {
     pub(crate) tool_actions: Vec<OwnedToolAction>,
     pub(crate) skill_usages: Vec<OwnedSkillUsage>,
     pub(crate) hook_invocations: Vec<OwnedHookInvocation>,
+    pub(crate) setting_events: Vec<OwnedSessionSettingEvent>,
     pub(crate) pi_evidence: Option<PiPersistedEvidence>,
 }
 
@@ -343,6 +366,11 @@ pub(crate) struct PiPersistedUsage {
     pub(crate) output_tokens: i64,
     pub(crate) cache_creation_tokens: i64,
     pub(crate) cache_read_tokens: i64,
+    pub(crate) reasoning_tokens: Option<i64>,
+    pub(crate) stop_reason: Option<String>,
+    pub(crate) had_error: Option<bool>,
+    pub(crate) tokens_before: Option<i64>,
+    pub(crate) reasoning_duration_ms: Option<i64>,
     pub(crate) input_cost: Option<f64>,
     pub(crate) output_cost: Option<f64>,
     pub(crate) cache_read_cost: Option<f64>,
@@ -1914,6 +1942,11 @@ fn build_pi_persisted_evidence(
             output_tokens: pi_usage_dimension(native_usage, "output")?,
             cache_creation_tokens: pi_usage_dimension(native_usage, "cacheWrite")?,
             cache_read_tokens: pi_usage_dimension(native_usage, "cacheRead")?,
+            reasoning_tokens: None,
+            stop_reason: None,
+            had_error: None,
+            tokens_before: None,
+            reasoning_duration_ms: None,
             input_cost: pi_usage_cost(native_usage, "input")?,
             output_cost: pi_usage_cost(native_usage, "output")?,
             cache_read_cost: pi_usage_cost(native_usage, "cacheRead")?,
@@ -2074,6 +2107,7 @@ fn parse_transcript_analytics_source_bytes(
             is_sidechain: native_identity.is_sidechain,
             agent_id: native_identity.agent_id.clone(),
             project,
+            session_name: None,
             cwd,
             hostname: hostname.to_owned(),
             mtime_ns: stable_stat.mtime_ns(),
@@ -2086,6 +2120,7 @@ fn parse_transcript_analytics_source_bytes(
         tool_actions,
         skill_usages,
         hook_invocations,
+        setting_events: Vec::new(),
         pi_evidence,
     };
     Ok(ParsedTranscriptAnalyticsSource {
@@ -2132,6 +2167,10 @@ pub(crate) fn stamp_analytics_root(
         row.provider == native.provider
             && row.source_key == source_key
             && row.chain_id == native.chain_id
+    }) && parsed.snapshot.setting_events.iter().all(|row| {
+        row.provider == native.provider
+            && row.source_key == source_key
+            && row.chain_id == native.chain_id
     });
     if !rows_match {
         return Err(TranscriptAnalyticsError::InconsistentSnapshot);
@@ -2152,6 +2191,9 @@ pub(crate) fn stamp_analytics_root(
         row.session_id = root_session_id.to_owned();
     }
     for row in &mut parsed.snapshot.hook_invocations {
+        row.session_id = root_session_id.to_owned();
+    }
+    for row in &mut parsed.snapshot.setting_events {
         row.session_id = root_session_id.to_owned();
     }
     Ok(parsed.snapshot)
@@ -2270,6 +2312,52 @@ mod tests {
         );
     }
 
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Analytics Evidence Foundation Starts Empty]]
+    #[test]
+    fn pi_analytics_evidence_foundation_starts_empty() {
+        let dir = TempDir::new().expect("corpus directory");
+        let session_id = "01a018c8-2867-71be-a72b-cdf822ddbe75";
+        let path = dir.path().join("root.jsonl");
+        std::fs::write(&path, include_str!("fixtures/pi-parity-corpus/root.jsonl"))
+            .expect("write corpus session");
+        let source = DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: source_root_key(IntegrationProvider::Pi),
+            source_key: crate::storage::pi_source_key(TEST_HOSTNAME, session_id)
+                .expect("canonical Pi source key"),
+            filesystem_path: path.clone(),
+            canonical_path: path,
+            layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
+        };
+
+        let parsed = parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+            .expect("parse persisted Pi session");
+        assert_eq!(parsed.snapshot.source.session_name, None);
+        assert!(parsed.snapshot.setting_events.is_empty());
+        assert!(parsed.snapshot.tool_actions.iter().all(|row| {
+            row.is_error.is_none()
+                && row.details_json.is_none()
+                && row.result_image_count.is_none()
+                && row.duration_ms.is_none()
+        }));
+        assert!(
+            parsed
+                .snapshot
+                .pi_evidence
+                .as_ref()
+                .expect("Pi evidence")
+                .usage
+                .iter()
+                .all(|row| {
+                    row.reasoning_tokens.is_none()
+                        && row.stop_reason.is_none()
+                        && row.had_error.is_none()
+                        && row.tokens_before.is_none()
+                        && row.reasoning_duration_ms.is_none()
+                })
+        );
+    }
+
     fn set_mtime_ns(path: &Path, mtime_ns: i64) {
         let file = File::options()
             .write(true)
@@ -2377,6 +2465,7 @@ mod tests {
             agent_id: None,
             is_sidechain: false,
             project: None,
+            session_name: None,
             cwd: None,
             hostname: Some(TEST_HOSTNAME.to_owned()),
             mtime_ns: Some(mtime_ns),
