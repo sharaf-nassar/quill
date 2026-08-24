@@ -4,10 +4,7 @@
 //! module owns the four writable configuration values; `web_ui.last_error` is
 //! controller-owned status and remains absent until a listener failure occurs.
 
-use std::{
-    fmt,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::Serialize;
 
@@ -56,14 +53,6 @@ impl WebUiConfigError {
     }
 }
 
-impl fmt::Display for WebUiConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.message)
-    }
-}
-
-impl std::error::Error for WebUiConfigError {}
-
 impl Default for WebUiConfig {
     fn default() -> Self {
         Self {
@@ -97,21 +86,13 @@ pub fn load_web_ui_config(storage: &Storage) -> Result<WebUiConfig, WebUiConfigE
         None => defaults.enabled,
         Some("true") => true,
         Some("false") => false,
-        Some(_) => {
-            return Err(WebUiConfigError::new(
-                WebUiConfigErrorCode::InvalidStoredConfiguration,
-                "Stored Web UI configuration is invalid. Reset it from Settings.",
-            ));
-        }
+        Some(_) => return Err(invalid_stored_configuration()),
     };
     let port = match values.get(WEB_UI_PORT_KEY).and_then(Option::as_deref) {
         None => defaults.port,
-        Some(value) => value.parse::<u16>().map_err(|_| {
-            WebUiConfigError::new(
-                WebUiConfigErrorCode::InvalidStoredConfiguration,
-                "Stored Web UI configuration is invalid. Reset it from Settings.",
-            )
-        })?,
+        Some(value) => value
+            .parse::<u16>()
+            .map_err(|_| invalid_stored_configuration())?,
     };
     let host_policy = match values
         .get(WEB_UI_HOST_POLICY_KEY)
@@ -120,21 +101,11 @@ pub fn load_web_ui_config(storage: &Storage) -> Result<WebUiConfig, WebUiConfigE
         None => defaults.host_policy,
         Some("all") => WebUiHostPolicy::All,
         Some("allowlist") => WebUiHostPolicy::Allowlist,
-        Some(_) => {
-            return Err(WebUiConfigError::new(
-                WebUiConfigErrorCode::InvalidStoredConfiguration,
-                "Stored Web UI configuration is invalid. Reset it from Settings.",
-            ));
-        }
+        Some(_) => return Err(invalid_stored_configuration()),
     };
     let allowlist = match values.get(WEB_UI_ALLOWLIST_KEY).and_then(Option::as_deref) {
         None => defaults.allowlist,
-        Some(value) => serde_json::from_str(value).map_err(|_| {
-            WebUiConfigError::new(
-                WebUiConfigErrorCode::InvalidStoredConfiguration,
-                "Stored Web UI configuration is invalid. Reset it from Settings.",
-            )
-        })?,
+        Some(value) => serde_json::from_str(value).map_err(|_| invalid_stored_configuration())?,
     };
 
     validate_web_ui_config(WebUiConfig {
@@ -143,16 +114,7 @@ pub fn load_web_ui_config(storage: &Storage) -> Result<WebUiConfig, WebUiConfigE
         host_policy,
         allowlist,
     })
-    .map_err(|error| {
-        if error.code == WebUiConfigErrorCode::Storage {
-            error
-        } else {
-            WebUiConfigError::new(
-                WebUiConfigErrorCode::InvalidStoredConfiguration,
-                "Stored Web UI configuration is invalid. Reset it from Settings.",
-            )
-        }
-    })
+    .map_err(|_| invalid_stored_configuration())
 }
 
 /// Validate, canonicalize, and atomically persist all writable Web UI keys.
@@ -175,7 +137,10 @@ pub fn save_web_ui_config(
 
     storage
         .set_settings_atomically(&[
-            (WEB_UI_ENABLED_KEY, bool_setting_value(config.enabled)),
+            (
+                WEB_UI_ENABLED_KEY,
+                crate::bool_setting_value(config.enabled),
+            ),
             (WEB_UI_PORT_KEY, &port),
             (WEB_UI_HOST_POLICY_KEY, host_policy),
             (WEB_UI_ALLOWLIST_KEY, &allowlist),
@@ -319,15 +284,18 @@ fn looks_like_invalid_ipv4(entry: &str) -> bool {
             .all(|label| !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+const fn invalid_stored_configuration() -> WebUiConfigError {
+    WebUiConfigError::new(
+        WebUiConfigErrorCode::InvalidStoredConfiguration,
+        "Stored Web UI configuration is invalid. Reset it from Settings.",
+    )
+}
+
 const fn invalid_allowlist_entry() -> WebUiConfigError {
     WebUiConfigError::new(
         WebUiConfigErrorCode::InvalidAllowlistEntry,
         "Web UI allowlist entries must be IPv4 or IPv6 addresses, CIDR ranges, or RFC-1123 hostnames.",
     )
-}
-
-const fn bool_setting_value(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
 }
 
 const fn host_policy_value(policy: WebUiHostPolicy) -> &'static str {
@@ -419,31 +387,20 @@ mod tests {
         );
 
         let defaults = WebUiConfig::default();
-        assert_eq!(
-            validate_web_ui_config_for_ports(
-                WebUiConfig {
-                    port: 19876,
-                    ..defaults.clone()
-                },
-                19876,
-                19877,
-            )
-            .expect_err("ingestion port collision")
-            .code,
-            WebUiConfigErrorCode::PortCollision
-        );
-        assert_eq!(
-            validate_web_ui_config_for_ports(
-                WebUiConfig {
-                    port: 19877,
-                    ..defaults
-                },
-                19876,
-                19877,
-            )
-            .expect_err("context port collision")
-            .code,
-            WebUiConfigErrorCode::PortCollision
-        );
+        for port in [19876, 19877] {
+            assert_eq!(
+                validate_web_ui_config_for_ports(
+                    WebUiConfig {
+                        port,
+                        ..defaults.clone()
+                    },
+                    19876,
+                    19877,
+                )
+                .expect_err("Quill listener port collision")
+                .code,
+                WebUiConfigErrorCode::PortCollision
+            );
+        }
     }
 }
