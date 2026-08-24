@@ -1,7 +1,7 @@
 ---
 title: Loaded hosts invalidate tight p95 release qualification
 date: 2026-08-18
-last_updated: 2026-08-20
+last_updated: 2026-08-24
 component: pi-tracking-qualification
 tags: [benchmark, p95, rss, scheduler, swap, qualification, ports]
 problem_type: environment
@@ -83,8 +83,30 @@ already burned at least three attempts, one of them (attempt 3) failing purely
 on RSS p95 for the load reason documented here; each of those attempts was
 cheap to avoid and expensive to run.
 
+## Scoped backfill variant
+
+Run `run-20260824T054432.HNHvMq` reached the same environment gate on
+`quill-3cmg.8`, whose acceptance requires live-fold p95 during a Pi-scoped
+history backfill. Deterministic implementation tests passed in the preserved
+worktree, but the worker correctly refused to run the measurement.
+
+The first preflight reported load `5.68/8.24/12.10` with Scribe, Pi, Docker,
+and container work active. A supervisor-directed recheck was worse:
+`15.34/18.86/15.81`, with unrelated ESLint, Scribe, Docker, and several Pi
+processes still consuming CPU. Ports `19876` and `19877` were free, proving
+that the port check alone is insufficient for any tight fold-latency gate.
+
+The task remains open with stable signature
+`performance preflight: no-concurrent-workload assumption violated`. Its
+uncommitted code and passing deterministic tests are preserved at
+`/home/mamba/work/quill/.worktrees/implement-ready/run-20260824T054432.HNHvMq/quill-3cmg.8`.
+There is no squash commit because recording invalid p95 evidence would violate
+the acceptance contract.
+
 ## Prevention
 
+- Apply this preflight to scoped backfill fold-latency gates, not only release
+  qualification. Free ports do not prove a valid measurement window.
 - Run the two-command preflight above before dispatching qualification, and
   treat either signal as disqualifying on its own.
 - Record load, swap, and top CPU consumers beside every tight p95 result.
