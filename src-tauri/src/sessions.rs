@@ -2567,6 +2567,9 @@ pub struct ToolAction {
     pub summary: String,
     pub full_input: Option<String>,  // JSON string, max 10KB
     pub full_output: Option<String>, // JSON string, max 10KB, set later from tool_result
+    pub is_error: Option<bool>,
+    pub details_json: Option<String>,
+    pub result_image_count: Option<i64>,
     // Lines added/removed for `code_change` actions, computed at ingest from the
     // FULL (untruncated) tool input before `full_input` is capped at 10KB. NULL
     // for non-code-change actions and legacy rows ingested before migration 33.
@@ -2696,6 +2699,8 @@ pub struct HookInvocation {
 // JSONL parsing
 // ---------------------------------------------------------------------------
 
+const TOOL_RESULT_DETAILS_MAX_BYTES: usize = 10_240;
+
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
@@ -2709,6 +2714,26 @@ fn truncate(s: &str, max_len: usize) -> String {
             .unwrap_or(0);
         format!("{}... [truncated]", &s[..boundary])
     }
+}
+
+fn pi_tool_result_details(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(serde_json::Value::as_object)
+        .and_then(|details| serde_json::to_string(details).ok())
+        .filter(|details| details.len() <= TOOL_RESULT_DETAILS_MAX_BYTES)
+}
+
+fn pi_tool_result_image_count(content: Option<&serde_json::Value>) -> i64 {
+    content
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |blocks| {
+            blocks
+                .iter()
+                .filter(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("image")
+                })
+                .count() as i64
+        })
 }
 
 /// Build a human-readable summary for a Claude tool invocation.
@@ -3957,6 +3982,15 @@ pub(crate) fn extract_pi_session(
                 .get("content")
                 .map(pi_message_text)
                 .map(|value| truncate(&value, 10_240));
+            let is_error = Some(
+                entry
+                    .message
+                    .get("isError")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            );
+            let details_json = pi_tool_result_details(entry.message.get("details"));
+            let result_image_count = Some(pi_tool_result_image_count(entry.message.get("content")));
             if let Some(tool_entry) = tool_use_map.get(tool_use_id)
                 && let Some(message) = messages.get_mut(tool_entry.message_idx)
             {
@@ -3966,6 +4000,9 @@ pub(crate) fn extract_pi_session(
                     .find(|action| action.tool_use_id == tool_use_id)
                 {
                     action.full_output = output.clone();
+                    action.is_error = is_error;
+                    action.details_json = details_json;
+                    action.result_image_count = result_image_count;
                 }
                 if tool_entry.category == "command"
                     && let Some(output) = &output
@@ -4047,6 +4084,9 @@ pub(crate) fn extract_pi_session(
                     summary: summary.clone(),
                     full_input: full_input.clone(),
                     full_output: None,
+                    is_error: None,
+                    details_json: None,
+                    result_image_count: None,
                     lines_added,
                     lines_removed,
                     timestamp: entry.base.timestamp.clone(),
@@ -4470,6 +4510,9 @@ fn extract_claude_messages_from_jsonl_records(
                                 summary: summary.clone(),
                                 full_input: full_input.clone(),
                                 full_output: None,
+                                is_error: None,
+                                details_json: None,
+                                result_image_count: None,
                                 lines_added,
                                 lines_removed,
                                 timestamp: timestamp.clone(),
@@ -4945,6 +4988,9 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             summary: summary.clone(),
                             full_input: Some(truncate(&arguments, 10240)),
                             full_output: None,
+                            is_error: None,
+                            details_json: None,
+                            result_image_count: None,
                             lines_added,
                             lines_removed,
                             timestamp: timestamp.clone(),
@@ -5023,6 +5069,9 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             summary: summary.clone(),
                             full_input: Some(truncate(&input, 10240)),
                             full_output: None,
+                            is_error: None,
+                            details_json: None,
+                            result_image_count: None,
                             lines_added,
                             lines_removed,
                             timestamp: timestamp.clone(),
@@ -5897,6 +5946,126 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.len() <= 10_256 && value.ends_with("... [truncated]"))
         );
+    }
+
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Tool Result Correlation]]
+    #[test]
+    fn pi_tool_result_evidence_is_bounded_and_last_write_wins() {
+        let bounded_details = serde_json::json!({"payload": "x".repeat(10_226)});
+        let bounded_details_json =
+            serde_json::to_string(&bounded_details).expect("serialize details");
+        assert_eq!(bounded_details_json.len(), TOOL_RESULT_DETAILS_MAX_BYTES);
+        let oversized_details = serde_json::json!({"diff": "x".repeat(10_230)});
+        let transcript = [
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": "pi-tool-evidence",
+                "timestamp": "2026-08-14T08:00:00Z",
+                "cwd": "/work/quill"
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "assistant-1",
+                "parentId": null,
+                "timestamp": "2026-08-14T08:00:01Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "toolCall", "id": "command", "name": "bash", "arguments": {"command": "echo hi"}},
+                        {"type": "toolCall", "id": "code", "name": "write", "arguments": {"path": "src/main.rs", "content": "one\ntwo"}},
+                        {"type": "toolCall", "id": "detail", "name": "read", "arguments": {"path": "README.md"}}
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "result-command-first",
+                "parentId": "assistant-1",
+                "timestamp": "2026-08-14T08:00:02Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "command",
+                    "isError": true,
+                    "details": {"result": "first"},
+                    "content": [{"type": "image"}, {"type": "image"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "result-code",
+                "parentId": "assistant-1",
+                "timestamp": "2026-08-14T08:00:03Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "code",
+                    "isError": true,
+                    "details": oversized_details,
+                    "content": [{"type": "image"}, {"type": "text", "text": "written"}, {"type": "image"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "result-detail",
+                "parentId": "assistant-1",
+                "timestamp": "2026-08-14T08:00:04Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "detail",
+                    "details": "not-an-object",
+                    "content": "read"
+                }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "result-command-last",
+                "parentId": "assistant-1",
+                "timestamp": "2026-08-14T08:00:05Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "command",
+                    "isError": false,
+                    "details": bounded_details,
+                    "content": [{"type": "text", "text": "done"}, {"type": "image"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|entry| entry.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let extracted = extract_messages_from_jsonl_contents(
+            IntegrationProvider::Pi,
+            Path::new("session.jsonl"),
+            &transcript,
+        );
+        let actions = &extracted.messages[0].tool_actions;
+        let action = |tool_use_id| {
+            actions
+                .iter()
+                .find(|action| action.tool_use_id == tool_use_id)
+                .expect("tool action")
+        };
+
+        let command = action("command");
+        assert_eq!(command.is_error, Some(false));
+        assert_eq!(
+            command.details_json.as_deref(),
+            Some(bounded_details_json.as_str())
+        );
+        assert_eq!(command.result_image_count, Some(1));
+
+        let code = action("code");
+        assert_eq!(code.is_error, Some(true));
+        assert_eq!(code.details_json, None);
+        assert_eq!(code.result_image_count, Some(2));
+        assert_eq!((code.lines_added, code.lines_removed), (Some(2), Some(0)));
+
+        let detail = action("detail");
+        assert_eq!(detail.is_error, Some(false));
+        assert_eq!(detail.details_json, None);
+        assert_eq!(detail.result_image_count, Some(0));
     }
 
     // @lat: [[session-search-tests#Session Search Test Specs#Index Test Resource Budget]]

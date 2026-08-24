@@ -863,7 +863,7 @@ payloads, the other two keep their values. `is_error`, `result_image_count`, and
 
 The row's presence is asserted alongside the NULLs because dropping the row
 would also satisfy a NULL-only check, and the category-agnostic subagent
-readers depend on it existing.
+readers depend on it existing. `storage::tests::tool_detail_rows_store_no_payload_while_siblings_keep_theirs` reads all seven fields back, pinning NULL payloads and retained `is_error`/`result_image_count` evidence.
 
 ### Retention delete engine
 

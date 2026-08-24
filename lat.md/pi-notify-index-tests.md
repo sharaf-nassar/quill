@@ -16,13 +16,13 @@ A Pi notify persists parsed `tool_actions` and `skill_usages`, then admits the s
 
 Startup and watcher reconciliation can authoritatively replace those rows later under the same owner.
 
-Write and edit inputs carry their line counts through to code stats, a `tool_detail` row keeps its identity while its payload columns drop at the bind, and a SKILL.md read attributes to its skill. Re-notifying the same transcript replaces the rows instead of doubling them, and the fast-path rows still land when the search index is absent.
+Write and edit inputs carry their line counts through to code stats, a `tool_detail` row keeps its identity while its payload columns drop at the bind, and a SKILL.md read attributes to its skill. Re-notifying the same transcript replaces the rows instead of doubling them, and the fast-path rows still land when the search index is absent. `storage::tests::tool_detail_rows_store_no_payload_while_siblings_keep_theirs` pins that detail rows retain `is_error` and `result_image_count` while all three payload columns are NULL.
 
 ## Owned Row Builder Shared With Retained Parsing
 
 Pi's notify path and retained reconciliation build `tool_actions` and `skill_usages` rows through the same identity-aware builder.
 
-The action-key fallback chain and skill fan-out therefore produce identical shapes under one canonical Pi source key; retained Claude/Codex sources continue supplying their native chain identity.
+The action-key fallback chain, result evidence, and skill fan-out therefore produce identical shapes under one canonical Pi source key; retained Claude/Codex sources continue supplying their native chain identity. `transcript_analytics::tests::owned_tool_rows_differ_only_by_owner_identity` pins the shared action keys plus `is_error`, `details_json`, and `result_image_count`.
 
 ## Configured Root Containment
 
@@ -51,6 +51,8 @@ The narrow parser extracts each user and assistant message once by entry id with
 ## Tool Result Correlation
 
 Pi assistant tool calls populate tool, file, command, and code-change metadata. Matching results attach at 10 KiB, command previews stay at 300 bytes, and result entries never become search documents.
+
+`sessions::tests::pi_tool_result_evidence_is_bounded_and_last_write_wins` pins last-result-wins `is_error`, object-only details JSON at or below 10 KiB, oversize or malformed details as NULL, image-block counts without bytes, and input-derived code line counts unchanged by `details`.
 
 ## Provider Safe Search
 

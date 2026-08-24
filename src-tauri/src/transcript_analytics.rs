@@ -235,9 +235,9 @@ pub(crate) fn owned_tool_rows(
                 summary: action.summary.clone(),
                 full_input: action.full_input.clone(),
                 full_output: action.full_output.clone(),
-                is_error: None,
-                details_json: None,
-                result_image_count: None,
+                is_error: action.is_error,
+                details_json: action.details_json.clone(),
+                result_image_count: action.result_image_count,
                 duration_ms: None,
                 lines_added: action.lines_added,
                 lines_removed: action.lines_removed,
@@ -4131,6 +4131,9 @@ mod tests {
                 summary: "read a file".to_owned(),
                 full_input: None,
                 full_output: None,
+                is_error: Some(true),
+                details_json: Some(r#"{"detail":"fixture"}"#.to_owned()),
+                result_image_count: Some(2),
                 lines_added: None,
                 lines_removed: None,
                 timestamp: TEST_TIMESTAMP.to_owned(),
@@ -4168,19 +4171,8 @@ mod tests {
         );
         let pi_source_key = crate::storage::pi_source_key(TEST_HOSTNAME, "pi-session")
             .expect("canonical Pi source key");
-        let (pi_actions, pi_skills) = owned_tool_rows(
-            &OwnedToolRowIdentity {
-                provider: IntegrationProvider::Pi,
-                source_key: &pi_source_key,
-                session_id: "pi-session",
-                chain_id: "pi-session",
-                parent_chain_id: None,
-                agent_id: None,
-                is_sidechain: false,
-                hostname: TEST_HOSTNAME,
-            },
-            &messages,
-        );
+        let (pi_actions, pi_skills) =
+            crate::sessions::pi_transcript_tool_rows("pi-session", TEST_HOSTNAME, &messages);
 
         let action_keys = |rows: &[OwnedToolAction]| {
             rows.iter()
@@ -4196,6 +4188,42 @@ mod tests {
             action_keys(&pi_actions),
             action_keys(&retained_actions),
             "both owners dedupe on the same action keys"
+        );
+        let action_evidence = |rows: &[OwnedToolAction]| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.is_error,
+                        row.details_json.clone(),
+                        row.result_image_count,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            action_evidence(&pi_actions),
+            action_evidence(&retained_actions)
+        );
+        assert_eq!(
+            action_evidence(&pi_actions),
+            vec![
+                (
+                    Some(true),
+                    Some(r#"{"detail":"fixture"}"#.to_owned()),
+                    Some(2)
+                ),
+                (
+                    Some(true),
+                    Some(r#"{"detail":"fixture"}"#.to_owned()),
+                    Some(2)
+                ),
+                (
+                    Some(true),
+                    Some(r#"{"detail":"fixture"}"#.to_owned()),
+                    Some(2)
+                ),
+            ],
+            "both owners keep the shared result evidence while supplying distinct identities"
         );
 
         let skill_shape = |rows: &[OwnedSkillUsage]| {
