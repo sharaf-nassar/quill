@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use crate::integrations::IntegrationProvider;
+use crate::model_usage::{ModelEvidence, ObservationKind};
 use crate::sessions::{
     DiscoveredRetainedJsonlSource, ExtractedMessage, ProviderRootEnumerationOutcome,
     ProviderSourceRoot, RetainedJsonlSourceLayoutHint, SessionEventKind,
@@ -354,14 +355,16 @@ pub(crate) struct PiPersistedReceipt {
     pub(crate) occurred_at_ms: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PiPersistedUsage {
     pub(crate) source_record_key: String,
     pub(crate) source_ordinal: i64,
+    pub(crate) observation_kind: ObservationKind,
     pub(crate) turn_id: String,
     pub(crate) timestamp: String,
     pub(crate) observed_at_ms: i64,
-    pub(crate) model_id: String,
+    pub(crate) model_id: Option<String>,
+    pub(crate) model_evidence: ModelEvidence,
     pub(crate) input_tokens: i64,
     pub(crate) output_tokens: i64,
     pub(crate) cache_creation_tokens: i64,
@@ -388,6 +391,10 @@ pub(crate) struct TranscriptRecordDiagnostics {
     pub(crate) layout_hint_conflicts: usize,
     /// Source ordinal of the first skipped record, kept for triage.
     pub(crate) first_conflict_ordinal: Option<u64>,
+    /// Future Pi stop reasons retained without rejecting their source.
+    pub(crate) unknown_stop_reasons: usize,
+    /// Source ordinal of the first future Pi stop reason.
+    pub(crate) first_unknown_stop_reason_ordinal: Option<u64>,
 }
 
 impl TranscriptRecordDiagnostics {
@@ -397,7 +404,7 @@ impl TranscriptRecordDiagnostics {
     }
 
     fn is_empty(&self) -> bool {
-        self.skipped_records() == 0
+        self.skipped_records() == 0 && self.unknown_stop_reasons == 0
     }
 }
 
@@ -409,12 +416,14 @@ fn log_record_diagnostics(
         return;
     }
     log::warn!(
-        "Retained transcript analytics source skipped anomalous records: provider={} source={} conflicting_identity_records={} layout_hint_conflicts={} first_conflict_ordinal={:?}",
+        "Retained transcript analytics source retained bounded anomalies: provider={} source={} conflicting_identity_records={} layout_hint_conflicts={} first_conflict_ordinal={:?} unknown_stop_reasons={} first_unknown_stop_reason_ordinal={:?}",
         source.provider.as_str(),
         source.source_key,
         diagnostics.conflicting_identity_records,
         diagnostics.layout_hint_conflicts,
         diagnostics.first_conflict_ordinal,
+        diagnostics.unknown_stop_reasons,
+        diagnostics.first_unknown_stop_reason_ordinal,
     );
 }
 
@@ -1695,6 +1704,80 @@ fn pi_usage_dimension(
         .ok_or(TranscriptAnalyticsError::PiSourceIdentity)
 }
 
+fn pi_optional_usage_dimension(
+    usage: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<i64>, TranscriptAnalyticsError> {
+    let Some(value) = usage.get(key).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_i64()
+        .filter(|value| (0..=100_000_000).contains(value))
+        .ok_or(TranscriptAnalyticsError::PiSourceIdentity)?;
+    Ok(Some(value))
+}
+
+const PI_STOP_REASON_MAX_BYTES: usize = 256;
+
+fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> String {
+    let end = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    value[..if value.len() <= max_bytes {
+        value.len()
+    } else {
+        end
+    }]
+        .to_owned()
+}
+
+fn pi_stop_reason(
+    value: Option<&Value>,
+    source_ordinal: u64,
+    diagnostics: &mut TranscriptRecordDiagnostics,
+) -> Option<String> {
+    let value = value.and_then(Value::as_str)?;
+    let normalized = [
+        ("stop", "stop"),
+        ("length", "length"),
+        ("toolUse", "toolUse"),
+        ("error", "error"),
+        ("aborted", "aborted"),
+    ]
+    .into_iter()
+    .find_map(|(known, normalized)| value.eq_ignore_ascii_case(known).then_some(normalized));
+    if let Some(normalized) = normalized {
+        return Some(normalized.to_owned());
+    }
+    diagnostics.unknown_stop_reasons = diagnostics.unknown_stop_reasons.saturating_add(1);
+    diagnostics
+        .first_unknown_stop_reason_ordinal
+        .get_or_insert(source_ordinal);
+    Some(bounded_utf8_prefix(value, PI_STOP_REASON_MAX_BYTES))
+}
+
+fn pi_summary_model(value: &Value) -> (Option<String>, ModelEvidence) {
+    let provider = value.get("provider").and_then(Value::as_str);
+    let model = value
+        .get("model")
+        .or_else(|| value.get("modelId"))
+        .and_then(Value::as_str);
+    match (provider, model) {
+        (None, None) => (None, ModelEvidence::Missing),
+        (Some(provider), Some(model)) => {
+            match crate::model_usage::validate_model_id(&format!("{provider}/{model}")) {
+                Ok(model_id) => (Some(model_id), ModelEvidence::Explicit),
+                Err(_) => (None, ModelEvidence::Invalid),
+            }
+        }
+        _ => (None, ModelEvidence::Invalid),
+    }
+}
+
 fn pi_usage_cost(
     usage: &serde_json::Map<String, Value>,
     key: &str,
@@ -1745,6 +1828,7 @@ fn build_pi_persisted_evidence(
     session: &crate::pi_session::PiSession,
     source_key: &str,
     hostname: &str,
+    diagnostics: &mut TranscriptRecordDiagnostics,
 ) -> Result<PiPersistedEvidence, TranscriptAnalyticsError> {
     let normalized_hostname = crate::live_tracker::normalize_observed_hostname(hostname)
         .ok_or(TranscriptAnalyticsError::PiSourceIdentity)?;
@@ -1934,17 +2018,23 @@ fn build_pi_persisted_evidence(
             ),
             source_ordinal: i64::try_from(entry.source_ordinal)
                 .map_err(|_| TranscriptAnalyticsError::PiSourceIdentity)?,
+            observation_kind: ObservationKind::Turn,
             turn_id: entry.base.id.clone(),
             timestamp: entry.base.timestamp.clone(),
             observed_at_ms: pi_timestamp_ms(&entry.base.timestamp)?,
-            model_id,
+            model_id: Some(model_id),
+            model_evidence: ModelEvidence::Explicit,
             input_tokens: pi_usage_dimension(native_usage, "input")?,
             output_tokens: pi_usage_dimension(native_usage, "output")?,
             cache_creation_tokens: pi_usage_dimension(native_usage, "cacheWrite")?,
             cache_read_tokens: pi_usage_dimension(native_usage, "cacheRead")?,
-            reasoning_tokens: None,
-            stop_reason: None,
-            had_error: None,
+            reasoning_tokens: pi_optional_usage_dimension(native_usage, "reasoning")?,
+            stop_reason: pi_stop_reason(
+                entry.message.get("stopReason"),
+                entry.source_ordinal,
+                diagnostics,
+            ),
+            had_error: Some(entry.message.get("errorMessage").is_some()),
             tokens_before: None,
             reasoning_duration_ms: None,
             input_cost: pi_usage_cost(native_usage, "input")?,
@@ -1954,6 +2044,62 @@ fn build_pi_persisted_evidence(
             total_cost: pi_usage_cost(native_usage, "total")?,
         });
     }
+
+    let mut seen_summaries = HashSet::new();
+    for entry in &session.summary_entries {
+        if !seen_summaries.insert(entry.base.id.as_str()) {
+            continue;
+        }
+        let Some(native_usage) = entry.value.get("usage").and_then(Value::as_object) else {
+            continue;
+        };
+        let (model_id, model_evidence) = pi_summary_model(&entry.value);
+        let tokens_before = match entry.kind {
+            crate::pi_session::PiSummaryKind::Compaction => entry
+                .value
+                .get("tokensBefore")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_i64()
+                        .filter(|value| (0..=100_000_000).contains(value))
+                        .ok_or(TranscriptAnalyticsError::PiSourceIdentity)
+                })
+                .transpose()?,
+            crate::pi_session::PiSummaryKind::BranchSummary => None,
+        };
+        usage.push(PiPersistedUsage {
+            source_record_key: format!(
+                "pi_summary_v1:{}:{}",
+                session.header.id.len(),
+                entry.base.id
+            ),
+            source_ordinal: i64::try_from(entry.source_ordinal)
+                .map_err(|_| TranscriptAnalyticsError::PiSourceIdentity)?,
+            observation_kind: ObservationKind::Summary,
+            turn_id: entry.base.id.clone(),
+            timestamp: entry.base.timestamp.clone(),
+            observed_at_ms: pi_timestamp_ms(&entry.base.timestamp)?,
+            model_id,
+            model_evidence,
+            input_tokens: pi_usage_dimension(native_usage, "input")?,
+            output_tokens: pi_usage_dimension(native_usage, "output")?,
+            cache_creation_tokens: pi_usage_dimension(native_usage, "cacheWrite")?,
+            cache_read_tokens: pi_usage_dimension(native_usage, "cacheRead")?,
+            reasoning_tokens: pi_optional_usage_dimension(native_usage, "reasoning")?,
+            stop_reason: None,
+            had_error: None,
+            tokens_before,
+            reasoning_duration_ms: None,
+            input_cost: pi_usage_cost(native_usage, "input")?,
+            output_cost: pi_usage_cost(native_usage, "output")?,
+            cache_read_cost: pi_usage_cost(native_usage, "cacheRead")?,
+            cache_write_cost: pi_usage_cost(native_usage, "cacheWrite")?,
+            total_cost: pi_usage_cost(native_usage, "total")?,
+        });
+    }
+
+    usage.sort_by_key(|row| row.source_ordinal);
 
     Ok(PiPersistedEvidence {
         lifecycle,
@@ -1997,14 +2143,11 @@ fn parse_transcript_analytics_source_bytes(
         .map_err(|error| TranscriptAnalyticsError::PiSession(error.to_string()))?
         .ok_or_else(|| TranscriptAnalyticsError::PiSession("missing session header".into()))?;
         let native_identity = resolve_pi_native_identity(&session)?;
-        let pi_evidence = build_pi_persisted_evidence(&session, &source_key, hostname)?;
+        let mut diagnostics = TranscriptRecordDiagnostics::default();
+        let pi_evidence =
+            build_pi_persisted_evidence(&session, &source_key, hostname, &mut diagnostics)?;
         let extracted = crate::sessions::extract_pi_session(&source.canonical_path, session);
-        (
-            native_identity,
-            TranscriptRecordDiagnostics::default(),
-            extracted,
-            Some(pi_evidence),
-        )
+        (native_identity, diagnostics, extracted, Some(pi_evidence))
     } else {
         let (native_identity, diagnostics) = resolve_native_identity(source, &records)?;
         let extracted =
@@ -2213,6 +2356,7 @@ mod tests {
 
     const TEST_HOSTNAME: &str = "host-a";
     const TEST_TIMESTAMP: &str = "2026-01-01T00:00:00.000Z";
+    const PI_USAGE_EVIDENCE: &str = include_str!("fixtures/pi-usage-evidence.jsonl");
     /// Explicit mtime so fingerprint tests never depend on the wall clock or on
     /// filesystem timestamp granularity.
     const FIXED_MTIME_NS: i64 = 1_700_000_000_123_456_789;
@@ -2281,6 +2425,21 @@ mod tests {
         discovered_source(provider, path, layout_hint)
     }
 
+    fn pi_usage_evidence_source(dir: &Path) -> DiscoveredRetainedJsonlSource {
+        let path = dir.join("pi-usage-evidence.jsonl");
+        std::fs::write(&path, PI_USAGE_EVIDENCE).expect("write Pi usage evidence fixture");
+        set_mtime_ns(&path, FIXED_MTIME_NS);
+        DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: source_root_key(IntegrationProvider::Pi),
+            source_key: crate::storage::pi_source_key(TEST_HOSTNAME, "pi-usage-evidence")
+                .expect("canonical Pi usage source key"),
+            filesystem_path: path.clone(),
+            canonical_path: path,
+            layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
+        }
+    }
+
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Persisted Turn Recovery]]
     #[test]
     fn persisted_pi_corpus_derives_source_owned_response_times() {
@@ -2312,9 +2471,267 @@ mod tests {
         );
     }
 
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Analytics Evidence Foundation Starts Empty]]
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Pi Reasoning And Outcome Evidence]]
     #[test]
-    fn pi_analytics_evidence_foundation_starts_empty() {
+    fn pi_reasoning_and_outcome_evidence_preserves_usage_totals() {
+        let dir = TempDir::new().expect("fixture directory");
+        let source = pi_usage_evidence_source(dir.path());
+        let parsed = parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+            .expect("parse Pi usage evidence");
+        let usage = &parsed
+            .snapshot
+            .pi_evidence
+            .as_ref()
+            .expect("Pi evidence")
+            .usage;
+        let turns = usage
+            .iter()
+            .filter(|row| row.observation_kind == ObservationKind::Turn)
+            .collect::<Vec<_>>();
+
+        assert_eq!(turns.len(), 3);
+        assert_eq!(
+            turns
+                .iter()
+                .map(|row| {
+                    row.input_tokens
+                        + row.output_tokens
+                        + row.cache_creation_tokens
+                        + row.cache_read_tokens
+                })
+                .sum::<i64>(),
+            222,
+            "reasoning is informational and must not be added to token totals"
+        );
+        assert_eq!(
+            turns
+                .iter()
+                .map(|row| row.reasoning_tokens)
+                .collect::<Vec<_>>(),
+            vec![Some(7), None, Some(0)]
+        );
+        assert_eq!(
+            turns
+                .iter()
+                .map(|row| row.stop_reason.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("toolUse"), None, Some("futureStop")]
+        );
+        assert_eq!(
+            turns.iter().map(|row| row.had_error).collect::<Vec<_>>(),
+            vec![Some(false), Some(true), Some(false)]
+        );
+        assert_eq!(parsed.diagnostics.unknown_stop_reasons, 1);
+        assert_eq!(
+            parsed.diagnostics.first_unknown_stop_reason_ordinal,
+            Some(6)
+        );
+
+        let unknown = "x".repeat(PI_STOP_REASON_MAX_BYTES + 20);
+        let mut diagnostics = TranscriptRecordDiagnostics::default();
+        let bounded = pi_stop_reason(Some(&Value::String(unknown.clone())), 9, &mut diagnostics)
+            .expect("bounded unknown stop reason");
+        assert_eq!(bounded.len(), PI_STOP_REASON_MAX_BYTES);
+        assert!(unknown.starts_with(&bounded));
+        assert_eq!(diagnostics.unknown_stop_reasons, 1);
+        assert_eq!(diagnostics.first_unknown_stop_reason_ordinal, Some(9));
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Pi Summary Usage Evidence]]
+    #[test]
+    fn pi_summary_usage_has_stable_identity_and_no_fabricated_model() {
+        let dir = TempDir::new().expect("fixture directory");
+        let source = pi_usage_evidence_source(dir.path());
+        let first = parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+            .expect("first Pi usage parse");
+        let second = parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+            .expect("second Pi usage parse");
+        let first_usage = &first
+            .snapshot
+            .pi_evidence
+            .as_ref()
+            .expect("first Pi evidence")
+            .usage;
+        let second_usage = &second
+            .snapshot
+            .pi_evidence
+            .as_ref()
+            .expect("second Pi evidence")
+            .usage;
+        assert_eq!(first_usage, second_usage, "reparse identity must be stable");
+
+        let summaries = first_usage
+            .iter()
+            .filter(|row| row.observation_kind == ObservationKind::Summary)
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].source_record_key, "pi_summary_v1:17:compact-1");
+        assert_eq!(summaries[0].turn_id, "compact-1");
+        assert_eq!(summaries[0].model_id, None);
+        assert_eq!(summaries[0].model_evidence, ModelEvidence::Missing);
+        assert_eq!(summaries[0].reasoning_tokens, Some(50));
+        assert_eq!(summaries[0].tokens_before, Some(5000));
+        assert_eq!(summaries[0].total_cost, Some(1.3));
+        assert_eq!(summaries[1].source_record_key, "pi_summary_v1:17:branch-1");
+        assert_eq!(summaries[1].turn_id, "branch-1");
+        assert_eq!(
+            summaries[1].model_id.as_deref(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+        assert_eq!(summaries[1].model_evidence, ModelEvidence::Explicit);
+        assert_eq!(summaries[1].reasoning_tokens, None);
+        assert_eq!(summaries[1].tokens_before, None);
+        assert_eq!(summaries[1].total_cost, Some(0.51));
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Pi Summary Accounting Reconciliation]]
+    #[test]
+    #[serial]
+    fn pi_summary_usage_reconciles_without_turn_inflation() {
+        clear_env();
+        let data_dir = TempDir::new().expect("data directory");
+        let transcript_dir = TempDir::new().expect("transcript directory");
+        let storage = init_storage_in(&data_dir);
+        let source = pi_usage_evidence_source(transcript_dir.path());
+        let generation = storage
+            .begin_transcript_analytics_generation(IntegrationProvider::Pi, source.source_root_key)
+            .expect("begin Pi usage generation");
+        let snapshot = stamp_analytics_root(
+            parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+                .expect("parse Pi usage evidence"),
+            "pi-usage-evidence",
+            generation,
+        )
+        .expect("stamp Pi usage snapshot");
+
+        storage
+            .replace_transcript_analytics_snapshot(&snapshot)
+            .expect("first Pi usage replacement");
+        storage
+            .replace_transcript_analytics_snapshot(&snapshot)
+            .expect("idempotent Pi usage replacement");
+
+        let conn = rusqlite::Connection::open(storage.database_path())
+            .expect("open Pi usage accounting reader");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*),
+                        SUM(observation_kind = 'turn'),
+                        SUM(observation_kind = 'summary'),
+                        SUM(input_tokens + output_tokens
+                            + cache_creation_tokens + cache_read_tokens)
+                 FROM model_usage_observations
+                 WHERE provider = 'pi' AND source_key = ?1",
+                rusqlite::params![source.source_key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .expect("read Pi model observations"),
+            (5, 3, 2, 2032)
+        );
+        let persisted_cost = conn
+            .query_row(
+                "SELECT SUM(total_cost) FROM model_usage_observations
+                 WHERE provider = 'pi' AND source_key = ?1",
+                rusqlite::params![source.source_key],
+                |row| row.get::<_, f64>(0),
+            )
+            .expect("read Pi usage cost");
+        assert!((persisted_cost - 2.032).abs() < 1e-12);
+        assert_eq!(
+            conn.query_row(
+                "SELECT SUM(obs_count), SUM(turn_count),
+                        SUM(input_tokens + output_tokens
+                            + cache_creation_tokens + cache_read_tokens)
+                 FROM model_usage_hourly
+                 WHERE provider = 'pi' AND source_key = ?1",
+                rusqlite::params![source.source_key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("read Pi hourly usage"),
+            (5, 3, 2032)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*),
+                        SUM(observation_kind = 'turn'),
+                        SUM(observation_kind = 'summary'),
+                        SUM(input_tokens + output_tokens
+                            + cache_creation_input_tokens
+                            + cache_read_input_tokens)
+                 FROM token_snapshots
+                 WHERE provider = 'pi' AND session_id = 'pi-usage-evidence'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .expect("read Pi token snapshots"),
+            (5, 3, 2, 2032)
+        );
+        drop(conn);
+
+        let stats = storage
+            .get_token_stats(
+                "30d",
+                Some(IntegrationProvider::Pi),
+                None,
+                Some("pi-usage-evidence"),
+                None,
+            )
+            .expect("read Pi provider token totals");
+        assert_eq!(stats.total_tokens, 2032);
+        assert_eq!(stats.turn_count, 3);
+
+        let overview = storage
+            .get_model_usage_overview(crate::models::ModelRange::ThirtyDays, Some("pi"))
+            .expect("read Pi model overview");
+        assert_eq!(overview.totals.total_tokens, 2032);
+        assert_eq!(overview.totals.turns, 3);
+        assert_eq!(overview.totals.attributed_tokens, 732);
+
+        let history = storage
+            .get_session_model_history(
+                "pi",
+                "pi-usage-evidence",
+                crate::models::ModelRange::ThirtyDays,
+            )
+            .expect("read Pi session model history");
+        let segment_turns = history
+            .chains
+            .iter()
+            .flat_map(|chain| &chain.segments)
+            .map(|segment| match segment {
+                crate::models::SessionModelSegment::Model { turn_count, .. }
+                | crate::models::SessionModelSegment::ModelGap { turn_count, .. } => *turn_count,
+            })
+            .sum::<i64>();
+        assert_eq!(history.attributed_tokens, 732);
+        assert_eq!(history.unattributed_tokens, 1300);
+        assert_eq!(segment_turns, 3);
+        clear_env();
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Remaining Analytics Evidence Foundation]]
+    #[test]
+    fn remaining_pi_analytics_evidence_foundation_stays_empty() {
         let dir = TempDir::new().expect("corpus directory");
         let session_id = "01a018c8-2867-71be-a72b-cdf822ddbe75";
         let path = dir.path().join("root.jsonl");
@@ -2348,13 +2765,7 @@ mod tests {
                 .expect("Pi evidence")
                 .usage
                 .iter()
-                .all(|row| {
-                    row.reasoning_tokens.is_none()
-                        && row.stop_reason.is_none()
-                        && row.had_error.is_none()
-                        && row.tokens_before.is_none()
-                        && row.reasoning_duration_ms.is_none()
-                })
+                .all(|row| row.reasoning_duration_ms.is_none())
         );
     }
 

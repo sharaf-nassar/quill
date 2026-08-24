@@ -631,7 +631,10 @@ failed-rebuild recovery tests (current backup code is schema-45-specific
   `pi_summary_v1:{header-len}:{entry-id}`, `observation_kind='summary'`,
   `turn_id` = entry id, `token_evidence='direct'`, model fields empty
   with `model_evidence='missing'` unless the entry names one; excluded
-  from turn counters, included in token rollups/snapshots.
+  from turn counters, included in token rollups/snapshots. Migration 48
+  adds `token_snapshots.observation_kind IN ('turn','summary')` with a
+  legacy/default value of `turn`, so snapshot and cleanup totals include
+  summary spend without counting it as a turn.
 - Tantivy: schema bump adding `custom_type` field; Pi `custom_message`
   entries index with role literal `custom_message`; full index rebuild
   on first open after upgrade (budgeted with the migration).
@@ -688,8 +691,10 @@ its owning lat.md spec, one-to-one with tests, attached to its work item
   line counts unchanged where `details.diff` exists.
 - Storage (Rust): migration rebuild preserves rows/indexes and extends
   CHECK; generalized backup/preflight and failed-rebuild restore path;
-  new-column watermark behavior on `tool_actions` inserts; summary rows
-  excluded from turn counters and included in token rollups; retention
+  token snapshot migration defaults legacy rows to turns and admits only
+  turn/summary; new-column watermark behavior on `tool_actions` inserts;
+  summary rows excluded from turn counters and included in token rollups;
+  retention
   prunes summary rows with their table (updated retention specs);
   prune/generation safety for `session_setting_events`; outcome
   aggregation denominators (NOT NULL only) per session/model/window.

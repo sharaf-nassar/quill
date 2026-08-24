@@ -8,7 +8,9 @@ These tests pin the shared persisted Pi parser used by search indexing and sourc
 
 ## V3 Message Entries
 
-V3 headers, message entries, model changes, and original source ordinals retain the identity, cwd, timestamps, ids, parent links, model values, and usage evidence needed by indexing and snapshots.
+V3 parsing retains native message, model-change, and summary evidence with original source order.
+
+Headers and entries preserve identity, cwd, timestamps, ids, parent links, model values, and usage needed by indexing and snapshots. Compaction and branch-summary entries keep their exact JSON value for retained analytics without becoming conversation messages.
 
 ## V2 Hook Messages
 

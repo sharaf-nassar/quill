@@ -6869,15 +6869,16 @@ impl Storage {
                          input_cost, output_cost, cache_read_cost,
                          cache_write_cost, total_cost
                      ) VALUES (
-                         'pi', ?1, ?2, ?3, 'turn', ?4, ?4, ?4, ?5,
-                         ?6, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13,
-                         ?14, ?15, ?16, ?17, ?18, 'explicit', 'direct', ?5,
-                         ?19, ?20, ?21, ?22, ?23
+                         'pi', ?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6,
+                         ?7, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14,
+                         ?15, ?16, ?17, ?18, ?19, ?20, 'direct', ?6,
+                         ?21, ?22, ?23, ?24, ?25
                      )",
                     params![
                         source.source_key,
                         row.source_record_key,
                         row.source_ordinal,
+                        row.observation_kind.as_str(),
                         source.source_session_id,
                         row.turn_id,
                         row.model_id,
@@ -6893,6 +6894,7 @@ impl Storage {
                         row.had_error.map(i64::from),
                         row.tokens_before,
                         row.reasoning_duration_ms,
+                        row.model_evidence.as_str(),
                         row.input_cost,
                         row.output_cost,
                         row.cache_read_cost,
@@ -6904,15 +6906,19 @@ impl Storage {
                 tx.execute(
                     "INSERT INTO token_snapshots (
                          provider, session_id, hostname, timestamp,
-                         input_tokens, output_tokens,
+                         observation_kind, input_tokens, output_tokens,
                          cache_creation_input_tokens,
                          cache_read_input_tokens, cwd, is_sidechain,
                          agent_id, parent_uuid
-                     ) VALUES ('pi', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, NULL)",
+                     ) VALUES (
+                         'pi', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                         0, NULL, NULL
+                     )",
                     params![
                         source.analytics_session_id,
                         source.hostname,
                         row.timestamp,
+                        row.observation_kind.as_str(),
                         row.input_tokens,
                         row.output_tokens,
                         row.cache_creation_tokens,
@@ -6932,13 +6938,14 @@ impl Storage {
                          cache_read_tokens_present, first_observed_at_ms,
                          last_observed_at_ms, raw_pruned
                      ) VALUES (
-                         (?1 / ?9) * ?9, 'pi', ?2, ?3, ?4, 1, 1, 0, 0,
-                         ?5, 1, ?6, 1, ?7, 1, ?8, 1, ?1, ?1, 0
+                         (?1 / ?10) * ?10, 'pi', ?2, ?3, ?4, 1, ?5, 0, 0,
+                         ?6, 1, ?7, 1, ?8, 1, ?9, 1, ?1, ?1, 0
                      )
                      ON CONFLICT(hour_utc, provider, derived_model_id, source_key)
                      DO UPDATE SET
                          obs_count = model_usage_hourly.obs_count + 1,
-                         turn_count = model_usage_hourly.turn_count + 1,
+                         turn_count = model_usage_hourly.turn_count
+                             + excluded.turn_count,
                          input_tokens = model_usage_hourly.input_tokens + excluded.input_tokens,
                          input_tokens_present = model_usage_hourly.input_tokens_present + 1,
                          output_tokens = model_usage_hourly.output_tokens + excluded.output_tokens,
@@ -6962,9 +6969,12 @@ impl Storage {
                      WHERE model_usage_hourly.raw_pruned = 0",
                     params![
                         row.observed_at_ms,
-                        row.model_id,
+                        row.model_id.as_deref().unwrap_or(""),
                         source.source_key,
                         source.analytics_session_id,
+                        i64::from(
+                            row.observation_kind == crate::model_usage::ObservationKind::Turn
+                        ),
                         row.input_tokens,
                         row.output_tokens,
                         row.cache_creation_tokens,
@@ -10326,6 +10336,14 @@ impl Storage {
                     .map_err(|e| format!("Migration 48 add tool_actions.{column}: {e}"))?;
                 }
             }
+            if !table_has_column(&tx, "token_snapshots", "observation_kind") {
+                tx.execute_batch(
+                    "ALTER TABLE token_snapshots ADD COLUMN observation_kind TEXT
+                     NOT NULL DEFAULT 'turn'
+                     CHECK(observation_kind IN ('turn', 'summary'));",
+                )
+                .map_err(|e| format!("Migration 48 add token snapshot kind: {e}"))?;
+            }
             if !table_has_column(&tx, "transcript_analytics_sources", "session_name") {
                 tx.execute_batch(
                     "ALTER TABLE transcript_analytics_sources
@@ -13251,7 +13269,7 @@ impl Storage {
 
                 let is_turn = match row.observation_kind.as_str() {
                     "turn" => true,
-                    "token" => false,
+                    "token" | "summary" => false,
                     _ => {
                         return Err(SessionModelHistoryQueryError::Storage(
                             "Model session history has an invalid observation kind".to_string(),
@@ -14723,7 +14741,7 @@ impl Storage {
                  COALESCE(SUM(output_tokens), 0),
                  COALESCE(SUM(cache_creation_input_tokens), 0),
                  COALESCE(SUM(cache_read_input_tokens), 0),
-                 COUNT(*)
+                 COUNT(CASE WHEN observation_kind = 'turn' THEN 1 END)
              FROM token_snapshots
              WHERE timestamp >= ?1",
         );
@@ -15248,7 +15266,8 @@ impl Storage {
                 "SELECT
                      hostname,
                      SUM(input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens) as total_tokens,
-                     COUNT(*) as turn_count,
+                     COUNT(CASE WHEN observation_kind = 'turn' THEN 1 END)
+                         as turn_count,
                      MAX(timestamp) as last_active
                  FROM token_snapshots
                  WHERE timestamp >= ?1
@@ -15286,7 +15305,8 @@ impl Storage {
                      cwd,
                      hostname,
                      SUM(input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens) as total_tokens,
-                     COUNT(*) as turn_count,
+                     COUNT(CASE WHEN observation_kind = 'turn' THEN 1 END)
+                         as turn_count,
                      COUNT(DISTINCT provider || ':' || session_id) as session_count,
                      MAX(timestamp) as last_active
                  FROM token_snapshots
@@ -19959,7 +19979,7 @@ impl Storage {
                  SUM(output_tokens),
                  SUM(cache_creation_input_tokens),
                  SUM(cache_read_input_tokens),
-                 COUNT(*)
+                 COUNT(CASE WHEN observation_kind = 'turn' THEN 1 END)
              FROM token_snapshots
              WHERE timestamp < ?1
              GROUP BY hour, provider, hostname
@@ -22143,6 +22163,7 @@ mod tests {
              ALTER TABLE tool_actions DROP COLUMN details_json;
              ALTER TABLE tool_actions DROP COLUMN result_image_count;
              ALTER TABLE tool_actions DROP COLUMN duration_ms;
+             ALTER TABLE token_snapshots DROP COLUMN observation_kind;
              ALTER TABLE transcript_analytics_sources DROP COLUMN session_name;
              DELETE FROM schema_version WHERE version = 48;",
         )
@@ -22487,6 +22508,14 @@ mod tests {
                      'pi', 'source-a', 'pi:sessions', '/tmp/source-a.jsonl',
                      'session-a', 'session-a', 'session-a', 0, 'host-a', 1,
                      'ok', 'transcript'
+                 );
+                 INSERT INTO token_snapshots (
+                     provider, session_id, hostname, timestamp, input_tokens,
+                     output_tokens, cache_creation_input_tokens,
+                     cache_read_input_tokens, is_sidechain
+                 ) VALUES (
+                     'pi', 'session-a', 'host-a',
+                     '2026-08-24T00:00:00.000Z', 11, 7, 0, 0, 0
                  );",
             )
             .expect("seed schema-47 evidence");
@@ -22593,6 +22622,43 @@ mod tests {
             )
             .expect("read migrated session name"),
             None
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT observation_kind FROM token_snapshots
+                 WHERE provider = 'pi' AND session_id = 'session-a'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read migrated token snapshot kind"),
+            "turn"
+        );
+        conn.execute(
+            "INSERT INTO token_snapshots (
+                 provider, session_id, hostname, timestamp, input_tokens,
+                 output_tokens, cache_creation_input_tokens,
+                 cache_read_input_tokens, observation_kind
+             ) VALUES (
+                 'pi', 'session-summary', 'host-a',
+                 '2026-08-24T00:00:01.000Z', 100, 20, 0, 0, 'summary'
+             )",
+            [],
+        )
+        .expect("summary token snapshot kind must be accepted");
+        assert!(
+            conn.execute(
+                "INSERT INTO token_snapshots (
+                     provider, session_id, hostname, timestamp, input_tokens,
+                     output_tokens, cache_creation_input_tokens,
+                     cache_read_input_tokens, observation_kind
+                 ) VALUES (
+                     'pi', 'session-invalid', 'host-a',
+                     '2026-08-24T00:00:02.000Z', 1, 1, 0, 0, 'future'
+                 )",
+                [],
+            )
+            .is_err(),
+            "token snapshot kind must remain closed outside turn/summary"
         );
         conn.execute(
             "INSERT INTO session_setting_events (

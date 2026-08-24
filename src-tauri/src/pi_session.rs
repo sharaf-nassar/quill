@@ -58,12 +58,27 @@ pub(crate) struct PiTrackingEntry {
     pub(crate) tracking: PiProtocolV2TrackingEntry,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PiSummaryKind {
+    Compaction,
+    BranchSummary,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PiSummaryEntry {
+    pub(crate) base: PiSessionEntryBase,
+    pub(crate) source_ordinal: u64,
+    pub(crate) kind: PiSummaryKind,
+    pub(crate) value: Value,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PiSession {
     pub(crate) header: PiSessionHeader,
     pub(crate) entries: Vec<PiMessageEntry>,
     pub(crate) model_changes: Vec<PiModelChangeEntry>,
     pub(crate) tracking_entries: Vec<PiTrackingEntry>,
+    pub(crate) summary_entries: Vec<PiSummaryEntry>,
 }
 
 #[derive(Debug)]
@@ -174,6 +189,7 @@ pub(crate) fn parse_pi_session_records(
     let mut entries = Vec::new();
     let mut model_changes = Vec::new();
     let mut tracking_entries = Vec::new();
+    let mut summary_entries = Vec::new();
     for (source_ordinal, value) in records {
         match value.get("type").and_then(Value::as_str) {
             Some("message") => {
@@ -191,6 +207,20 @@ pub(crate) fn parse_pi_session_records(
                 if let Ok(mut entry) = serde_json::from_value::<PiModelChangeEntry>(value) {
                     entry.source_ordinal = source_ordinal;
                     model_changes.push(entry);
+                }
+            }
+            Some(entry_type @ ("compaction" | "branch_summary")) => {
+                if let Ok(base) = serde_json::from_value::<PiSessionEntryBase>(value.clone()) {
+                    summary_entries.push(PiSummaryEntry {
+                        base,
+                        source_ordinal,
+                        kind: if entry_type == "compaction" {
+                            PiSummaryKind::Compaction
+                        } else {
+                            PiSummaryKind::BranchSummary
+                        },
+                        value,
+                    });
                 }
             }
             Some("custom")
@@ -232,6 +262,7 @@ pub(crate) fn parse_pi_session_records(
         entries,
         model_changes,
         tracking_entries,
+        summary_entries,
     }))
 }
 
@@ -270,6 +301,17 @@ mod tests {
         assert_eq!(session.model_changes.len(), 1);
         assert_eq!(session.model_changes[0].provider, "anthropic");
         assert_eq!(session.model_changes[0].model_id, "claude-sonnet-4-5");
+        assert_eq!(session.summary_entries.len(), 2);
+        assert_eq!(session.summary_entries[0].base.id, "compact");
+        assert_eq!(
+            session.summary_entries[0].kind,
+            super::PiSummaryKind::Compaction
+        );
+        assert_eq!(session.summary_entries[1].base.id, "summary");
+        assert_eq!(
+            session.summary_entries[1].kind,
+            super::PiSummaryKind::BranchSummary
+        );
     }
 
     // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#V2 Hook Messages]]

@@ -10,9 +10,9 @@ Pi usage tests pin persisted-session reconciliation, canonical ownership, and th
 
 Migration 48 installs the provider-neutral analytics evidence foundation without populating later Pi producers.
 
-Opening a schema-47 database first publishes a verified schema-47 backup, then rebuilds `model_usage_observations` with the `turn`/`token`/`summary` CHECK while preserving row ids, values, the source-record uniqueness constraint, and all seven named indexes. It adds nullable reasoning/outcome/savings/duration evidence, nullable tool error/detail/image/duration evidence, `session_setting_events`, and nullable transcript-source `session_name`, then rearms `transcript_analytics_reingest_pending` and records version 48 once.
+Opening a schema-47 database first publishes a verified schema-47 backup, then rebuilds `model_usage_observations` with the `turn`/`token`/`summary` CHECK while preserving row ids, values, the source-record uniqueness constraint, and all seven named indexes. It adds nullable reasoning/outcome/savings/duration evidence, nullable tool error/detail/image/duration evidence, `session_setting_events`, nullable transcript-source `session_name`, and a `turn`/`summary` token-snapshot kind whose legacy default is `turn`; then it rearms `transcript_analytics_reingest_pending` and records version 48 once.
 
-The migration test inserts old-shape model, tool, and source rows before opening the real migration path. It proves old rows remain byte-accountable, summary rows and unknown stop-reason text are accepted, other observation kinds remain rejected, additive columns start NULL, setting identity is unique by `(provider, source_key, setting, source_ordinal)`, and reopen does not re-enter migration 48.
+The migration test inserts old-shape model, tool, source, and token-snapshot rows before opening the real migration path. It proves old rows remain byte-accountable, summary observations and snapshots plus unknown stop-reason text are accepted, other kinds remain rejected, additive columns start NULL, legacy snapshots stay turns, setting identity is unique by `(provider, source_key, setting, source_ordinal)`, and reopen does not re-enter migration 48.
 
 ## Analytics Migration Backup Preflight And Recovery
 
@@ -40,11 +40,29 @@ The migration wall-time measurement uses one hash-pinned audit-window corpus.
 
 Three controlled local runs measured 714 ms, 624 ms, and 591 ms from `Storage::init_at` entry through verified backup, migration, index recreation, and startup-index repair; median 624 ms. Environment, command, scope, and limitations are recorded in `specs/030-pi-analytics-migration-measurement.md`.
 
-## Analytics Evidence Foundation Starts Empty
+## Pi Reasoning And Outcome Evidence
 
-Retained Pi parsing leaves every later-producer evidence slot explicitly empty.
+Retained Pi assistant usage captures reasoning and outcome evidence without changing token totals.
 
-`reasoning_tokens`, `stop_reason`, `had_error`, `tokens_before`, `reasoning_duration_ms`, tool `is_error`/`details_json`/`result_image_count`/`duration_ms`, setting events, and session name all remain `None` or empty on the pinned Pi parity corpus. Existing usage, runtime, tool, and skill extraction remains unchanged.
+`transcript_analytics::tests::pi_reasoning_and_outcome_evidence_preserves_usage_totals` parses nullable `usage.reasoning`, normalizes known stop reasons, stores absent reasoning and stop reason as NULL, records `errorMessage` presence as measured true/false evidence, and retains unknown stop reasons under the 256-byte bound with count-plus-first-ordinal diagnostics. Reasoning stays informational: input/output/cache totals do not add it again.
+
+## Pi Summary Usage Evidence
+
+Compaction and branch-summary usage becomes stable summary observations without invented model identity.
+
+`transcript_analytics::tests::pi_summary_usage_has_stable_identity_and_no_fabricated_model` pins `pi_summary_v1:{session-id-length}:{entry-id}` identity, bounded compaction `tokens_before`, missing model fields with `model_evidence='missing'`, explicit valid provider/model evidence when supplied, and identical rows across reparses.
+
+## Pi Summary Accounting Reconciliation
+
+Summary spend enters every token aggregate while turn counters remain assistant-only.
+
+`transcript_analytics::tests::pi_summary_usage_reconciles_without_turn_inflation` replaces the same pinned source twice and proves five observations reconcile to three turns plus two summaries. Raw observations, model hourly rows, token snapshots, provider token stats, model overview totals, and session history all report 2,032 tokens. Only assistant rows enter token, model, or segment turn counters; the model-less compaction remains 1,300 unattributed tokens.
+
+## Remaining Analytics Evidence Foundation
+
+Later Pi analytics producers remain explicitly empty on the pinned parity corpus.
+
+`reasoning_duration_ms`, tool `is_error`/`details_json`/`result_image_count`/`duration_ms`, setting events, and session name remain `None` or empty while existing runtime, tool, and skill extraction stays unchanged.
 
 ## Native Usage Migration
 
