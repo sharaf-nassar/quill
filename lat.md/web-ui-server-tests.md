@@ -34,7 +34,8 @@ is refused exactly like a wrong code.
 
 The pairing page carries its own policy pinning its one inline script by hash,
 states no Quill data, and references no bundle chunk, so an unpaired browser can
-bootstrap without receiving application assets.
+bootstrap without receiving application assets. Regenerating the credential
+invalidates a session that was live before the rotation.
 
 ## Only the isolated monitor bundle is servable
 

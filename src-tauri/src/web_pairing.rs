@@ -116,8 +116,12 @@ pub fn pairing_code() -> Result<String, String> {
 /// verifying, which is the feature's revocation path.
 pub fn rotate_pairing_code() -> Result<String, String> {
     let mut cached = cache()?;
+    rotate_pairing_code_at(&secret_path()?, &mut cached)
+}
+
+fn rotate_pairing_code_at(path: &Path, cached: &mut Option<String>) -> Result<String, String> {
     let code = generate_code();
-    write_code(&secret_path()?, &code)?;
+    write_code(path, &code)?;
     *cached = Some(code.clone());
     log::info!("Rotated web pairing secret");
     Ok(code)
@@ -249,18 +253,19 @@ mod tests {
         assert!(!codes_match(&code, ""));
     }
 
-    // @lat: [[backend#Backend#HTTP API Server#Web UI pairing credential]]
+    // @lat: [[web-ui-server-tests#Web UI Server Test Specs#Unpaired access reaches only the pairing bootstrap]]
     #[test]
-    fn rotation_invalidates_a_live_session() {
+    fn regeneration_invalidates_a_live_session() {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("web_pairing_secret");
         let original = load_or_create(&path).expect("create credential");
         let session = issue_session_with(&original, 1_000);
         assert!(verify_session_with(&original, &session, 1_000));
 
-        let rotated = generate_code();
-        write_code(&path, &rotated).expect("rotate credential");
+        let mut cached = Some(original.clone());
+        let rotated = rotate_pairing_code_at(&path, &mut cached).expect("regenerate credential");
         assert_ne!(rotated, original);
+        assert_eq!(cached.as_deref(), Some(rotated.as_str()));
         assert_eq!(load_or_create(&path).expect("reload"), rotated);
         assert!(!verify_session_with(&rotated, &session, 1_000));
         assert!(verify_session_with(
