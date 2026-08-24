@@ -8,6 +8,8 @@ The React 19 frontend is a multi-window Tauri application with custom hooks for 
 
 Each window gets its own Suspense boundary with a fallback. Per-window zoom persistence is stored in localStorage (`quill-zoom-{view}`) and supports Ctrl+/-, Ctrl+0 with a 0.5-2.0x range via Tauri's native webview zoom API, falling back to CSS `zoom` only outside Tauri. Ctrl+F is blocked to prevent the webview's native find-in-page (no search UI exists). A `ToastProvider` context wraps all views for notifications, [[src/hooks/useIntegrations.ts]] gates provider-dependent secondary windows when no provider is enabled, and [[src/windows/SessionsWindowView.tsx]] refreshes the session index on demand before loading search facets.
 
+The [[features#Settings Window]]'s Web tab is the desktop-only control surface for that browser entry; it is described in [[features#Settings Window#Web UI Section]].
+
 `web.html` loads the separate browser entry, [[src/web-main.tsx]]. It installs the HTTP Tauri shim before dynamically importing shared monitor code, imports neither the desktop main entry nor its mock fixture path, and does not register the desktop find, zoom, or Manage accelerators. Crash reporting and the updater are absent, leaving browser-native Ctrl+F and Ctrl+plus/minus/zero behavior intact. [[src/web/WebShell.tsx]] renders the shared Limits and view bands below a brand-only header; it has no titlebar controls, context menu, or desktop management action. Its `wg-shell--web` class squares off the widget's window chrome, sizes the shell against the dynamic viewport (`100dvh`) so a phone URL bar never hides the scroll column, and arms the web-only responsive rules in `src/styles/index.css`: under `(pointer: coarse)` or at 430px-and-narrower viewports, every operable control meets the DESIGN.md 44x44 CSS-pixel touch minimum — strip members (range and breakdown toggles, view switcher and its options, chart grouping) grow their real boxes, the chart grouping strip reflows from the chart overlay into a row above it, and the two lone compact controls (hooks help, CPA disclosure) expand through transparent `::before` hit areas. The desktop widget carries none of these rules; the monitor bands reflow without clipping or horizontal scroll from 360px up. [[src/web/useWebMonitorData.ts]] reads only cached usage, provider status, and CPA status through the shared invoke cache, refreshes stale mounted subscribers every 60 seconds only while visible and on browser focus, and renders unavailable inputs as gaps. Its no-provider state directs the user to enable a provider on desktop without offering a browser action.
 
 ### Window Routes
@@ -324,7 +326,7 @@ It drives the [[features#Settings Window]]'s Integrations tab and blocked-window
 
 ### Settings Hooks
 
-Four hooks back the [[features#Settings Window]]: each owns one slice of state, calls Tauri IPC for mutations, and subscribes to the matching push event so the Settings surface and the widget titlebar stay in sync.
+Five hooks back the [[features#Settings Window]]: each owns one slice of state, calls Tauri IPC for mutations, and subscribes to the matching push event so the Settings surface and the widget titlebar stay in sync.
 
 | Hook | File | Source of truth | Listens for |
 |------|------|-----------------|-------------|
@@ -332,6 +334,9 @@ Four hooks back the [[features#Settings Window]]: each owns one slice of state, 
 | `useRuntimeSettings` | [[src/hooks/useRuntimeSettings.ts]] | `RuntimeSettings` background-task tunings (live-usage interval, rule watcher, always-on-top) | `runtime-settings-updated` |
 | `useLearningSettings` | [[src/hooks/useLearningSettings.ts]] | `LearningSettings` (trigger mode, periodic interval, thresholds) | None — read on mount and after save |
 | `useRetentionPolicy` | [[src/hooks/useRetentionPolicy.ts]] | `RetentionPolicy` (window, watermark, last run) via `get_retention_policy` / `set_retention_policy` | `retention-maintenance-finished` |
+| `useWebUiSettings` | [[src/hooks/useWebUiSettings.ts]] | `WebUiConfig` plus the pairing code and live `WebUiStatus` via the four desktop Web UI commands | None — read on mount and after every write |
+
+[[src/hooks/useWebUiSettings.ts#useWebUiSettings]] keeps configuration and listener status as two reads because they answer different questions: the config is what the user asked for, the status is what the listener did with it. Every write re-reads status, since a successful transition rebinds and a failed one records `web_ui.last_error` while rolling back to the previous socket. Rejections are recognized against the backend's `WebUiErrorCode` list rather than cast, so an unrecognized rejection is reported as `unexpected` instead of being labelled with a typed code it never carried. The four commands it drives are absent from the web transport's permitted-command table, so this hook is reachable from the desktop only. Its config and status shapes are imported from [[src/web/httpTransport.ts]], the one TypeScript home for the protocol contract.
 
 `useIntegrationFeatures` exposes typed setters per flag that each invoke a dedicated `set_*_enabled` IPC, while `useRuntimeSettings` and `useLearningSettings` save the whole struct in one call.
 

@@ -392,11 +392,11 @@ The Settings section of the [[frontend#Manage Workspace]], opened by the titleba
 
 Rendered as the `settings` section of the Manage workspace ([[src/windows/ManageWindowView.tsx]]); the titlebar cog opens `manage` at that section (via a `manage:navigate` event when it is already open). The former standalone `?view=settings` window was retired.
 
-Settings is always reachable (the Manage workspace never gates it) so users can manage integrations and runtime preferences before any provider is enabled. The shell lives in [[src/windows/SettingsWindowView.tsx]]; the active tab is owned by the Manage shell and passed in, so a `settings:<tab>` deep link retargets an already-open workspace instead of being ignored by a mounted component's own state; its `.settings-tabs` flex container uses `nowrap` so the five top tabs never collapse onto a second row, and its own window chrome (titlebar/close) is suppressed via `manage.css` when embedded in the Manage content pane.
+Settings is always reachable (the Manage workspace never gates it) so users can manage integrations and runtime preferences before any provider is enabled. The shell lives in [[src/windows/SettingsWindowView.tsx]]; the active tab is owned by the Manage shell and passed in, so a `settings:<tab>` deep link retargets an already-open workspace instead of being ignored by a mounted component's own state; its `.settings-tabs` flex container uses `nowrap` so the six top tabs never collapse onto a second row — six exceed the content pane at the Manage window's 720px floor, so the strip scrolls horizontally rather than wrapping or clipping a tab out of reach — and its own window chrome (titlebar/close) is suppressed via `manage.css` when embedded in the Manage content pane.
 
 ### Tab Layout
 
-Top-tabs navigation hosts five panels: General, Integrations, Context, Learning, and Performance.
+Top-tabs navigation hosts six panels: General, Integrations, Context, Learning, Performance, and Web.
 
 | Tab | Panel | Settings |
 | ----- | ------- | ---------- |
@@ -405,12 +405,57 @@ Top-tabs navigation hosts five panels: General, Integrations, Context, Learning,
 | Context | [[src/components/settings/ContextTab.tsx]] | Working Context Preservation global toggle, Context savings telemetry sub-toggle (gated on context preservation), and the [[features#Brevity Profile]] global toggle (gated on having any provider enabled), each with descriptive copy explaining what gets installed |
 | Learning | [[src/components/settings/LearningTab.tsx]] | Learning trigger mode, periodic enable, periodic interval, min observations, min confidence, plus the Rule Watcher master toggle |
 | Performance | [[src/components/settings/PerformanceTab.tsx]] | Live-usage refresh enable + interval (60–600s), model-index rebuild and committed progress from [[frontend#Frontend#Components#Model Rollup Maintenance]], manual database compaction, and the manual retention prune control described in [[frontend#Frontend#Components#Retention Control]] |
+| Web | [[src/components/settings/WebTab.tsx]] | The browser listener's enable toggle, port, host policy, pairing code, and listener status, described in [[features#Settings Window#Web UI Section]] |
 
 ### Version and Release Notes
 
 The General tab's About section is the settings surface that reports the running app version and opens the release-notes window.
 
 [[src/components/settings/GeneralTab.tsx]] reads the version once on mount through the Tauri `getVersion()` API and renders it in the About row; a failed read is logged and the row falls back to "Version unavailable" rather than disappearing, so the adjacent "What's new" button always works. That button focuses an existing `release-notes` webview when one is open and otherwise creates it at `/?view=release-notes` ([[src/windows/ReleaseNotesWindow.tsx]]), which keeps the release-notes viewer reachable from settings independently of the main-window chrome.
+
+### Web UI Section
+
+The desktop-only control surface for the app-served browser monitor, and the
+place P11's informed opt-in is actually carried.
+
+[[src/components/settings/WebTab.tsx]] drives the four Web UI commands through
+[[src/hooks/useWebUiSettings.ts#useWebUiSettings]]. The disclosure renders above
+the enable toggle and stays visible while the feature is off, so it is read
+before enablement rather than after: it names the sixteen monitor reads the
+server-side allowlist permits — rate-limit utilization and reset windows, token,
+cost and code-line totals, project names and absolute paths, recorded hostnames,
+session identifiers and live agent lineage, model IDs, skill and hook names,
+runtime statistics, context-savings figures, enabled providers, and the
+retention window — states that nothing is redacted, and states that the
+transport is HTTP rather than HTTPS. It also states what is never served
+(Settings, Manage, Sessions, Learning, Memory) and that a browser cannot write.
+
+The port field holds the user's draft until blur or Enter and then submits it;
+`web_config.rs` remains the validator, and the field guards only its own
+1024–65535 range because a `u16` command argument cannot carry an out-of-range
+value to the backend at all. A rejected candidate leaves the running
+configuration in place, so the draft keeps the refused value for correction
+while the row shows why it was refused.
+
+Host acceptance is a radio group rather than a toggle strip: both modes carry
+their own exposure copy so the accept-all consequence is readable before it is
+chosen, and choosing it is the explicit act P11 requires. The pairing row shows
+the code with a Regenerate action and states that regenerating signs out every
+paired browser and that the code is never the credential the agents report with.
+
+The listener readout separates *bound* from *reachable*. It reports the socket
+Quill actually holds (`127.0.0.1:<port>` or `0.0.0.0:<port>`) and the
+server-produced URLs, and it never claims another device can reach them: a
+same-host check cannot prove remote reachability, so the wildcard-bind copy says
+only that Quill holds the socket and that a firewall anywhere on the route can
+still refuse a device. Disabled reads as "no socket is bound". One "Last error"
+line shows the last typed command rejection, falling back to the persisted
+`web_ui.last_error` so a bind failure recorded at startup is visible whenever
+Settings is next opened.
+
+Browser fixtures answer all four commands with the same loopback-versus-wildcard
+bind rule and the same typed port rejections, so the surface stays inspectable
+outside Tauri.
 
 ### Database Compaction
 

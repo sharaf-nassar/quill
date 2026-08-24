@@ -18,9 +18,27 @@
   background: var(--console-black);
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   flex-shrink: 0;
+  /* Six tabs exceed the content pane at the Manage window's 720px floor. The
+     strip scrolls rather than wrapping or clipping, so every tab stays
+     reachable and the row count never changes with the window width. */
+  overflow-x: auto;
+}
+
+.settings-tabs::-webkit-scrollbar {
+  height: 4px;
+}
+
+.settings-tabs::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.settings-tabs::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 2px;
 }
 
 .settings-tab {
+  flex-shrink: 0;
   background: transparent;
   border: none;
   border-bottom: 2px solid transparent;
@@ -686,6 +704,116 @@
   }
 }
 
+/* ─── Web UI section (feature 029) ───
+   A two-mode choice with real exposure consequences, so it is a radio group and
+   not a toggle strip: the options carry their own disclosure copy and the user
+   must be able to read both before picking one. */
+.web-policy {
+  margin: 8px 4px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  min-width: 0;
+}
+
+.web-policy:disabled {
+  opacity: 0.55;
+}
+
+.web-policy-legend {
+  padding: 0 4px;
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+
+.web-policy-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+.web-policy-option + .web-policy-option {
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.web-policy-option input {
+  margin: 1px 0 0;
+  accent-color: var(--signal-blue);
+  cursor: inherit;
+}
+
+.web-policy-option input:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.7);
+  outline-offset: 2px;
+}
+
+.web-policy-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.web-policy-label {
+  color: var(--readout);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.web-policy-description {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.web-pairing-code {
+  padding: 3px 8px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 3px;
+  color: var(--readout-bright);
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  overflow-wrap: anywhere;
+}
+
+.web-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  margin: 4px 4px 0;
+  padding: 0 0 8px;
+}
+
+.web-status-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.web-status-item dt {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.38);
+}
+
+.web-status-item dd {
+  margin: 0;
+  color: var(--readout-bright);
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
 /* ─── Prose blocks (descriptive copy in tabs) ─── */
 .settings-prose {
   margin: 12px 4px;
@@ -704,6 +832,11 @@
 
 .settings-prose p + p {
   margin-top: 6px;
+}
+
+.settings-prose strong {
+  color: var(--readout-bright);
+  font-weight: 600;
 }
 
 .settings-prose code {

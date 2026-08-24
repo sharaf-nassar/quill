@@ -10,6 +10,7 @@ import IntegrationsTab from "../components/settings/IntegrationsTab";
 import ContextTab from "../components/settings/ContextTab";
 import LearningTab from "../components/settings/LearningTab";
 import PerformanceTab from "../components/settings/PerformanceTab";
+import WebTab from "../components/settings/WebTab";
 import "../styles/settings.css";
 
 interface SettingsWindowViewProps {
@@ -46,6 +47,7 @@ function SettingsWindowView({
           <LearningTab learning={learning} runtime={runtime} />
         )}
         {active === "performance" && <PerformanceTab runtime={runtime} />}
+        {active === "web" && <WebTab />}
       </div>
     </div>
   );

@@ -3,7 +3,8 @@ export type SettingsTabId =
   | "integrations"
   | "context"
   | "learning"
-  | "performance";
+  | "performance"
+  | "web";
 
 interface SettingsTabsProps {
   active: SettingsTabId;
@@ -16,6 +17,7 @@ const TABS: ReadonlyArray<{ id: SettingsTabId; label: string }> = [
   { id: "context", label: "Context" },
   { id: "learning", label: "Learning" },
   { id: "performance", label: "Performance" },
+  { id: "web", label: "Web" },
 ];
 
 function SettingsTabs({ active, onChange }: SettingsTabsProps) {

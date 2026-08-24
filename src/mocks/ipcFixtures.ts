@@ -41,6 +41,11 @@ import type {
   TokenStats,
   UsageData,
 } from "../types";
+import type {
+  WebUiConfig,
+  WebUiConfigResponse,
+  WebUiStatus,
+} from "../web/httpTransport";
 
 const now = Date.now();
 const M = 60_000;
@@ -2374,6 +2379,81 @@ function setRetentionPolicyFixture(
   return retentionPolicy();
 }
 
+// --- Web UI settings (feature 029) --------------------------------------------
+
+// Reassigned, never mutated, so the browser behaves like the real
+// write-then-reread: `set_web_ui_config` returns what it stored and
+// `get_web_ui_status` reflects that same transition.
+let webUiConfig: WebUiConfig = {
+  enabled: false,
+  port: 19878,
+  host_policy: "allowlist",
+  allowlist: [],
+};
+// Rotation is a counter rather than a random draw: this file's values stay
+// deterministic so design screenshots do not drift between reloads.
+const WEB_UI_PAIRING_CODES = [
+  "bXBWc0R2M0tuUXhMOWZfMg",
+  "c1E3dEpyNGhZbTJfTHhCdw",
+  "ZjZrTndVOWFEc3hQMl9ScQ",
+] as const;
+let webUiPairingIndex = 0;
+let webUiPairingCode: string = WEB_UI_PAIRING_CODES[0];
+let webUiLastError: string | null = null;
+
+function webUiStatusFixture(): WebUiStatus {
+  if (!webUiConfig.enabled) {
+    return {
+      running: false,
+      bound_addr: null,
+      reachable_urls: [],
+      last_error: webUiLastError,
+    };
+  }
+  // The listener binds loopback until a non-local host is allowed, exactly as
+  // the controller does, so the browser can read both status shapes.
+  const external =
+    webUiConfig.host_policy === "all" || webUiConfig.allowlist.length > 0;
+  const host = external ? "0.0.0.0" : "127.0.0.1";
+  return {
+    running: true,
+    bound_addr: `${host}:${webUiConfig.port}`,
+    reachable_urls: external
+      ? [
+          `http://127.0.0.1:${webUiConfig.port}/`,
+          `http://192.168.1.24:${webUiConfig.port}/`,
+        ]
+      : [`http://127.0.0.1:${webUiConfig.port}/`],
+    last_error: webUiLastError,
+  };
+}
+
+function setWebUiConfigFixture(
+  args: Record<string, unknown> | undefined,
+): WebUiConfigResponse {
+  const candidate = args?.config as WebUiConfig | undefined;
+  if (candidate === undefined) {
+    throw new Error("missing config");
+  }
+  // Mirrors the backend's typed rejection: a refused candidate never replaces
+  // the stored configuration, so the settings surface can be exercised against
+  // a real last-known-good rollback in the browser.
+  if (candidate.port === 19876 || candidate.port === 19877) {
+    webUiLastError = "Web UI port conflicts with the Quill ingestion server.";
+    throw {
+      code: "port_collision",
+      message: webUiLastError,
+    };
+  }
+  if (candidate.port < 1024) {
+    webUiLastError = "Web UI port must be between 1024 and 65535.";
+    throw { code: "invalid_port", message: webUiLastError };
+  }
+  webUiLastError = null;
+  webUiConfig = { ...candidate, allowlist: [...candidate.allowlist].sort() };
+  return { config: webUiConfig, pairing_code: webUiPairingCode };
+}
+
 // --- Widget aggregates (feature 018) ------------------------------------------
 
 const SESSION_CURVE = [2, 3, 3, 5, 4, 6, 7, 8, 7, 9, 10, 12, 13] as const;
@@ -2412,6 +2492,18 @@ const fixtures: Record<string, FixtureHandler> = {
   set_runtime_settings: () => runtimeSettings,
   get_learning_settings: () => learningSettings,
   set_learning_settings: () => learningSettings,
+  // web UI
+  get_web_ui_config: () => ({
+    config: webUiConfig,
+    pairing_code: webUiPairingCode,
+  }),
+  set_web_ui_config: (args) => setWebUiConfigFixture(args),
+  get_web_ui_status: () => webUiStatusFixture(),
+  regenerate_web_pairing_code: () => {
+    webUiPairingIndex = (webUiPairingIndex + 1) % WEB_UI_PAIRING_CODES.length;
+    webUiPairingCode = WEB_UI_PAIRING_CODES[webUiPairingIndex];
+    return { pairing_code: webUiPairingCode };
+  },
   compact_database: async () => {
     await emit("compact-database-progress", { phase: "Checking disk space", pct: 15 });
     await new Promise((resolve) => setTimeout(resolve, 350));
