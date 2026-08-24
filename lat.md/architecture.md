@@ -59,7 +59,7 @@ Neither Manage nor release-notes had any affordance at all before this, because 
 
 ## Module Map
 
-The Rust backend in [[src-tauri/src/lib.rs]] registers 92 Tauri commands and starts background tasks on launch. Four Web UI scaffold commands intentionally return a typed `not_implemented` error until their configuration, lifecycle, and pairing work lands.
+The Rust backend in [[src-tauri/src/lib.rs]] registers 93 Tauri commands and starts background tasks on launch. Four Web UI scaffold commands intentionally return a typed `not_implemented` error until their configuration, lifecycle, and pairing work lands.
 
 ### Backend Modules
 
@@ -71,6 +71,7 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 | HTTP server | [[src-tauri/src/server.rs]] | Axum API on port 19876 for hook data ingestion |
 | Web UI server scaffold | [[src-tauri/src/web_server/mod.rs]] | Shared Axum router state and typed pre-implementation error; no listener or routes yet |
 | Web UI config | [[src-tauri/src/web_config.rs]] | Typed config validation and atomic `web_ui.*` dotted-settings persistence |
+| Web UI command allowlist | [[src-tauri/src/web_allowlist.rs]] | The single default-deny match naming every command a browser may invoke |
 | Storage | [[src-tauri/src/storage.rs]] | SQLite schema, migrations, queries, aggregation |
 | Sessions | [[src-tauri/src/sessions.rs]] | Tantivy full-text indexing of session transcripts |
 | Pi session format | [[src-tauri/src/pi_session.rs]] | Narrow v2/v3 message parsing and bounded header probes for search and temporary live fallback |
@@ -120,7 +121,7 @@ An Axum server on port 19876 (configurable via `QUILL_PORT`) receives data from 
 
 The web-only monitor uses a same-origin invoke bridge with a default-deny read-command boundary.
 
-`POST /api/web/invoke` runs through [[src/web/httpTransport.ts]]. [[src-tauri/src/web_server/mod.rs]] owns the matching serde envelopes, exact command table, desktop config/status field names, pairing-cookie attributes, and canonical reachable-URL formatting; the shim holds no parallel command or settings-key table. Success and command failures retain Tauri-style promise behavior; host/session refusals stay empty-body `403` responses before data access. The normative cross-language payloads and fixtures live in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
+`POST /api/web/invoke` runs through [[src/web/httpTransport.ts]]. [[src-tauri/src/web_server/mod.rs]] owns the matching serde envelopes, desktop config/status field names, pairing-cookie attributes, and canonical reachable-URL formatting, while [[src-tauri/src/web_allowlist.rs]] owns the exact permitted-command table. The shim holds no parallel command or settings-key table. Success and command failures retain Tauri-style promise behavior; host/session refusals stay empty-body `403` responses before data access. The normative cross-language payloads and fixtures live in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
 
 There is no browser push channel in v1. Event listen/unlisten and window/webview plugin calls are client-local no-ops, while every `plugin:*` command remains denied server-side; visibility-aware polling supplies freshness.
 

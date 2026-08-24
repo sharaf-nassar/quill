@@ -38,3 +38,4 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[pi-extension-tests]] — Pi tool, telemetry, local-only, containment, and real-loader test specs
 - [[pi-spool-tests]] — Pi spool drain, overlap, gap, and throttling test specs
 - [[context-http-api-tests]] — Loopback context API security, parity, execution, and pi telemetry test specs
+- [[web-ui-server-tests]] — Browser command default-deny test specs

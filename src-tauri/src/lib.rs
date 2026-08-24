@@ -48,6 +48,7 @@ mod transcript_analytics;
 mod transcript_identity;
 mod transcript_watcher;
 mod tray_keepalive;
+pub mod web_allowlist;
 mod web_config;
 /// Identity-scoped web pairing credential and the HMAC sessions derived from
 /// it. Public because the web listener's request gates verify against it.
@@ -3125,6 +3126,22 @@ async fn fetch_usage_data(app: tauri::AppHandle) -> Result<UsageData, String> {
 #[tauri::command]
 async fn refresh_usage_data(app: tauri::AppHandle) -> Result<UsageData, String> {
     refresh_usage_cache(Some(&app), true).await
+}
+
+/// Read the usage the desktop already has, without contacting a provider.
+///
+/// This is the only usage read [[src-tauri/src/web_allowlist.rs]] permits, so a
+/// browser viewer never spends the user's quota and never writes a snapshot:
+/// the in-process cache is what the desktop currently displays, and the
+/// persisted fallback is the last stored snapshot when that cache is cold.
+#[tauri::command]
+async fn get_cached_usage_data() -> Result<UsageData, String> {
+    if let Some((_, usage)) = current_usage_context() {
+        return Ok(usage);
+    }
+    let storage = get_storage()?;
+    let statuses = integrations::load_statuses(storage)?;
+    Ok(load_cached_usage_data(&statuses))
 }
 
 #[tauri::command]
@@ -6283,6 +6300,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             fetch_usage_data,
             refresh_usage_data,
+            get_cached_usage_data,
             get_indicator_primary_provider,
             set_indicator_primary_provider,
             get_usage_history,

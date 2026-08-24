@@ -30,7 +30,7 @@ The route set is `/api/v1/context/{index,fetch,execute,search,source,stats,purge
 
 [[src-tauri/src/web_server/mod.rs]] defines the third listener's closed invoke and pairing protocol independently of the writable ingestion API.
 
-Browser dispatch is one exact default-deny match over the monitor's cache/local-storage reads; `fetch_usage_data`, `refresh_usage_data`, setters, maintenance commands, and the full `plugin:*` namespace are excluded. Command denial is a JSON `403`, while host/session refusal remains an empty-body `403` before dispatch.
+Browser dispatch is one exact default-deny match over the monitor's cache/local-storage reads, owned by [[src-tauri/src/web_allowlist.rs#is_permitted_command]]; `fetch_usage_data`, `refresh_usage_data`, retry/backfill and maintenance commands, every setter, and the full `plugin:*` namespace are excluded. Each permitted arm carries the storage read it resolves to, matching is on the complete command string so no prefix, suffix, or alias widens it, and nothing is keyed on a command count. Command denial is a JSON `403`, while host/session refusal remains an empty-body `403` before dispatch.
 
 Desktop configuration serializes as `{ config: { enabled, port, host_policy, allowlist }, pairing_code }`; status serializes as `{ running, bound_addr, reachable_urls, last_error }`. Reachable URLs use concrete interface IPs, explicit ports, IPv6 brackets, and a trailing slash. Pairing sets `quill_web_session` for 30 days with `Path=/`, `HttpOnly`, and `SameSite=Strict`, omitting `Domain`, `Secure`, and `Expires` for the intentionally plain-HTTP listener. Cross-language round-trip fixtures are fixed by `specs/029-web-ui-server.md#web-transport-protocol-contract`.
 
@@ -1030,7 +1030,7 @@ Tables for recording per-session token consumption and hourly host-level aggrega
 - **token_hourly** — Hourly aggregates per provider/host (total tokens, turn_count). Unique on (hour, hostname, provider).
 - Analytics session history, compact token stats, and delete-session cleanup all treat sessions as `(provider, session_id)` pairs so Claude and Codex ids cannot collide.
 
-Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (13)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
+Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (14)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
 
 Pushed Pi usage reuses `token_snapshots` only for lifecycle origins marked ephemeral. The model-observation event UUID admits the snapshot once, preserving tokens after live teardown without changing non-ephemeral rows.
 
@@ -1583,13 +1583,15 @@ typed, display-safe `not_implemented` error during the scaffold.
 The error comes from [[src-tauri/src/web_server/mod.rs#WebUiError]]. No listener,
 settings mutation, status read, or pairing action exists yet.
 
-### Usage and Token Commands (13)
+### Usage and Token Commands (14)
 
 Live usage and token analytics commands back provider quota, history, breakdown, and context-savings views.
 
-`fetch_usage_data`, `get_usage_history`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_activity_series`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`, `get_skill_breakdown`, `get_skill_project_breakdown`, `get_hook_breakdown`, `get_context_savings_analytics`.
+`fetch_usage_data`, `get_cached_usage_data`, `get_usage_history`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_activity_series`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`, `get_skill_breakdown`, `get_skill_project_breakdown`, `get_hook_breakdown`, `get_context_savings_analytics`.
 
 The live-usage commands now treat utilization history as `(provider, bucket_key)` data instead of assuming a single global Claude bucket label.
+
+[[src-tauri/src/lib.rs#get_cached_usage_data]] is the network-free read the web listener uses in place of `fetch_usage_data`. It returns the in-process usage cache the desktop currently displays, falling back to saved provider statuses plus the last stored snapshots when that cache is cold. It never fetches, never stores a snapshot, and emits no event, so browser viewers cannot multiply provider egress or spend quota.
 
 [[src-tauri/src/storage.rs#Storage#get_activity_series]] counts distinct `session_id` and distinct `cwd` per bucket. Those counts are distinct *within* a bucket and deliberately do not sum to a range total — a session spanning three buckets is counted in each — and snapshots with no `cwd` are left out of the project count instead of being folded into an invented "unknown" project.
 

@@ -3,6 +3,9 @@
 //! The normative payloads, field names, status mapping, command table, cookie
 //! attributes, and URL formatting live in
 //! `specs/029-web-ui-server.md#web-transport-protocol-contract`.
+//!
+//! The permitted-command boundary itself lives in
+//! [[src-tauri/src/web_allowlist.rs]] so there is one default-deny matcher.
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -226,29 +229,6 @@ where
     }
 }
 
-/// Security boundary for browser invokes. No aliases or prefix matches.
-pub fn is_permitted_command(command: &str) -> bool {
-    matches!(
-        command,
-        "get_activity_series"
-            | "get_cached_usage_data"
-            | "get_code_stats"
-            | "get_code_stats_history"
-            | "get_context_savings_analytics"
-            | "get_cpa_connection_status"
-            | "get_hook_breakdown"
-            | "get_host_breakdown"
-            | "get_llm_runtime_stats"
-            | "get_model_usage_overview"
-            | "get_project_breakdown"
-            | "get_provider_statuses"
-            | "get_retention_policy"
-            | "get_session_breakdown"
-            | "get_skill_breakdown"
-            | "get_token_history"
-    )
-}
-
 /// Format concrete local interface addresses for Settings display.
 pub fn format_reachable_urls(
     addresses: impl IntoIterator<Item = IpAddr>,
@@ -329,41 +309,6 @@ mod tests {
             InvokeResponse::<Value>::command_denied().status(),
             INVOKE_DENIED_STATUS
         );
-    }
-
-    #[test]
-    fn command_table_is_default_deny() {
-        for command in [
-            "get_activity_series",
-            "get_cached_usage_data",
-            "get_code_stats",
-            "get_code_stats_history",
-            "get_context_savings_analytics",
-            "get_cpa_connection_status",
-            "get_hook_breakdown",
-            "get_host_breakdown",
-            "get_llm_runtime_stats",
-            "get_model_usage_overview",
-            "get_project_breakdown",
-            "get_provider_statuses",
-            "get_retention_policy",
-            "get_session_breakdown",
-            "get_skill_breakdown",
-            "get_token_history",
-        ] {
-            assert!(is_permitted_command(command), "{command}");
-        }
-
-        for command in [
-            "fetch_usage_data",
-            "refresh_usage_data",
-            "set_runtime_settings",
-            "plugin:event|listen",
-            "plugin:window|get_all_windows",
-            "unknown",
-        ] {
-            assert!(!is_permitted_command(command), "{command}");
-        }
     }
 
     #[test]
