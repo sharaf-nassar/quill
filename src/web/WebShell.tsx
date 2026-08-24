@@ -8,7 +8,7 @@ function WebShell() {
   const noRefresh = useCallback(async () => undefined, []);
 
   return (
-    <main className="wg-shell" aria-label="Quill web monitor">
+    <main className="wg-shell wg-shell--web" aria-label="Quill web monitor">
       <header className="wg-web-header">
         <div className="wg-tb-brand">
           <span className="wg-glyph" aria-hidden="true" />

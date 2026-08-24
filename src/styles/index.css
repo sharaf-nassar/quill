@@ -1900,6 +1900,70 @@ body {
   padding: 0 14px;
 }
 
+/* ─── Web shell — the browser-served monitor (specs/029-web-ui-server) ───
+   A browser page is not a floating window: the web shell squares off the
+   widget's window chrome and sizes against the dynamic viewport so a phone
+   URL bar never hides the bottom of the scroll column. Everything else is
+   the shared widget surface, untouched. */
+.wg-shell--web {
+  height: 100vh;
+  height: 100dvh;
+  border: 0;
+  border-radius: 0;
+}
+
+/* DESIGN.md, The Touch Target Rule: on touch-capable web viewports every
+   operable control offers a 44x44 CSS-pixel hit area. The width arm keeps
+   the guarantee on phone-sized windows (the supported 360-430px band) even
+   where pointer coarseness is not reported. Strip members (toggles, view
+   switcher, chart grouping) grow their real boxes — packed 1px apart, a
+   transparent expansion would overlap the neighbouring control's hit area —
+   while the two lone compact controls (hooks help, CPA disclosure) keep
+   their visual size and expand through a transparent ::before that
+   hit-tests to the same button and reaches no other control. */
+@media (pointer: coarse), (max-width: 430px) {
+  .wg-shell--web .wg-toggle,
+  .wg-shell--web .wg-viewdd-btn,
+  .wg-shell--web .wg-viewdd-option,
+  .wg-shell--web .wg-chart-dimensions button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  /* The grown grouping strip no longer fits the chart's quiet corner: in
+     its overlay position it would sit on the delta and headline lines, so
+     it reflows into a full-width row above the chart instead. */
+  .wg-shell--web .wg-chart-controls {
+    position: static;
+    margin-bottom: var(--space-xs);
+  }
+
+  .wg-shell--web .wg-usage-chart .viz-chart-legend {
+    top: 54px;
+  }
+
+  .wg-shell--web .wg-breakdown-help,
+  .wg-shell--web .wg-cpa-toggle {
+    position: relative;
+  }
+
+  /* 16px visual circle to a 44px square. The abspos pseudo resolves against
+     the 14px padding box (border-box sizing minus the 1px border), so 15px
+     is what reaches 14px beyond the visual edge. */
+  .wg-shell--web .wg-breakdown-help::before {
+    content: "";
+    position: absolute;
+    inset: -15px;
+  }
+
+  /* 18x24px visual keycap + 13px/10px sides = 44px square. */
+  .wg-shell--web .wg-cpa-toggle::before {
+    content: "";
+    position: absolute;
+    inset: -10px -13px;
+  }
+}
+
 .wg-tb-brand {
   display: flex;
   align-items: center;
