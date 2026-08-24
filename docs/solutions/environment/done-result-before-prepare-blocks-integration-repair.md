@@ -1,7 +1,7 @@
 ---
 title: A done result before prepare can make integration repair unreachable
 date: 2026-08-23
-last_updated: 2026-08-23
+last_updated: 2026-08-24
 component: implement-ready
 tags: [beads, rail, integration, retry-gate, worktrees, knip]
 problem_type: workflow
@@ -73,13 +73,24 @@ removed every rail-compliant path to land it.
 
 ## Fix
 
-No fix commit landed in this run. Task `quill-j76f.2` remains open with the
-resolved worktree preserved and downstream web-server tasks stranded. Its bead
-notes contain the exact recovery path and gate outputs.
+A fresh single-task rail run rebuilt the preserved resolution from current
+`main`, produced a new verifiable result, and integrated `quill-j76f.2` as
+`0d43fad0b101b24601513ad87b53fb4951bd4c2b`. Recovery did not reuse or mutate
+the immutable result from the failed run.
 
-A future recovery must start with a rail-verifiable branch whose final worker
-result includes the scaffold merge and a green Knip gate. Do not reuse the done
-attempt artifact as proof for a different branch head.
+## Existing-file hub variant
+
+Run `run-20260823T215909.bbDS2t` proved the same failure does not require an
+add/add conflict. Tasks `quill-j76f.3`, `.4`, and `.5` were launched together
+because the overlap report classified their shared edits to
+`src-tauri/src/lib.rs` as hub contention rather than conflict. Pairing task `.4`
+integrated first as `aa496b75d156032bbff5c99dd1064114d72de492`.
+
+The already-verified `.3` and `.5` branches then both failed `prepare` with
+content conflicts in `src-tauri/src/lib.rs`; `.3` also conflicted in
+`lat.md/backend.md`. Their worktrees remain preserved for fresh-run recovery.
+Hub classification describes a known shared file, not proof that independently
+landed hunks will rebase cleanly.
 
 ## Prevention
 
@@ -87,9 +98,9 @@ attempt artifact as proof for a different branch head.
   failure means `status: failed` even when the worker says done.
 - Do not normalize unsupported worker statuses such as `completed` until checks
   and commit evidence independently satisfy acceptance.
-- When the first task creates a file that another ready task also declares,
-  serialize them despite a hub-contention classification; add/add conflicts are
-  not ordinary disjoint hub edits.
+- Serialize tasks that share a declared hub file unless an earlier task has
+  integrated and the next worker branches from that result. Hub classification
+  is not proof of rebase compatibility, whether the file is new or existing.
 - Resolve known sequencing-only unused-file failures before recording success,
   either by landing the real importer first or by adding an explicit temporary
   entry that the importer task removes.
