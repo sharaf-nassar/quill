@@ -16,6 +16,8 @@ use axum::Router;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
+pub mod controller;
+
 /// State shared by all web UI routes.
 ///
 /// Fields are added by the controller, credential, and request-gate work items.
@@ -29,35 +31,98 @@ pub fn router(state: Arc<WebServerState>) -> Router {
     Router::new().with_state(state)
 }
 
-/// Display-safe error returned while the web UI scaffold has no implementation.
+/// Typed, display-safe error returned by desktop Web UI commands.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebUiError {
     pub code: WebUiErrorCode,
-    pub message: &'static str,
+    pub message: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WebUiErrorCode {
-    NotImplemented,
     PairingUnavailable,
+    InvalidPort,
+    PortCollision,
+    InvalidAllowlistEntry,
+    TooManyAllowlistEntries,
+    InvalidStoredConfiguration,
+    Storage,
+    BindFailed,
+    RollbackFailed,
 }
 
 impl WebUiError {
-    pub fn not_implemented() -> Self {
-        Self {
-            code: WebUiErrorCode::NotImplemented,
-            message: "Web UI server is not implemented yet.",
-        }
-    }
-
     /// The credential's own failure path stays display-safe: the underlying
     /// filesystem error names a path and is logged, never returned.
     pub fn pairing_unavailable() -> Self {
         Self {
             code: WebUiErrorCode::PairingUnavailable,
-            message: "Could not update the web pairing code.",
+            message: "Could not update the web pairing code.".to_string(),
+        }
+    }
+
+    pub(crate) fn storage(operation: &'static str, error: impl std::fmt::Display) -> Self {
+        log::error!("{operation}: {error}");
+        Self {
+            code: WebUiErrorCode::Storage,
+            message: "Web UI configuration is unavailable.".to_string(),
+        }
+    }
+
+    pub(crate) fn bind(address: SocketAddr, error: &std::io::Error) -> Self {
+        log::warn!("Could not bind Web UI listener on {address}: {error}");
+        let message = match error.kind() {
+            std::io::ErrorKind::AddrInUse => {
+                format!("Web UI port {} is already in use.", address.port())
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                "Quill does not have permission to open the Web UI listener.".to_string()
+            }
+            std::io::ErrorKind::AddrNotAvailable => {
+                "The selected Web UI network address is unavailable.".to_string()
+            }
+            _ => "Could not start the Web UI listener.".to_string(),
+        };
+        Self {
+            code: WebUiErrorCode::BindFailed,
+            message,
+        }
+    }
+
+    pub(crate) fn rollback(bind_error: &Self, rollback_error: &Self) -> Self {
+        log::error!(
+            "Web UI rebind failed and the previous listener could not be restored: {}; {}",
+            bind_error.message,
+            rollback_error.message
+        );
+        Self {
+            code: WebUiErrorCode::RollbackFailed,
+            message: "Could not restore the previous Web UI listener.".to_string(),
+        }
+    }
+}
+
+impl From<crate::web_config::WebUiConfigError> for WebUiError {
+    fn from(error: crate::web_config::WebUiConfigError) -> Self {
+        use crate::web_config::WebUiConfigErrorCode;
+
+        let code = match error.code {
+            WebUiConfigErrorCode::InvalidPort => WebUiErrorCode::InvalidPort,
+            WebUiConfigErrorCode::PortCollision => WebUiErrorCode::PortCollision,
+            WebUiConfigErrorCode::InvalidAllowlistEntry => WebUiErrorCode::InvalidAllowlistEntry,
+            WebUiConfigErrorCode::TooManyAllowlistEntries => {
+                WebUiErrorCode::TooManyAllowlistEntries
+            }
+            WebUiConfigErrorCode::InvalidStoredConfiguration => {
+                WebUiErrorCode::InvalidStoredConfiguration
+            }
+            WebUiConfigErrorCode::Storage => WebUiErrorCode::Storage,
+        };
+        Self {
+            code,
+            message: error.message.to_string(),
         }
     }
 }

@@ -5641,30 +5641,48 @@ async fn remove_custom_project(path: String) -> Result<(), String> {
     })
 }
 
-// Pairing owns the final `WebUiConfigResponse` envelope. Until that module
-// lands, these commands intentionally return only the durable config rather
-// than inventing an empty pairing code.
 #[tauri::command]
-async fn get_web_ui_config() -> Result<web_server::WebUiConfig, web_config::WebUiConfigError> {
-    let storage = get_storage().map_err(|error| {
-        web_config::WebUiConfigError::storage("Read Web UI configuration", error)
+async fn get_web_ui_config(
+    controller: tauri::State<'_, Arc<web_server::controller::WebListenerController>>,
+) -> Result<web_server::WebUiConfigResponse, web_server::WebUiError> {
+    let storage = get_storage()
+        .map_err(|error| web_server::WebUiError::storage("Read Web UI configuration", error))?;
+    let config = controller.config(storage).await?;
+    let pairing_code = run_blocking(web_pairing::pairing_code).map_err(|error| {
+        log::error!("Failed to read the web pairing credential: {error}");
+        web_server::WebUiError::pairing_unavailable()
     })?;
-    tokio::task::block_in_place(move || web_config::load_web_ui_config(storage))
+    Ok(web_server::WebUiConfigResponse {
+        config,
+        pairing_code,
+    })
 }
 
 #[tauri::command]
 async fn set_web_ui_config(
+    controller: tauri::State<'_, Arc<web_server::controller::WebListenerController>>,
     config: web_server::WebUiConfig,
-) -> Result<web_server::WebUiConfig, web_config::WebUiConfigError> {
-    let storage = get_storage().map_err(|error| {
-        web_config::WebUiConfigError::storage("Save Web UI configuration", error)
+) -> Result<web_server::WebUiConfigResponse, web_server::WebUiError> {
+    let storage = get_storage()
+        .map_err(|error| web_server::WebUiError::storage("Save Web UI configuration", error))?;
+    let config = controller.apply_config(storage, config).await?;
+    let pairing_code = run_blocking(web_pairing::pairing_code).map_err(|error| {
+        log::error!("Failed to read the web pairing credential: {error}");
+        web_server::WebUiError::pairing_unavailable()
     })?;
-    tokio::task::block_in_place(move || web_config::save_web_ui_config(storage, config))
+    Ok(web_server::WebUiConfigResponse {
+        config,
+        pairing_code,
+    })
 }
 
 #[tauri::command]
-async fn get_web_ui_status() -> Result<(), web_server::WebUiError> {
-    Err(web_server::WebUiError::not_implemented())
+async fn get_web_ui_status(
+    controller: tauri::State<'_, Arc<web_server::controller::WebListenerController>>,
+) -> Result<web_server::WebUiStatus, web_server::WebUiError> {
+    let storage = get_storage()
+        .map_err(|error| web_server::WebUiError::storage("Read Web UI status", error))?;
+    Ok(controller.status(storage).await)
 }
 
 #[tauri::command]
@@ -5810,6 +5828,13 @@ pub fn run() {
             let Some(storage) = initialize_storage_or_report_fatal(app.handle()) else {
                 return Ok(());
             };
+            let web_listener = Arc::new(web_server::controller::WebListenerController::new(
+                Arc::new(web_server::WebServerState),
+            ));
+            app.manage(Arc::clone(&web_listener));
+            tauri::async_runtime::spawn(async move {
+                web_listener.initialize(storage).await;
+            });
             // Read the crash-reporting opt-in before any other startup work so
             // a panic during initialization can only report once the user has
             // turned reporting on.

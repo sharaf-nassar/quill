@@ -54,11 +54,10 @@ configuration; absent means `null`.
 
 The config commands read related keys while the storage lock is held, validate
 before calling `set_settings_atomically`, then write all four rows in its one
-SQLite transaction. A rejected port, collision, or allowlist candidate cannot
-partially persist or replace the previous config. Until the pairing module
-lands, `get_web_ui_config` and `set_web_ui_config` temporarily return the
-inner `WebUiConfig`; pairing upgrades them to the protocol's final response
-shape instead of emitting an invented empty code.
+SQLite transaction. A rejected port, collision, allowlist candidate, or listener
+transition cannot partially persist or replace the previous config. Both config
+commands return the protocol's `WebUiConfigResponse`, including the separate
+pairing code.
 
 `port` must be 1024–65535 and cannot equal the resolved `QUILL_PORT` or
 `QUILL_CONTEXT_PORT`. The allowlist accepts IPv4/IPv6 literals, canonical CIDR
@@ -80,6 +79,29 @@ config unchanged.
 
 Wildcard, malformed IP/CIDR/hostname, entry 65, privileged port, and either
 resolved Quill listener collision must return a typed display-safe error.
+
+### Web UI listener lifecycle
+
+[[src-tauri/src/web_server/controller.rs]] is the sole runtime owner of the
+third listener. Tauri setup only creates and manages the controller, then spawns
+its initialization future; settings reads, binds, shutdowns, and startup-error
+writes remain off setup's critical path.
+
+Empty or loopback-only allowlists bind `127.0.0.1`; `host_policy=all` or the
+first non-local allowlist entry binds `0.0.0.0`. Disable persists first and then
+gracefully releases the socket. A different-port change binds the replacement
+first, persists only after success, swaps it into status, then gracefully stops
+the old listener. A same-port address change must stop the old listener first;
+if candidate bind or persistence fails, the controller rebinds the previous
+address and leaves its durable config unchanged. Shutdown waits two seconds
+before aborting a stuck task.
+
+Startup bind failures leave the enabled config intact and persist their
+display-safe message in `web_ui.last_error`; a later successful transition
+clears it. `get_web_ui_status` reports the live task separately from config:
+`running`, canonical `bound_addr`, concrete loopback or route-selected local
+URLs, and the latest startup or runtime error. It never treats a wildcard bind
+as proof that a firewall permits external traffic.
 
 ### Authentication
 
@@ -1574,14 +1596,17 @@ Key-value configuration and schema migration version tracking.
 
 The Tauri commands registered in [[src-tauri/src/lib.rs]] are grouped by feature.
 
-### Web UI Scaffold Commands (4)
+### Web UI Commands (4)
 
-`get_web_ui_config`, `set_web_ui_config`, `get_web_ui_status`, and
-`regenerate_web_pairing_code` are registered desktop IPC commands that return a
-typed, display-safe `not_implemented` error during the scaffold.
+Four desktop IPC commands expose Web UI configuration, listener status, and
+pairing-code rotation.
 
-The error comes from [[src-tauri/src/web_server/mod.rs#WebUiError]]. No listener,
-settings mutation, status read, or pairing action exists yet.
+`set_web_ui_config` delegates to the serialized listener controller before
+returning the final config-plus-pairing envelope; status reflects the live
+listener rather than only the persisted enable flag. Expected validation, bind,
+rollback, storage, and pairing failures use
+[[src-tauri/src/web_server/mod.rs#WebUiError]] as one typed display-safe
+boundary.
 
 ### Usage and Token Commands (14)
 

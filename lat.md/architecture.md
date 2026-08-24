@@ -59,7 +59,7 @@ Neither Manage nor release-notes had any affordance at all before this, because 
 
 ## Module Map
 
-The Rust backend in [[src-tauri/src/lib.rs]] registers 93 Tauri commands and starts background tasks on launch. Four Web UI scaffold commands intentionally return a typed `not_implemented` error until their configuration, lifecycle, and pairing work lands.
+The Rust backend in [[src-tauri/src/lib.rs]] registers 93 Tauri commands and starts background tasks on launch. The Web UI controller is managed during setup, but its storage read and listener startup run asynchronously so window creation never waits on a bind.
 
 ### Backend Modules
 
@@ -69,7 +69,8 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 |--------|------|---------|
 | Entry point | [[src-tauri/src/lib.rs]] | IPC commands, tray, auto-updater, background tasks |
 | HTTP server | [[src-tauri/src/server.rs]] | Axum API on port 19876 for hook data ingestion |
-| Web UI server scaffold | [[src-tauri/src/web_server/mod.rs]] | Shared Axum router state and typed pre-implementation error; no listener or routes yet |
+| Web UI server | [[src-tauri/src/web_server/mod.rs]] | Shared Axum router state, wire types, and typed desktop-command errors |
+| Web UI listener controller | [[src-tauri/src/web_server/controller.rs]] | Runtime enable, disable, rebind, rollback, graceful shutdown, and live status |
 | Web UI config | [[src-tauri/src/web_config.rs]] | Typed config validation and atomic `web_ui.*` dotted-settings persistence |
 | Web UI command allowlist | [[src-tauri/src/web_allowlist.rs]] | The single default-deny match naming every command a browser may invoke |
 | Storage | [[src-tauri/src/storage.rs]] | SQLite schema, migrations, queries, aggregation |
@@ -124,6 +125,8 @@ The web-only monitor uses a same-origin invoke bridge with a default-deny read-c
 `POST /api/web/invoke` runs through [[src/web/httpTransport.ts]]. [[src-tauri/src/web_server/mod.rs]] owns the matching serde envelopes, desktop config/status field names, pairing-cookie attributes, and canonical reachable-URL formatting, while [[src-tauri/src/web_allowlist.rs]] owns the exact permitted-command table. The shim holds no parallel command or settings-key table. Success and command failures retain Tauri-style promise behavior; host/session refusals stay empty-body `403` responses before data access. The normative cross-language payloads and fixtures live in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
 
 There is no browser push channel in v1. Event listen/unlisten and window/webview plugin calls are client-local no-ops, while every `plugin:*` command remains denied server-side; visibility-aware polling supplies freshness.
+
+[[src-tauri/src/web_server/controller.rs]] owns the listener independently of the ingestion and context servers. It serializes runtime config transitions, binds loopback until policy admits a non-local host, performs different-port bind-before-swap and same-port stop-bind-rollback sequencing, and persists startup bind errors. `running` and `bound_addr` prove only local listener state; reachable URL candidates do not claim firewall reachability.
 
 ### Tauri Events
 
