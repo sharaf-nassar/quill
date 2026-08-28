@@ -1,3 +1,5 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { sentryVitePlugin } from "@sentry/vite-plugin";
@@ -52,12 +54,39 @@ function liveDevCsp(): Plugin {
   };
 }
 
+// Vite's dependency optimizer has no cross-process locking: it writes
+// `deps_temp_<hash>/` under `cacheDir` and renames it onto `deps/`. Eleven test
+// files call `createServer()` and one calls `build()`, each loading this config
+// and each defaulting to `node_modules/.vite` — the very directory a running
+// `npm run tauri -- dev` owns. Their config hash differs from the dev server's,
+// so they re-optimize into the shared cache and race that rename, leaving
+// orphaned temporaries and no `deps/` at all. Vite then serves modules whose
+// pre-bundled dependencies 404, which shows up as the app rendering with its
+// CSS silently missing — the dev server "not reloading".
+//
+// Node sets `NODE_TEST_CONTEXT` in every `node --test` child; the filename check
+// is a second, repo-owned signal so this keeps holding if that variable ever
+// changes. Either one moves the test servers onto their own cache directory,
+// with no shell prefix that would break on Windows.
+//
+// That directory lives in the OS temp dir rather than under `node_modules`,
+// because these servers set `optimizeDeps.noDiscovery` and never commit a
+// `deps/`: every run leaves its temporaries behind, ~39MB a time. Somewhere the
+// OS reclaims is the right home for a cache nothing reads twice.
+function testCacheDir(): string | undefined {
+  const isTestRunner =
+    Boolean(process.env.NODE_TEST_CONTEXT) ||
+    Boolean(process.argv[1]?.endsWith(".test.mjs"));
+  return isTestRunner ? join(tmpdir(), "quill-vite-test-cache") : undefined;
+}
+
 export default defineConfig(({ mode }) => {
   const webBuild = mode === "web";
   const upload = sentryUpload(!webBuild);
 
   return {
     plugins: [react(), liveDevCsp(), ...(upload ? [upload] : [])],
+    cacheDir: testCacheDir(),
     clearScreen: false,
     server: {
       host: "0.0.0.0",

@@ -31,6 +31,12 @@ tokio = { version = "1", features = ["net", "sync", "process", "time", "io-util"
 tauri-plugin-updater = "2.10.0"
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
+# Opening a URL in the user's browser is per-OS shell-out plus scope
+# validation; the official plugin is smaller than reinventing either half.
+tauri-plugin-opener = "2"
+# `navigator.clipboard.writeText` fails silently under WebKitGTK on focus and
+# permission edge cases, so clipboard writes go through the OS API instead.
+tauri-plugin-clipboard-manager = "2"
 log = "0.4"
 rand = "0.8"
 subtle = "2"

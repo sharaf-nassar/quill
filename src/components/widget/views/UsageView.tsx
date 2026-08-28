@@ -12,9 +12,9 @@
 //     silently used a different window would be a quiet lie (constitution #1).
 //     The insight line rotates across windows, but only under the stated rule
 //     in `insightLine.ts` — never by taste and never on a timer.
-//   - **Colour means something.** Metric hues appear only on a cell's swatch,
-//     sparkline stroke and endpoint; values stay `--text-hi`. Green/red on a
-//     delta is assigned by *meaning*, not by arrow direction — a falling
+//   - **Colour means something.** Each metric hue ties together its value,
+//     label, swatch, sparkline stroke, and endpoint. Green/red on a delta is
+//     assigned by *meaning*, not by arrow direction — a falling
 //     tokens-per-LOC is an improvement and renders green even though it points
 //     down.
 //
@@ -62,7 +62,6 @@ import type {
   HookBreakdown,
   HostBreakdown,
   IntegrationProvider,
-  InsightTrend,
   ProjectBreakdown,
   ModelUsageOverviewTotals,
   RangeType,
@@ -159,28 +158,6 @@ function rangeMomentum(totals: readonly number[]): Delta | null {
   };
 }
 
-/**
- * A metric trend rendered by meaning. `upIsGood` carries whether rising is an
- * improvement for this metric; when it is unknown the chip stays neutral
- * rather than guessing.
- */
-function trendDelta(trend: InsightTrend | null): Delta | null {
-  if (!trend) return null;
-  const rounded = Math.round(trend.percentage * 10) / 10;
-  const title = "Against the previous window of the same length";
-  if (trend.direction === "flat" || rounded < 0.1) {
-    return { text: "— 0%", tone: "flat", title };
-  }
-  const rising = trend.direction === "up";
-  const tone =
-    trend.upIsGood === null
-      ? "flat"
-      : trend.upIsGood === rising
-        ? "positive"
-        : "negative";
-  return { text: `${rising ? "▲" : "▼"}${rounded}%`, tone, title };
-}
-
 /** Cache hit rate over the range, on the same denominator analytics uses. */
 function cacheHitRate(stats: ModelUsageOverviewTotals | null): number | null {
   if (!stats) return null;
@@ -215,21 +192,13 @@ interface ReadoutProps {
   value: string;
   hue: string;
   values: readonly number[];
-  delta?: Delta | null;
 }
 
-/** One cell of the 3x2 grid: value, hue-swatched label, and its own series. */
-function Readout({ label, value, hue, values, delta }: ReadoutProps) {
+/** One cell of the 3x2 grid: hue-linked value, label, and series. */
+function Readout({ label, value, hue, values }: ReadoutProps) {
   return (
-    <div className="wg-cell">
-      <span className="wg-cell-value">
-        {value}
-        {delta && (
-          <span className="wg-cell-delta" data-tone={delta.tone} title={delta.title}>
-            {delta.text}
-          </span>
-        )}
-      </span>
+    <div className="wg-cell wg-cell--metric" style={{ color: hue }}>
+      <span className="wg-cell-value">{value}</span>
       <span className="wg-cell-key">
         <i className="wg-cell-swatch" style={{ background: hue }} aria-hidden="true" />
         {label}
@@ -955,7 +924,6 @@ function UsageView({ range, webSurface = false }: UsageViewProps) {
           }
           hue="var(--metric-tok-per-loc)"
           values={insights.efficiency.sparkline.map((point) => point.value)}
-          delta={trendDelta(insights.efficiency.trend)}
         />
         <Readout
           label="LOC / hr"
@@ -966,7 +934,6 @@ function UsageView({ range, webSurface = false }: UsageViewProps) {
           }
           hue="var(--metric-loc-per-hr)"
           values={insights.velocity.sparkline.map((point) => point.value)}
-          delta={trendDelta(insights.velocity.trend)}
         />
         <Readout
           label="Sessions"

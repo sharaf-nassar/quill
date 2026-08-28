@@ -10,9 +10,11 @@ These tests protect exact frontend query windows and conditional breakdown reads
 
 Every internal comparison range resolves to exactly twice its displayed widget range and shares the same pinned lower-bound helper used by history readers.
 
+No widget surface requests one today, so this guards the range table itself rather than a live caller.
+
 ## Displayed Windows Bound Every Query
 
-Code insights may request exactly two displayed periods; every other logged widget query stays at or below its displayed range.
+Every logged widget query stays at or below its displayed range, code insights included.
 
 ## Breakdown Transitions Issue Unique Reads
 

@@ -1,14 +1,17 @@
 import { setCrashReportingEnabled } from "./lib/crashReporting";
-import React, { Suspense } from "react";
+import React, { Suspense, useEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { reactErrorHandler } from "@sentry/react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ToastProvider } from "./hooks/useToast";
 import { useIntegrations } from "./hooks/useIntegrations";
 import WindowResizeHandles from "./components/WindowResizeHandles";
+import MigrationView from "./components/MigrationView";
+import RootErrorBoundary from "./components/RootErrorBoundary";
 import { openManageWindow } from "./lib/manageWindow";
-import type { RuntimeSettings } from "./types";
+import type { RuntimeSettings, StartupStatus } from "./types";
 import "./styles/index.css";
 
 // In a plain browser (no Tauri runtime) during dev, install a mock IPC layer so
@@ -22,11 +25,15 @@ if (import.meta.env.DEV && !("__TAURI_INTERNALS__" in window)) {
 
 // SDK stays uninitialized until the stored opt-in says otherwise — short
 // window at boot where errors aren't captured is the price of strict privacy.
-void invoke<RuntimeSettings>("get_runtime_settings")
-  .then((s) => setCrashReportingEnabled(s.crashReportingEnabled))
-  .catch(() => {
-    /* stay off when settings can't be read */
-  });
+function syncCrashReportingPreference(): void {
+  void invoke<RuntimeSettings>("get_runtime_settings")
+    .then((s) => setCrashReportingEnabled(s.crashReportingEnabled))
+    .catch(() => {
+      /* stay off when settings can't be read */
+    });
+}
+
+syncCrashReportingPreference();
 
 const App = React.lazy(() => import("./App"));
 const ReleaseNotesWindowView = React.lazy(
@@ -90,7 +97,8 @@ const ManageWindowView = React.lazy(
 }
 
 const params = new URLSearchParams(window.location.search);
-const view = params.get("view");
+const requestedView = params.get("view");
+const view = requestedView ?? (getCurrentWebview().label === "migration" ? "migration" : null);
 
 // The widget paints its own rounded surface on a transparent window, so the
 // document must not paint one behind it. Other routes keep an opaque page.
@@ -121,8 +129,9 @@ function MainAppView() {
   );
 }
 
-// Only main / manage / release-notes routes remain after the workspace
-// consolidation, and all three are reachable without an enabled provider
+// Normal routes remain main / manage / release-notes after workspace
+// consolidation; the transient migration label is gated above. All three are
+// reachable without an enabled provider
 // (Manage gates each section inline), so the former per-window provider
 // blocking is gone.
 function RoutedView() {
@@ -145,6 +154,65 @@ function RoutedView() {
   return <MainAppView />;
 }
 
+const INITIAL_STARTUP_STATUS: StartupStatus = {
+  state: "starting",
+  stage: "Starting Quill",
+  detail: "Opening local services",
+  completedBytes: null,
+  totalBytes: null,
+};
+
+// @lat: [[frontend#Frontend#Entry Point]]
+function StartupGate() {
+  const [status, setStatus] = useState(INITIAL_STARTUP_STATUS);
+  const sawStatusEvent = useRef(false);
+
+  useEffect(() => {
+    let active = true;
+    let stopListening: (() => void) | undefined;
+    const applyStatus = (next: StartupStatus) => {
+      if (!active) return;
+      setStatus((current) => (current.state === "ready" ? current : next));
+    };
+
+    void listen<StartupStatus>("startup-status", ({ payload }) => {
+      sawStatusEvent.current = true;
+      applyStatus(payload);
+    }).then((unlisten) => {
+      if (active) stopListening = unlisten;
+      else unlisten();
+    });
+
+    void invoke<StartupStatus>("get_startup_status")
+      .then((snapshot) => {
+        if (!sawStatusEvent.current) applyStatus(snapshot);
+      })
+      .catch((error) => {
+        if (!sawStatusEvent.current) {
+          applyStatus({
+            state: "error",
+            stage: "Quill could not read startup status",
+            detail: String(error),
+            completedBytes: null,
+            totalBytes: null,
+          });
+        }
+      });
+
+    return () => {
+      active = false;
+      stopListening?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (status.state === "ready") syncCrashReportingPreference();
+  }, [status.state]);
+
+  if (status.state !== "ready") return <MigrationView status={status} />;
+  return view === "migration" ? null : <RoutedView />;
+}
+
 ReactDOM.createRoot(document.getElementById("root")!, {
   onUncaughtError: reactErrorHandler(),
   onCaughtError: reactErrorHandler(),
@@ -152,9 +220,11 @@ ReactDOM.createRoot(document.getElementById("root")!, {
 }).render(
   <React.StrictMode>
     <ToastProvider>
-      <Suspense fallback={<div className="loading">Loading...</div>}>
-        <RoutedView />
-      </Suspense>
+      <RootErrorBoundary>
+        <Suspense fallback={<div className="loading">Loading...</div>}>
+          <StartupGate />
+        </Suspense>
+      </RootErrorBoundary>
     </ToastProvider>
   </React.StrictMode>,
 );

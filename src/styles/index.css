@@ -91,8 +91,8 @@
   --text: #c9d1d9;
   --faint: #6e7681;
 
-  /* Metric identity — allowed on sparkline strokes, endpoints, and label
-     swatches only. Values stay --text-hi; these are never severity. */
+  /* Metric identity — shared by each readout's value, label, swatch,
+     sparkline stroke, and endpoint. These are never severity. */
   --metric-runtime: #22d3ee;
   --metric-tok-per-loc: #a78bfa;
   --metric-loc-per-hr: #f472b6;
@@ -101,8 +101,8 @@
   --metric-net-lines: #a3e635;
 
   /* Context identity — the three token categories the Context view accounts
-     for. Same law as the metric hues: swatches and split segments only, and
-     none of them is a severity colour. */
+     for. These remain on swatches and split segments only; none is a
+     severity colour. */
   --context-preserved: #22d3ee;
   --context-retrieved: #60a5fa;
   --context-routing: #a78bfa;
@@ -148,12 +148,258 @@ body {
   user-select: none;
 }
 
+/* Shown by [[src/components/RootErrorBoundary.tsx]] when a window would
+   otherwise render nothing at all. */
+.root-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-md);
+  padding: 20px 16px;
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.root-error-title {
+  margin: 0;
+  color: var(--text-hi);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.root-error-detail {
+  margin: 0;
+  color: var(--label);
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
+.root-error-action {
+  padding: 4px 12px;
+  color: var(--text-hi);
+  background: var(--hover);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  font: inherit;
+  cursor: pointer;
+}
+
+.root-error-action:hover {
+  border-color: var(--signal-blue);
+}
+
 /* Suspense fallback for every lazily loaded window view. */
 .loading {
   color: var(--label);
   font-size: 11px;
   padding: 20px 12px;
   text-align: center;
+}
+
+/* Startup database migration — one compact instrument plane. */
+html[data-view="migration"],
+html[data-view="migration"] body,
+html[data-view="migration"] #root {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+}
+
+.migration-shell {
+  display: grid;
+  grid-template-rows: 36px 1fr;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.migration-titlebar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: 0 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.migration-wordmark,
+.migration-mode {
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1;
+  letter-spacing: 0.1em;
+}
+
+.migration-wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  color: var(--text-hi);
+  letter-spacing: 0.14em;
+}
+
+.migration-wordmark::before {
+  width: 5px;
+  height: 5px;
+  background: var(--signal-cyan);
+  border-radius: var(--radius-xs);
+  content: "";
+}
+
+.migration-mode {
+  padding-left: var(--space-md);
+  color: var(--faint);
+  border-left: 1px solid var(--line);
+}
+
+.migration-quit {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  margin-left: auto;
+  color: var(--faint);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-md);
+  place-items: center;
+  font: inherit;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease;
+}
+
+.migration-quit:hover {
+  color: var(--text-hi);
+  background: var(--hover);
+}
+
+.migration-body {
+  align-self: center;
+  padding: var(--space-xl) 14px var(--space-2xl);
+}
+
+.migration-body h1 {
+  color: var(--text-hi);
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+}
+
+.migration-body p {
+  margin-top: var(--space-sm);
+  color: var(--label);
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+.migration-readout {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-md);
+  margin-top: var(--space-2xl);
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.migration-bytes {
+  flex: none;
+  color: var(--label);
+  font-size: 10px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.migration-track {
+  position: relative;
+  height: 7px;
+  margin-top: var(--space-md);
+  overflow: hidden;
+  background: var(--inset);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-pill);
+}
+
+.migration-fill {
+  position: relative;
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--signal-cyan);
+  border-radius: inherit;
+  transition: width 300ms ease;
+}
+
+.migration-fill::after {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--text-hi);
+  content: "";
+  opacity: 0.85;
+}
+
+.migration-track[data-indeterminate="true"] .migration-fill {
+  width: 30%;
+  animation: migration-scan 1.4s cubic-bezier(0.32, 0.72, 0, 1) infinite;
+}
+
+.migration-shell[data-state="error"] .migration-wordmark::before,
+.migration-shell[data-state="error"] .migration-fill {
+  background: var(--meter-red);
+  animation: none;
+}
+
+.migration-shell[data-state="error"] .migration-fill {
+  width: 100%;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .migration-shell[data-state="migrating"] .migration-wordmark::before {
+    animation: migration-pulse 1.8s ease-in-out infinite;
+  }
+}
+
+@keyframes migration-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes migration-scan {
+  from {
+    transform: translateX(-105%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .migration-fill {
+    transition: none;
+  }
+
+  .migration-track[data-indeterminate="true"] .migration-fill {
+    width: 100%;
+    opacity: 0.45;
+    animation: none;
+  }
 }
 
 /* Context menu */
@@ -1904,12 +2150,47 @@ body {
    A browser page is not a floating window: the web shell squares off the
    widget's window chrome and sizes against the dynamic viewport so a phone
    URL bar never hides the bottom of the scroll column. Everything else is
-   the shared widget surface, untouched. */
+   the shared widget surface, untouched.
+
+   One density also means the layout gains nothing from a 27" monitor: past
+   roughly 1.8x the 360px design width the meter bars turn into runways and the
+   readout columns into gaps, so the measure is capped and centred. Below the
+   cap nothing changes — the fluid-band rule still carries every width down to
+   the 320px minimum. */
 .wg-shell--web {
   height: 100vh;
   height: 100dvh;
+  max-width: 640px;
+  margin-inline: auto;
   border: 0;
   border-radius: 0;
+}
+
+/* Past the cap, filling the viewport is no longer the honest shape: a capped
+   column stretched to `100dvh` draws its own edges down through a bordered void
+   under the footer. So above the cap the shell stops claiming the height it is
+   not using — it sizes to its content, keeps `100dvh` only as a ceiling, and
+   sits as a bordered panel centred in the page. Below the cap (phones, the
+   360-430px band) none of this applies: edge-to-edge and full-height is right
+   there, and the squared chrome above stands. */
+@media (min-width: 641px) {
+  html[data-view="web"] body {
+    display: grid;
+    /* One full-width column, so the shell's own max-width and auto margins
+       still do the horizontal centring; this rule only centres vertically. */
+    grid-template-columns: 1fr;
+    align-content: center;
+    min-height: 100dvh;
+  }
+
+  .wg-shell--web {
+    /* `.wg-scroll` still carries `flex: 1 1 auto; min-height: 0`, so once the
+       content passes the ceiling the shell clamps and the column scrolls. */
+    height: auto;
+    max-height: calc(100dvh - var(--space-2xl) * 2);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+  }
 }
 
 /* DESIGN.md, The Touch Target Rule: on touch-capable web viewports every
@@ -2298,18 +2579,15 @@ body {
 }
 
 /* Tone is assigned by meaning, never by arrow direction. */
-.wg-usage-delta[data-tone="positive"],
-.wg-cell-delta[data-tone="positive"] {
+.wg-usage-delta[data-tone="positive"] {
   color: var(--meter-green);
 }
 
-.wg-usage-delta[data-tone="negative"],
-.wg-cell-delta[data-tone="negative"] {
+.wg-usage-delta[data-tone="negative"] {
   color: var(--meter-red);
 }
 
-.wg-usage-delta[data-tone="flat"],
-.wg-cell-delta[data-tone="flat"] {
+.wg-usage-delta[data-tone="flat"] {
   color: var(--faint);
 }
 
@@ -2384,9 +2662,15 @@ body {
   white-space: nowrap;
 }
 
-.wg-cell-delta {
-  font-size: 9px;
-  font-weight: 600;
+/* The hue names the readout, but a mid-luminance hue at 15px renders visibly
+   thinner than --text-hi and reads as smaller type. Both tiers are lifted
+   toward the neutral ladder so weight survives the colour. */
+.wg-cell--metric .wg-cell-value {
+  color: color-mix(in oklab, currentColor 75%, var(--text));
+}
+
+.wg-cell--metric .wg-cell-key {
+  color: color-mix(in oklab, currentColor 45%, var(--text-hi));
 }
 
 .wg-cell-key {

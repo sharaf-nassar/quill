@@ -6,7 +6,7 @@
 export const WEB_INVOKE_PATH = "/api/web/invoke";
 export const WEB_PAIR_PATH = "/api/web/pair";
 
-export type WebUiHostPolicy = "all" | "allowlist";
+
 
 export interface InvokeRequest {
   cmd: string;
@@ -41,7 +41,6 @@ export interface PairRequest {
 export interface WebUiConfig {
   enabled: boolean;
   port: number;
-  host_policy: WebUiHostPolicy;
   allowlist: string[];
 }
 

@@ -94,7 +94,11 @@ Acceptance Criteria:
 - A Settings control enables/disables the web UI. Default is disabled.
 - Enabling binds a listener without restarting the app; disabling releases it
   without restarting the app.
-- While enabled, Settings displays the URL(s) the UI is reachable at.
+- While enabled, Settings displays the socket the listener holds, as a link that
+  opens it in the browser. Superseded the earlier reachable-URL list: a
+  server-produced URL reads as a promise another device can get there, which no
+  same-host check can establish. A wildcard bind links to loopback, since that
+  is where a click inside the desktop app is going.
 - The enabled/disabled state persists across app restarts.
 - With the feature disabled, no socket is bound on the configured port
   (verifiable: the port is connection-refused).
@@ -228,7 +232,8 @@ Acceptance Criteria:
    separate web password/token, a pairing code shown in Settings, or none.
    "Accept all hosts" with no auth means anyone who can route to the port reads
    the user's full usage history — is that an acceptable user-chosen state, or
-   must auth be mandatory when accept-all is selected?
+   must auth be mandatory when accept-all is selected? (Resolved in Q1, then
+   revised: accept-all was removed outright rather than qualified.)
 3. **Live updates.** The desktop UI receives push events. In the browser:
    polling, SSE, WebSocket, or no live updates in v1?
 4. **Host matching semantics.** Is the allowlist matched against the peer IP,
@@ -380,7 +385,7 @@ cross-dimension hits are marked. Line references were verified against source.
   before binding the new port. Transitions are serialized bind-new → persist →
   swap → drop-old; any failure preserves the last-known-good config and listener
   (P4, P5).
-- **Settings keys** `web_ui.enabled`, `web_ui.port`, `web_ui.host_policy`,
+- **Settings keys** `web_ui.enabled`, `web_ui.port`,
   `web_ui.allowlist` (JSON array), `web_ui.last_error`, written through
   `set_settings_atomically` — dotted key/value needs no migration. Default port
   **19878**; accept 1024-65535; reject collisions with the resolved
@@ -398,8 +403,12 @@ cross-dimension hits are marked. Line references were verified against source.
   included, decided before any data is read — so "not a partial render" becomes
   `status == 403 && body.len() == 0`.
 - **Bounds:** per-peer-IP token bucket over a size-capped LRU (an uncapped peer
-  map is itself the DoS), 120 req/min/peer, ≤8 concurrent connections, 1 MiB
-  body cap, 10s request timeout. The existing limiter is one global deque per
+  map is itself the DoS), 120 req/min/peer, ≤64 concurrent connections reaped
+  after 90s idle, 1 MiB body cap, 10s request timeout. The connection bound was
+  ≤8 with no idle reap, which bounded nothing: a slot is held for the
+  connection's lifetime, a browser keeps about six alive per origin, and an
+  abandoned half-closed socket never returned its slot at all. One phone beside
+  a desktop browser stopped the listener accepting. The existing limiter is one global deque per
   endpoint with no peer identity ([[src-tauri/src/server.rs]]), so one hostile
   client would starve every other; it is not reused as-is.
 - **Settings home: a dedicated Web section** rather than a row in General. The
@@ -428,12 +437,26 @@ cross-dimension hits are marked. Line references were verified against source.
 
 **Q1: Access-control posture — what gates a browser connection?**
 
-A: **Web credential required, plus the host policy as a second gate.** A
-separate, revocable, web-only credential is always mandatory — a pairing code
-displayed in Settings with a Regenerate action. The browser enters it once and
-holds a cookie-scoped session thereafter. `auth_secret` never leaves the
-desktop under any configuration. The bind address derives from the host policy:
-loopback-only until the user allows a non-local host.
+A: **The web credential is the gate.** A separate, revocable, web-only
+credential is always mandatory — a pairing code displayed in Settings with a
+Regenerate action. The browser enters it once and holds a cookie-scoped session
+thereafter. `auth_secret` never leaves the desktop under any configuration. The
+bind address derives from the allowlist: loopback-only until the user lists a
+name other than this machine's.
+
+**Superseded — the "host policy as a second gate" half.** It shipped as a
+peer-address filter with an `Accept all hosts` mode, and both halves were wrong.
+The mode short-circuited the filter, so one click made the list decorative. The
+filter itself answered the wrong question: entries were resolved through the
+desktop's own resolver, so on a Debian-style host the machine's own name
+resolved to `127.0.1.1` and admitted nobody while the socket still bound every
+interface — a listener that looked open and was shut, with no way to tell.
+
+The allowlist is now a `Host`-name check: the names this Quill answers to.
+That is a DNS-rebinding defence, not access control, and it is deliberately not
+a second gate — any device that can route to the port may connect using an
+allowed name. The pairing credential is the only thing deciding who gets in,
+which is what Q1 already required.
 
 Reflected in: Goals (opt-in exposure), Story 1 and Story 3 acceptance criteria,
 and a new Story 6.
@@ -503,9 +526,11 @@ unimplementable.
 **New Story 6 — Pair a browser.** As a user, I want to authorize a specific
 browser once, so that casual network neighbours cannot read my data and I can
 cut off access later.
-Acceptance criteria: Settings displays a pairing code and a Regenerate action;
-an unpaired browser receives the `403` empty-body refusal on every path,
-including static assets; a paired browser holds a session across reloads;
+Acceptance criteria: Settings displays a pairing code that copies on click and a
+Regenerate action; an unpaired browser receives the `403` empty-body refusal on
+every path including static assets, except the entry document, which redirects
+to the pairing page without serving bundle content; a paired browser holds a
+session across reloads;
 Regenerate invalidates every existing session; `auth_secret` is never
 transmitted to any client; pairing attempts are rate-limited per peer.
 
@@ -513,7 +538,11 @@ transmitted to any client; pairing attempts are rate-limited per peer.
 on my phone, so that I can check Quill away from my desk.
 Acceptance criteria: the monitor surface renders without clipping or horizontal
 scroll from 360px viewport width upward; touch targets meet the `DESIGN.md`
-minimum; the layout degrades by reflow rather than by hiding data (P1, P9).
+minimum; the layout degrades by reflow rather than by hiding data (P1, P9). Past
+640px the measure is capped and centred instead of stretching — the density is
+tuned for 360px, so a wider viewport dilutes the bands rather than filling them
+— and the shell sizes to its content as a bordered, vertically centred panel,
+with the viewport kept only as a scrolling ceiling.
 
 **Constraints** — add: P7 authorization is granted for automated tests covering
 disabled-means-no-socket, host-denied-before-any-data, denied-command
@@ -597,6 +626,13 @@ informed opt-in, a mandatory credential, the loopback-by-default bind, and
 pre-enablement disclosure — "scrubbed" is knowingly waived for a surface the
 user deliberately points at their own data. No constitution edit; the waiver is
 recorded here and no scrubbing layer is built.
+
+The disclosure shipped as an exhaustive recital of all sixteen permitted reads
+and was later cut to three sentences: read-only scope, "everything the widget
+shows" plus absolute project paths, and unencrypted transport. Informed opt-in
+is measured by what a user actually reads, and a thirteen-line field list is
+skipped. The enumeration remains normative here and enforced by the server-side
+command allowlist, which is the boundary that matters.
 P1: cache-only reads mean the web view shows the evidence the desktop has, never
 a fresher invented one. P2: extends existing Axum/Tauri/React layers; adds two
 crates. P3: the listener is a detached tokio task off Tauri setup's critical
@@ -639,7 +675,7 @@ lifecycle, or CSP. Nothing here re-attempts a documented failure.
 | `.gitignore` | `dist-web/` |
 | `src/windows/SettingsWindowView.tsx` | Renders tab content — must import and render `WebTab` when `active === "web"` |
 | [[src/components/settings/SettingsTabs.tsx]] | Add the `web` tab id and label |
-| `src/components/settings/WebTab.tsx` (new) | Enable toggle, port, host policy, pairing code + Regenerate, disclosure, reachable URL, status, last error |
+| `src/components/settings/WebTab.tsx` (new) | Enable toggle, port, host policy, copy-on-click pairing code + Regenerate, disclosure, linked bound address, status, last error |
 | `src/components/settings/AllowlistEditor.tsx` (new) | Add/remove rows; submits candidates and displays typed backend rejection — parsing stays canonical in Rust |
 | `src/hooks/useWebUiSettings.ts` (new) | Typed read/write of `web_ui.*` |
 | `scripts/csp.test.mjs` | Pin two named policies |
@@ -656,7 +692,7 @@ No schema migration. Five new rows in the existing `settings` table:
 | --- | --- | --- | --- |
 | `web_ui.enabled` | bool | `false` | — |
 | `web_ui.port` | int | `19878` | 1024-65535; rejects the resolved `QUILL_PORT` and context port |
-| `web_ui.host_policy` | `"all"` \| `"allowlist"` | `"allowlist"` | — |
+| `web_ui.host_policy` | retired | blanked on save | Removed: `all` bypassed the allowlist. Read only to clear it, so a downgrade cannot rediscover a stale `all`. |
 | `web_ui.allowlist` | JSON array | `[]` | IPv4/IPv6 literal, CIDR, or RFC-1123 hostname; no wildcards; deduped; ≤64 entries |
 | `web_ui.last_error` | string \| null | `null` | Set on startup bind failure so Settings can show it when opened later |
 
@@ -766,7 +802,6 @@ get_web_ui_config() -> {
   config: {
     enabled: boolean,
     port: integer,
-    host_policy: "all" | "allowlist",
     allowlist: string[]
   },
   pairing_code: string
@@ -784,15 +819,24 @@ regenerate_web_pairing_code() -> { pairing_code: string }
 ```
 
 `last_error` is status, not writable config. Persistent storage uses exactly
-`web_ui.enabled`, `web_ui.port`, `web_ui.host_policy`, `web_ui.allowlist`, and
+`web_ui.enabled`, `web_ui.port`, `web_ui.allowlist`, and
 `web_ui.last_error`; no camelCase aliases exist.
 
 When `running` is false, `bound_addr` is `null` and `reachable_urls` is empty.
 When running, `bound_addr` is canonical `SocketAddr` text. Reachable URLs are
 server-produced from concrete local interface IP addresses, never wildcard
-bind addresses or hostname aliases: `http://<IPv4>:<port>/` or
-`http://[<IPv6>]:<port>/`. The explicit port and trailing slash are mandatory;
-values are deduplicated and sorted lexicographically before serialization.
+bind addresses or hostname aliases: `http://<IPv4>:<port>/pair` or
+`http://[<IPv6>]:<port>/pair`. The explicit port is mandatory, and the path is
+`/pair` rather than `/` because a browser opening one of these URLs holds no
+session yet and `/` is session-gated — offering the bare origin would answer
+`403` instead of the monitor. Values are deduplicated and sorted
+lexicographically before serialization.
+
+`GET /pair` answers `303` to `/` when the request already carries a live
+session cookie, so a returning browser follows the same link straight to the
+monitor instead of re-entering a code. Without a live session it renders the
+pairing page as before; the `403` class for `/`, `/assets/*`, `POST
+/api/web/invoke`, and unrouted paths is unchanged.
 
 #### Pairing and session cookie
 
@@ -873,7 +917,7 @@ and token count.
    The resulting Tauri identity must be `com.quilltoolkit.app.dev`.
 3. While the isolated desktop is stopped, preconfigure only that development
    database: one provider enabled, `web_ui.enabled=true`, port 19878,
-   `host_policy=allowlist`, and an empty allowlist (loopback-only). Restart with
+   and an empty allowlist (loopback-only). Restart with
    the same `npm run tauri -- dev` command. Do not touch production state.
 4. Launch a separate Chrome process with a freshly cleared user-data directory,
    headless mode, and its own loopback CDP port. Pair it through `/pair`, then

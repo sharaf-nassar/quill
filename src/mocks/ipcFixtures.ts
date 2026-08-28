@@ -2444,7 +2444,6 @@ function setRetentionPolicyFixture(
 let webUiConfig: WebUiConfig = {
   enabled: false,
   port: 19878,
-  host_policy: "allowlist",
   allowlist: [],
 };
 // Rotation is a counter rather than a random draw: this file's values stay
@@ -2469,8 +2468,11 @@ function webUiStatusFixture(): WebUiStatus {
   }
   // The listener binds loopback until a non-local host is allowed, exactly as
   // the controller does, so the browser can read both status shapes.
-  const external =
-    webUiConfig.host_policy === "all" || webUiConfig.allowlist.length > 0;
+  // Listing a name only another device would use is what asks for a
+  // network-visible socket, exactly as the controller decides it.
+  const external = webUiConfig.allowlist.some(
+    (entry) => entry.toLowerCase() !== "localhost" && !entry.startsWith("127."),
+  );
   const host = external ? "0.0.0.0" : "127.0.0.1";
   return {
     running: true,
@@ -2532,6 +2534,22 @@ function activitySeries(range: string, buckets: number): ActivitySeriesResponse 
 type FixtureHandler = (args?: Record<string, unknown>) => unknown;
 
 const fixtures: Record<string, FixtureHandler> = {
+  get_startup_status: () =>
+    new URLSearchParams(window.location.search).get("view") === "migration"
+      ? {
+          state: "migrating",
+          stage: "Creating verified backup",
+          detail: "Keep Quill open while local data is updated.",
+          completedBytes: 6_281_347_072,
+          totalBytes: 18_750_808_064,
+        }
+      : {
+          state: "ready",
+          stage: "Ready",
+          detail: "Startup complete",
+          completedBytes: null,
+          totalBytes: null,
+        },
   // integrations / settings
   get_provider_statuses: () => marketingScreenshotMode()
     ? providerStatuses.filter(({ provider }) => provider !== "mini_max")
@@ -2670,6 +2688,18 @@ let listenerSeq = 1;
 export function handleInvoke(cmd: string, args?: Record<string, unknown>): unknown {
   // Event plugin: let `listen()` resolve with a fake registration; events never fire.
   if (cmd.startsWith("plugin:event|listen")) return listenerSeq++;
+  // A browser already has the behaviour the opener plugin exists to add, so
+  // external links stay clickable under `/impeccable live` instead of no-oping.
+  if (cmd === "plugin:opener|open_url") {
+    window.open(String(args?.url ?? ""), "_blank", "noopener");
+    return undefined;
+  }
+  // A browser's own clipboard is the thing the plugin stands in for, and it is
+  // reliable here — the WebKitGTK failure mode the plugin exists for is a
+  // desktop-webview problem.
+  if (cmd === "plugin:clipboard-manager|write_text") {
+    return navigator.clipboard.writeText(String(args?.text ?? ""));
+  }
   if (cmd.startsWith("plugin:")) return undefined;
 
   const fixture = fixtures[cmd];

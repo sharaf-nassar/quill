@@ -218,9 +218,9 @@ over-alerting and under-informing: dense, quiet, semantic.
 ## 2. Colors
 
 One flat plane needs fewer surfaces and stricter hues. The palette is a
-surface pair, a hairline ladder, a brightness-only text ladder, and four
-closed sets of meaningful color: severity, provider identity, metric identity,
-and limit-window identity.
+surface pair, a hairline ladder, a brightness-first text ladder with one
+metric-readout exception, and four closed sets of meaningful color: severity,
+provider identity, metric identity, and limit-window identity.
 
 ### Surfaces
 - **Surface** (`#14181f`): the plane. The widget shell, every band, every row.
@@ -237,7 +237,7 @@ and limit-window identity.
   survives for the not-yet-migrated windows only; see §6.
 
 ### The Text Ladder
-Hierarchy is brightness, never hue.
+Hierarchy is brightness by default; compact metric readouts are the named hue exception.
 - **Text Hi** (`#e6edf3`): values, headlines, the active option. The digits you
   came to read.
 - **Text** (`#c9d1d9`): rows and running text.
@@ -277,12 +277,23 @@ alone — and the same model keeps the same shade on every surface of a view.
 
 ### Metric Identity
 Six fixed hues that name the six readouts, plus three that name the context
-categories. Within metric readouts, they are permitted on **sparkline strokes,
-their endpoint dots, label swatches, and split-bar segments only.** Values stay
-Text Hi. Limit-window labels may reuse metric hues as category identifiers under
-the rule below.
+categories. Within metric readouts, they are permitted on the **primary value,
+text label, swatch, sparkline stroke, endpoint dot, and split-bar segments.**
+The repeated hue binds each compact readout into one scannable unit; the label,
+swatch, and chart shape keep color from becoming the only cue. Delta text stays
+on the separate status vocabulary. Limit-window labels may reuse metric hues as
+category identifiers under the rule below.
 - Runtime `#22d3ee` · Tokens-per-LOC `#a78bfa` · LOC-per-hour `#f472b6` ·
   Sessions `#818cf8` · Projects `#2dd4bf` · Net lines `#a3e635`.
+- **Text tints.** The raw hues sit at 0.30–0.65 relative luminance against Text
+  Hi's 0.84, so on text their antialiased edges collapse into the plane and the
+  glyphs read thinner and smaller than the same type in neutral. Swatches,
+  strokes, endpoints, and segments take the raw hue; *text* takes it mixed back
+  toward the neutral ladder — the value at `color-mix(in oklab, hue 75%, Text)`
+  and the label at `color-mix(in oklab, hue 45%, Text Hi)`. Both tiers clear
+  7:1 on Surface. The heavier 15px value can hold the more saturated mix and
+  still read at weight; the 9px letterspaced label takes the paler one, which
+  is the tier that actually needed the lift.
 - Context: preserved `#22d3ee` · retrieved `#60a5fa` · routing `#a78bfa`.
 
 ### Limit Window Identity
@@ -517,6 +528,21 @@ widget's 360px design width: a 14px gutter, an 8/10/12/16px vertical ladder,
 the window — a widget dragged to 1200px keeps the same gutter and type ladder
 and simply gives its bands more room.
 
+Giving bands more room stops paying off eventually, and the browser is where
+that shows. A dragged window is a width the user asked for, so it is honoured;
+a browser tab just inherits whatever the monitor is, so the web surface caps its
+measure at 640px and centres. Past roughly 1.8x the design width the limit
+meters read as runways and the readout grid as gaps — that is dilution, not
+room.
+
+Past that cap the web surface also stops claiming height it is not using. A
+capped column stretched to the full viewport draws its own edges down through
+empty space below the last band, which reads as a layout that failed to fill
+rather than one that chose its size. So above 640px it sizes to its content,
+keeps the viewport only as a ceiling, and sits as a bordered panel centred in
+the page — the single place a Quill surface is a panel rather than a plane.
+Below the cap, phone viewports stay edge-to-edge and full-height.
+
 **The stated exception.** The Manage workspace (Sessions, Learning, Settings),
 the settings surfaces, and the release-notes window still render in
 their pre-existing roomier density on the Graphite Stack — cards, borders, and
@@ -545,13 +571,15 @@ redesign pass moves it onto the flat plane. Until then:
 - **Do** distinguish 5-hour, 7-day, and Fable limit labels with Runtime light
   blue, Projects teal, and Tokens-per-LOC purple while keeping their raw text
   and position as non-color cues.
-- **Do** keep metric-readout hues on sparkline strokes, endpoints, and swatches
-  only — values stay Text Hi. The named limit-window label reuse is the sole
-  text exception.
+- **Do** carry each metric-readout hue through its value, text label, swatch,
+  sparkline stroke, and endpoint — but mix the two text tiers back toward the
+  neutral ladder so colored type keeps its weight. Keep delta text on the
+  separate status vocabulary; the named limit-window labels remain the other
+  metric-text reuse.
 - **Do** set `font-variant-numeric: tabular-nums` on every live or compared
   number, and keep type at 8px or above.
-- **Do** make values bright and labels dim; build hierarchy with brightness and
-  weight, not new hues.
+- **Do** make neutral values bright and labels dim; metric readouts use only
+  their six fixed identity hues, never ad-hoc color.
 - **Do** keep motion functional and fast (120ms on state, 0.3s on fills) and
   honor `prefers-reduced-motion`.
 - **Do** expose the value: progressbar roles, live regions, and labeled button

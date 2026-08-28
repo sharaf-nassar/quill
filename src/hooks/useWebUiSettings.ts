@@ -47,7 +47,6 @@ export interface WebUiError {
 export const WEB_UI_CONFIG_DEFAULTS: WebUiConfig = {
   enabled: false,
   port: 19878,
-  host_policy: "allowlist",
   allowlist: [],
 };
 

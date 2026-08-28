@@ -13,7 +13,9 @@ The application pairs a Rust backend with a React frontend communicating over Ta
 
 ## Multi-Window Design
 
-The app runs as three Tauri windows routed by a URL query parameter in [[src/main.tsx]]: the main widget, the consolidated Manage workspace, and a release-notes viewer. All three are transparent, paint custom visual chrome, and resize freely.
+Normal operation uses three Tauri windows routed by a URL query parameter in [[src/main.tsx]].
+
+The main widget, consolidated Manage workspace, and release-notes viewer are transparent, paint custom visual chrome, and resize freely. A schema upgrade adds one short-lived `migration` window, then closes it before revealing `main`.
 
 The main window hosts the widget shell described in [[frontend#Main Window Layout]]. The [[features#Session Search]], [[features#Learning System]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
 
@@ -21,9 +23,11 @@ The Sessions, Learning, and Settings management surfaces are consolidated into a
 
 ### Window Configuration
 
-The main widget lives in `src-tauri/tauri.conf.json`, while the dynamically created `manage` and `release-notes` windows are allowed by `src-tauri/capabilities/default.json`.
+The main widget lives in `src-tauri/tauri.conf.json`, while the dynamically created `manage`, `release-notes`, and transient `migration` windows are allowed by `src-tauri/capabilities/default.json`.
 
 The main window is `resizable: true` and drags freely on both axes. It opens at 360x800 with a 320px minimum width and a 200px minimum height, declares no maximum on either axis, and stays transparent so the widget can paint its own rounded surface. Its chrome is [[src/components/widget/WidgetTitleBar.tsx]]; the app version moved to Settings.
+
+A required database migration hides `main` without changing its size or position, then creates a centered 520x300 `migration` webview. The transient label is denylisted from `tauri-plugin-window-state`, uses the existing default capability, and is non-resizable and always on top. Tauri setup returns before storage initialization so it can paint while migration runs on a worker; after success the backend restores persisted `main` geometry, publishes `ready`, closes `migration`, and shows `main`.
 
 Topmost behavior is a backend-owned runtime setting, not restored window geometry. [[src-tauri/src/lib.rs#apply_runtime_settings]] admits one Settings or tray writer through a nonblocking gate, submits each changed native request immediately, and only publishes the preference after persistence and checkitem synchronization succeed; failed stages compensate to the persisted prior state. A concurrent writer receives a busy error instead of blocking the event-loop thread while another writer marshals menu work back to it.
 
@@ -108,7 +112,7 @@ React and TypeScript sources organized by feature domain under `src/`.
 
 ## Communication Layers
 
-Data flows through four communication channels between the system's components.
+Data flows through five communication channels between the system's components.
 
 ### Tauri IPC
 
@@ -124,17 +128,35 @@ An Axum server on port 19876 (configurable via `QUILL_PORT`) receives data from 
 
 The optional web-only monitor is Quill's third Axum listener, separate from ingestion and context listeners.
 
-It starts disabled; its default configuration binds `127.0.0.1:19878` until `host_policy=all` or a non-loopback allowlist entry requests `0.0.0.0`. Ingestion remains on `:19876`; the context listener remains loopback `:19877`.
+It starts disabled; its default configuration binds `127.0.0.1:19878` until an allowlist entry naming something other than this machine requests `0.0.0.0`. Ingestion remains on `:19876`; the context listener remains loopback `:19877`.
 
 Its request classes make bootstrap explicit: `GET /pair` and `POST /api/web/pair` are public but peer-filtered and rate-limited; `/`, `/assets/*`, and `POST /api/web/invoke` also require a live session cookie. The inline pairing page carries no app asset and uses a hash-pinned script CSP. A paired miss outside the monitor asset graph is `404`; an unpaired asset, invoke, or fallback request is an empty-body `403` before any Quill read.
 
 [[src/web/httpTransport.ts]] sends the closed invoke envelope to `POST /api/web/invoke`. [[src-tauri/src/web_server/mod.rs]] owns matching serde envelopes, desktop config/status field names, pairing-cookie attributes, and reachable-URL formatting; [[src-tauri/src/web_allowlist.rs]] owns the one exact default-deny table. Only sixteen monitor reads reach the shared desktop implementations. The shim owns neither a second command table nor settings keys: command failures retain Tauri-style promise behavior, and `plugin:*` remains server-denied even though browser event/window/webview calls are client-local no-ops. The normative cross-language payloads and fixtures live in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
 
-[[src-tauri/src/web_server/gates.rs]] identifies callers only by accepted socket peer, never `Host` or reverse DNS. It forward-resolves hostname allowlist entries when committed, pins those addresses until restart or re-save, fails closed on an empty or failed resolution, and lets loopback bypass only peer filtering. Per-peer general and pairing budgets, a bounded peer table, an eight-connection listener, 1 MiB body cap, and ten-second request timeout constrain every route. Peer, budget, and session refusal is an empty-body `403` before route data access.
+[[src-tauri/src/web_server/gates.rs]] refuses any request whose `Host` names something the listener does not answer to — the configured allowlist plus the implicit `localhost`, `127.0.0.1`, and `[::1]`, compared case-insensitively with the port stripped. That is a name check, not access control: it defeats DNS rebinding, and deciding *who* may connect is the pairing credential's job alone.
+
+It replaced a peer-address filter that resolved allowlist entries through this machine's resolver and pinned the results. That design answered the wrong question and did so invisibly: on a Debian-style host, entering the machine's own name resolved to `127.0.1.1`, admitting nobody while the socket still bound every interface. A name is now compared as a name, so nothing in `/etc/hosts`, DNS, or a search domain can widen or collapse an entry. Rate limiting still keys on the socket peer, which no header can forge.
+
+Per-peer general and pairing budgets, a bounded peer table, a 64-connection listener with a 90-second idle reap, 1 MiB body cap, and ten-second request timeout constrain every route. Host, budget, and session refusal is an empty-body `403` before route data access.
+
+The listener bound was eight connections held for each connection's whole lifetime, which is not a bound at all: a browser opens about six parallel connections per origin and keeps them alive, so one phone beside a desktop browser filled it. Worse, a half-closed socket the peer abandoned held its slot forever. Accepting then stopped and every later request queued unanswered — the monitor appeared to hang after pairing. `REQUEST_TIMEOUT` could not help, since it bounds a request and an idle connection has none. Slots are now reclaimed after 90 seconds without a read or write, a window that clears the monitor's 55-second poll so a live viewer is never cut off mid-cadence.
 
 [[src-tauri/src/web_pairing.rs]] keeps a separate identity-scoped 160-bit credential, never the ingestion bearer secret. Pairing compares it constant-time and issues an HMAC session cookie; regenerating it invalidates every browser session. [[src-tauri/src/web_server/controller.rs]] serializes enable, disable, and reconfiguration: different-port changes bind, persist, swap, then retire; same-port address changes stop, bind, and rebind the old listener if bind or persistence fails. Startup failures persist a display-safe error. `running` and `bound_addr` prove only a local listener; reachable URL candidates do not claim firewall reachability.
 
 There is no browser push channel in v1. [[src/web/useWebMonitorData.ts]] provides freshness with visibility-aware 55-second polling plus focus refresh; its ordinary isolated 20-sample qualification recorded 55.056 seconds p95 against the 60-second budget.
+
+### External Link Opening
+
+Leaving the app for the user's default browser is its own channel, because the webview cannot do it unaided.
+
+A plain `<a target="_blank">` is silently dropped inside a Tauri v2 webview: nothing handles the resulting new-window request, so the click does nothing at all. Every external link therefore routes through [[src/lib/openExternal.ts#handleExternalClick]], which keeps the `href` for hover, focus, and copy-link, calls `preventDefault()`, and hands the URL to `tauri-plugin-opener`. Failures are logged rather than retried, since a refusal means the capability scope did its job.
+
+`src-tauri/capabilities/default.json` grants `opener:allow-open-url` for the command and `opener:allow-default-urls` for its scope — `mailto:`, `tel:`, `http://`, `https://`. The broader `opener:default` set is deliberately not used: it also grants `reveal-item-in-dir`, which no Quill surface needs. Two surfaces consume this today: the Web tab's listener readout — both the bound address and every reachable URL, skipping wildcard binds that are not destinations — and the learning run-history error messages, whose URLs come from agent output and so must stay inside that scheme allowlist.
+
+Clipboard writes have the same shape and the same reason. `navigator.clipboard.writeText` fails silently under WebKitGTK on focus and permission edge cases, so the Web tab's copy-on-click pairing code goes through `tauri-plugin-clipboard-manager`, granted as `clipboard-manager:allow-write-text` alone — reads, images, HTML, and clear stay denied. [[src/mocks/ipcFixtures.ts#handleInvoke]] answers `plugin:clipboard-manager|write_text` with the browser's own clipboard, which is reliable outside the desktop webview.
+
+Under the browser mock, [[src/mocks/ipcFixtures.ts#handleInvoke]] answers `plugin:opener|open_url` with `window.open` instead of the blanket `plugin:*` no-op, so links stay clickable outside Tauri.
 
 ### Tauri Events
 
@@ -152,7 +174,7 @@ All tasks that touch the database or network MUST be spawned async — never blo
 - **Learning periodic timer**: Runs behavioral analysis every N minutes if configured
 - **Integration refresh + tray summary**: One merged task runs `startup_refresh` (detect providers, save, emit `integrations-updated`) then populates tray summary items. Merged to avoid redundant `detect_all` subprocess calls.
 - **Live usage refresh**: Background loop that updates the main widget and tray summary rows. The enable flag (`live_usage.enabled`) and refresh interval (`live_usage.interval_seconds`, 60–600, default 180) are read from the settings table on every iteration so the [[features#Settings Window]] can adjust both at runtime.
-- **Transcript rescan loop**: Always-on incremental rescan of the Claude and Codex transcript roots via [[src-tauri/src/lib.rs#spawn_transcript_rescan_loop]]. Every 120 seconds it enqueues each changed canonical source once; one coordinator tracks independent model and transcript completion, retry, and events. A separate [[src-tauri/src/lib.rs#spawn_startup_model_source_reconciliation]] pass re-admits retained model inventory after every launch. Unchanged sources are cheap stat-only no-ops.
+- **Transcript rescan loop**: Always-on incremental rescan of every retained Claude, Codex, and Pi transcript root via [[src-tauri/src/lib.rs#spawn_transcript_rescan_loop]]. Every 120 seconds it enqueues each changed canonical source once; one coordinator tracks independent model and transcript completion, retry, and events. Startup whole-root transcript reconciliation belongs to the watcher's retained-scan worker after its cold live fold, while [[src-tauri/src/lib.rs#spawn_startup_model_source_reconciliation]] separately re-admits retained Claude/Codex model inventory. Unchanged sources are cheap stat-only no-ops.
 - **Rule filesystem watcher**: Optional. The `rule_watcher.enabled` setting (default true) is checked at startup; disabling skips the `notify` watcher entirely. Live re-toggling takes effect after the next app launch since the watcher holds an OS handle.
 - **Tray "Check for Update"**: Manual trigger via system tray menu. Uses `tauri-plugin-dialog` to show a native OS confirmation dialog when an update is found (Install / Not Now), or an info dialog when already up to date. The frontend still performs its own 4-hour availability check via `@tauri-apps/plugin-updater`, but the titlebar install action now delegates to [[src-tauri/src/lib.rs#install_app_update]] so Rust owns the install-and-restart boundary.
 

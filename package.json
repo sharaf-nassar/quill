@@ -19,7 +19,9 @@
   },
   "dependencies": {
     "@sentry/react": "^10.54.0",
-    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/api": "~2.11.1",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
+    "@tauri-apps/plugin-opener": "^2.5.4",
     "@tauri-apps/plugin-updater": "^2.10.0",
     "dompurify": "^3.4.2",
     "marked": "^18.0.3",
@@ -29,7 +31,7 @@
   "devDependencies": {
     "@eslint/js": "^9.39.3",
     "@sentry/vite-plugin": "^5.3.0",
-    "@tauri-apps/cli": "^2.0.0",
+    "@tauri-apps/cli": "~2.11.4",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.0.0",

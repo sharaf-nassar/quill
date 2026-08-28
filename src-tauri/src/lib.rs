@@ -80,16 +80,19 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
 };
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use storage::Storage;
+use storage::{MigrationProgress, StartupMigrationPlan, Storage};
 use subtle::ConstantTimeEq;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Emitter, Listener, LogicalSize, Manager, PhysicalPosition};
+use tauri::{
+    Emitter, Listener, LogicalSize, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
+};
 use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_updater::UpdaterExt;
 use tauri_plugin_window_state::{StateFlags, WindowExt};
 
 static STORAGE: OnceLock<Storage> = OnceLock::new();
+static STARTUP_STATUS: OnceLock<Mutex<StartupStatus>> = OnceLock::new();
 static STARTUP_CLEANUP_DONE: OnceLock<()> = OnceLock::new();
 static USAGE_CACHE: OnceLock<Mutex<Option<UsageCacheEntry>>> = OnceLock::new();
 static USAGE_REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -117,9 +120,87 @@ pub(crate) const TRANSCRIPT_ANALYTICS_UPDATED_EVENT: &str = "transcript-analytic
 pub(crate) const SESSIONS_LIVE_UPDATED_EVENT: &str = "sessions-live-updated";
 const ROLLUP_BACKFILL_PROGRESS_EVENT: &str = "rollup-backfill-progress";
 const ROLLUP_BACKFILL_FINISHED_EVENT: &str = "rollup-backfill-finished";
+const STARTUP_STATUS_EVENT: &str = "startup-status";
+const MIGRATION_WINDOW_LABEL: &str = "migration";
+const MIGRATION_WINDOW_WIDTH: f64 = 520.0;
+const MIGRATION_WINDOW_HEIGHT: f64 = 300.0;
 // Marker prefix `storage::Storage::init` puts in front of a schema upper-bound
 // rejection. It is an internal wire marker, never user-facing text.
 const SCHEMA_TOO_NEW_ERROR_PREFIX: &str = "SCHEMA_TOO_NEW:";
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum StartupState {
+    Starting,
+    Migrating,
+    Ready,
+    Error,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupStatus {
+    state: StartupState,
+    stage: String,
+    detail: String,
+    completed_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+}
+
+impl Default for StartupStatus {
+    fn default() -> Self {
+        Self {
+            state: StartupState::Starting,
+            stage: "Starting Quill".to_string(),
+            detail: "Opening local services".to_string(),
+            completed_bytes: None,
+            total_bytes: None,
+        }
+    }
+}
+
+fn current_startup_status() -> StartupStatus {
+    STARTUP_STATUS
+        .get_or_init(|| Mutex::new(StartupStatus::default()))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+fn publish_startup_status(app: &tauri::AppHandle, status: StartupStatus) {
+    *STARTUP_STATUS
+        .get_or_init(|| Mutex::new(StartupStatus::default()))
+        .lock()
+        .unwrap() = status.clone();
+    if let Err(error) = app.emit(STARTUP_STATUS_EVENT, status) {
+        log::warn!("Failed to emit startup status: {error}");
+    }
+}
+
+fn publish_migration_progress(app: &tauri::AppHandle, progress: MigrationProgress) {
+    let detail = match progress.stage {
+        "backup" => "Copying the current database before changing its schema. Keep Quill open.",
+        "verifying" => "Checking the backup before changing local data. Keep Quill open.",
+        "rebuilding" => "Rewriting analytics data for this version. Keep Quill open.",
+        "finalizing" => "Completing startup checks and cleanup. Keep Quill open.",
+        _ => "Keep Quill open while local data is updated.",
+    };
+    publish_startup_status(
+        app,
+        StartupStatus {
+            state: StartupState::Migrating,
+            stage: progress.detail,
+            detail: detail.to_string(),
+            completed_bytes: progress.completed_bytes,
+            total_bytes: progress.total_bytes,
+        },
+    );
+}
+
+#[tauri::command]
+fn get_startup_status() -> StartupStatus {
+    current_startup_status()
+}
 
 /// Process-wide exclusion for database maintenance and ingest writes.
 ///
@@ -712,43 +793,6 @@ fn enqueue_retained_source_domains(
     Ok(admission)
 }
 
-fn spawn_startup_transcript_analytics_reconciliation(app: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        let result = tauri::async_runtime::spawn_blocking(|| {
-            let storage = get_storage()?;
-            transcript_analytics::run_startup_transcript_analytics_reconciliation(
-                storage,
-                &sessions::SessionIndex::local_hostname(),
-            )
-        })
-        .await;
-        match result {
-            Ok(Ok(summary)) => {
-                log::info!(
-                    "Startup transcript analytics reconciliation complete: replaced={} pruned={} roots_complete={}",
-                    summary.replaced_sources,
-                    summary.pruned_sources,
-                    summary.completed_all_roots,
-                );
-                if let Some(error) = &summary.failure {
-                    log::warn!("Startup transcript analytics reconciliation incomplete: {error}");
-                }
-                if (summary.replaced_sources > 0 || summary.pruned_sources > 0)
-                    && let Err(error) = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ())
-                {
-                    log::warn!("Failed to emit startup transcript analytics update: {error}");
-                }
-            }
-            Ok(Err(error)) => {
-                log::error!("Startup transcript analytics reconciliation failed: {error}");
-            }
-            Err(error) => {
-                log::error!("Startup transcript analytics worker failed: {error}");
-            }
-        }
-    });
-}
-
 /// Re-admit retained model sources after runner state is available.
 ///
 /// The durable backfill is intentionally one-shot. This independent startup
@@ -787,34 +831,17 @@ fn spawn_transcript_rescan_loop(app: tauri::AppHandle) {
             let previous = watermark;
             let result = tauri::async_runtime::spawn_blocking(move || {
                 let roots = sessions::enumerate_retained_jsonl_source_roots();
-                let changed = collect_rescan_changed_sources_from_roots(previous, &roots);
-                let storage = get_storage()?;
-                let summary = transcript_analytics::run_transcript_analytics_reconciliation(
-                    storage,
-                    &sessions::SessionIndex::local_hostname(),
-                    &roots,
-                )?;
-                Ok::<_, String>((changed, summary))
+                collect_rescan_changed_sources_from_roots(previous, &roots)
             })
             .await;
-            let (changed, summary) = match result {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => {
-                    log::warn!("Transcript rescan reconciliation failed: {error}");
-                    continue;
-                }
+            let changed = match result {
+                Ok(changed) => changed,
                 Err(error) => {
                     log::warn!("Transcript rescan worker failed: {error}");
                     continue;
                 }
             };
             watermark = tick_start;
-
-            if (summary.replaced_sources > 0 || summary.pruned_sources > 0)
-                && let Err(error) = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ())
-            {
-                log::warn!("Failed to emit transcript rescan analytics update: {error}");
-            }
 
             if changed.is_empty() {
                 continue;
@@ -1945,6 +1972,15 @@ pub(crate) fn report_fatal_port_conflict(app: &tauri::AppHandle, port: u16) {
         .show(move |_| std::process::exit(1));
 }
 
+fn publish_storage(storage: Storage) -> Result<&'static Storage, String> {
+    if STORAGE.set(storage).is_err() {
+        return Err("storage initialization was requested more than once".to_string());
+    }
+    STORAGE
+        .get()
+        .ok_or_else(|| "storage initialization did not publish global state".to_string())
+}
+
 /// Publish the process-wide storage handle, or surface a fatal failure.
 ///
 /// Returns `None` once the failure dialog owns termination; the caller must
@@ -1955,23 +1991,178 @@ fn initialize_storage_or_report_fatal(app: &tauri::AppHandle) -> Option<&'static
         return Some(storage);
     }
 
-    match Storage::init() {
-        Ok(storage) => {
-            if STORAGE.set(storage).is_err() {
-                log::error!("BUG: STORAGE was already initialized");
-            }
-        }
+    match Storage::init().and_then(publish_storage) {
+        Ok(storage) => Some(storage),
         Err(error) => {
             report_fatal_storage_failure(app, &error);
-            return None;
+            None
         }
     }
+}
 
-    let storage = STORAGE.get();
-    if storage.is_none() {
-        report_fatal_storage_failure(app, "storage initialization did not publish global state");
+fn show_migration_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window is unavailable".to_string())?;
+    main.hide()
+        .map_err(|error| format!("Hide main window for database update: {error}"))?;
+
+    let migration = match WebviewWindowBuilder::new(
+        app,
+        MIGRATION_WINDOW_LABEL,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("Quill Database Update")
+    .inner_size(MIGRATION_WINDOW_WIDTH, MIGRATION_WINDOW_HEIGHT)
+    .resizable(false)
+    .transparent(true)
+    .decorations(false)
+    .always_on_top(true)
+    .build()
+    {
+        Ok(window) => window,
+        Err(error) => {
+            let _ = main.show();
+            return Err(format!("Create database update window: {error}"));
+        }
+    };
+    migration.on_window_event(|event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            if matches!(current_startup_status().state, StartupState::Ready) {
+                return;
+            }
+            api.prevent_close();
+            std::process::exit(0);
+        }
+    });
+    if let Err(error) = migration.center() {
+        log::warn!("Failed to center database update window: {error}");
     }
-    storage
+    if let Err(error) = migration.show() {
+        log::warn!("Failed to show database update window: {error}");
+    }
+    let _ = migration.set_focus();
+    Ok(())
+}
+
+// @lat: [[backend#Backend#Entry Point#Startup migration surface]]
+fn start_storage_migration(app: tauri::AppHandle, plan: StartupMigrationPlan) {
+    publish_startup_status(
+        &app,
+        StartupStatus {
+            state: StartupState::Migrating,
+            stage: "Preparing database update".to_string(),
+            detail: format!(
+                "Updating local data from schema {} to {}.",
+                plan.current_version, plan.target_version
+            ),
+            completed_bytes: Some(0),
+            total_bytes: Some(plan.database_bytes),
+        },
+    );
+
+    std::thread::spawn(move || {
+        let progress_app = app.clone();
+        let progress = Arc::new(move |progress| {
+            publish_migration_progress(&progress_app, progress);
+        });
+        let storage = match Storage::init_with_progress(progress).and_then(publish_storage) {
+            Ok(storage) => storage,
+            Err(error) => {
+                publish_startup_status(
+                    &app,
+                    StartupStatus {
+                        state: StartupState::Error,
+                        stage: "Database update stopped".to_string(),
+                        detail: error.clone(),
+                        completed_bytes: None,
+                        total_bytes: None,
+                    },
+                );
+                report_fatal_storage_failure(&app, &error);
+                return;
+            }
+        };
+
+        let startup_app = app.clone();
+        let schedule_result =
+            app.run_on_main_thread(move || match finish_setup(&startup_app, storage) {
+                Ok(()) => {
+                    publish_startup_status(
+                        &startup_app,
+                        StartupStatus {
+                            state: StartupState::Ready,
+                            stage: "Ready".to_string(),
+                            detail: "Database update complete".to_string(),
+                            completed_bytes: None,
+                            total_bytes: None,
+                        },
+                    );
+                    if let Some(migration) = startup_app.get_webview_window(MIGRATION_WINDOW_LABEL)
+                        && let Err(error) = migration.close()
+                    {
+                        log::warn!("Failed to close database update window: {error}");
+                    }
+                    if let Some(main) = startup_app.get_webview_window("main") {
+                        if let Err(error) = main.show() {
+                            log::warn!("Failed to show main window after database update: {error}");
+                        }
+                        let _ = main.set_focus();
+                    }
+                }
+                Err(error) => {
+                    let detail = format!("Finish startup after database update: {error}");
+                    publish_startup_status(
+                        &startup_app,
+                        StartupStatus {
+                            state: StartupState::Error,
+                            stage: "Quill could not finish starting".to_string(),
+                            detail: detail.clone(),
+                            completed_bytes: None,
+                            total_bytes: None,
+                        },
+                    );
+                    report_fatal_storage_failure(&startup_app, &detail);
+                }
+            });
+        if let Err(error) = schedule_result {
+            let detail = format!("Schedule startup after database update: {error}");
+            publish_startup_status(
+                &app,
+                StartupStatus {
+                    state: StartupState::Error,
+                    stage: "Quill could not finish starting".to_string(),
+                    detail: detail.clone(),
+                    completed_bytes: None,
+                    total_bytes: None,
+                },
+            );
+            report_fatal_storage_failure(&app, &detail);
+        }
+    });
+}
+
+fn finish_direct_startup(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let Some(storage) = initialize_storage_or_report_fatal(app) else {
+        return Ok(());
+    };
+    finish_setup(app, storage)?;
+    publish_startup_status(
+        app,
+        StartupStatus {
+            state: StartupState::Ready,
+            stage: "Ready".to_string(),
+            detail: "Startup complete".to_string(),
+            completed_bytes: None,
+            total_bytes: None,
+        },
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn quit_during_startup() {
+    std::process::exit(0);
 }
 
 fn cleanup_interrupted_learning_runs(storage: &Storage) {
@@ -5813,6 +6004,483 @@ fn packaged_version_allows_updates(major: u64, minor: u64, patch: u64) -> bool {
     (major, minor, patch) != (0, 0, 0)
 }
 
+// @lat: [[backend#Backend#Entry Point#Startup migration surface]]
+fn finish_setup(app: &tauri::AppHandle, storage: &'static Storage) -> tauri::Result<()> {
+    let web_listener = Arc::new(web_server::controller::WebListenerController::new(
+        Arc::new(web_server::WebServerState {
+            app: Some(app.clone()),
+            ..Default::default()
+        }),
+    ));
+    app.manage(Arc::clone(&web_listener));
+    tauri::async_runtime::spawn(async move {
+        web_listener.initialize(storage).await;
+    });
+    // Read the crash-reporting opt-in before any other startup work so
+    // a panic during initialization can only report once the user has
+    // turned reporting on.
+    crash_reporting::set_enabled(read_bool_setting(
+        storage,
+        CRASH_REPORTING_OPT_IN_KEY,
+        RuntimeSettings::default().crash_reporting_enabled,
+    ));
+    // Clean up any runs left in "running" state from a previous crash.
+    // This must stay after the single-instance plugin setup so a
+    // duplicate launch cannot mark the primary's active runs interrupted.
+    cleanup_interrupted_learning_runs(storage);
+    let secret = load_http_auth_secret();
+
+    // Feature 005 US2 T034 (H-4 / FR-011): mint the ephemeral
+    // per-process learning capability token before any window or the
+    // HTTP server starts, so a state-changing learning IPC can never
+    // race ahead of an initialized token.
+    app.manage(LearningCapability::generate());
+    let model_usage_runner_state = Arc::new(RetainedSourceRunnerState::new());
+    app.manage(Arc::clone(&model_usage_runner_state));
+    // The live tracker must be managed before the transcript watcher
+    // thread starts: the watcher's cold-start sweep resolves it from
+    // app state and would otherwise find nothing to fold into.
+    let live_tracker = Arc::new(live_tracker::LiveTracker::new(Some(app.clone())));
+    if !integrations::load_integration_features(storage)
+        .is_ok_and(|features| features.activity_tracking)
+    {
+        live_tracker.set_activity_tracking_enabled(false);
+    }
+    for status in integrations::load_statuses(storage).unwrap_or_default() {
+        if !status.enabled {
+            live_tracker.set_provider_enabled(status.provider, false);
+        }
+    }
+    app.manage(Arc::clone(&live_tracker));
+    // Retained runtime analytics are a startup responsibility, not a
+    // side effect of opening or manually syncing Session Search. The
+    // transcript watcher schedules that blocking pass on its retained
+    // worker only after its cold live-tracker sweep completes.
+    if let Err(error) = spawn_model_rollup_backfill(app.clone()) {
+        log::error!("Could not schedule model rollup backfill: {error}");
+    }
+    if let Err(error) = spawn_runtime_rollup_backfill(app.clone()) {
+        log::error!("Could not schedule runtime rollup backfill: {error}");
+    }
+    transcript_watcher::start(app.clone());
+    // Always-on incremental rescan so live coverage no longer depends
+    // solely on the per-session notify hook. Feeds changed sources into
+    // the same live-reconcile queue; spawned async to never block setup.
+    spawn_transcript_rescan_loop(app.clone());
+
+    // Migration 28 starts pending. A prior process can also leave a
+    // committed running state behind; reset that run to a fresh
+    // startup_resume generation before scheduling the same nonblocking
+    // retained-history worker. Live reconciliation may temporarily own
+    // the shared permit, so the reserved task waits instead of dropping
+    // the startup pass.
+    match storage.reset_interrupted_model_backfill() {
+        Ok(status) if status.status == ModelBackfillState::Pending => {
+            emit_committed_model_backfill_status(app, &status);
+            if let Some(reservation) = model_usage_runner_state.try_reserve_retained_backfill()
+                && let Err(error) = spawn_reserved_model_history_backfill(app.clone(), reservation)
+            {
+                log::error!("Could not schedule model history backfill: {error}");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            log::error!("Could not resume interrupted model history backfill: {error}");
+        }
+    }
+    // Re-admit Claude/Codex model sources even when migration 28's
+    // one-time backfill is complete. Pi startup replacement runs in the
+    // transcript pass above and must not duplicate model work here.
+    spawn_startup_model_source_reconciliation(app.clone());
+
+    // Initialize session search index first (shared with HTTP server)
+    let session_index: Option<Arc<sessions::SessionIndex>> = {
+        let index_dir = app_data_dir().join("session-index");
+
+        match sessions::SessionIndex::open_or_create(&index_dir) {
+            Ok(idx) => {
+                let idx = Arc::new(idx);
+                app.manage(sessions::SessionIndexState(idx.clone()));
+
+                Some(idx)
+            }
+            Err(e) => {
+                log::error!("Failed to initialize session index: {e}");
+                None
+            }
+        }
+    };
+
+    // Spawn the HTTP token reporting server (needs AppHandle for events)
+    if let Some(storage) = STORAGE.get() {
+        {
+            let handle = app.clone();
+            tauri::async_runtime::spawn(server::start_server(
+                storage,
+                secret,
+                handle,
+                session_index,
+                live_tracker,
+            ));
+        }
+
+        // Periodic aggregation/cleanup every hour
+        tauri::async_runtime::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                if let Err(e) = tokio::task::block_in_place(|| storage.aggregate_and_cleanup()) {
+                    log::error!("Periodic usage cleanup error: {e}");
+                }
+                if let Err(e) =
+                    tokio::task::block_in_place(|| storage.aggregate_and_cleanup_tokens())
+                {
+                    log::error!("Periodic token cleanup error: {e}");
+                }
+                if let Err(e) = tokio::task::block_in_place(|| storage.cleanup_old_observations()) {
+                    log::error!("Periodic observation cleanup error: {e}");
+                }
+            }
+        });
+
+        // Learning periodic analysis timer -- polls every minute, runs when interval elapsed
+        let periodic_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut last_run = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+                let enabled = storage
+                    .get_setting("learning.enabled")
+                    .ok()
+                    .flatten()
+                    .is_some_and(|v| v == "true");
+                let trigger_mode = storage
+                    .get_setting("learning.trigger_mode")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+
+                if !enabled || normalize_learning_trigger_mode(&trigger_mode) != "periodic" {
+                    continue;
+                }
+
+                let interval_mins: u64 = storage
+                    .get_setting("learning.periodic_minutes")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(180);
+
+                if last_run.elapsed() >= std::time::Duration::from_secs(interval_mins * 60) {
+                    last_run = std::time::Instant::now();
+                    if let Err(e) =
+                        learning::spawn_analysis(storage, "periodic", None, &periodic_handle, false)
+                            .await
+                    {
+                        log::error!("Periodic learning analysis error: {e}");
+                    }
+                }
+            }
+        });
+    }
+
+    // Rule filesystem watcher for real-time reconciliation
+    if let Some(storage) = STORAGE.get() {
+        rule_watcher::start(app.clone(), storage);
+    }
+
+    // startup_refresh is merged into the tray summary spawn below
+    // to avoid redundant detect_all calls.
+
+    // Refresh live usage in the background. Interval and enable flag come
+    // from RuntimeSettings so the Settings window can adjust both at runtime.
+    {
+        let usage_refresh_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let (enabled, interval_secs) = STORAGE
+                    .get()
+                    .map(|s| {
+                        let cfg = load_runtime_settings(s);
+                        (cfg.live_usage_enabled, cfg.live_usage_interval_seconds)
+                    })
+                    .unwrap_or((true, LIVE_USAGE_REFRESH_INTERVAL_SECS));
+                let sleep_secs = interval_secs.max(LIVE_USAGE_INTERVAL_MIN_SECS) as u64;
+                tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+                if !enabled {
+                    continue;
+                }
+                if let Err(error) = refresh_usage_cache(Some(&usage_refresh_handle), false).await {
+                    log::warn!("Periodic usage refresh failed: {error}");
+                }
+            }
+        });
+    }
+
+    // Restore the always-on-top preference, seeding the widget's
+    // fresh-install default on the first run of the new UI.
+    let on_top_enabled = STORAGE
+        .get()
+        .map(seed_widget_always_on_top)
+        .unwrap_or(false);
+
+    if let Some(w) = app.get_webview_window("main") {
+        if let Err(error) = w.set_always_on_top(on_top_enabled) {
+            log::warn!("Failed to apply always-on-top at startup: {error}");
+        }
+        // The plugin's automatic restore is skipped for `main`, so the
+        // geometry a widget must keep across restarts — where the user
+        // parked it and how big they dragged it — is restored here.
+        // Only these two flags: platform config owns decorations and
+        // close-to-tray owns visibility, so restoring other state here
+        // could let a stale file undo either contract. SIZE is additionally
+        // withheld on the one launch that resets a pre-widget size —
+        // see `widget_restore_flags`. With no storage the marker can
+        // neither be read nor written, so fall back to the safe half of
+        // that decision and let the config size stand.
+        let restore_flags = STORAGE
+            .get()
+            .map(widget_restore_flags)
+            .unwrap_or(StateFlags::POSITION);
+        if let Err(error) = w.restore_state(restore_flags) {
+            log::warn!("Failed to restore widget window geometry: {error}");
+        }
+        // Seeding the size means the config height is what opens, and
+        // that height assumes a display tall enough for the whole
+        // default view. Cap it to the work area here so a short screen
+        // gets a shorter widget instead of one running off the bottom.
+        // Gated on the same flag rather than on the marker so a
+        // restored size — the user's own — is never touched.
+        if !restore_flags.contains(StateFlags::SIZE) {
+            clamp_seeded_widget_height(&w);
+        }
+        // Use the opaque taskbar icon (transparent PNGs render as black in _NET_WM_ICON)
+        let taskbar_icon_bytes = include_bytes!("../icons/taskbar-icon.png");
+        match tauri::image::Image::from_bytes(taskbar_icon_bytes as &[u8]) {
+            Ok(img) => match w.set_icon(img) {
+                Ok(_) => log::info!("Window icon set successfully"),
+                Err(e) => log::error!("Failed to set window icon: {e}"),
+            },
+            Err(e) => log::error!("Failed to load taskbar icon: {e}"),
+        }
+    }
+
+    let summary_now = MenuItem::with_id(app, "indicator_now", "Now: --", false, None::<&str>)?;
+    let summary_reset =
+        MenuItem::with_id(app, "indicator_reset", "Resets: --", false, None::<&str>)?;
+    let summary_week = MenuItem::with_id(app, "indicator_week", "Week: --", false, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "Show Widget", true, None::<&str>)?;
+    let on_top = CheckMenuItem::with_id(
+        app,
+        "on_top",
+        "Always on Top",
+        true,
+        on_top_enabled,
+        None::<&str>,
+    )?;
+    // Share the handle so set_runtime_settings can keep the
+    // tray checkmark in sync when the user toggles from Settings.
+    let _ = TRAY_ON_TOP_ITEM.set(on_top.clone());
+    let update = MenuItem::with_id(app, "check_update", "Check for Update", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &summary_now,
+            &summary_reset,
+            &summary_week,
+            &show,
+            &on_top,
+            &update,
+            &quit,
+        ],
+    )?;
+
+    let summary_now_handle = summary_now.clone();
+    let summary_reset_handle = summary_reset.clone();
+    let summary_week_handle = summary_week.clone();
+    let tray_update_handle = app.clone();
+    let _indicator_tray_listener =
+        app.listen(
+            indicator::INDICATOR_UPDATED_EVENT,
+            move |event| match serde_json::from_str::<StatusIndicatorState>(event.payload()) {
+                Ok(state) => update_indicator_tray_summary(
+                    &tray_update_handle,
+                    &summary_now_handle,
+                    &summary_reset_handle,
+                    &summary_week_handle,
+                    &state,
+                ),
+                Err(error) => {
+                    log::warn!("Failed to parse indicator tray update payload: {error}");
+                }
+            },
+        );
+
+    let tray_builder = TrayIconBuilder::with_id(TRAY_ID)
+        .icon(app.default_window_icon().unwrap().clone())
+        .tooltip("Quill")
+        .title("Indicator state unavailable")
+        .menu(&menu)
+        .on_menu_event(move |app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "on_top" => {
+                let Some(storage) = STORAGE.get() else {
+                    let mut message =
+                        "Always on Top tray transition failed: storage unavailable"
+                            .to_string();
+                    if let Err(error) = on_top.set_checked(on_top_enabled) {
+                        message.push_str(&format!(
+                            "; rollback errors: restore Always on Top tray checkmark to {on_top_enabled}: {error}"
+                        ));
+                    }
+                    log::error!("{message}");
+                    return;
+                };
+                let desired = match on_top.is_checked() {
+                    Ok(desired) => desired,
+                    Err(error) => {
+                        let previous = load_runtime_settings(storage);
+                        let mut rollback_errors = Vec::new();
+                        if let Err(rollback_error) =
+                            on_top.set_checked(previous.always_on_top)
+                        {
+                            rollback_errors.push(format!(
+                                "restore Always on Top tray checkmark to {}: {rollback_error}",
+                                previous.always_on_top
+                            ));
+                        }
+                        log::error!(
+                            "Always on Top tray transition failed: {}",
+                            format_runtime_settings_failure(
+                                format!("Read toggled tray check state: {error}"),
+                                rollback_errors,
+                            )
+                        );
+                        return;
+                    }
+                };
+                let mut settings = load_runtime_settings(storage);
+                settings.always_on_top = desired;
+                if let Err(error) =
+                    apply_runtime_settings(app, storage, settings, Some(&on_top))
+                {
+                    let committed = load_runtime_settings(storage).always_on_top;
+                    let error = match on_top.set_checked(committed) {
+                        Ok(()) => error,
+                        Err(rollback_error) => format_runtime_settings_failure(
+                            error,
+                            vec![format!(
+                                "restore Always on Top tray checkmark to committed state {committed}: {rollback_error}"
+                            )],
+                        ),
+                    };
+                    log::error!("Always on Top tray transition failed: {error}");
+                }
+            }
+            "check_update" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    check_for_update(&app).await;
+                });
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        });
+    let tray = tray_builder.build(app)?;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = tray.set_icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = tray;
+
+    tray_keepalive::install(app);
+
+    // Refresh provider state and populate tray summary in one
+    // background task.  Uses a dedicated Storage connection so
+    // slow debug-build queries don't block the global Mutex
+    // that frontend invoke handlers need.
+    {
+        let tray_handle = app.clone();
+        let sn = summary_now.clone();
+        let sr = summary_reset.clone();
+        let sw = summary_week.clone();
+        tauri::async_runtime::spawn(async move {
+            match tokio::task::block_in_place(|| integrations::startup_refresh(&tray_handle)) {
+                Ok(statuses) => {
+                    tokio::task::block_in_place(|| {
+                        let Ok(tray_storage) = Storage::init() else {
+                            return;
+                        };
+                        let cpa_connection = integrations::cpa::load_connection(&tray_storage)
+                            .ok()
+                            .flatten();
+                        let status_key = provider_status_key(&statuses, cpa_connection.as_ref());
+                        let usage = current_usage_cache(&status_key).unwrap_or_else(|| {
+                            let enabled = enabled_providers(&statuses);
+                            if enabled.is_empty() {
+                                return UsageData {
+                                    buckets: Vec::new(),
+                                    provider_errors: Vec::new(),
+                                    provider_credits: Vec::new(),
+                                    cpa_accounts: Vec::new(),
+                                    cpa_pools: Vec::new(),
+                                    error: Some("No providers are enabled.".to_string()),
+                                };
+                            }
+                            let mut buckets = Vec::new();
+                            for provider in enabled {
+                                if let Ok(b) = tray_storage.get_latest_usage_buckets(provider)
+                                    && !b.is_empty()
+                                {
+                                    buckets.extend(b);
+                                }
+                            }
+                            build_usage_data(buckets, Vec::new(), Vec::new())
+                        });
+                        let configured_provider = tray_storage
+                            .get_indicator_primary_provider()
+                            .unwrap_or(None);
+                        let mut state = indicator::resolve_indicator_state(
+                            configured_provider,
+                            &statuses,
+                            &usage,
+                        );
+                        state.updated_at = state.resolved_primary_provider.and_then(|p| {
+                            tray_storage
+                                .get_latest_usage_snapshot_timestamp(p)
+                                .ok()
+                                .flatten()
+                                .and_then(|ts| parse_timestamp(Some(ts)))
+                                .map(|dt| dt.to_rfc3339())
+                        });
+                        update_indicator_tray_summary(&tray_handle, &sn, &sr, &sw, &state);
+                    });
+                }
+                Err(e) => {
+                    log::error!("Integration startup refresh failed: {e}");
+                }
+            }
+        });
+    }
+
+    // Feature 010 (FR-002): if running as an un-integrated AppImage,
+    // offer one-time self-integration via a native prompt. Spawned async
+    // so it never blocks GTK/webview startup (mirrors the tray
+    // check_for_update path). Inert on non-AppImage runtimes.
+    {
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            maybe_prompt_appimage_integration(&app_handle).await;
+        });
+    }
+
+    Ok(())
+}
+
 pub fn run() {
     // Must run before any Tauri plugin is constructed so the new instance
     // does not race the dying predecessor for the single-instance lock.
@@ -5845,11 +6513,8 @@ pub fn run() {
         .plugin(
             tauri_plugin_updater::Builder::new()
                 .default_version_comparator(|current, update| {
-                    packaged_version_allows_updates(
-                        current.major,
-                        current.minor,
-                        current.patch,
-                    ) && update.version > current
+                    packaged_version_allows_updates(current.major, current.minor, current.patch)
+                        && update.version > current
                 })
                 .build(),
         )
@@ -5859,515 +6524,34 @@ pub fn run() {
         .plugin(
             tauri_plugin_window_state::Builder::new()
                 .with_state_flags(StateFlags::all() & !StateFlags::DECORATIONS)
+                .with_denylist(&[MIGRATION_WINDOW_LABEL])
                 .skip_initial_state("main")
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
-            // A failed migration or an unreadable database is terminal, but the
-            // dialog that says so can only render once this handler returns, so
-            // abandon the rest of startup instead of exiting from here.
-            let Some(storage) = initialize_storage_or_report_fatal(app.handle()) else {
-                return Ok(());
-            };
-            let web_listener = Arc::new(web_server::controller::WebListenerController::new(
-                Arc::new(web_server::WebServerState {
-                    app: Some(app.handle().clone()),
-                    ..Default::default()
-                }),
-            ));
-            app.manage(Arc::clone(&web_listener));
-            tauri::async_runtime::spawn(async move {
-                web_listener.initialize(storage).await;
-            });
-            // Read the crash-reporting opt-in before any other startup work so
-            // a panic during initialization can only report once the user has
-            // turned reporting on.
-            crash_reporting::set_enabled(read_bool_setting(
-                storage,
-                CRASH_REPORTING_OPT_IN_KEY,
-                RuntimeSettings::default().crash_reporting_enabled,
-            ));
-            // Clean up any runs left in "running" state from a previous crash.
-            // This must stay after the single-instance plugin setup so a
-            // duplicate launch cannot mark the primary's active runs interrupted.
-            cleanup_interrupted_learning_runs(storage);
-            let secret = load_http_auth_secret();
-
-            // Feature 005 US2 T034 (H-4 / FR-011): mint the ephemeral
-            // per-process learning capability token before any window or the
-            // HTTP server starts, so a state-changing learning IPC can never
-            // race ahead of an initialized token.
-            app.manage(LearningCapability::generate());
-            let model_usage_runner_state = Arc::new(RetainedSourceRunnerState::new());
-            app.manage(Arc::clone(&model_usage_runner_state));
-            // The live tracker must be managed before the transcript watcher
-            // thread starts: the watcher's cold-start sweep resolves it from
-            // app state and would otherwise find nothing to fold into.
-            let live_tracker = Arc::new(live_tracker::LiveTracker::new(Some(
-                app.handle().clone(),
-            )));
-            if !integrations::load_integration_features(storage)
-                .is_ok_and(|features| features.activity_tracking)
-            {
-                live_tracker.set_activity_tracking_enabled(false);
-            }
-            for status in integrations::load_statuses(storage).unwrap_or_default() {
-                if !status.enabled {
-                    live_tracker.set_provider_enabled(status.provider, false);
-                }
-            }
-            app.manage(Arc::clone(&live_tracker));
-            // Retained runtime analytics are a startup responsibility, not a
-            // side effect of opening or manually syncing Session Search.
-            // Blocking inventory/parsing stays off the UI thread; shared root
-            // permits serialize this pass with any early live notifications.
-            spawn_startup_transcript_analytics_reconciliation(app.handle().clone());
-            if let Err(error) = spawn_model_rollup_backfill(app.handle().clone()) {
-                log::error!("Could not schedule model rollup backfill: {error}");
-            }
-            if let Err(error) = spawn_runtime_rollup_backfill(app.handle().clone()) {
-                log::error!("Could not schedule runtime rollup backfill: {error}");
-            }
-            transcript_watcher::start(app.handle().clone());
-            // Always-on incremental rescan so live coverage no longer depends
-            // solely on the per-session notify hook. Feeds changed sources into
-            // the same live-reconcile queue; spawned async to never block setup.
-            spawn_transcript_rescan_loop(app.handle().clone());
-
-            // Migration 28 starts pending. A prior process can also leave a
-            // committed running state behind; reset that run to a fresh
-            // startup_resume generation before scheduling the same nonblocking
-            // retained-history worker. Live reconciliation may temporarily own
-            // the shared permit, so the reserved task waits instead of dropping
-            // the startup pass.
-            match storage.reset_interrupted_model_backfill() {
-                Ok(status) if status.status == ModelBackfillState::Pending => {
-                    emit_committed_model_backfill_status(app.handle(), &status);
-                    if let Some(reservation) =
-                        model_usage_runner_state.try_reserve_retained_backfill()
-                        && let Err(error) =
-                            spawn_reserved_model_history_backfill(app.handle().clone(), reservation)
-                    {
-                        log::error!("Could not schedule model history backfill: {error}");
+            let handle = app.handle().clone();
+            match Storage::startup_migration_plan() {
+                Ok(Some(plan)) => match show_migration_window(&handle) {
+                    Ok(()) => start_storage_migration(handle, plan),
+                    Err(error) => {
+                        log::warn!("Could not show database update window: {error}");
+                        finish_direct_startup(&handle)?;
                     }
-                }
-                Ok(_) => {}
+                },
+                Ok(None) => finish_direct_startup(&handle)?,
                 Err(error) => {
-                    log::error!("Could not resume interrupted model history backfill: {error}");
+                    log::warn!("Could not pre-check the database schema: {error}");
+                    finish_direct_startup(&handle)?;
                 }
             }
-            // Re-admit Claude/Codex model sources even when migration 28's
-            // one-time backfill is complete. Pi startup replacement runs in the
-            // transcript pass above and must not duplicate model work here.
-            spawn_startup_model_source_reconciliation(app.handle().clone());
-
-            // Initialize session search index first (shared with HTTP server)
-            let session_index: Option<Arc<sessions::SessionIndex>> = {
-                let index_dir = app_data_dir().join("session-index");
-
-                match sessions::SessionIndex::open_or_create(&index_dir) {
-                    Ok(idx) => {
-                        let idx = Arc::new(idx);
-                        app.manage(sessions::SessionIndexState(idx.clone()));
-
-                        Some(idx)
-                    }
-                    Err(e) => {
-                        log::error!("Failed to initialize session index: {e}");
-                        None
-                    }
-                }
-            };
-
-            // Spawn the HTTP token reporting server (needs AppHandle for events)
-            if let Some(storage) = STORAGE.get() {
-                {
-                    let handle = app.handle().clone();
-                    tauri::async_runtime::spawn(server::start_server(
-                        storage,
-                        secret,
-                        handle,
-                        session_index,
-                        live_tracker,
-                    ));
-                }
-
-                // Periodic aggregation/cleanup every hour
-                tauri::async_runtime::spawn(async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-                    interval.tick().await; // skip the immediate first tick
-                    loop {
-                        interval.tick().await;
-                        if let Err(e) =
-                            tokio::task::block_in_place(|| storage.aggregate_and_cleanup())
-                        {
-                            log::error!("Periodic usage cleanup error: {e}");
-                        }
-                        if let Err(e) =
-                            tokio::task::block_in_place(|| storage.aggregate_and_cleanup_tokens())
-                        {
-                            log::error!("Periodic token cleanup error: {e}");
-                        }
-                        if let Err(e) =
-                            tokio::task::block_in_place(|| storage.cleanup_old_observations())
-                        {
-                            log::error!("Periodic observation cleanup error: {e}");
-                        }
-                    }
-                });
-
-                // Learning periodic analysis timer -- polls every minute, runs when interval elapsed
-                let periodic_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let mut last_run = std::time::Instant::now();
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-
-                        let enabled = storage
-                            .get_setting("learning.enabled")
-                            .ok()
-                            .flatten()
-                            .is_some_and(|v| v == "true");
-                        let trigger_mode = storage
-                            .get_setting("learning.trigger_mode")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-
-                        if !enabled || normalize_learning_trigger_mode(&trigger_mode) != "periodic"
-                        {
-                            continue;
-                        }
-
-                        let interval_mins: u64 = storage
-                            .get_setting("learning.periodic_minutes")
-                            .ok()
-                            .flatten()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(180);
-
-                        if last_run.elapsed() >= std::time::Duration::from_secs(interval_mins * 60)
-                        {
-                            last_run = std::time::Instant::now();
-                            if let Err(e) = learning::spawn_analysis(
-                                storage,
-                                "periodic",
-                                None,
-                                &periodic_handle,
-                                false,
-                            )
-                            .await
-                            {
-                                log::error!("Periodic learning analysis error: {e}");
-                            }
-                        }
-                    }
-                });
-            }
-
-            // Rule filesystem watcher for real-time reconciliation
-            if let Some(storage) = STORAGE.get() {
-                rule_watcher::start(app.handle().clone(), storage);
-            }
-
-            // startup_refresh is merged into the tray summary spawn below
-            // to avoid redundant detect_all calls.
-
-            // Refresh live usage in the background. Interval and enable flag come
-            // from RuntimeSettings so the Settings window can adjust both at runtime.
-            {
-                let usage_refresh_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    loop {
-                        let (enabled, interval_secs) = STORAGE
-                            .get()
-                            .map(|s| {
-                                let cfg = load_runtime_settings(s);
-                                (cfg.live_usage_enabled, cfg.live_usage_interval_seconds)
-                            })
-                            .unwrap_or((true, LIVE_USAGE_REFRESH_INTERVAL_SECS));
-                        let sleep_secs = interval_secs.max(LIVE_USAGE_INTERVAL_MIN_SECS) as u64;
-                        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
-                        if !enabled {
-                            continue;
-                        }
-                        if let Err(error) = refresh_usage_cache(Some(&usage_refresh_handle), false).await {
-                            log::warn!("Periodic usage refresh failed: {error}");
-                        }
-                    }
-                });
-            }
-
-            // Restore the always-on-top preference, seeding the widget's
-            // fresh-install default on the first run of the new UI.
-            let on_top_enabled = STORAGE
-                .get()
-                .map(seed_widget_always_on_top)
-                .unwrap_or(false);
-
-            if let Some(w) = app.get_webview_window("main") {
-                if let Err(error) = w.set_always_on_top(on_top_enabled) {
-                    log::warn!("Failed to apply always-on-top at startup: {error}");
-                }
-                // The plugin's automatic restore is skipped for `main`, so the
-                // geometry a widget must keep across restarts — where the user
-                // parked it and how big they dragged it — is restored here.
-                // Only these two flags: platform config owns decorations and
-                // close-to-tray owns visibility, so restoring other state here
-                // could let a stale file undo either contract. SIZE is additionally
-                // withheld on the one launch that resets a pre-widget size —
-                // see `widget_restore_flags`. With no storage the marker can
-                // neither be read nor written, so fall back to the safe half of
-                // that decision and let the config size stand.
-                let restore_flags = STORAGE
-                    .get()
-                    .map(widget_restore_flags)
-                    .unwrap_or(StateFlags::POSITION);
-                if let Err(error) = w.restore_state(restore_flags) {
-                    log::warn!("Failed to restore widget window geometry: {error}");
-                }
-                // Seeding the size means the config height is what opens, and
-                // that height assumes a display tall enough for the whole
-                // default view. Cap it to the work area here so a short screen
-                // gets a shorter widget instead of one running off the bottom.
-                // Gated on the same flag rather than on the marker so a
-                // restored size — the user's own — is never touched.
-                if !restore_flags.contains(StateFlags::SIZE) {
-                    clamp_seeded_widget_height(&w);
-                }
-                // Use the opaque taskbar icon (transparent PNGs render as black in _NET_WM_ICON)
-                let taskbar_icon_bytes = include_bytes!("../icons/taskbar-icon.png");
-                match tauri::image::Image::from_bytes(taskbar_icon_bytes as &[u8]) {
-                    Ok(img) => match w.set_icon(img) {
-                        Ok(_) => log::info!("Window icon set successfully"),
-                        Err(e) => log::error!("Failed to set window icon: {e}"),
-                    },
-                    Err(e) => log::error!("Failed to load taskbar icon: {e}"),
-                }
-            }
-
-            let summary_now =
-                MenuItem::with_id(app, "indicator_now", "Now: --", false, None::<&str>)?;
-            let summary_reset =
-                MenuItem::with_id(app, "indicator_reset", "Resets: --", false, None::<&str>)?;
-            let summary_week =
-                MenuItem::with_id(app, "indicator_week", "Week: --", false, None::<&str>)?;
-            let show = MenuItem::with_id(app, "show", "Show Widget", true, None::<&str>)?;
-            let on_top = CheckMenuItem::with_id(
-                app,
-                "on_top",
-                "Always on Top",
-                true,
-                on_top_enabled,
-                None::<&str>,
-            )?;
-            // Share the handle so set_runtime_settings can keep the
-            // tray checkmark in sync when the user toggles from Settings.
-            let _ = TRAY_ON_TOP_ITEM.set(on_top.clone());
-            let update =
-                MenuItem::with_id(app, "check_update", "Check for Update", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(
-                app,
-                &[
-                    &summary_now,
-                    &summary_reset,
-                    &summary_week,
-                    &show,
-                    &on_top,
-                    &update,
-                    &quit,
-                ],
-            )?;
-
-            let summary_now_handle = summary_now.clone();
-            let summary_reset_handle = summary_reset.clone();
-            let summary_week_handle = summary_week.clone();
-            let tray_update_handle = app.handle().clone();
-            let _indicator_tray_listener =
-                app.listen(indicator::INDICATOR_UPDATED_EVENT, move |event| {
-                    match serde_json::from_str::<StatusIndicatorState>(event.payload()) {
-                        Ok(state) => update_indicator_tray_summary(
-                            &tray_update_handle,
-                            &summary_now_handle,
-                            &summary_reset_handle,
-                            &summary_week_handle,
-                            &state,
-                        ),
-                        Err(error) => {
-                            log::warn!("Failed to parse indicator tray update payload: {error}");
-                        }
-                    }
-                });
-
-            let tray_builder = TrayIconBuilder::with_id(TRAY_ID)
-                .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("Quill")
-                .title("Indicator state unavailable")
-                .menu(&menu)
-                .on_menu_event(move |app, event| match event.id().as_ref() {
-                    "show" => show_main_window(app),
-                    "on_top" => {
-                        let Some(storage) = STORAGE.get() else {
-                            let mut message =
-                                "Always on Top tray transition failed: storage unavailable"
-                                    .to_string();
-                            if let Err(error) = on_top.set_checked(on_top_enabled) {
-                                message.push_str(&format!(
-                                    "; rollback errors: restore Always on Top tray checkmark to {on_top_enabled}: {error}"
-                                ));
-                            }
-                            log::error!("{message}");
-                            return;
-                        };
-                        let desired = match on_top.is_checked() {
-                            Ok(desired) => desired,
-                            Err(error) => {
-                                let previous = load_runtime_settings(storage);
-                                let mut rollback_errors = Vec::new();
-                                if let Err(rollback_error) =
-                                    on_top.set_checked(previous.always_on_top)
-                                {
-                                    rollback_errors.push(format!(
-                                        "restore Always on Top tray checkmark to {}: {rollback_error}",
-                                        previous.always_on_top
-                                    ));
-                                }
-                                log::error!(
-                                    "Always on Top tray transition failed: {}",
-                                    format_runtime_settings_failure(
-                                        format!("Read toggled tray check state: {error}"),
-                                        rollback_errors,
-                                    )
-                                );
-                                return;
-                            }
-                        };
-                        let mut settings = load_runtime_settings(storage);
-                        settings.always_on_top = desired;
-                        if let Err(error) =
-                            apply_runtime_settings(app, storage, settings, Some(&on_top))
-                        {
-                            let committed = load_runtime_settings(storage).always_on_top;
-                            let error = match on_top.set_checked(committed) {
-                                Ok(()) => error,
-                                Err(rollback_error) => format_runtime_settings_failure(
-                                    error,
-                                    vec![format!(
-                                        "restore Always on Top tray checkmark to committed state {committed}: {rollback_error}"
-                                    )],
-                                ),
-                            };
-                            log::error!("Always on Top tray transition failed: {error}");
-                        }
-                    }
-                    "check_update" => {
-                        let app = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            check_for_update(&app).await;
-                        });
-                    }
-                    "quit" => app.exit(0),
-                    _ => {}
-                });
-            let tray = tray_builder.build(app)?;
-            #[cfg(target_os = "macos")]
-            {
-                let _ = tray.set_icon_as_template(true);
-            }
-            #[cfg(not(target_os = "macos"))]
-            let _ = tray;
-
-            tray_keepalive::install(app.handle());
-
-            // Refresh provider state and populate tray summary in one
-            // background task.  Uses a dedicated Storage connection so
-            // slow debug-build queries don't block the global Mutex
-            // that frontend invoke handlers need.
-            {
-                let tray_handle = app.handle().clone();
-                let sn = summary_now.clone();
-                let sr = summary_reset.clone();
-                let sw = summary_week.clone();
-                tauri::async_runtime::spawn(async move {
-                    match tokio::task::block_in_place(|| {
-                        integrations::startup_refresh(&tray_handle)
-                    }) {
-                        Ok(statuses) => {
-                            tokio::task::block_in_place(|| {
-                                let Ok(tray_storage) = Storage::init() else {
-                                    return;
-                                };
-                                let cpa_connection =
-                                    integrations::cpa::load_connection(&tray_storage)
-                                        .ok()
-                                        .flatten();
-                                let status_key =
-                                    provider_status_key(&statuses, cpa_connection.as_ref());
-                                let usage = current_usage_cache(&status_key).unwrap_or_else(|| {
-                                    let enabled = enabled_providers(&statuses);
-                                    if enabled.is_empty() {
-                                        return UsageData {
-                                            buckets: Vec::new(),
-                                            provider_errors: Vec::new(),
-                                            provider_credits: Vec::new(),
-                                            cpa_accounts: Vec::new(),
-                                            cpa_pools: Vec::new(),
-                                            error: Some("No providers are enabled.".to_string()),
-                                        };
-                                    }
-                                    let mut buckets = Vec::new();
-                                    for provider in enabled {
-                                        if let Ok(b) =
-                                            tray_storage.get_latest_usage_buckets(provider)
-                                            && !b.is_empty()
-                                        {
-                                            buckets.extend(b);
-                                        }
-                                    }
-                                    build_usage_data(buckets, Vec::new(), Vec::new())
-                                });
-                                let configured_provider = tray_storage
-                                    .get_indicator_primary_provider()
-                                    .unwrap_or(None);
-                                let mut state = indicator::resolve_indicator_state(
-                                    configured_provider,
-                                    &statuses,
-                                    &usage,
-                                );
-                                state.updated_at = state.resolved_primary_provider.and_then(|p| {
-                                    tray_storage
-                                        .get_latest_usage_snapshot_timestamp(p)
-                                        .ok()
-                                        .flatten()
-                                        .and_then(|ts| parse_timestamp(Some(ts)))
-                                        .map(|dt| dt.to_rfc3339())
-                                });
-                                update_indicator_tray_summary(&tray_handle, &sn, &sr, &sw, &state);
-                            });
-                        }
-                        Err(e) => {
-                            log::error!("Integration startup refresh failed: {e}");
-                        }
-                    }
-                });
-            }
-
-            // Feature 010 (FR-002): if running as an un-integrated AppImage,
-            // offer one-time self-integration via a native prompt. Spawned async
-            // so it never blocks GTK/webview startup (mirrors the tray
-            // check_for_update path). Inert on non-AppImage runtimes.
-            {
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    maybe_prompt_appimage_integration(&app_handle).await;
-                });
-            }
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_startup_status,
+            quit_during_startup,
             fetch_usage_data,
             refresh_usage_data,
             get_cached_usage_data,

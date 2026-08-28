@@ -3,12 +3,21 @@ import type { WebUiConfig } from "../../web/httpTransport";
 import type { WebUiError } from "../../hooks/useWebUiSettings";
 
 interface AllowlistEditorProps {
+  id: string;
+  /** Names the radio option this editor configures, for assistive tech. */
+  labelledBy: string;
   config: WebUiConfig;
   disabled: boolean;
   save: (next: WebUiConfig) => Promise<WebUiError | null>;
 }
 
-function AllowlistEditor({ config, disabled, save }: AllowlistEditorProps) {
+function AllowlistEditor({
+  id,
+  labelledBy,
+  config,
+  disabled,
+  save,
+}: AllowlistEditorProps) {
   const [candidate, setCandidate] = useState("");
   const [entryError, setEntryError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -49,17 +58,16 @@ function AllowlistEditor({ config, disabled, save }: AllowlistEditorProps) {
   };
 
   return (
-    <section className="web-allowlist" aria-labelledby="web-allowlist-heading">
-      <h3 id="web-allowlist-heading" className="web-allowlist-heading">
-        Allowed hosts
-      </h3>
+    <section id={id} className="web-allowlist" aria-labelledby={labelledBy}>
       <p className="web-allowlist-description">
-        Add an IP address, CIDR range, or hostname. Quill validates and
-        canonicalizes every entry when you submit it.
+        The names and addresses another device may use to reach this Quill —
+        the host part of the URL you would type, not the device doing the
+        typing. Listing anything beyond this machine also serves the listener
+        on your network. Pairing still decides who gets in.
       </p>
       <form className="web-allowlist-form" onSubmit={addEntry}>
         <label className="web-allowlist-input-label" htmlFor="web-ui-allowlist-entry">
-          Add allowed host
+          Add address
         </label>
         <div className="web-allowlist-input-row">
           <input
@@ -69,7 +77,7 @@ function AllowlistEditor({ config, disabled, save }: AllowlistEditorProps) {
             value={candidate}
             disabled={busy}
             spellCheck={false}
-            placeholder="IP address, CIDR, or hostname"
+            placeholder="hostname or IP address"
             aria-invalid={entryError !== null}
             aria-describedby={entryError === null ? undefined : "web-allowlist-error"}
             onChange={(event) => {
@@ -88,7 +96,9 @@ function AllowlistEditor({ config, disabled, save }: AllowlistEditorProps) {
         </p>
       )}
       {config.allowlist.length === 0 ? (
-        <p className="web-allowlist-empty">No allowed hosts yet.</p>
+        <p className="web-allowlist-empty">
+          Nothing listed — this machine only, on loopback.
+        </p>
       ) : (
         <ul className="web-allowlist-entries" aria-label="Allowed hosts">
           {config.allowlist.map((entry) => (
@@ -98,7 +108,7 @@ function AllowlistEditor({ config, disabled, save }: AllowlistEditorProps) {
                 type="button"
                 className="settings-button"
                 disabled={busy}
-                aria-label={`Remove ${entry} from allowlist`}
+                aria-label={`Stop answering to ${entry}`}
                 onClick={() => void removeEntry(entry)}
               >
                 Remove

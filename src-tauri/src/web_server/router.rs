@@ -14,9 +14,9 @@ use std::sync::{Arc, LazyLock};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::State,
+    extract::{Request, State},
     http::{HeaderValue, StatusCode, header},
-    middleware,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -32,8 +32,8 @@ use crate::{
     web_allowlist::is_permitted_command,
     web_pairing,
     web_server::{
-        InvokeRequest, InvokeResponse, PairRequest, WebServerState, assets,
-        gates::{enforce_pairing_budget, refused, require_session},
+        InvokeRequest, InvokeResponse, PAIR_PATH, PairRequest, WebServerState, assets,
+        gates::{enforce_pairing_budget, refused, require_session, session_is_live},
         session_cookie,
     },
 };
@@ -48,16 +48,43 @@ pub fn routes(state: Arc<WebServerState>) -> Router {
             enforce_pairing_budget,
         )),
     );
+    // The entry document is the one authenticated path a human types, so an
+    // unpaired browser is sent to the pairing page instead of refused. Assets,
+    // invoke, and unrouted paths keep the empty-body `403`: a redirect is only
+    // meaningful for a navigation, and only `/pair` — already public to this
+    // same peer — is disclosed by it.
+    let document = Router::new()
+        .route("/", get(assets::document))
+        .layer(middleware::from_fn(pair_or_document));
     let authenticated = Router::new()
         .route("/api/web/invoke", post(invoke))
         .merge(assets::routes())
         .fallback(unserved)
         .layer(middleware::from_fn(require_session))
         .with_state(state);
-    public.merge(authenticated)
+    public.merge(document).merge(authenticated)
 }
 
-async fn pair_page() -> Response {
+pub(super) async fn pair_or_document(request: Request, next: Next) -> Response {
+    if session_is_live(&request) {
+        next.run(request).await
+    } else {
+        redirect_to(PAIR_PATH)
+    }
+}
+
+fn redirect_to(location: &'static str) -> Response {
+    (StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response()
+}
+
+/// A paired browser that lands here — from a bookmark, or from the redirect
+/// above after its session was still live — is sent on rather than asked to
+/// re-enter a code it does not need. The two redirects cannot loop: each fires
+/// on the opposite session state.
+async fn pair_page(request: Request) -> Response {
+    if session_is_live(&request) {
+        return redirect_to("/");
+    }
     (
         [
             (
@@ -428,8 +455,27 @@ mod tests {
         assert!(!body.contains("src="), "{body}");
         assert!(!body.contains("/assets/"), "{body}");
 
+        // The entry document redirects a navigation to the pairing page it is
+        // already allowed to fetch; it never serves the bundle unpaired.
+        let document = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("non-redirecting client")
+            .get(format!("{base}/"))
+            .send()
+            .await
+            .expect("unpaired document");
+        assert_eq!(document.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            document.headers().get(header::LOCATION).expect("location"),
+            "/pair"
+        );
+        assert!(
+            document.bytes().await.expect("redirect body").is_empty(),
+            "the redirect must carry no bundle content"
+        );
+
         for (method, path) in [
-            (reqwest::Method::GET, "/"),
             (reqwest::Method::GET, "/assets/app.js"),
             (reqwest::Method::POST, "/api/web/invoke"),
             (reqwest::Method::GET, "/does-not-exist"),

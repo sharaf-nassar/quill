@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, type ReactNode } from "react";
 import type { LearningRun, RunPhase } from "../../types";
 import { providerScopeClass, providerScopeLabel } from "../../utils/providers";
+import { handleExternalClick } from "../../lib/openExternal";
 import { timeAgo } from "../../utils/time";
 
 interface RunHistoryProps {
@@ -23,7 +24,12 @@ function renderErrorMessage(message: string): ReactNode {
   const parts = message.split(/(https?:\/\/[^\s)]+)/g);
   return parts.map((part, idx) =>
     idx % 2 === 1 ? (
-      <a key={idx} href={part} target="_blank" rel="noreferrer noopener">
+      <a
+        key={idx}
+        href={part}
+        rel="noreferrer noopener"
+        onClick={handleExternalClick}
+      >
         {part}
       </a>
     ) : (

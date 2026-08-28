@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Default capabilities for Quill widget",
-  "windows": ["main", "manage", "release-notes"],
+  "windows": ["main", "manage", "release-notes", "migration"],
   "permissions": [
     "core:default",
     "core:window:default",
@@ -26,6 +26,9 @@
     "window-state:default",
     "updater:default",
     "log:default",
-    "dialog:default"
+    "dialog:default",
+    "opener:allow-open-url",
+    "opener:allow-default-urls",
+    "clipboard-manager:allow-write-text"
   ]
 }

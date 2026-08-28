@@ -423,14 +423,19 @@ place P11's informed opt-in is actually carried.
 [[src/components/settings/WebTab.tsx]] drives the four Web UI commands through
 [[src/hooks/useWebUiSettings.ts#useWebUiSettings]]. The disclosure renders above
 the enable toggle and stays visible while the feature is off, so it is read
-before enablement rather than after: it names the sixteen monitor reads the
-server-side allowlist permits — rate-limit utilization and reset windows, token,
-cost and code-line totals, project names and absolute paths, recorded hostnames,
-session identifiers and live agent lineage, model IDs, skill and hook names,
-runtime statistics, context-savings figures, enabled providers, and the
-retention window — states that nothing is redacted, and states that the
-transport is HTTP rather than HTTPS. It also states what is never served
-(Settings, Manage, Sessions, Learning, Memory) and that a browser cannot write.
+before enablement rather than after. It is three sentences: what the surface is
+and that it is read-only, that a paired browser sees everything the widget shows
+including project names and their absolute paths, and that the transport is
+unencrypted.
+
+It previously enumerated all sixteen permitted monitor reads. That was accurate
+and skipped — thirteen lines of field names is a wall, and a disclosure nobody
+finishes discloses nothing. P11 asks for informed opt-in, not exhaustive
+recital, so the list collapsed to the claim that covers it ("everything the
+widget shows") plus the one item a user would not predict from the widget:
+absolute filesystem paths. The full field list stays normative in
+`specs/029-web-ui-server.md` and in the server-side command allowlist, which is
+where it is enforced rather than merely stated.
 
 The port field holds the user's draft until blur or Enter and then submits it;
 `web_config.rs` remains the validator, and the field guards only its own
@@ -439,27 +444,76 @@ value to the backend at all. A rejected candidate leaves the running
 configuration in place, so the draft keeps the refused value for correction
 while the row shows why it was refused.
 
-Host acceptance is a radio group rather than a toggle strip: both modes carry
-their own exposure copy so the accept-all consequence is readable before it is
-chosen, and choosing it is the explicit act P11 requires.
-[[src/components/settings/AllowlistEditor.tsx]] lives in that fieldset. Its form
-submits each unparsed candidate through `set_web_ui_config`, renders the
-backend's `invalid_allowlist_entry` and `too_many_allowlist_entries` failures
-beside the input, and renders only the canonical sorted list returned by Rust.
-The native form and per-row Remove buttons keep adding and removal keyboard
-operable. The pairing row shows the code with a Regenerate action and states
+Host acceptance is one list, not a mode choice. P11's explicit act is now
+adding an entry that names something other than this machine, which is also what
+moves the bind off loopback — exposure follows from a specific name the user
+typed rather than from a blanket option.
+[[src/components/settings/AllowlistEditor.tsx]] is now the fieldset's only
+child, named directly by its legend. The radio pair it used to sit beside is
+gone: `Accept all hosts` bypassed the allowlist entirely, so one click made the
+list decorative — a hole rather than a choice — and with it removed there is
+nothing left to choose between.
+
+Its entries are the names this Quill answers to, checked against the request's
+`Host`. They are not a list of peers, and the copy says so at the point of
+entry: *the host part of the URL you would type, not the device doing the
+typing*. The list also decides the bind, so it states that listing anything
+beyond this machine serves the listener on the network, and that pairing is
+still what decides who gets in — a name check cannot.
+
+Its form submits each unparsed candidate through `set_web_ui_config`, renders
+the backend's `invalid_allowlist_entry` and `too_many_allowlist_entries`
+failures beside the input, and renders only the canonical sorted list returned
+by Rust. The native form and per-row Remove buttons keep adding and removal
+keyboard operable. The empty state restates the consequence at the point of use
+— this machine only, on loopback — rather than leaving it in the radio
+description three rows above. The pairing row shows the code with a Regenerate action and states
 that regenerating signs out every paired browser and that the code is never the
 credential the agents report with.
 
-The listener readout separates *bound* from *reachable*. It reports the socket
-Quill actually holds (`127.0.0.1:<port>` or `0.0.0.0:<port>`) and the
-server-produced URLs, and it never claims another device can reach them: a
-same-host check cannot prove remote reachability, so the wildcard-bind copy says
-only that Quill holds the socket and that a firewall anywhere on the route can
-still refuse a device. Disabled reads as "no socket is bound". One "Last error"
-line shows the last typed command rejection, falling back to the persisted
-`web_ui.last_error` so a bind failure recorded at startup is visible whenever
-Settings is next opened.
+The code itself is a button that copies it, because its whole purpose is to be
+typed into another device. It keeps the readout's appearance rather than a
+control's — the value is still the thing being read — and is disabled while
+loading or unavailable. The write goes through `tauri-plugin-clipboard-manager`
+rather than `navigator.clipboard`, which fails silently under WebKitGTK on focus
+and permission edge cases; a copy that reported success while leaving the
+clipboard stale would send the user to the pair page with the wrong value, so a
+refusal raises an error toast instead of being swallowed.
+
+The listener readout is two facts: State, and the socket Quill actually holds
+(`127.0.0.1:<port>` or `0.0.0.0:<port>`). Disabled reads as "no socket is
+bound". One "Last error" line shows the last typed command rejection, falling
+back to the persisted `web_ui.last_error` so a bind failure recorded at startup
+is visible whenever Settings is next opened.
+
+The reachable-URL list that used to sit below it is gone, and the
+bound-versus-reachable prose with it. That paragraph existed to qualify the
+list — to stop a server-produced URL reading as a promise that another device
+can actually get there, which no same-host check can establish. With no list to
+qualify, the disclaimer had nothing to disclaim, and a bound socket states only
+what Quill holds. The `reachable_urls` status field is still produced by Rust
+and no longer rendered.
+
+The bound address is itself the link, opening in the user's default browser
+through [[src/lib/openExternal.ts#handleExternalClick]], because a readout the
+user has to retype is not an affordance. The anchor keeps its `href` so hover,
+focus, and copy-link behave normally, and the click is intercepted rather than
+followed — see
+[[architecture#Architecture#Communication Layers#External Link Opening]] for why
+a bare `target="_blank"` cannot do this.
+
+A wildcard bind resolves to loopback rather than losing its link. `0.0.0.0` and
+`[::]` are socket facts, not hostnames a browser can visit, but the port is
+still served on this machine — which is where a click inside the desktop app is
+going. So the readout keeps displaying the true socket while the link targets
+`http://127.0.0.1:<port>/`. Only a stopped listener, or a `bound_addr` with no
+numeric port, renders as plain text.
+
+The link is the bare origin, because noticing that a browser has not paired is
+the listener's job rather than the user's to route around: an unpaired
+navigation to `/` is redirected to the pairing page, and `/pair` redirects back
+once a session exists. One memorable URL therefore works before pairing, after
+it, and from a bookmark.
 
 Browser fixtures answer all four commands with the same loopback-versus-wildcard
 bind rule and the same typed port rejections, so the surface stays inspectable

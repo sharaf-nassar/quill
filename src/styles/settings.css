@@ -705,9 +705,8 @@
 }
 
 /* ─── Web UI section (feature 029) ───
-   A two-mode choice with real exposure consequences, so it is a radio group and
-   not a toggle strip: the options carry their own disclosure copy and the user
-   must be able to read both before picking one. */
+   One list, no modes. The accept-all option that used to sit beside it
+   bypassed the list entirely, so there is nothing left to choose between. */
 .web-policy {
   margin: 8px 4px;
   padding: 10px 12px;
@@ -729,63 +728,19 @@
   text-transform: uppercase;
 }
 
-.web-policy-option {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 6px 0;
-  cursor: pointer;
-}
 
-.web-policy-option + .web-policy-option {
-  border-top: 1px solid rgba(255, 255, 255, 0.04);
-}
-
-.web-policy-option input {
-  margin: 1px 0 0;
-  accent-color: var(--signal-blue);
-  cursor: inherit;
-}
-
-.web-policy-option input:focus-visible {
-  outline: 2px solid rgba(96, 165, 250, 0.7);
-  outline-offset: 2px;
-}
-
-.web-policy-body {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.web-policy-label {
-  color: var(--readout);
-  font-size: 12px;
-  font-weight: 500;
-}
-
-.web-policy-description {
-  color: rgba(255, 255, 255, 0.5);
-  font-size: 11px;
-  line-height: 1.45;
-}
-
+/* The fieldset's only child now, so it needs no indent or ownership rule —
+   the legend names it directly. */
 .web-allowlist {
-  margin: 4px 0 0 24px;
-  padding: 10px 0 0;
-  border-top: 1px solid rgba(255, 255, 255, 0.04);
   min-width: 0;
 }
 
-.web-allowlist-heading,
 .web-allowlist-description,
 .web-allowlist-empty,
 .web-allowlist-error {
   margin: 0;
 }
 
-.web-allowlist-heading,
 .web-allowlist-input-label {
   color: rgba(255, 255, 255, 0.72);
   font-size: 10px;
@@ -856,15 +811,35 @@
   overflow-wrap: anywhere;
 }
 
+/* A button, because clicking it copies the code. It keeps the readout's look
+   rather than a control's: the value is still the thing being read. */
 .web-pairing-code {
   padding: 3px 8px;
   background: rgba(255, 255, 255, 0.06);
+  border: 1px solid transparent;
   border-radius: 3px;
   color: var(--readout-bright);
   font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
   letter-spacing: 0.5px;
   overflow-wrap: anywhere;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.web-pairing-code:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.web-pairing-code:focus-visible {
+  outline: 1px solid var(--signal-blue);
+  outline-offset: 2px;
+}
+
+.web-pairing-code:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .web-status {
@@ -931,6 +906,42 @@
   font-size: 10px;
   font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color: var(--readout);
+}
+
+/* Reads as a link before it is hovered, since leaving the app is a real act. */
+.settings-external-link {
+  color: var(--signal-blue);
+  text-decoration: underline;
+  text-decoration-color: rgba(96, 165, 250, 0.4);
+  text-underline-offset: 2px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.settings-external-link code {
+  color: inherit;
+  background: rgba(96, 165, 250, 0.1);
+}
+
+.settings-external-link:hover {
+  text-decoration-color: currentcolor;
+}
+
+.settings-external-link:hover code {
+  background: rgba(96, 165, 250, 0.18);
+}
+
+.settings-external-link:focus-visible {
+  outline: 1px solid var(--signal-blue);
+  outline-offset: 2px;
+}
+
+/* The listener's one action: whichever interface it bound, this machine reaches
+   it here. Sits under the readout so the facts stay facts and the link stays a
+   link. */
+.web-open {
+  margin: 0 4px 8px;
+  font-size: 11px;
 }
 
 /* ─── Empty / error states ─── */

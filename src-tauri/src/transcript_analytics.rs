@@ -7,11 +7,13 @@ use std::sync::LazyLock;
 
 use crate::integrations::IntegrationProvider;
 use crate::model_usage::{ModelEvidence, ObservationKind};
+#[cfg(test)]
+use crate::sessions::enumerate_retained_jsonl_source_roots;
 use crate::sessions::{
     DiscoveredRetainedJsonlSource, ExtractedMessage, ProviderRootEnumerationOutcome,
     ProviderSourceRoot, RetainedJsonlSourceLayoutHint, SessionEventKind,
-    enumerate_retained_jsonl_source_roots, extract_messages_from_jsonl_records,
-    extract_skill_accesses_from_tool_action, retained_jsonl_source_root_identities,
+    extract_messages_from_jsonl_records, extract_skill_accesses_from_tool_action,
+    retained_jsonl_source_root_identities,
 };
 use crate::storage::{
     FailedTranscriptAnalyticsSource, Storage, StoredTranscriptAnalyticsSource,
@@ -877,14 +879,44 @@ fn commit_transcript_snapshot(
     )
 }
 
-const TRANSCRIPT_ANALYTICS_REINGEST_MARKER: &str = "transcript_analytics_reingest_pending";
+pub(crate) const TRANSCRIPT_ANALYTICS_REINGEST_MARKER: &str =
+    "transcript_analytics_reingest_pending";
+pub(crate) const PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER: &str =
+    "pi_transcript_analytics_reingest_pending";
+const PI_PERSISTED_SOURCE_RECONCILIATION_MARKER: &str =
+    "pi_persisted_source_reconciliation_pending";
 
-/// Read the durable migration-30 reingest marker once per reconciliation run.
-fn transcript_analytics_reingest_pending(storage: &Storage) -> bool {
-    match storage.get_setting(TRANSCRIPT_ANALYTICS_REINGEST_MARKER) {
+#[derive(Clone, Copy, Default)]
+struct TranscriptAnalyticsReingestState {
+    global: bool,
+    pi_analytics: bool,
+    pi_persisted_source: bool,
+}
+
+impl TranscriptAnalyticsReingestState {
+    fn read(storage: &Storage) -> Self {
+        Self {
+            global: reingest_marker_pending(storage, TRANSCRIPT_ANALYTICS_REINGEST_MARKER),
+            pi_analytics: reingest_marker_pending(storage, PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER),
+            pi_persisted_source: reingest_marker_pending(
+                storage,
+                PI_PERSISTED_SOURCE_RECONCILIATION_MARKER,
+            ),
+        }
+    }
+
+    fn force_for(self, provider: IntegrationProvider) -> bool {
+        self.global
+            || provider == IntegrationProvider::Pi
+                && (self.pi_analytics || self.pi_persisted_source)
+    }
+}
+
+fn reingest_marker_pending(storage: &Storage, marker: &str) -> bool {
+    match storage.get_setting(marker) {
         Ok(value) => value.is_some(),
         Err(error) => {
-            log::warn!("Could not read transcript analytics reingest marker: {error}");
+            log::warn!("Could not read transcript analytics reingest marker {marker}: {error}");
             false
         }
     }
@@ -1137,7 +1169,7 @@ pub(crate) fn reconcile_live_transcript_source(
         existing,
         hostname,
         generation,
-        transcript_analytics_reingest_pending(storage),
+        reingest_marker_pending(storage, TRANSCRIPT_ANALYTICS_REINGEST_MARKER),
     ) {
         Ok(ClassifiedTranscriptSource::Parsed(parsed)) => *parsed,
         Ok(ClassifiedTranscriptSource::Unchanged) => {
@@ -1262,6 +1294,20 @@ fn record_summary_failure(summary: &mut TranscriptAnalyticsReconciliationSummary
     }
 }
 
+fn clear_reingest_marker(
+    storage: &Storage,
+    marker: &str,
+    summary: &mut TranscriptAnalyticsReconciliationSummary,
+) {
+    if let Err(error) = storage.delete_setting(marker) {
+        summary.completed_all_roots = false;
+        record_summary_failure(
+            summary,
+            format!("retained transcript analytics marker clear failed: {error}"),
+        );
+    }
+}
+
 /// Run the durable whole-root reconciliation independently of Session Search.
 /// The root permit remains owned from inventory through final pruning.
 ///
@@ -1269,6 +1315,7 @@ fn record_summary_failure(summary: &mut TranscriptAnalyticsReconciliationSummary
 /// failure never cancels the remaining roots; only a database that refuses a
 /// bounded diagnostic write abandons the run, because nothing after that point
 /// could retain last-known-good state.
+#[cfg(test)]
 pub(crate) fn run_startup_transcript_analytics_reconciliation(
     storage: &Storage,
     hostname: &str,
@@ -1287,15 +1334,20 @@ pub(crate) fn run_transcript_analytics_reconciliation(
             .into_iter()
             .map(|(provider, source_root_key)| (provider, source_root_key.to_owned())),
     )?;
-    let force_full_reparse = transcript_analytics_reingest_pending(storage);
+    let reingest = TranscriptAnalyticsReingestState::read(storage);
     let mut summary = TranscriptAnalyticsReconciliationSummary::default();
-    let mut completed_roots = 0usize;
+    let mut successful_roots = 0usize;
+    let mut pi_roots = 0usize;
+    let mut successful_pi_roots = 0usize;
     for root in roots {
+        if root.provider == IntegrationProvider::Pi {
+            pi_roots = pi_roots.saturating_add(1);
+        }
         let outcome = match reconcile_transcript_source_root(
             storage,
             root,
             hostname,
-            force_full_reparse,
+            reingest.force_for(root.provider),
         ) {
             Ok(outcome) => outcome,
             Err(RootReconciliationFault::RootUnavailable(error)) => {
@@ -1339,7 +1391,12 @@ pub(crate) fn run_transcript_analytics_reconciliation(
         match prune_completed_transcript_root(storage, &proof) {
             Ok(pruned) => {
                 summary.pruned_sources = summary.pruned_sources.saturating_add(pruned);
-                completed_roots = completed_roots.saturating_add(1);
+                if outcome.failed_sources == 0 {
+                    successful_roots = successful_roots.saturating_add(1);
+                    if root.provider == IntegrationProvider::Pi {
+                        successful_pi_roots = successful_pi_roots.saturating_add(1);
+                    }
+                }
             }
             Err(error) => record_summary_failure(
                 &mut summary,
@@ -1347,21 +1404,24 @@ pub(crate) fn run_transcript_analytics_reconciliation(
             ),
         }
     }
-    summary.completed_all_roots = completed_roots == roots.len();
-    if summary.completed_all_roots && force_full_reparse {
-        for marker in [
-            TRANSCRIPT_ANALYTICS_REINGEST_MARKER,
-            "pi_persisted_source_reconciliation_pending",
-        ] {
-            if let Err(error) = storage.delete_setting(marker) {
-                summary.completed_all_roots = false;
-                record_summary_failure(
-                    &mut summary,
-                    format!("retained transcript analytics marker clear failed: {error}"),
-                );
-                break;
-            }
-        }
+    summary.completed_all_roots = successful_roots == roots.len();
+    let pi_completed = pi_roots > 0 && successful_pi_roots == pi_roots;
+    if reingest.global && summary.completed_all_roots {
+        clear_reingest_marker(storage, TRANSCRIPT_ANALYTICS_REINGEST_MARKER, &mut summary);
+    }
+    if reingest.pi_analytics && pi_completed {
+        clear_reingest_marker(
+            storage,
+            PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER,
+            &mut summary,
+        );
+    }
+    if reingest.pi_persisted_source && pi_completed {
+        clear_reingest_marker(
+            storage,
+            PI_PERSISTED_SOURCE_RECONCILIATION_MARKER,
+            &mut summary,
+        );
     }
     log::info!(
         "Retained transcript analytics reconciliation: replaced={} pruned={} failed_sources={} skipped_records={} roots_complete={}",
@@ -4412,6 +4472,274 @@ mod tests {
                 assert_eq!(verdict(&unforced), expected, "{name}");
             }
         }
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Pi Scoped Reingest Marker]]
+    #[test]
+    #[serial]
+    fn pi_scoped_reingest_retries_and_clears_once_after_success() {
+        clear_env();
+        let data_dir = TempDir::new().expect("data directory");
+        let claude_dir = TempDir::new().expect("Claude transcript directory");
+        let pi_dir = TempDir::new().expect("Pi transcript directory");
+        let storage = init_storage_in(&data_dir);
+        for marker in [
+            TRANSCRIPT_ANALYTICS_REINGEST_MARKER,
+            PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER,
+            PI_PERSISTED_SOURCE_RECONCILIATION_MARKER,
+        ] {
+            storage
+                .delete_setting(marker)
+                .expect("clear startup marker");
+        }
+
+        let claude = write_jsonl_source(
+            claude_dir.path(),
+            "claude.jsonl",
+            IntegrationProvider::Claude,
+            claude_parent_hint(),
+            &[
+                claude_line("user", "claude-session", "claude-user", Some("/work/quill")),
+                claude_line(
+                    "assistant",
+                    "claude-session",
+                    "claude-answer",
+                    Some("/work/quill"),
+                ),
+            ],
+        );
+        let pi = pi_usage_evidence_source(pi_dir.path());
+        let invalid_session_id = "pi-retry-source";
+        let invalid_path = pi_dir.path().join("pi-retry-source.jsonl");
+        std::fs::write(&invalid_path, "{}\n").expect("write invalid Pi source");
+        let invalid = DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: source_root_key(IntegrationProvider::Pi),
+            source_key: crate::storage::pi_source_key(TEST_HOSTNAME, invalid_session_id)
+                .expect("canonical retry source key"),
+            filesystem_path: invalid_path.clone(),
+            canonical_path: invalid_path,
+            layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
+        };
+        let root =
+            |provider: IntegrationProvider,
+             path: &Path,
+             sources: Vec<DiscoveredRetainedJsonlSource>| ProviderSourceRoot {
+                provider,
+                source_root_key: source_root_key(provider),
+                resolved_root_path: path.to_path_buf(),
+                canonical_root_path: Some(path.to_path_buf()),
+                outcome: ProviderRootEnumerationOutcome::Complete,
+                sources,
+            };
+        let initial_roots = vec![
+            root(
+                IntegrationProvider::Claude,
+                claude_dir.path(),
+                vec![claude.clone()],
+            ),
+            root(IntegrationProvider::Pi, pi_dir.path(), vec![pi.clone()]),
+        ];
+        let initial =
+            run_transcript_analytics_reconciliation(&storage, TEST_HOSTNAME, &initial_roots)
+                .expect("seed retained analytics");
+        assert!(initial.completed_all_roots);
+
+        let reader = rusqlite::Connection::open(storage.database_path())
+            .expect("open marker verification connection");
+        reader
+            .execute(
+                "UPDATE transcript_analytics_sources
+                 SET last_attempt_at_ms = 111
+                 WHERE provider = 'claude' AND source_key = ?1",
+                rusqlite::params![claude.source_key],
+            )
+            .expect("seed Claude fast-path sentinel");
+        reader
+            .execute(
+                "UPDATE transcript_analytics_sources
+                 SET last_attempt_at_ms = 222
+                 WHERE provider = 'pi' AND source_key = ?1",
+                rusqlite::params![pi.source_key],
+            )
+            .expect("seed Pi reparse sentinel");
+        reader
+            .execute(
+                "UPDATE model_usage_observations SET reasoning_tokens = NULL
+                 WHERE provider = 'pi' AND source_key = ?1",
+                rusqlite::params![pi.source_key],
+            )
+            .expect("remove Pi reasoning evidence");
+        reader
+            .execute_batch(
+                "CREATE TABLE marker_delete_audit(deleted INTEGER NOT NULL);
+                 CREATE TRIGGER audit_pi_analytics_marker_delete
+                 AFTER DELETE ON settings
+                 WHEN OLD.key = 'pi_transcript_analytics_reingest_pending'
+                 BEGIN
+                     INSERT INTO marker_delete_audit(deleted) VALUES (1);
+                 END;",
+            )
+            .expect("install marker delete audit");
+        storage
+            .set_setting(PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER, "1")
+            .expect("arm Pi reingest marker");
+
+        let retry_roots = vec![
+            root(
+                IntegrationProvider::Claude,
+                claude_dir.path(),
+                vec![claude.clone()],
+            ),
+            root(
+                IntegrationProvider::Pi,
+                pi_dir.path(),
+                vec![pi.clone(), invalid.clone()],
+            ),
+        ];
+        let failed = run_transcript_analytics_reconciliation(&storage, TEST_HOSTNAME, &retry_roots)
+            .expect("run failed Pi backfill");
+        assert_eq!(failed.failed_sources, 1);
+        assert!(!failed.completed_all_roots);
+        assert_eq!(
+            storage
+                .get_setting(PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER)
+                .expect("read retained marker"),
+            Some("1".to_owned())
+        );
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT last_attempt_at_ms FROM transcript_analytics_sources
+                     WHERE provider = 'claude' AND source_key = ?1",
+                    rusqlite::params![claude.source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read Claude sentinel"),
+            111,
+            "the Pi marker must not force a Claude source"
+        );
+        assert_ne!(
+            reader
+                .query_row(
+                    "SELECT last_attempt_at_ms FROM transcript_analytics_sources
+                     WHERE provider = 'pi' AND source_key = ?1",
+                    rusqlite::params![pi.source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read Pi attempt timestamp"),
+            222,
+            "the Pi source must bypass freshness while its marker is set"
+        );
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT COUNT(reasoning_tokens)
+                     FROM model_usage_observations
+                     WHERE provider = 'pi' AND source_key = ?1
+                       AND observation_kind = 'turn'",
+                    rusqlite::params![pi.source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count restored reasoning rows"),
+            2
+        );
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM marker_delete_audit", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count premature marker clears"),
+            0
+        );
+
+        let retried =
+            run_transcript_analytics_reconciliation(&storage, TEST_HOSTNAME, &retry_roots)
+                .expect("retry failed Pi backfill");
+        assert_eq!(retried.failed_sources, 1);
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT COUNT(*) FROM model_usage_observations
+                     WHERE provider = 'pi' AND source_key = ?1",
+                    rusqlite::params![pi.source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count idempotent retry observations"),
+            5
+        );
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM marker_delete_audit", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count retry marker clears"),
+            0
+        );
+
+        std::fs::write(
+            &invalid.canonical_path,
+            jsonl_body(&[
+                json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": invalid_session_id,
+                    "timestamp": TEST_TIMESTAMP,
+                    "cwd": "/work/quill"
+                })
+                .to_string(),
+                json!({
+                    "type": "message",
+                    "id": "retry-answer",
+                    "parentId": null,
+                    "timestamp": TEST_TIMESTAMP,
+                    "message": {
+                        "role": "assistant",
+                        "content": "done",
+                        "provider": "cliproxyapi",
+                        "model": "gpt-5.6-luna",
+                        "usage": {"input": 10, "output": 1, "totalTokens": 11},
+                        "stopReason": "stop"
+                    }
+                })
+                .to_string(),
+            ]),
+        )
+        .expect("repair retryable Pi source");
+        let completed =
+            run_transcript_analytics_reconciliation(&storage, TEST_HOSTNAME, &retry_roots)
+                .expect("complete Pi backfill");
+        assert_eq!(completed.failed_sources, 0);
+        assert!(completed.completed_all_roots);
+        assert_eq!(
+            storage
+                .get_setting(PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER)
+                .expect("read cleared marker"),
+            None
+        );
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM marker_delete_audit", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count successful marker clear"),
+            1
+        );
+
+        let unchanged =
+            run_transcript_analytics_reconciliation(&storage, TEST_HOSTNAME, &retry_roots)
+                .expect("run idempotent post-backfill pass");
+        assert_eq!(unchanged.replaced_sources, 0);
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM marker_delete_audit", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count repeated marker clears"),
+            1,
+            "the completed marker is cleared exactly once"
+        );
+        clear_env();
     }
 
     // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Forced Reparse Reads The Source]]

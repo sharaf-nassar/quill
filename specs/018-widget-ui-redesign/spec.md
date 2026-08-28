@@ -146,8 +146,9 @@ history stays reachable.
 6. As an operator, I want the six key metrics distinguishable at a glance,
    so the readout grid reads instantly.
    - AC: each metric carries its fixed hue (runtime cyan, tok/LOC violet,
-     LOC/hr magenta, sessions indigo, projects teal, net lines lime) on
-     exactly its label swatch, sparkline, and endpoint — values stay white.
+     LOC/hr magenta, sessions indigo, projects teal, net lines lime) across
+     its value, text label, swatch, sparkline, and endpoint. Delta text keeps
+     its separate semantic status color.
    - AC: sparklines are computed from the selected range's real series.
 
 7. As an operator, I want the breakdown section switchable between Sessions,

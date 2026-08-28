@@ -10,7 +10,7 @@ Pi usage tests pin persisted-session reconciliation, canonical ownership, and th
 
 Migration 48 installs the provider-neutral analytics evidence foundation without populating later Pi producers.
 
-Opening a schema-47 database first publishes a verified schema-47 backup, then rebuilds `model_usage_observations` with the `turn`/`token`/`summary` CHECK while preserving row ids, values, the source-record uniqueness constraint, and all seven named indexes. It adds nullable reasoning/outcome/savings/duration evidence, nullable tool error/detail/image/duration evidence, `session_setting_events`, nullable transcript-source `session_name`, and a `turn`/`summary` token-snapshot kind whose legacy default is `turn`; then it rearms `transcript_analytics_reingest_pending` and records version 48 once.
+Opening a schema-47 database first publishes a verified schema-47 backup, then rebuilds `model_usage_observations` with the `turn`/`token`/`summary` CHECK while preserving row ids, values, the source-record uniqueness constraint, and all seven named indexes. It adds nullable reasoning/outcome/savings/duration evidence, nullable tool error/detail/image/duration evidence, `session_setting_events`, nullable transcript-source `session_name`, and a `turn`/`summary` token-snapshot kind whose legacy default is `turn`; then it rearms only `pi_transcript_analytics_reingest_pending` and records version 48 once, leaving unchanged Claude and Codex roots on their freshness paths.
 
 The migration test inserts old-shape model, tool, source, and token-snapshot rows before opening the real migration path. It proves old rows remain byte-accountable, summary observations and snapshots plus unknown stop-reason text are accepted, other kinds remain rejected, additive columns start NULL, legacy snapshots stay turns, setting identity is unique by `(provider, source_key, setting, source_ordinal)`, and reopen does not re-enter migration 48.
 
@@ -18,7 +18,7 @@ The migration test inserts old-shape model, tool, source, and token-snapshot row
 
 Migration backup, disk preflight, retry, and manual restore share one version-parameterized recovery contract.
 
-Every destructive schema migration uses the same `VACUUM INTO` backup path and verification routine. Before backup or rebuild, free space must be at least twice the current database file size; an unreadable or insufficient probe fails before DDL. Schema 47 publishes to `/absolute/path/to/usage.db.schema-47.backup`, including committed WAL state, and verifies `PRAGMA quick_check`, exact schema version, file fsync, atomic rename, directory fsync, and a second post-publish verification.
+The schema-45/pre-46 and schema-47/pre-48 rebuilds use the same `VACUUM INTO` backup path and verification routine. Before backup or rebuild, free space must be at least twice the current database file size; an unreadable or insufficient probe fails before DDL. Schema 47 publishes to `/absolute/path/to/usage.db.schema-47.backup`, including committed WAL state, and verifies `PRAGMA quick_check`, exact schema version, file fsync, atomic rename, directory fsync on Unix, and a second post-publish verification.
 
 A failed table rebuild rolls its transaction back to schema 47 with every row intact. Removing the injected blocker resumes migration against the verified backup. The recovery test also replaces the database with that backup and proves startup reapplies migration 48 without data loss.
 
@@ -87,6 +87,18 @@ The models overview exposes unattributed summary spend as its own reconciling bu
 Sessions rows carry the registry session name and the range-scoped failed tool-call count as nullable joined evidence.
 
 `storage::tests::session_breakdown_joins_names_and_tool_failure_counts` pins `populate_session_analytics_evidence` resolving a named Pi registry row, measured failures counting only in-range `is_error = 1` tool rows, all-success sessions reading a real zero, and sessions without error evidence staying NULL rather than zero.
+
+## Pi Scoped Reingest Marker
+
+Historical Pi analytics backfill must bypass freshness only for Pi roots and clear its marker only after complete Pi success.
+
+`transcript_analytics::tests::pi_scoped_reingest_retries_and_clears_once_after_success` seeds unchanged Claude and Pi sources, removes retained Pi reasoning evidence, and arms only `pi_transcript_analytics_reingest_pending`. It proves Claude keeps its fast-path sentinel while Pi reparses, a failing Pi sibling keeps the marker armed across repeated idempotent retries, repairing that sibling restores the expected evidence, the successful pass deletes the marker exactly once, and the next ordinary pass replaces nothing. Migration 48 separately pins that it arms this Pi marker without setting the global all-provider marker.
+
+## Pi Backfill Starvation Budget
+
+The pinned historical Pi backfill must complete without pushing live-fold p95 beyond the existing 10% overhead budget.
+
+`transcript_watcher::tests::measure_pi_backfill_live_fold_p95_on_pinned_corpus` is an explicit ignored measurement over manifest SHA-256 `0489da2b94fe813d785f8b5bc4ed2f871b3f0732cde6aab5334c55788f9f673e` and generated corpus SHA-256 `b889dab75da4ee743fcc37e505d0814a4c137c2c015bd76b907b715e560e032e`: 80 sessions, 30,700 entries, 12,685 assistant messages, and 16,670 tool results. It schedules retained work only after a live fold, keeps the backfill active across every candidate sample, asserts the exact 14-family evidence count vector after backfill and idempotent replay, reports both wall times plus baseline/candidate p95, and rejects overhead above 10%. Results are valid only with no live Quill listener and no concurrent host workload.
 
 ## Native Usage Migration
 

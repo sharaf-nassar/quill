@@ -15,8 +15,9 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex, RwLock},
     task::{Context, Poll},
@@ -35,13 +36,30 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore},
+    time::Sleep,
 };
 
-use crate::web_server::{SESSION_COOKIE_NAME, WebServerState, WebUiConfig, WebUiHostPolicy};
+use crate::web_server::{SESSION_COOKIE_NAME, WebServerState, WebUiConfig};
 
 /// Live browser connections the listener will hold at once. Accepting is
 /// suspended past this, so a hostile client cannot exhaust sockets or tasks.
-pub const MAX_CONCURRENT_CONNECTIONS: usize = 8;
+///
+/// A browser opens about six parallel connections per origin and keeps them
+/// alive, so the previous bound of 8 was under two devices: one phone loading
+/// the monitor alongside a desktop browser filled it, accepting stopped, and
+/// every later request queued unanswered. The bound exists to cap a hostile
+/// client, not to ration honest ones.
+pub const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+/// How long a connection may sit without reading or writing before it is
+/// dropped and its slot returned.
+///
+/// Without this the slot is held for the connection's lifetime, and a lifetime
+/// has no upper bound: an idle keep-alive holds one indefinitely, and a
+/// half-closed socket the peer abandoned holds one forever. `REQUEST_TIMEOUT`
+/// does not help — it bounds a request, and an idle connection has none. The
+/// window clears the monitor's 55-second poll, so a live viewer is never cut
+/// off mid-cadence.
+const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(90);
 /// The largest request body any web route may receive.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Wall-clock bound on one request, gates included.
@@ -55,10 +73,11 @@ const MAX_PAIRING_REQUESTS: usize = 10;
 /// An unbounded peer table is itself the denial-of-service, so tracking is
 /// capped and the least recently active peer is evicted at the cap.
 const MAX_TRACKED_PEERS: usize = 256;
-/// One budget shared by every hostname entry, because the controller pins
-/// under its transition lock: a hostile or unreachable resolver must not be
-/// able to stall a settings save once per allowlist entry.
-const RESOLVE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Names the listener answers to without being listed, so the desktop's own
+/// link keeps working whatever the user has configured. An empty allowlist is
+/// therefore loopback-only rather than broken.
+const IMPLICIT_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
 
 /// The request classes that carry separate per-peer budgets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,24 +94,12 @@ pub struct WebPeer(SocketAddr);
 
 /// Host filtering and per-peer budgets for one running listener.
 ///
-/// The default is deny-all, so a listener that has not yet pinned a
-/// configuration admits nobody but loopback.
+/// The default admits only [`IMPLICIT_HOSTS`], so a listener that has not yet
+/// adopted a configuration serves this machine and nothing else.
 #[derive(Default)]
 pub struct RequestGates {
-    policy: RwLock<PinnedPolicy>,
+    hosts: RwLock<Vec<String>>,
     peers: Mutex<HashMap<IpAddr, PeerBudget>>,
-}
-
-#[derive(Default)]
-struct PinnedPolicy {
-    accept_all: bool,
-    networks: Vec<PinnedNetwork>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PinnedNetwork {
-    base: IpAddr,
-    prefix: u8,
 }
 
 struct PeerBudget {
@@ -102,24 +109,33 @@ struct PeerBudget {
 }
 
 impl RequestGates {
-    /// Adopt a committed configuration: resolve its hostname entries once and
-    /// pin the resulting addresses. Called on the config the controller has
-    /// persisted, so a failed transition keeps the previous pinned set.
-    pub async fn pin_allowlist(&self, config: &WebUiConfig) {
-        *self.policy.write().expect("web gate policy lock") = PinnedPolicy {
-            accept_all: matches!(config.host_policy, WebUiHostPolicy::All),
-            networks: pin_networks(&config.allowlist).await,
-        };
+    /// Adopt a committed configuration's allowed host names. Called on the
+    /// config the controller has persisted, so a failed transition keeps the
+    /// previous set.
+    pub fn adopt_allowlist(&self, config: &WebUiConfig) {
+        *self.hosts.write().expect("web gate host lock") = config.allowlist.clone();
     }
 
-    /// Whether the host policy admits this peer. Loopback always passes here
-    /// and still faces the session gate on authenticated routes.
-    pub fn allows_peer(&self, peer: IpAddr) -> bool {
-        if peer.is_loopback() {
+    /// Whether the listener answers to the name this request asked for.
+    ///
+    /// This is a name check, not access control: it is what stops a hostile
+    /// domain resolved to this address from reaching the listener (DNS
+    /// rebinding). Deciding *who* may connect is the pairing credential's job.
+    pub fn allows_host(&self, host: &str) -> bool {
+        let Some(name) = host_name(host) else {
+            return false;
+        };
+        if IMPLICIT_HOSTS
+            .iter()
+            .any(|implicit| name.eq_ignore_ascii_case(implicit))
+        {
             return true;
         }
-        let policy = self.policy.read().expect("web gate policy lock");
-        policy.accept_all || policy.networks.iter().any(|network| network.contains(peer))
+        self.hosts
+            .read()
+            .expect("web gate host lock")
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(name))
     }
 
     /// Charge one request of `class` to `peer` and report whether it fits the
@@ -179,96 +195,25 @@ impl PeerBudget {
     }
 }
 
-impl PinnedNetwork {
-    fn host(address: IpAddr) -> Self {
-        let prefix = match address {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-        Self {
-            base: address,
-            prefix,
-        }
+/// The name half of a `Host` header, lowercased for comparison.
+///
+/// A `Host` carries `name[:port]`, and an IPv6 literal keeps its brackets, so
+/// the port is stripped from the last colon only when no bracket follows it.
+/// The port is deliberately ignored: it is the socket's business, and a name
+/// does not become a different name on another port.
+fn host_name(host: &str) -> Option<&str> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
     }
-
-    /// Entries reach here already canonicalized by
-    /// [[src-tauri/src/web_config.rs#canonical_allowlist_entry]]; anything that
-    /// is not an address or network is a hostname needing resolution.
-    fn parse_literal(entry: &str) -> Option<Self> {
-        match entry.split_once('/') {
-            Some((address, prefix)) => Some(Self {
-                base: address.parse().ok()?,
-                prefix: prefix.parse().ok()?,
-            }),
-            None => Some(Self::host(entry.parse().ok()?)),
-        }
-    }
-
-    fn contains(&self, peer: IpAddr) -> bool {
-        match (self.base, peer) {
-            (IpAddr::V4(base), IpAddr::V4(peer)) => {
-                mask_v4(base, self.prefix) == mask_v4(peer, self.prefix)
-            }
-            (IpAddr::V6(base), IpAddr::V6(peer)) => {
-                mask_v6(base, self.prefix) == mask_v6(peer, self.prefix)
-            }
-            _ => false,
-        }
-    }
-}
-
-fn mask_v4(address: Ipv4Addr, prefix: u8) -> u32 {
-    let bits = u32::from(address);
-    if prefix >= 32 {
-        bits
-    } else {
-        bits & (u32::MAX << (32 - prefix))
-    }
-}
-
-fn mask_v6(address: Ipv6Addr, prefix: u8) -> u128 {
-    let bits = u128::from(address);
-    if prefix >= 128 {
-        bits
-    } else {
-        bits & (u128::MAX << (128 - prefix))
-    }
-}
-
-/// Turn canonical allowlist entries into the addresses they admit. Literals
-/// resolve for free; hostnames share one forward-resolution deadline. Failure,
-/// an empty answer, and an exhausted budget all pin nothing, which denies the
-/// entry until the next re-save.
-async fn pin_networks(entries: &[String]) -> Vec<PinnedNetwork> {
-    let mut networks = Vec::new();
-    let mut hostnames = Vec::new();
-    for entry in entries {
-        match PinnedNetwork::parse_literal(entry) {
-            Some(network) => networks.push(network),
-            None => hostnames.push(entry.as_str()),
-        }
-    }
-
-    let deadline = tokio::time::Instant::now() + RESOLVE_BUDGET;
-    for hostname in hostnames {
-        let Ok(resolved) =
-            tokio::time::timeout_at(deadline, tokio::net::lookup_host((hostname, 0))).await
-        else {
-            log::warn!(
-                "Web UI allowlist resolution exceeded {RESOLVE_BUDGET:?}; {hostname} and any later hostname entry admit nobody until the next save"
-            );
-            break;
-        };
-        match resolved {
-            Ok(addresses) => {
-                networks.extend(addresses.map(|address| PinnedNetwork::host(address.ip())));
-            }
-            Err(error) => {
-                log::warn!("Web UI allowlist entry {hostname} did not resolve: {error}");
-            }
-        }
-    }
-    networks
+    let name = match host.rfind(']') {
+        Some(bracket) => &host[..=bracket],
+        None => match host.rfind(':') {
+            Some(colon) => &host[..colon],
+            None => host,
+        },
+    };
+    (!name.is_empty()).then_some(name)
 }
 
 /// Wrap every route — including the fallback — in the gates that apply to all
@@ -281,21 +226,26 @@ pub fn apply_request_gates(router: Router, state: Arc<WebServerState>) -> Router
         .layer(middleware::from_fn(enforce_request_timeout))
 }
 
-/// The general class gate: known peer, allowed by the host policy, inside its
-/// general budget. Runs before routing, so a refusal reads no Quill data.
-/// Private because [`apply_request_gates`] is its only mount point — mounting
-/// it twice would charge one request to the budget twice.
+/// The general class gate: an allowed host name, a known peer, and that peer
+/// inside its general budget. Runs before routing, so a refusal reads no Quill
+/// data. Private because [`apply_request_gates`] is its only mount point —
+/// mounting it twice would charge one request to the budget twice.
 async fn enforce_peer_gate(
     State(state): State<Arc<WebServerState>>,
     request: Request,
     next: Next,
 ) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !state.gates.allows_host(host) {
+        return refused();
+    }
     let Some(peer) = peer_ip(&request) else {
         return refused();
     };
-    if !state.gates.allows_peer(peer) {
-        return refused();
-    }
     if !state.gates.admits_request(peer, RequestClass::General) {
         return refused();
     }
@@ -342,7 +292,7 @@ fn peer_ip(request: &Request) -> Option<IpAddr> {
         .map(|ConnectInfo(peer)| peer.0.ip().to_canonical())
 }
 
-fn session_is_live(request: &Request) -> bool {
+pub(super) fn session_is_live(request: &Request) -> bool {
     request
         .headers()
         .get_all(header::COOKIE)
@@ -364,15 +314,16 @@ pub(super) fn refused() -> Response {
 ///
 /// The permit is taken before `accept` and released when the connection's IO is
 /// dropped, so the bound counts live connections rather than in-flight
-/// requests: an idle keep-alive socket still costs its slot.
+/// requests. [`IDLE_CONNECTION_TIMEOUT`] is what keeps that lifetime finite.
 pub struct BoundedListener {
     inner: TcpListener,
     permits: Arc<Semaphore>,
 }
 
-/// An accepted connection holding its concurrency slot for its whole lifetime.
+/// An accepted connection holding its concurrency slot until it goes idle.
 pub struct BoundedConnection {
     stream: TcpStream,
+    idle: Pin<Box<Sleep>>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -400,6 +351,7 @@ impl Listener for BoundedListener {
                     return (
                         BoundedConnection {
                             stream,
+                            idle: Box::pin(tokio::time::sleep(IDLE_CONNECTION_TIMEOUT)),
                             _permit: permit,
                         },
                         WebPeer(address),
@@ -439,23 +391,61 @@ impl Connected<IncomingStream<'_, BoundedListener>> for WebPeer {
     }
 }
 
+impl BoundedConnection {
+    /// Report whether the connection has gone idle, and otherwise arm the timer
+    /// to fire once more from now. Called on every completed read and write, so
+    /// the deadline tracks activity rather than connection age.
+    fn idle_expired(&mut self, cx: &mut Context<'_>) -> bool {
+        self.idle.as_mut().poll(cx).is_ready()
+    }
+
+    fn mark_active(&mut self) {
+        self.idle
+            .as_mut()
+            .reset(tokio::time::Instant::now() + IDLE_CONNECTION_TIMEOUT);
+    }
+}
+
+fn idle_timeout_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "web connection idle past its timeout",
+    )
+}
+
 impl AsyncRead for BoundedConnection {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(cx, buf)
+        let this = self.get_mut();
+        if this.idle_expired(cx) {
+            return Poll::Ready(Err(idle_timeout_error()));
+        }
+        let polled = Pin::new(&mut this.stream).poll_read(cx, buf);
+        if polled.is_ready() {
+            this.mark_active();
+        }
+        polled
     }
 }
 
 impl AsyncWrite for BoundedConnection {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.stream).poll_write(cx, buf)
+        let this = self.get_mut();
+        if this.idle_expired(cx) {
+            return Poll::Ready(Err(idle_timeout_error()));
+        }
+        let polled = Pin::new(&mut this.stream).poll_write(cx, buf);
+        if polled.is_ready() {
+            this.mark_active();
+        }
+        polled
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -486,6 +476,7 @@ mod tests {
         body::Bytes,
         routing::{get, post},
     };
+    use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const QUILL_DATA: &str = "project /home/dev/quill 12345 tokens";
@@ -495,20 +486,13 @@ mod tests {
         literal.parse().expect("test address")
     }
 
-    async fn gates_pinned_to(
-        allowlist: &[&str],
-        host_policy: WebUiHostPolicy,
-    ) -> Arc<WebServerState> {
+    async fn gates_answering_to(allowlist: &[&str]) -> Arc<WebServerState> {
         let state = Arc::new(WebServerState::default());
-        state
-            .gates
-            .pin_allowlist(&WebUiConfig {
-                enabled: true,
-                port: 19878,
-                host_policy,
-                allowlist: allowlist.iter().map(|entry| (*entry).to_string()).collect(),
-            })
-            .await;
+        state.gates.adopt_allowlist(&WebUiConfig {
+            enabled: true,
+            port: 19878,
+            allowlist: allowlist.iter().map(|entry| (*entry).to_string()).collect(),
+        });
         state
     }
 
@@ -525,13 +509,22 @@ mod tests {
                     middleware::from_fn_with_state(Arc::clone(state), enforce_pairing_budget),
                 ),
             );
-        let authenticated = Router::new()
+        // The entry document sits behind the same session check but answers a
+        // navigation with a redirect, so it is modelled as its own class.
+        let document = Router::new()
             .route("/", get(|| async { QUILL_DATA }))
+            .layer(middleware::from_fn(
+                crate::web_server::router::pair_or_document,
+            ));
+        let authenticated = Router::new()
             .route("/assets/app.js", get(|| async { QUILL_DATA }))
             .route("/api/web/invoke", post(|_: Bytes| async { QUILL_DATA }))
             .layer(middleware::from_fn(require_session));
 
-        apply_request_gates(public.merge(authenticated), Arc::clone(state))
+        apply_request_gates(
+            public.merge(document).merge(authenticated),
+            Arc::clone(state),
+        )
     }
 
     /// Serve the class router while presenting `peer` as the accepted socket's
@@ -555,7 +548,7 @@ mod tests {
         format!("http://{address}")
     }
 
-    async fn assert_all_classes_refused(base: &str) {
+    async fn assert_all_classes_refused(base: &str, host: &str) {
         let client = reqwest::Client::new();
         for (method, path) in [
             (reqwest::Method::GET, "/pair"),
@@ -567,10 +560,15 @@ mod tests {
         ] {
             let response = client
                 .request(method.clone(), format!("{base}{path}"))
+                .header(header::HOST, host)
                 .send()
                 .await
                 .unwrap_or_else(|error| panic!("{method} {path}: {error}"));
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path} as {host:?}"
+            );
             assert!(
                 response.bytes().await.expect("refusal body").is_empty(),
                 "{method} {path} must refuse before reading any Quill data"
@@ -580,17 +578,24 @@ mod tests {
 
     // @lat: [[web-ui-server-tests#Web UI Server Test Specs#Host denial precedes any data]]
     #[tokio::test]
-    async fn a_non_allowed_peer_is_refused_on_every_route_class() {
-        let state =
-            gates_pinned_to(&["10.0.0.0/24", "192.168.1.7"], WebUiHostPolicy::Allowlist).await;
+    async fn an_unlisted_host_is_refused_on_every_route_class() {
+        let state = gates_answering_to(&["quill.lan", "192.168.1.7"]).await;
+        let base = spawn_with_peer(&state, ip("203.0.113.9")).await;
 
-        assert_all_classes_refused(&spawn_with_peer(&state, ip("203.0.113.9")).await).await;
-        assert_all_classes_refused(&spawn_with_peer(&state, ip("10.0.1.9")).await).await;
-        assert_all_classes_refused(&spawn_with_peer(&state, ip("192.168.1.8")).await).await;
+        // A name the listener does not answer to is refused before routing,
+        // whatever address it arrives from. This is the rebinding defence: an
+        // attacker's domain pointed at this address gets nothing.
+        for host in ["evil.example", "quill.lan.evil.example", "10.0.1.9", ""] {
+            assert_all_classes_refused(&base, host).await;
+        }
 
-        for allowed in ["10.0.0.9", "192.168.1.7"] {
-            let base = spawn_with_peer(&state, ip(allowed)).await;
-            let response = reqwest::get(format!("{base}/pair"))
+        // Listed names answer, port and case notwithstanding — a name is not a
+        // different name on another port.
+        for allowed in ["quill.lan", "QUILL.LAN", "quill.lan:19878", "192.168.1.7"] {
+            let response = reqwest::Client::new()
+                .get(format!("{base}/pair"))
+                .header(header::HOST, allowed)
+                .send()
                 .await
                 .expect("pair page");
             assert_eq!(response.status(), StatusCode::OK, "{allowed}");
@@ -600,50 +605,73 @@ mod tests {
 
     // @lat: [[web-ui-server-tests#Web UI Server Test Specs#Host denial precedes any data]]
     #[tokio::test]
-    async fn an_empty_or_unresolvable_allowlist_admits_nobody_but_loopback() {
-        for allowlist in [vec![], vec!["nonexistent-quill-host.invalid"]] {
-            let state = gates_pinned_to(&allowlist, WebUiHostPolicy::Allowlist).await;
-            assert_all_classes_refused(&spawn_with_peer(&state, ip("203.0.113.9")).await).await;
+    async fn an_empty_allowlist_answers_only_to_local_names() {
+        let state = gates_answering_to(&[]).await;
+        let base = spawn_with_peer(&state, ip("203.0.113.9")).await;
+        assert_all_classes_refused(&base, "quill.lan").await;
 
-            // Loopback bypasses host filtering only: the public class answers,
-            // the authenticated class still demands a session.
-            let base = spawn_with_peer(&state, ip("127.0.0.1")).await;
-            let client = reqwest::Client::new();
-            assert_eq!(
-                client
-                    .get(format!("{base}/pair"))
-                    .send()
-                    .await
-                    .expect("pair page")
-                    .status(),
-                StatusCode::OK
-            );
-            for path in ["/", "/assets/app.js"] {
-                let response = client
-                    .get(format!("{base}{path}"))
-                    .send()
-                    .await
-                    .expect("unpaired loopback request");
-                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
-                assert!(
-                    response.bytes().await.expect("refusal body").is_empty(),
-                    "{path}"
-                );
-            }
-        }
+        // The implicit local names always answer, so an empty list is
+        // loopback-only rather than a listener that refuses its own UI. They
+        // still face the session gate on authenticated routes.
+        let client = reqwest::Client::new();
+        assert_eq!(
+            client
+                .get(format!("{base}/pair"))
+                .header(header::HOST, "localhost")
+                .send()
+                .await
+                .expect("pair page")
+                .status(),
+            StatusCode::OK
+        );
+        let response = client
+            .get(format!("{base}/assets/app.js"))
+            .header(header::HOST, "127.0.0.1:19878")
+            .send()
+            .await
+            .expect("unpaired local request");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.bytes().await.expect("refusal body").is_empty());
+
+        // The document redirects instead of refusing, and still hands over no
+        // bundle content.
+        let document = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("non-redirecting client")
+            .get(format!("{base}/"))
+            .header(header::HOST, "localhost")
+            .send()
+            .await
+            .expect("unpaired local document");
+        assert_eq!(document.status(), StatusCode::SEE_OTHER);
+        assert!(document.bytes().await.expect("redirect body").is_empty());
     }
 
     // @lat: [[web-ui-server-tests#Web UI Server Test Specs#Host denial precedes any data]]
     #[tokio::test]
-    async fn a_pinned_hostname_admits_only_its_resolved_addresses() {
-        let state = gates_pinned_to(&["localhost"], WebUiHostPolicy::Allowlist).await;
+    async fn only_listed_and_implicit_names_are_answered() {
+        let state = gates_answering_to(&["quill.lan"]).await;
+        let gates = &state.gates;
 
-        assert!(state.gates.allows_peer(ip("127.0.0.1")));
-        assert!(!state.gates.allows_peer(ip("203.0.113.9")));
+        for implicit in ["localhost", "127.0.0.1", "127.0.0.1:19878", "[::1]:19878"] {
+            assert!(gates.allows_host(implicit), "{implicit}");
+        }
+        assert!(gates.allows_host("quill.lan"));
+        assert!(gates.allows_host("quill.lan:19878"));
 
-        // `host_policy=all` is the only setting that skips the pinned set.
-        let open = gates_pinned_to(&[], WebUiHostPolicy::All).await;
-        assert!(open.gates.allows_peer(ip("203.0.113.9")));
+        // No suffix, prefix, or empty match, and nothing resolves: the entry is
+        // compared as a name, so this machine's DNS cannot widen it.
+        for refused in [
+            "",
+            "lan",
+            "quill",
+            "notquill.lan",
+            "quill.lan.evil",
+            "192.168.1.7",
+        ] {
+            assert!(!gates.allows_host(refused), "{refused}");
+        }
     }
 
     // @lat: [[web-ui-server-tests#Web UI Server Test Specs#Request classes carry bounded per-peer budgets]]
@@ -682,7 +710,7 @@ mod tests {
     // @lat: [[web-ui-server-tests#Web UI Server Test Specs#Connection and body caps bound one client]]
     #[tokio::test]
     async fn the_listener_holds_no_more_than_the_connection_cap() {
-        let state = gates_pinned_to(&[], WebUiHostPolicy::Allowlist).await;
+        let state = gates_answering_to(&[]).await;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind bounded listener");
@@ -699,7 +727,9 @@ mod tests {
 
         async fn ask(stream: &mut TcpStream, wait: Duration) -> Option<String> {
             stream
-                .write_all(b"GET /pair HTTP/1.1\r\nHost: quill\r\n\r\n")
+                // An implicit local name, so the cap is what this test
+                // measures rather than the host gate in front of it.
+                .write_all(b"GET /pair HTTP/1.1\r\nHost: localhost\r\n\r\n")
                 .await
                 .ok()?;
             let mut buffer = [0u8; 128];
@@ -740,7 +770,7 @@ mod tests {
     // @lat: [[web-ui-server-tests#Web UI Server Test Specs#Connection and body caps bound one client]]
     #[tokio::test]
     async fn an_oversized_body_is_rejected_at_the_size_cap() {
-        let state = gates_pinned_to(&["10.0.0.0/24"], WebUiHostPolicy::Allowlist).await;
+        let state = gates_answering_to(&[]).await;
         let base = spawn_with_peer(&state, ip("10.0.0.9")).await;
 
         let response = reqwest::Client::new()

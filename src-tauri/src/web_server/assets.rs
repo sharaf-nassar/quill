@@ -31,24 +31,24 @@ struct WebBundle;
 /// rather than `index.html`.
 const DOCUMENT: &str = "web.html";
 
-/// Serve the monitor document and its asset graph.
+/// Serve the monitor's asset graph.
 ///
 /// The monitor surface is one document with no client-side router, so the SPA
-/// fallback set is exactly `/`. Every other path resolves against real files
-/// under `assets/` and otherwise falls through to the caller's `404`: a browser
-/// cannot reach the entry document by asking for an arbitrary path, and no
-/// build artifact outside `assets/` — the Vite manifest included — is
+/// fallback set is exactly `/` — mounted separately by
+/// [[src-tauri/src/web_server/router.rs#routes]] because an unpaired browser is
+/// redirected there rather than refused. Every other path resolves against real
+/// files under `assets/` and otherwise falls through to the caller's `404`: a
+/// browser cannot reach the entry document by asking for an arbitrary path, and
+/// no build artifact outside `assets/` — the Vite manifest included — is
 /// addressable at all.
 pub fn routes<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    Router::new()
-        .route("/", get(document))
-        .route("/assets/{*path}", get(asset))
+    Router::new().route("/assets/{*path}", get(asset))
 }
 
-async fn document() -> Response {
+pub(super) async fn document() -> Response {
     serve(DOCUMENT)
 }
 

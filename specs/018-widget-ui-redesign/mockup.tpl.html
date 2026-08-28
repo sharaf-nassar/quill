@@ -197,13 +197,13 @@
   .cell{padding:11px 14px 10px;min-width:0;border-top:1px solid var(--line-soft)}
   .cell:nth-child(3n+2),.cell:nth-child(3n){border-left:1px solid var(--line-soft)}
   .cell .v{
-    font-size:15px;font-weight:600;letter-spacing:-.01em;line-height:1.15;color:var(--text-hi);
+    font-size:15px;font-weight:600;letter-spacing:-.01em;line-height:1.15;
+    color:color-mix(in oklab,currentColor 75%,var(--text));
     display:flex;align-items:baseline;gap:5px;white-space:nowrap;
   }
-  .cell .v .d{font-size:9px;font-weight:600}
-  .d.up{color:var(--green)} .d.down{color:var(--red)} .d.flat{color:var(--faint)}
   .cell .k{
-    font-size:9px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--label);
+    font-size:9px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;
+    color:color-mix(in oklab,currentColor 45%,var(--text-hi));
     margin-top:3px;display:flex;align-items:center;gap:5px;
   }
   .cell .k .msw{width:5px;height:5px;border-radius:2px;flex:0 0 5px}
@@ -350,7 +350,7 @@
 
       <div class="grid num">
         <div class="cell" data-c="#22d3ee"><span class="v">5h 33m</span><span class="k"><i class="msw"></i>Runtime</span><svg class="cspark" data-s="3,4,4,5,6,6,7,8" aria-hidden="true"></svg></div>
-        <div class="cell" data-c="#a78bfa"><span class="v">463 <span class="d down">▼13%</span></span><span class="k"><i class="msw"></i>Tok / LOC</span><svg class="cspark" data-s="8,7,8,6,6,5,5,4" aria-hidden="true"></svg></div>
+        <div class="cell" data-c="#a78bfa"><span class="v">463</span><span class="k"><i class="msw"></i>Tok / LOC</span><svg class="cspark" data-s="8,7,8,6,6,5,5,4" aria-hidden="true"></svg></div>
         <div class="cell" data-c="#f472b6"><span class="v">1,229</span><span class="k"><i class="msw"></i>LOC / hr</span><svg class="cspark" data-s="5,6,5,7,6,7,7,7" aria-hidden="true"></svg></div>
         <div class="cell" data-c="#818cf8"><span class="v">13</span><span class="k"><i class="msw"></i>Sessions</span><svg class="cspark" data-s="2,3,3,5,4,6,7,8" aria-hidden="true"></svg></div>
         <div class="cell" data-c="#2dd4bf"><span class="v">9</span><span class="k"><i class="msw"></i>Projects</span><svg class="cspark" data-s="4,4,5,5,5,6,6,6" aria-hidden="true"></svg></div>
@@ -460,9 +460,10 @@
     svg.appendChild(el("circle",{cx:x-1.5,cy:y,r:2.4,fill:c,stroke:"#14181f","stroke-width":1.5}));
   });
 
-  // cell sparklines — metric hue, values stay white
+  // cell readouts — one metric hue across text, swatch, and sparkline
   document.querySelectorAll(".cell[data-c]").forEach(cell=>{
     const c = cell.getAttribute("data-c");
+    cell.style.color = c;
     const sw = cell.querySelector(".msw");
     if (sw) sw.style.background = c;
     const s = cell.querySelector(".cspark");

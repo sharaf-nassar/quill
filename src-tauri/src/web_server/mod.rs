@@ -141,11 +141,15 @@ pub const INVOKE_OK_STATUS: u16 = 200;
 pub const INVOKE_BAD_REQUEST_STATUS: u16 = 400;
 pub const INVOKE_DENIED_STATUS: u16 = 403;
 pub const PAIR_OK_STATUS: u16 = 204;
+/// The public bootstrap route, and the only path an unpaired browser may open.
+pub const PAIR_PATH: &str = "/pair";
 pub const SESSION_COOKIE_NAME: &str = "quill_web_session";
 pub const SESSION_COOKIE_MAX_AGE_SECONDS: u32 = 30 * 24 * 60 * 60;
 
 pub const WEB_UI_ENABLED_KEY: &str = "web_ui.enabled";
 pub const WEB_UI_PORT_KEY: &str = "web_ui.port";
+/// Retired. Read only so it can be blanked — its `all` value bypassed the
+/// allowlist, and a downgrade must not rediscover that.
 pub const WEB_UI_HOST_POLICY_KEY: &str = "web_ui.host_policy";
 pub const WEB_UI_ALLOWLIST_KEY: &str = "web_ui.allowlist";
 pub const WEB_UI_LAST_ERROR_KEY: &str = "web_ui.last_error";
@@ -242,19 +246,14 @@ pub struct PairRequest {
     pub code: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WebUiHostPolicy {
-    All,
-    Allowlist,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WebUiConfig {
     pub enabled: bool,
     pub port: u16,
-    pub host_policy: WebUiHostPolicy,
+    /// The host names this listener answers to, beyond the implicit local
+    /// ones. Never a list of peers: who may connect is the pairing
+    /// credential's question, and this one only decides which names resolve.
     pub allowlist: Vec<String>,
 }
 
@@ -305,6 +304,10 @@ where
 }
 
 /// Format concrete local interface addresses for Settings display.
+///
+/// These are the bare origin. Noticing that a browser has not paired is the
+/// listener's job, not the user's to route around: an unpaired `GET /`
+/// redirects to [`PAIR_PATH`], so one memorable URL works before and after.
 pub fn format_reachable_urls(
     addresses: impl IntoIterator<Item = IpAddr>,
     port: u16,

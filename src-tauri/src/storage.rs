@@ -12,7 +12,10 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use chrono::{DateTime, TimeDelta, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::integrations::IntegrationProvider;
 use crate::model_usage::{
@@ -104,6 +107,41 @@ use crate::models::{
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
 pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 48;
+
+#[derive(Clone, Debug)]
+pub(crate) struct StartupMigrationPlan {
+    pub(crate) current_version: i32,
+    pub(crate) target_version: i32,
+    pub(crate) database_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MigrationProgress {
+    pub(crate) stage: &'static str,
+    pub(crate) detail: String,
+    pub(crate) completed_bytes: Option<u64>,
+    pub(crate) total_bytes: Option<u64>,
+}
+
+// @lat: [[backend#Backend#Entry Point#Startup migration surface]]
+pub(crate) type MigrationProgressCallback = Arc<dyn Fn(MigrationProgress) + Send + Sync>;
+
+fn report_migration_progress(
+    progress: Option<&MigrationProgressCallback>,
+    stage: &'static str,
+    detail: impl Into<String>,
+    completed_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+) {
+    if let Some(progress) = progress {
+        progress(MigrationProgress {
+            stage,
+            detail: detail.into(),
+            completed_bytes,
+            total_bytes,
+        });
+    }
+}
 
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
@@ -890,10 +928,22 @@ fn ensure_schema_backup(
     conn: &Connection,
     path: &Path,
     expected_version: i32,
+    progress: Option<&MigrationProgressCallback>,
 ) -> Result<PathBuf, String> {
+    let database_bytes = std::fs::metadata(path)
+        .map_err(|error| format!("Inspect database before schema migration: {error}"))?
+        .len();
+    report_migration_progress(progress, "preparing", "Checking disk space", None, None);
     preflight_schema_migration_with_probe(path, available_disk_space)?;
     let backup = schema_backup_path(path, expected_version);
     if backup.exists() {
+        report_migration_progress(
+            progress,
+            "verifying",
+            "Checking existing backup",
+            None,
+            None,
+        );
         if verify_schema_backup(&backup, expected_version).is_ok() {
             return Ok(backup);
         }
@@ -909,9 +959,57 @@ fn ensure_schema_backup(
         })?;
     }
 
-    conn.execute("VACUUM INTO ?1", params![temporary.to_string_lossy()])
-        .map_err(|error| format!("Create schema-{expected_version} SQLite backup: {error}"))?;
+    report_migration_progress(
+        progress,
+        "backup",
+        "Creating verified backup",
+        Some(0),
+        Some(database_bytes),
+    );
+    let monitoring = Arc::new(AtomicBool::new(true));
+    let monitor = progress.cloned().map(|progress| {
+        let monitoring = Arc::clone(&monitoring);
+        let temporary = temporary.clone();
+        std::thread::spawn(move || {
+            while monitoring.load(Ordering::Acquire) {
+                let completed = std::fs::metadata(&temporary)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0)
+                    .min(database_bytes);
+                progress(MigrationProgress {
+                    stage: "backup",
+                    detail: "Creating verified backup".to_string(),
+                    completed_bytes: Some(completed),
+                    total_bytes: Some(database_bytes),
+                });
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        })
+    });
+    let backup_result = conn
+        .execute("VACUUM INTO ?1", params![temporary.to_string_lossy()])
+        .map_err(|error| format!("Create schema-{expected_version} SQLite backup: {error}"));
+    monitoring.store(false, Ordering::Release);
+    if let Some(monitor) = monitor {
+        let _ = monitor.join();
+    }
+    backup_result?;
+    report_migration_progress(
+        progress,
+        "backup",
+        "Creating verified backup",
+        Some(database_bytes),
+        Some(database_bytes),
+    );
+    report_migration_progress(
+        progress,
+        "verifying",
+        "Verifying backup integrity",
+        None,
+        None,
+    );
     verify_schema_backup(&temporary, expected_version)?;
+    report_migration_progress(progress, "publishing", "Saving verified backup", None, None);
     std::fs::File::open(&temporary)
         .and_then(|file| file.sync_all())
         .map_err(|error| format!("Sync schema-{expected_version} backup: {error}"))?;
@@ -923,6 +1021,13 @@ fn ensure_schema_backup(
             .and_then(|directory| directory.sync_all())
             .map_err(|error| format!("Sync schema-{expected_version} backup directory: {error}"))?;
     }
+    report_migration_progress(
+        progress,
+        "verifying",
+        "Checking published backup",
+        None,
+        None,
+    );
     verify_schema_backup(&backup, expected_version)?;
     Ok(backup)
 }
@@ -7178,11 +7283,52 @@ impl Storage {
         Self::init_at(db_path()?, true)
     }
 
+    pub(crate) fn init_with_progress(progress: MigrationProgressCallback) -> Result<Self, String> {
+        Self::init_at_with_progress(db_path()?, true, Some(&progress))
+    }
+
+    // @lat: [[backend#Backend#Entry Point#Startup migration surface]]
+    pub(crate) fn startup_migration_plan() -> Result<Option<StartupMigrationPlan>, String> {
+        let path = db_path()?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let database_bytes = std::fs::metadata(&path)
+            .map_err(|error| format!("Inspect database before startup: {error}"))?
+            .len();
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("Inspect database schema before startup: {error}"))?;
+        let current_version = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get::<_, i32>(0),
+            )
+            .unwrap_or(0);
+        if current_version >= MAX_SUPPORTED_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        Ok(Some(StartupMigrationPlan {
+            current_version,
+            target_version: MAX_SUPPORTED_SCHEMA_VERSION,
+            database_bytes,
+        }))
+    }
+
     pub(crate) fn initialize_database(path: &Path) -> Result<(), String> {
         Self::init_at(path.to_path_buf(), false).map(drop)
     }
 
     pub(crate) fn init_at(path: PathBuf, production_startup: bool) -> Result<Self, String> {
+        Self::init_at_with_progress(path, production_startup, None)
+    }
+
+    fn init_at_with_progress(
+        path: PathBuf,
+        production_startup: bool,
+        progress: Option<&MigrationProgressCallback>,
+    ) -> Result<Self, String> {
+        report_migration_progress(progress, "preparing", "Opening local database", None, None);
         let mut conn =
             Connection::open(&path).map_err(|e| format!("Failed to open database: {e}"))?;
 
@@ -9943,7 +10089,7 @@ impl Storage {
         // existed before this open are first advanced to schema 45, then
         // backed up here so no migration-46 DDL can precede the verified copy.
         if requires_schema_45_backup {
-            ensure_schema_backup(&conn, &path, 45)?;
+            ensure_schema_backup(&conn, &path, 45, progress)?;
         }
         if current_version < 46 {
             let tx = conn
@@ -10243,9 +10389,16 @@ impl Storage {
         // requires a transactional table rebuild; every existing row and
         // named index is verified before the version record can commit.
         if requires_schema_47_backup {
-            ensure_schema_backup(&conn, &path, 47)?;
+            ensure_schema_backup(&conn, &path, 47, progress)?;
         }
         if current_version < 48 {
+            report_migration_progress(
+                progress,
+                "rebuilding",
+                "Rebuilding analytics tables",
+                None,
+                None,
+            );
             if ObservationKind::Summary.as_str() != "summary" {
                 return Err("Migration 48 summary observation spelling drifted".to_string());
             }
@@ -10344,6 +10497,13 @@ impl Storage {
                  FROM model_usage_observations;",
             )
             .map_err(|e| format!("Migration 48 rebuild model observations: {e}"))?;
+            report_migration_progress(
+                progress,
+                "rebuilding",
+                "Rebuilding analytics indexes",
+                None,
+                None,
+            );
             let rows_after = tx
                 .query_row(
                     "SELECT COUNT(*) FROM model_usage_observations_v48",
@@ -10436,11 +10596,14 @@ impl Storage {
                      setting         TEXT NOT NULL CHECK(length(setting) > 0),
                      value           TEXT NOT NULL,
                      UNIQUE(provider, source_key, setting, source_ordinal)
-                 );
-                 INSERT OR REPLACE INTO settings(key, value)
-                     VALUES ('transcript_analytics_reingest_pending', '1');",
+                 );",
             )
             .map_err(|e| format!("Migration 48 analytics evidence schema: {e}"))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES (?1, '1')",
+                params![crate::transcript_analytics::PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER],
+            )
+            .map_err(|e| format!("Migration 48 set Pi analytics reingest marker: {e}"))?;
             let index_count = tx
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master
@@ -10469,6 +10632,13 @@ impl Storage {
                 .map_err(|e| format!("Migration 48 commit: {e}"))?;
         }
 
+        report_migration_progress(
+            progress,
+            "finalizing",
+            "Checking database indexes",
+            None,
+            None,
+        );
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -10479,14 +10649,35 @@ impl Storage {
         };
 
         if production_startup {
+            report_migration_progress(
+                progress,
+                "finalizing",
+                "Finalizing retained analytics",
+                None,
+                None,
+            );
             if let Err(e) = storage.aggregate_and_cleanup() {
                 log::warn!("Cleanup on startup failed: {e}");
             }
 
+            report_migration_progress(
+                progress,
+                "finalizing",
+                "Finalizing token history",
+                None,
+                None,
+            );
             if let Err(e) = storage.aggregate_and_cleanup_tokens() {
                 log::warn!("Token cleanup on startup failed: {e}");
             }
 
+            report_migration_progress(
+                progress,
+                "finalizing",
+                "Cleaning old observations",
+                None,
+                None,
+            );
             if let Err(e) = storage.cleanup_old_observations() {
                 log::warn!("Observation cleanup on startup failed: {e}");
             }
@@ -10513,6 +10704,7 @@ impl Storage {
             }
         }
 
+        report_migration_progress(progress, "complete", "Database update complete", None, None);
         Ok(storage)
     }
 
@@ -22581,6 +22773,10 @@ mod tests {
              ALTER TABLE tool_actions DROP COLUMN duration_ms;
              ALTER TABLE token_snapshots DROP COLUMN observation_kind;
              ALTER TABLE transcript_analytics_sources DROP COLUMN session_name;
+             DELETE FROM settings WHERE key IN (
+                 'transcript_analytics_reingest_pending',
+                 'pi_transcript_analytics_reingest_pending'
+             );
              DELETE FROM schema_version WHERE version = 48;",
         )
         .expect("rewind analytics capture migration");
@@ -23103,13 +23299,23 @@ mod tests {
         );
         assert_eq!(
             conn.query_row(
-                "SELECT value FROM settings
-                 WHERE key = 'transcript_analytics_reingest_pending'",
-                [],
+                "SELECT value FROM settings WHERE key = ?1",
+                params![crate::transcript_analytics::PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER],
                 |row| row.get::<_, String>(0),
             )
-            .expect("read reingest marker"),
+            .expect("read Pi reingest marker"),
             "1"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![crate::transcript_analytics::TRANSCRIPT_ANALYTICS_REINGEST_MARKER],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .expect("read global reingest marker"),
+            None,
+            "migration 48 must not force non-Pi retained roots"
         );
         drop(conn);
         drop(migrated);
@@ -23173,7 +23379,7 @@ mod tests {
 
         let backup = {
             let conn = Connection::open(&db).expect("open schema-47 database");
-            ensure_schema_backup(&conn, &db, 47).expect("publish schema-47 backup")
+            ensure_schema_backup(&conn, &db, 47, None).expect("publish schema-47 backup")
         };
         {
             let conn = Connection::open(&db).expect("open failure fixture");

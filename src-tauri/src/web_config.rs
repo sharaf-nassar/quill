@@ -4,7 +4,7 @@
 //! module owns the four writable configuration values; `web_ui.last_error` is
 //! controller-owned status and remains absent until a listener failure occurs.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 use serde::Serialize;
 
@@ -13,7 +13,7 @@ use crate::{
     storage::Storage,
     web_server::{
         WEB_UI_ALLOWLIST_KEY, WEB_UI_ENABLED_KEY, WEB_UI_HOST_POLICY_KEY, WEB_UI_PORT_KEY,
-        WebUiConfig, WebUiHostPolicy,
+        WebUiConfig,
     },
 };
 
@@ -58,7 +58,6 @@ impl Default for WebUiConfig {
         Self {
             enabled: false,
             port: DEFAULT_WEB_UI_PORT,
-            host_policy: WebUiHostPolicy::Allowlist,
             allowlist: Vec::new(),
         }
     }
@@ -94,24 +93,18 @@ pub fn load_web_ui_config(storage: &Storage) -> Result<WebUiConfig, WebUiConfigE
             .parse::<u16>()
             .map_err(|_| invalid_stored_configuration())?,
     };
-    let host_policy = match values
-        .get(WEB_UI_HOST_POLICY_KEY)
-        .and_then(Option::as_deref)
-    {
-        None => defaults.host_policy,
-        Some("all") => WebUiHostPolicy::All,
-        Some("allowlist") => WebUiHostPolicy::Allowlist,
-        Some(_) => return Err(invalid_stored_configuration()),
-    };
     let allowlist = match values.get(WEB_UI_ALLOWLIST_KEY).and_then(Option::as_deref) {
         None => defaults.allowlist,
         Some(value) => serde_json::from_str(value).map_err(|_| invalid_stored_configuration())?,
     };
 
+    // `web_ui.host_policy` is read only to retire it. Its `all` value bypassed
+    // the allowlist entirely, so a database still carrying it must not keep
+    // that behaviour: the key is ignored, the allowlist becomes the only
+    // answer, and an empty one is loopback. Migration is closed by omission.
     validate_web_ui_config(WebUiConfig {
         enabled,
         port,
-        host_policy,
         allowlist,
     })
     .map_err(|_| invalid_stored_configuration())
@@ -133,8 +126,6 @@ pub fn save_web_ui_config(
             "Web UI configuration is unavailable.",
         )
     })?;
-    let host_policy = host_policy_value(config.host_policy);
-
     storage
         .set_settings_atomically(&[
             (
@@ -142,7 +133,9 @@ pub fn save_web_ui_config(
                 crate::bool_setting_value(config.enabled),
             ),
             (WEB_UI_PORT_KEY, &port),
-            (WEB_UI_HOST_POLICY_KEY, host_policy),
+            // Written empty rather than left behind, so a downgrade cannot find
+            // a stale `all` and reopen the hole this change closed.
+            (WEB_UI_HOST_POLICY_KEY, ""),
             (WEB_UI_ALLOWLIST_KEY, &allowlist),
         ])
         .map_err(|error| WebUiConfigError::storage("Save Web UI configuration", error))?;
@@ -151,13 +144,14 @@ pub fn save_web_ui_config(
 }
 
 /// Parse an allowlist entry into its stable serialized spelling.
+/// Entries are the names a browser may put in a URL, so a CIDR range is not
+/// one: a `Host` header carries a single name, and no browser sends `/24`.
+/// Ranges were meaningful when this list filtered peer addresses; they can only
+/// mislead now, so they are rejected rather than silently never matching.
 pub fn canonical_allowlist_entry(entry: &str) -> Result<String, WebUiConfigError> {
     let entry = entry.trim();
-    if entry.is_empty() {
+    if entry.is_empty() || entry.contains('/') {
         return Err(invalid_allowlist_entry());
-    }
-    if entry.contains('/') {
-        return canonical_cidr(entry);
     }
     if let Ok(address) = entry.parse::<IpAddr>() {
         return Ok(address.to_string());
@@ -209,47 +203,6 @@ fn canonicalize_allowlist(entries: Vec<String>) -> Result<Vec<String>, WebUiConf
     Ok(entries)
 }
 
-fn canonical_cidr(entry: &str) -> Result<String, WebUiConfigError> {
-    let Some((address, prefix)) = entry.split_once('/') else {
-        return Err(invalid_allowlist_entry());
-    };
-    if address.is_empty()
-        || prefix.is_empty()
-        || entry.matches('/').count() != 1
-        || !prefix.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(invalid_allowlist_entry());
-    }
-    let prefix = prefix
-        .parse::<u8>()
-        .map_err(|_| invalid_allowlist_entry())?;
-    let address = address
-        .parse::<IpAddr>()
-        .map_err(|_| invalid_allowlist_entry())?;
-
-    let address = match address {
-        IpAddr::V4(address) if prefix <= 32 => {
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            IpAddr::V4(Ipv4Addr::from(u32::from(address) & mask))
-        }
-        IpAddr::V6(address) if prefix <= 128 => {
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u128::MAX << (128 - prefix)
-            };
-            IpAddr::V6(Ipv6Addr::from(u128::from(address) & mask))
-        }
-        _ => return Err(invalid_allowlist_entry()),
-    };
-
-    Ok(format!("{address}/{prefix}"))
-}
-
 fn canonical_hostname(entry: &str) -> Result<String, WebUiConfigError> {
     if entry.len() > 253
         || entry.ends_with('.')
@@ -294,15 +247,8 @@ const fn invalid_stored_configuration() -> WebUiConfigError {
 const fn invalid_allowlist_entry() -> WebUiConfigError {
     WebUiConfigError::new(
         WebUiConfigErrorCode::InvalidAllowlistEntry,
-        "Web UI allowlist entries must be IPv4 or IPv6 addresses, CIDR ranges, or RFC-1123 hostnames.",
+        "Enter a hostname or an IP address — the host part of the URL another device would use. Ranges are not host names.",
     )
-}
-
-const fn host_policy_value(policy: WebUiHostPolicy) -> &'static str {
-    match policy {
-        WebUiHostPolicy::All => "all",
-        WebUiHostPolicy::Allowlist => "allowlist",
-    }
 }
 
 #[cfg(test)]
@@ -315,7 +261,7 @@ mod tests {
     fn canonical_grammar_and_atomic_persistence() {
         let canonical = canonicalize_allowlist(vec![
             "EXAMPLE.com".to_string(),
-            "192.168.1.8/24".to_string(),
+            "192.168.1.8".to_string(),
             "2001:0DB8::1".to_string(),
             "example.com".to_string(),
         ])
@@ -323,10 +269,19 @@ mod tests {
         assert_eq!(
             canonical,
             [
-                "192.168.1.0/24".to_string(),
+                "192.168.1.8".to_string(),
                 "2001:db8::1".to_string(),
                 "example.com".to_string(),
             ]
+        );
+
+        // A range is not a host name a browser can send, so it is refused at
+        // the point of entry rather than stored as an entry that never matches.
+        assert_eq!(
+            canonicalize_allowlist(vec!["192.168.1.0/24".to_string()])
+                .expect_err("CIDR is not a host name")
+                .code,
+            WebUiConfigErrorCode::InvalidAllowlistEntry
         );
 
         let data_dir = TempDir::new().expect("temp data directory");
@@ -337,8 +292,7 @@ mod tests {
             WebUiConfig {
                 enabled: true,
                 port: 21000,
-                host_policy: WebUiHostPolicy::Allowlist,
-                allowlist: vec!["EXAMPLE.com".to_string(), "192.168.1.8/24".to_string()],
+                allowlist: vec!["EXAMPLE.com".to_string(), "192.168.1.8".to_string()],
             },
         )
         .expect("save valid config");

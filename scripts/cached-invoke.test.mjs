@@ -290,24 +290,18 @@ test("stable argument keys coalesce object order but isolate changed ranges", as
 });
 
 // @lat: [[widget-range-tests#Widget Range Query Tests#Displayed Windows Bound Every Query]]
-test("widget query plans request only the displayed range or its exact prior period", () => {
+test("widget query plans request only the displayed range", () => {
 	const queryLog = [];
-	for (const [displayedRange, requestedRange] of [
-		["1h", "2h"],
-		["6h", "12h"],
-		["24h", "2d"],
-		["7d", "14d"],
-	]) {
+	for (const displayedRange of ["1h", "6h", "24h", "7d"]) {
 		const queries = codeInsightsHistoryQueries(displayedRange).map(
 			({ command, args }) => ({ command, args }),
 		);
 		assert.deepEqual(queries, [
 			{
 				command: "get_token_history",
-				args: { range: requestedRange, hostname: null, sessionId: null, cwd: null },
+				args: { range: displayedRange, hostname: null, sessionId: null, cwd: null },
 			},
-			{ command: "get_code_stats_history", args: { range: requestedRange } },
-			{ command: "get_llm_runtime_stats", args: { range: requestedRange } },
+			{ command: "get_code_stats_history", args: { range: displayedRange } },
 		]);
 		queryLog.push({ displayedRange, queries });
 	}

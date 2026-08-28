@@ -10,6 +10,10 @@ The frontend uses Vite with the React plugin; the backend uses Cargo with Tauri.
 
 Vite serves on port 8181 in dev mode, binds `0.0.0.0`, and sets `allowedHosts: true` so a local `npx tauri dev` accepts network interfaces and arbitrary host headers. It ignores `src-tauri/**` to avoid extra frontend reloads during Rust rebuilds.
 
+One checkout may host only one Vite server per cache directory. `node_modules/.vite` has no cross-process locking: dependency optimization writes `deps_temp_<hash>/` and renames it onto `deps/`, so a second server racing that rename leaves orphaned temporaries and no `deps/` at all. Sources still resolve, so the app runs while dev-injected CSS silently disappears — see `docs/solutions/environment/second-vite-server-strips-dev-css.md`. This is the same single-writer rule the fixed provider ports impose on the app itself.
+
+The suite would otherwise break that rule on every run: eleven test files call `createServer()` and `scripts/web-bundle-isolation.test.mjs` calls `build()`, each loading this config. So `vite.config.ts` detects a `node --test` child — by `NODE_TEST_CONTEXT`, plus a `.test.mjs` filename check as a repo-owned fallback — and points `cacheDir` at `<tmpdir>/quill-vite-test-cache`. Neither signal needs a shell prefix, so it holds on Windows. The temp dir rather than another `node_modules` folder because these servers set `optimizeDeps.noDiscovery` and never commit a `deps/`, leaving roughly 39MB of temporaries per run that nothing reads twice. A hand-started second `vite` is still the operator's to avoid.
+
 Desktop production builds use esbuild minification and generate sourcemaps only
 when an authenticated Sentry upload is configured. Other builds omit maps so
 native packages cannot expose them. The build then rejects any remaining map
@@ -40,7 +44,9 @@ The bundled SQLite driver (`rusqlite` with `bundled` feature) avoids system depe
 
 ### Tauri Configuration
 
-`src-tauri/tauri.conf.json` defines product name "Quill", identifier `com.quilltoolkit.app`, with a borderless transparent main window (280x340px, min 240x200).
+`src-tauri/tauri.conf.json` defines product identity and the packaged main window.
+
+The main window is borderless and transparent at 360x800px with a 320x200 minimum. A schema upgrade hides it and creates a transient 520x300 `migration` webview at runtime; packaged window configuration remains unchanged.
 
 Bundle targets: macOS app bundle + DMG, Windows NSIS, Linux AppImage. The Linux `.deb` was dropped because Tauri's updater only self-updates AppImages, so deb installs were stranded on their installed version. The `bundle.linux.deb.desktopTemplate` (`desktop-template.desktop`) is deliberately retained even with no `.deb` shipped: the AppImage bundler builds its AppDir via the shared Debian data generator (`appimage`'s `linuxdeploy` calls `debian::generate_data`), so that template still drives the AppImage `.desktop` entry — do not remove it as "unused deb config." Auto-updater uses GitHub releases endpoint with minisign public key verification, and macOS update detection depends on shipping the signed `.app.tar.gz` updater bundle in addition to the DMG installer.
 
@@ -439,7 +445,9 @@ Rust crate dependencies grouped by role. Full list in `src-tauri/Cargo.toml`.
 
 **Core runtime**: Tauri 2, Axum 0.8, Tokio 1, rusqlite 0.31 (bundled), Tantivy 0.25, and reqwest 0.13.
 
-**Tauri plugins**: tauri-plugin-dialog 2, tauri-plugin-single-instance 2, tauri-plugin-window-state 2, tauri-plugin-updater 2, tauri-plugin-log 2.
+**Tauri plugins**: tauri-plugin-dialog 2, tauri-plugin-single-instance 2, tauri-plugin-window-state 2, tauri-plugin-updater 2, tauri-plugin-log 2, tauri-plugin-opener 2, tauri-plugin-clipboard-manager 2. The last two keep their JS bindings (`@tauri-apps/plugin-opener`, `@tauri-apps/plugin-clipboard-manager`) because the frontend is what initiates opening a URL or copying a value — see [[architecture#Architecture#Communication Layers#External Link Opening]].
+
+`@tauri-apps/api` and `@tauri-apps/cli` are pinned to their minor (`~2.11.x`) rather than carried on a caret. Tauri refuses to start when the npm API and the Rust crate differ on major/minor, so a caret range is a trap: any unrelated `npm install` can resolve the API forward while `Cargo.lock` stays put, and the next `tauri dev` fails with a version-mismatch error that names no cause. Installing `tauri-plugin-opener`'s JS binding — which requires `@tauri-apps/api ^2.11.0` — did exactly that against a 2.10.3 crate. The three move together deliberately: bump the crate with `cargo update -p tauri --precise`, then the two npm pins to match.
 
 **Utilities**: serde/serde_json, chrono, base64, sha2, similar 2, regex, walkdir, dirs, nix (unix only), sentry 0.34 (default-features off, with `backtrace`/`contexts`/`panic`/`reqwest`/`rustls`) for the [[features#Crash Reporting]] backend half.
 

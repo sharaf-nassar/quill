@@ -16,8 +16,8 @@ use crate::{
     storage::Storage,
     web_config::{load_web_ui_config, save_web_ui_config, validate_web_ui_config},
     web_server::{
-        WEB_UI_LAST_ERROR_KEY, WebServerState, WebUiConfig, WebUiError, WebUiHostPolicy,
-        WebUiStatus, format_reachable_urls,
+        WEB_UI_LAST_ERROR_KEY, WebServerState, WebUiConfig, WebUiError, WebUiStatus,
+        format_reachable_urls,
         gates::{BoundedListener, WebPeer},
         router,
     },
@@ -182,7 +182,7 @@ impl WebListenerController {
             }
         };
         state.config = config.clone();
-        self.router_state.gates.pin_allowlist(&config).await;
+        self.router_state.gates.adopt_allowlist(&config);
 
         if config.enabled {
             let target = bind_address(&config);
@@ -391,7 +391,7 @@ impl WebListenerController {
     ) -> Result<WebUiConfig, WebUiError> {
         let saved = tokio::task::block_in_place(|| save_web_ui_config(storage, config))
             .map_err(WebUiError::from)?;
-        self.router_state.gates.pin_allowlist(&saved).await;
+        self.router_state.gates.adopt_allowlist(&saved);
         Ok(saved)
     }
 
@@ -413,38 +413,24 @@ fn bind_address(config: &WebUiConfig) -> SocketAddr {
     SocketAddr::new(bind_ip, config.port)
 }
 
+/// Listing a name only another device would use is the act that asks for a
+/// network-visible socket, so the bind follows the allowlist rather than a
+/// separate switch. An empty list — or one naming only this machine — stays on
+/// loopback, which is what keeps the feature closed until it is asked for.
 fn needs_external_bind(config: &WebUiConfig) -> bool {
-    match config.host_policy {
-        WebUiHostPolicy::All => true,
-        WebUiHostPolicy::Allowlist => config
-            .allowlist
-            .iter()
-            .any(|entry| !allowlist_entry_is_loopback(entry)),
-    }
+    config
+        .allowlist
+        .iter()
+        .any(|entry| !allowlist_entry_is_loopback(entry))
 }
 
 fn allowlist_entry_is_loopback(entry: &str) -> bool {
     if entry.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    if let Ok(address) = entry.parse::<IpAddr>() {
-        return address.is_loopback();
-    }
-    let Some((address, prefix)) = entry.split_once('/') else {
-        // Hostnames other than localhost may resolve off-device. The request
-        // gate pins their concrete addresses when it applies the same config.
-        return false;
-    };
-    let Ok(address) = address.parse::<IpAddr>() else {
-        return false;
-    };
-    let Ok(prefix) = prefix.parse::<u8>() else {
-        return false;
-    };
-    match address {
-        IpAddr::V4(address) => prefix >= 8 && address.octets()[0] == 127,
-        IpAddr::V6(address) => prefix == 128 && address.is_loopback(),
-    }
+    entry
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 fn read_last_error(storage: &Storage) -> Option<String> {
@@ -512,12 +498,11 @@ mod tests {
             .port()
     }
 
-    fn config(enabled: bool, port: u16, host_policy: WebUiHostPolicy) -> WebUiConfig {
+    fn config(enabled: bool, port: u16, allowlist: &[&str]) -> WebUiConfig {
         WebUiConfig {
             enabled,
             port,
-            host_policy,
-            allowlist: Vec::new(),
+            allowlist: allowlist.iter().map(|entry| (*entry).to_string()).collect(),
         }
     }
 
@@ -537,8 +522,7 @@ mod tests {
         let temp = TempDir::new().expect("temp data directory");
         let storage = storage(&temp);
         let port = free_port();
-        save_web_ui_config(&storage, config(false, port, WebUiHostPolicy::Allowlist))
-            .expect("save disabled config");
+        save_web_ui_config(&storage, config(false, port, &[])).expect("save disabled config");
         let controller = WebListenerController::new(Arc::new(WebServerState::default()));
 
         controller.initialize(&storage).await;
@@ -556,7 +540,7 @@ mod tests {
         let new_port = free_port();
         let controller = WebListenerController::new(Arc::new(WebServerState::default()));
         let old_config = controller
-            .apply_config(&storage, config(true, old_port, WebUiHostPolicy::Allowlist))
+            .apply_config(&storage, config(true, old_port, &[]))
             .await
             .expect("enable old listener");
         let _blocker = TcpListener::bind((Ipv4Addr::LOCALHOST, new_port))
@@ -564,7 +548,7 @@ mod tests {
             .expect("occupy replacement port");
 
         let error = controller
-            .apply_config(&storage, config(true, new_port, WebUiHostPolicy::Allowlist))
+            .apply_config(&storage, config(true, new_port, &[]))
             .await
             .expect_err("replacement bind must fail");
 
@@ -574,10 +558,7 @@ mod tests {
         assert!(accepts_connection(SocketAddr::new(LOOPBACK_BIND_IP, old_port)).await);
 
         controller
-            .apply_config(
-                &storage,
-                config(false, old_port, WebUiHostPolicy::Allowlist),
-            )
+            .apply_config(&storage, config(false, old_port, &[]))
             .await
             .expect("disable listener");
     }
@@ -590,7 +571,7 @@ mod tests {
         let port = free_port();
         let controller = WebListenerController::new(Arc::new(WebServerState::default()));
         let old_config = controller
-            .apply_config(&storage, config(true, port, WebUiHostPolicy::Allowlist))
+            .apply_config(&storage, config(true, port, &[]))
             .await
             .expect("enable loopback listener");
         controller.set_bind_failure_hook(Arc::new(|address| {
@@ -603,7 +584,7 @@ mod tests {
         }));
 
         let error = controller
-            .apply_config(&storage, config(true, port, WebUiHostPolicy::All))
+            .apply_config(&storage, config(true, port, &["quill.lan"]))
             .await
             .expect_err("wildcard bind must fail");
 
@@ -615,7 +596,7 @@ mod tests {
         assert!(accepts_connection(SocketAddr::new(LOOPBACK_BIND_IP, port)).await);
 
         controller
-            .apply_config(&storage, config(false, port, WebUiHostPolicy::Allowlist))
+            .apply_config(&storage, config(false, port, &[]))
             .await
             .expect("disable listener");
     }

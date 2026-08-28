@@ -14,28 +14,44 @@ Refusals cover unknown names, every registered setter and mutation, `fetch_usage
 
 ## Host denial precedes any data
 
-A peer outside the pinned allowlist receives an empty-body `403` on the public,
-pairing, and authenticated route classes and on unrouted paths, so no handler
-runs and no Quill bytes are written.
+A request naming a host the listener does not answer to receives an empty-body
+`403` on every route class and on unrouted paths, so no handler runs and no
+Quill bytes are written.
 
-An allowed peer reaches the public class. An empty allowlist and an allowlist
-whose only entry fails to resolve both admit nobody but loopback, and loopback's
-exemption covers host filtering only — the authenticated class still refuses it
-without a session. A resolved hostname entry admits exactly the addresses it
-pinned, and only `host_policy=all` skips the pinned set.
+That covers the public, pairing, and authenticated classes alike, and an absent
+or empty `Host` is refused the same way.
+
+A listed name reaches the public class whatever address it arrives from, and
+matching ignores case and any port, since a name is not a different name on
+another port. An empty allowlist answers only to the implicit `localhost`,
+`127.0.0.1`, and `[::1]`, so it is loopback-only rather than a listener that
+refuses its own UI; that exemption covers the name check only — the
+authenticated class still refuses without a session, and the entry document
+still redirects rather than serving a chunk.
+
+Matching is by name and never by resolution, so no suffix, prefix, or empty
+value matches and nothing in this machine's `/etc/hosts` or DNS can widen an
+entry. Rate limiting still keys on the socket peer, which no header can forge.
 
 ## Unpaired access reaches only the pairing bootstrap
 
 Without a session cookie a peer receives the pairing page and nothing else.
 
-The root document, asset paths, the invoke route, and unrouted paths are all
-empty-body `403`, and a pairing request whose body is not the contracted shape
-is refused exactly like a wrong code.
+Asset paths, the invoke route, and unrouted paths are all empty-body `403`, and
+a pairing request whose body is not the contracted shape is refused exactly like
+a wrong code. The root document is the one navigation among them, so it answers
+`303` to `/pair` with an empty body rather than refusing — it still hands over no
+bundle content, and a denied peer is refused on it like any other route.
 
 The pairing page carries its own policy pinning its one inline script by hash,
 states no Quill data, and references no bundle chunk, so an unpaired browser can
 bootstrap without receiving application assets. Regenerating the credential
 invalidates a session that was live before the rotation.
+
+`/pair` must also serve the paired case, so a request carrying a live session
+cookie is answered `303` to `/` rather than the form. This does not widen the
+gate — the same request already passes `require_session` on the document — and
+the two redirects fire on opposite session states, so they cannot cycle.
 
 ## Only the isolated monitor bundle is servable
 
@@ -57,9 +73,13 @@ exceeds its cap however many peers appear.
 
 ## Connection and body caps bound one client
 
-The listener serves at most eight live connections; a further connection waits
-unserved until one is released, then completes. A request body over the size cap
-is refused rather than read.
+The listener serves at most `MAX_CONCURRENT_CONNECTIONS` live connections; a
+further connection waits unserved until one is released, then completes. A
+request body over the size cap is refused rather than read.
+
+A slot is held by the connection, not the request, so the cap only bounds
+anything because an idle connection is reaped: abandoned and half-closed
+sockets return their slots without the peer closing them.
 
 ## Disabled listener owns no socket
 

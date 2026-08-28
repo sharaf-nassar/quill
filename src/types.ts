@@ -1,5 +1,13 @@
 // Shared TypeScript interfaces matching Rust models in src-tauri/src/models.rs
 
+export interface StartupStatus {
+  state: "starting" | "migrating" | "ready" | "error";
+  stage: string;
+  detail: string;
+  completedBytes: number | null;
+  totalBytes: number | null;
+}
+
 export interface UsageBucket {
   provider: IntegrationProvider;
   key: string;
@@ -1062,13 +1070,6 @@ export interface ContextSavingsAnalyticsResponse
 	timeSeries?: ContextSavingsTimeSeriesPoint[];
 	timeseries?: ContextSavingsTimeSeriesPoint[];
 	breakdowns?: ContextSavingsBreakdownRow[] | ContextSavingsBreakdownsResponse;
-}
-
-export interface InsightTrend {
-	direction: "up" | "down" | "flat";
-	percentage: number;
-	/** Whether "up" is good (true) or bad (false). Null = neutral. */
-	upIsGood: boolean | null;
 }
 
 export interface SparklinePoint {
