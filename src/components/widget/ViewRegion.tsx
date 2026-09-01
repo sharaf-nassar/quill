@@ -10,6 +10,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import type { RangeType } from "../../types";
 import { useCachedInvokeEvents } from "../../hooks/useCachedInvokeEvents";
+import { openManageWindow } from "../../lib/manageWindow";
 import {
   readStoredWidgetRange,
   storeWidgetRange,
@@ -75,7 +76,21 @@ function ViewRegion({ webSurface = false }: { webSurface?: boolean }) {
             </button>
           ))}
         </div>
-        <span />
+        {/* The right track balances the grid; on desktop it carries the
+            Explore entry — every metric from this region overlaid on one
+            large graph in the Manage workspace. */}
+        {webSurface ? (
+          <span />
+        ) : (
+          <button
+            type="button"
+            className="wg-head-explore"
+            title="Open the Explore graph — every metric overlaid, over weeks or months"
+            onClick={() => void openManageWindow("explore")}
+          >
+            <span aria-hidden="true">⤢</span> Explore
+          </button>
+        )}
       </div>
       {active.render(range, webSurface)}
     </section>

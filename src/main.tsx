@@ -23,6 +23,42 @@ if (import.meta.env.DEV && !("__TAURI_INTERNALS__" in window)) {
   installBrowserMock();
 }
 
+// Dev-only stylesheet watchdog. A Vite restart mid-session (config edit,
+// dependency re-optimization) can hand an already-open window a module graph
+// whose CSS request lost the optimizer race: React keeps rendering while
+// every rule is silently gone — the "unstyled widget" in
+// docs/solutions/environment/second-vite-server-strips-dev-css.md. The
+// design tokens are the
+// oracle: when `--surface` is absent after load, reload once to fetch the
+// repaired graph. The sessionStorage latch stops a loop when styles are
+// genuinely broken, and clears on success so a later drop can heal again.
+// ponytail: load-time check only; a mid-session style drop without a reload
+// would need a MutationObserver on the style tags if it ever shows up.
+if (import.meta.env.DEV) {
+  const RETRY_KEY = "quill-dev-css-reload";
+  window.addEventListener("load", () => {
+    setTimeout(() => {
+      const styled =
+        getComputedStyle(document.documentElement)
+          .getPropertyValue("--surface")
+          .trim() !== "";
+      if (styled) {
+        sessionStorage.removeItem(RETRY_KEY);
+        return;
+      }
+      if (sessionStorage.getItem(RETRY_KEY)) {
+        console.error(
+          "[quill] dev stylesheet still missing after a reload — check the vite server",
+        );
+        return;
+      }
+      sessionStorage.setItem(RETRY_KEY, "1");
+      console.warn("[quill] dev stylesheet missing — reloading once to recover");
+      location.reload();
+    }, 300);
+  });
+}
+
 // SDK stays uninitialized until the stored opt-in says otherwise — short
 // window at boot where errors aren't captured is the price of strict privacy.
 function syncCrashReportingPreference(): void {

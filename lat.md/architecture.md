@@ -17,9 +17,9 @@ Normal operation uses three Tauri windows routed by a URL query parameter in [[s
 
 The main widget, consolidated Manage workspace, and release-notes viewer are transparent, paint custom visual chrome, and resize freely. A schema upgrade adds one short-lived `migration` window, then closes it before revealing `main`.
 
-The main window hosts the widget shell described in [[frontend#Main Window Layout]]. The [[features#Session Search]], [[features#Learning System]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
+The main window hosts the widget shell described in [[frontend#Main Window Layout]]. The [[features#Session Search]], [[features#Usage Explorer]], [[features#Learning System]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
 
-The Sessions, Learning, and Settings management surfaces are consolidated into a single rail-navigated `?view=manage` workspace ([[src/windows/ManageWindowView.tsx]]), opened from the widget titlebar's settings key or the app-scoped ⌘M / Ctrl+M accelerator. Each tool now renders as a section without standalone window chrome, with inline no-provider states, and Learning includes its run history. The standalone tool windows, their `?view=` routes, and capabilities entries were retired, leaving only `main`, `manage`, and `release-notes`. The previous inline `ProviderMenu` popover was removed earlier in favor of the dedicated settings surface.
+The Sessions, Explore, Learning, and Settings management surfaces are consolidated into a single rail-navigated `?view=manage` workspace ([[src/windows/ManageWindowView.tsx]]), opened from the widget titlebar's settings key or the app-scoped ⌘M / Ctrl+M accelerator. Each tool now renders as a section without standalone window chrome, with inline no-provider states, and Learning includes its run history. The standalone tool windows, their `?view=` routes, and capabilities entries were retired, leaving only `main`, `manage`, and `release-notes`. The previous inline `ProviderMenu` popover was removed earlier in favor of the dedicated settings surface.
 
 ### Window Configuration
 

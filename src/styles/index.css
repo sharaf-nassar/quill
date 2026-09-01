@@ -2487,19 +2487,34 @@ html[data-view="migration"] #root {
   position: relative;
 }
 
-/* The grouping toggle and its compact legend occupy the chart's quiet
-   top-right corner, packed to the right edge and wrapping the legend above
-   the toggle if a wide model set will not fit on one line. */
+/* The chart's quiet top-right corner, as two fixed rows: the compact legend
+   above, the grouping toggle below. The `left` inset
+   reserves only the delta's line-one column, so the legend wraps exactly when
+   it would touch that text and not before; the toggle row below may sit
+   beside the headline, whose overlay fade keeps it readable — the pre-cap
+   status quo. The box spans the corner, so it must not eat the chart's hover
+   scrubbing: the containers pass pointer events through and only the real
+   controls catch them. */
 .wg-chart-controls {
   position: absolute;
   top: 4px;
+  left: 68px;
   right: 2px;
   z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.wg-chart-controls-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 4px var(--space-sm);
+  max-width: 100%;
 }
 
 .wg-chart-dimensions {
@@ -2507,6 +2522,7 @@ html[data-view="migration"] #root {
   flex: 0 0 auto;
   border: 1px solid var(--line);
   background: var(--surface);
+  pointer-events: auto;
 }
 
 .wg-chart-legend-mini {
@@ -2563,6 +2579,35 @@ html[data-view="migration"] #root {
 
 .wg-chart-dimensions button:focus-visible {
   position: relative;
+  outline: 1px solid var(--signal-cyan);
+  outline-offset: -1px;
+}
+
+/* Band-header Explore entry — right track of the three-track head, so the
+   range strip stays centred. Opens the Manage window's Explore section,
+   where this region's series overlay one large multi-metric graph. */
+.wg-head-explore {
+  justify-self: end;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--label);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.wg-head-explore:hover {
+  background: var(--hover);
+  color: var(--text-hi);
+}
+
+.wg-head-explore:focus-visible {
   outline: 1px solid var(--signal-cyan);
   outline-offset: -1px;
 }

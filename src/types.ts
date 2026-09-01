@@ -674,7 +674,7 @@ export interface SessionContext {
 
 // Analytics redesign types
 
-export type ModelRange = "1h" | "6h" | "24h" | "7d" | "30d";
+export type ModelRange = "1h" | "6h" | "24h" | "7d" | "30d" | "90d";
 
 export interface ModelIdentity {
   provider: string;

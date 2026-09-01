@@ -158,7 +158,7 @@ Missing or invalid Codex rate-limit windows produce an account-scoped failure in
 
 Everything below LIMITS is one swappable view region: Usage (the default), Models, and Context, each a compact 360px surface in the same visual system.
 
-The view name and shared 1H/6H/24H/7D range strip live in the region's band header, so switching views keeps the operator's range and there is only ever one control strip. `30d` is absent because a month is not a widget scope. A fresh profile defaults to 1H; the last valid selection persists locally across restarts, while missing, invalid, inaccessible, or unwritable storage degrades safely to 1H without breaking the current selection. The dropdown is a listbox, not a menu, because it has a value. Composition detail lives in [[frontend#Frontend#Components#Widget View Region]].
+The view name and shared 1H/6H/24H/7D range strip live in the region's band header, so switching views keeps the operator's range and there is only ever one control strip. The header's right track carries the ⤢ Explore entry (desktop surface only), which opens [[features#Features#Usage Explorer]] — the region's series overlaid on one large multi-metric graph. `30d` is absent because a month is not a widget scope. A fresh profile defaults to 1H; the last valid selection persists locally across restarts, while missing, invalid, inaccessible, or unwritable storage degrades safely to 1H without breaking the current selection. The dropdown is a listbox, not a menu, because it has a value. Composition detail lives in [[frontend#Frontend#Components#Widget View Region]].
 
 Most view data is aggregated across all LLM providers; provider-scoped controls appear only where the underlying data model can preserve reliable provider identity.
 
@@ -203,6 +203,18 @@ What the working-context store did with the selected range: preserved and retrie
 The view is deliberately chartless. Its summary totals and its per-bucket series are computed from different token columns, so plotting the series beneath these headlines would put two disagreeing numbers in one band. The single visualization is a split bar assembled from the exact three figures printed around it: how the range's accounted context tokens divide between preservation, retrieval, and routing.
 
 Only category-scoped totals are read, never the legacy `tokens*Est` columns, because those counted telemetry as savings. A backend that does not categorize therefore reads as zero, and the view says which nothing it is looking at — "context events recorded, none carrying token categories" is a different fact from "no context events in this range". The retention ratio behind the preserved headline is `sources_retrieved / sources_preserved` over distinct `source_ref` values within the window, clamped to `[0, 1]`, computed in [[src-tauri/src/storage.rs#apply_retention_metrics]] from the `CONTEXT_SAVINGS_RETENTION_SQL` CTE. `src/hooks/useContextSavingsStats.ts` listens for the `context-savings-updated` event and invokes [[src-tauri/src/lib.rs#get_context_savings_analytics]].
+
+## Usage Explorer
+
+Every metric on one large graph, over weeks or months — the correlation surface the 360px widget deliberately is not.
+
+The Explore section of the Manage workspace ([[src/windows/ExploreWindowView.tsx]]) overlays the token series — grouped by CLI, Provider, or Model through the widget's [[src/components/widget/chartDimensions.ts#chartSeriesFor]] grouping — and the six readout metrics on one shared daily grid at 1W / 1M / 3M. The widget's ⤢ Explore button opens it through the Manage `?section=explore` deep link.
+
+Units differ wildly across the overlaid series, so [[src/components/explore/ExploreChart.tsx]] rescales each line onto a common plane — min–max normalized or indexed to its own average — and the header states the active rule in words; raw values stay authoritative in the tooltip, panel totals, and endpoint labels. [[src/hooks/useExploreSeries.ts#useExploreSeries]] assembles the grid: the model overview's daily buckets carry the token series, `get_activity_series` answers sessions and projects at one bucket per day on the same window, and token/code history points are re-bucketed client-side onto that grid. Runtime has no daily backend source — `get_llm_runtime_stats` answers a fixed 7-bucket sparkline for any range — so its overlay spreads each bucket as a per-day average and is labelled avg/day rather than pretending to daily evidence it does not have.
+
+The series panel toggles any line, ⌥-click solos one, and a solo is one click to undo via the restore chip; hovering a panel row or a correlation chip highlights its lines in the chart. A Pearson strip names the strongest visible pairs, and each chip solos its two series for direct comparison. The chart supports a hover crosshair with a sorted value tooltip, click-to-pin a day, and arrow-key day walking. Range, scale, 7-day-average smoothing, token grouping, and series visibility persist to `localStorage` (`quill-explore-state`).
+
+The 3M range extends the frontend `ModelRange` union with `90d`; the backend `ModelRange` enum and every explorer source already answered `90d` with daily buckets, so no backend change was needed.
 
 ## Learning System
 

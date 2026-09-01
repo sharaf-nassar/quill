@@ -34,13 +34,13 @@ const { default: ManageWindowView, parseTarget } = await server.ssrLoadModule(
 test.after(() => server.close());
 
 // @lat: [[manage-section-tests#Manage Section Tests#Available Manage Sections]]
-test("Manage offers Sessions, Learning, and Settings", () => {
+test("Manage offers Sessions, Explore, Learning, and Settings", () => {
 	const markup = renderToStaticMarkup(createElement(ManageWindowView));
 	const labels = [...markup.matchAll(/manage-rail-label[^>]*>([^<]+)/g)].map(
 		([, label]) => label,
 	);
 
-	assert.deepEqual(labels, ["Sessions", "Learning", "Settings", "Live"]);
+	assert.deepEqual(labels, ["Sessions", "Explore", "Learning", "Settings", "Live"]);
 });
 
 // @lat: [[manage-section-tests#Manage Section Tests#Section Deep Links]]

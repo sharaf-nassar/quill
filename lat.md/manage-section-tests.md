@@ -8,7 +8,7 @@ These tests pin the tools available through the Manage workspace rail.
 
 ## Available Manage Sections
 
-The Manage rail offers only Sessions, Learning, and Settings.
+The Manage rail offers only Sessions, Explore, Learning, and Settings.
 
 ## Section Deep Links
 

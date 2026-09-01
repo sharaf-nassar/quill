@@ -73,23 +73,26 @@ Then restart `npm run tauri -- dev`, which re-optimizes into a clean `deps/`.
 
 ## Repository fix
 
-The `npm test` half is now closed in `vite.config.ts`: a test-runner check moves
-`cacheDir` to `<tmpdir>/quill-vite-test-cache`, so test servers cannot touch
-`node_modules/.vite`.
+First pass (2026-08-26): a test-runner check (`NODE_TEST_CONTEXT` or a
+`.test.mjs` argv) moved test servers onto `<tmpdir>/quill-vite-test-cache`.
+That closed the `npm test` half only, and the failure recurred (2026-09-01)
+through callers the allowlist never named: agent-started screenshot servers
+(`npx vite --port 5199`) and an ad-hoc `createServer()` script whose filename
+did not end in `.test.mjs`.
 
-```ts
-const isTestRunner =
-  Boolean(process.env.NODE_TEST_CONTEXT) ||
-  Boolean(process.argv[1]?.endsWith(".test.mjs"));
-```
-
-Node sets `NODE_TEST_CONTEXT` in every `node --test` child, and the filename
-check is a second repo-owned signal in case that variable changes. Neither needs
-a shell prefix, so it holds on Windows. The temp dir is used rather than another
-`node_modules` folder because these servers set `optimizeDeps.noDiscovery` and
-never commit a `deps/` — they leave ~39MB of temporaries per run that nothing
-reads twice. Verified: `node_modules/.vite/deps` holds 54 entries before and
-after a full `npm test`, with no repo growth and no change in suite runtime.
+Second pass, current: the rule is inverted in `vite.config.ts`
+(`resolveCacheDir`). Only the bare `vite` CLI on its configured strict port —
+the exact process `npm run dev` and `tauri dev`'s `beforeDevCommand` spawn —
+defaults to the shared `node_modules/.vite`. Every other invocation
+(programmatic `createServer()`/`build()` from tests or one-off scripts, and a
+CLI run carrying a `--port` override) is routed to a private
+`<tmpdir>/quill-vite-<pid>` cache. Because `strictPort` makes a second
+no-override CLI die at bind, no second process can reach the shared cache
+long enough to race the `deps/` rename. Detection reads `process.argv[1]`
+(the `vite/bin/vite.js` entry or its `.bin/vite` shim, backslashes
+normalized), so it needs no shell prefix and holds on Windows. Misclassifying
+an unusual caller fails safe: a private cache only costs a re-optimize into
+temp, never a poisoned dev server.
 
 ## A second trigger: adding a dependency mid-session
 
@@ -110,17 +113,66 @@ error text plus a Reload action, so this class of failure is legible in one
 glance instead of an hour. The trigger itself is inherent to Vite: **restart the
 dev server after installing a package.**
 
+## A third trigger: editing vite.config.ts while dev runs
+
+Saving `vite.config.ts` restarts the Vite server in-process and re-optimizes
+the dependency cache. Two consequences, both observed 2026-09-01 while an
+agent iterated on the config against a live `tauri dev`:
+
+- An already-open window can race the re-optimization exactly like the
+  `npm install` trigger above: it reloads into a graph whose CSS module
+  request 404s, and renders unstyled while React keeps working.
+- A restart that *fails* (config error, optimizer race that throws) exits the
+  Vite process. Vite is the `beforeDevCommand`; when it dies the tauri CLI
+  tears down the whole dev chain — what the operator experiences as "npm
+  crashed".
+
+Rules and mitigations:
+
+- Process rule (now in `AGENTS.md`): land `vite.config.ts` edits, package
+  installs, and anything else that forces a re-optimize while dev is
+  *stopped*.
+- Self-heal (dev builds only, `src/main.tsx`): after load, a window whose
+  computed `--surface` token is empty reloads itself once — a sessionStorage
+  latch prevents loops and clears on success. The unstyled-widget symptom now
+  recovers in under a second instead of persisting until a manual reload.
+
+## Why orphans existed at all: Ctrl+C does not kill the tauri dev chain
+
+The stray servers were not operator carelessness. `tauri dev`'s cleanup
+(tauri-apps/tauri #10343, #2794, #4262) kills its `beforeDevCommand` tree
+recursively, but Ctrl+C fells the intermediate `npm`/`sh` links first, the
+Vite process reparents to the user manager, and the walk finds a broken
+chain. The orphan keeps port 8181; `strictPort` then blocks the next dev
+run's own server while windows load from the stale one. Observed twice: an
+orphan "started four days earlier" in the original incident, and an Aug 28
+server still answering four days of sessions on 2026-09-01.
+
+Repo fix in `vite.config.ts` (`tauriParentWatch`): when the server was
+spawned by the tauri hook chain (`TAURI_ENV_PLATFORM` is exported to hook
+commands), it polls `process.ppid` every 2s and shuts down once it differs
+from the ppid recorded at startup — reparenting is exactly the orphan's
+signature, and beats probing the original parent's liveness, which a
+surviving `npx` wrapper would fool. Manual `npm run dev` outside tauri sets
+no `TAURI_ENV_*`, so its lifecycle is untouched; in-process config-change
+restarts keep the same ppid. Verified: a reparented TAURI-env server
+self-terminates within one poll and logs
+`tauri dev chain is gone (reparented)`, while a reparented plain server
+stays up.
+
 ## Prevention
 
 - `AGENTS.md` already limits the repo to one running Quill because of the fixed
-  provider ports. The same single-writer rule still applies to Vite by hand: one
-  dev server per checkout, because `node_modules/.vite` has no cross-process
-  locking. The fix above only covers the automated collisions.
+  provider ports. The same single-writer rule now holds for Vite structurally:
+  only the bare CLI on the strict port can own `node_modules/.vite`, so extra
+  servers and scripts isolate themselves without anyone remembering a rule.
 - Before debugging a dev-run anomaly, run
   `ps aux | grep vite` and confirm exactly one server owns the checkout.
 - A missing `node_modules/.vite/deps` alongside many `deps_temp_*` directories
   is the signature of that race, not of a corrupt install.
-- Any new tool that starts Vite against this repo must set its own `cacheDir`.
+- A new tool that starts Vite against this repo no longer needs its own
+  `cacheDir` — `resolveCacheDir` assigns one — but must not pass a bare `vite`
+  invocation without `--port` while dev runs (strictPort will refuse it).
 - Restart `tauri dev` after any `npm install`; open windows cannot survive a
   dependency re-optimization.
 - A window that renders as a flat background with no content is a caught-nothing

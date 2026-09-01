@@ -820,19 +820,21 @@ function UsageView({ range, webSurface = false }: UsageViewProps) {
       <div className="wg-usage-band">
         <div className="wg-usage-chart">
           <div className="wg-chart-controls">
-            {chart && chart.totalTokens > 0 && (
-              <div className="wg-chart-legend-mini" aria-hidden="true">
-                {chart.legend.map((entry) => (
-                  <span className="wg-chart-legend-mini-item" key={entry.id}>
-                    <i
-                      className="wg-chart-legend-mini-swatch"
-                      style={{ background: entry.color }}
-                    />
-                    {entry.label}
-                  </span>
-                ))}
-              </div>
-            )}
+            <div className="wg-chart-controls-row">
+              {chart && chart.totalTokens > 0 && (
+                <div className="wg-chart-legend-mini" aria-hidden="true">
+                  {chart.legend.map((entry) => (
+                    <span className="wg-chart-legend-mini-item" key={entry.id}>
+                      <i
+                        className="wg-chart-legend-mini-swatch"
+                        style={{ background: entry.color }}
+                      />
+                      {entry.label}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
             <div className="wg-chart-dimensions" role="group" aria-label="Graph grouping">
               {([
                 ["cli", "CLI"],

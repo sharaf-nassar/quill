@@ -48,6 +48,12 @@ CI (`.github/workflows/ci.yml`) enforces the same and a macOS check.
 
 - Use `npm run tauri -- dev`. Never `cargo tauri dev` — it skips
   `tauri.dev.conf.json` and writes production state.
+- While a dev server is running, do not edit `vite.config.ts`, install
+  packages, or start extra Vite processes against this checkout. A config
+  save restarts the server and re-optimizes its dependency cache — open
+  windows can race that and drop their CSS — and a restart that fails tears
+  down the whole `tauri dev` chain. Land config changes while dev is
+  stopped. See `docs/solutions/environment/second-vite-server-strips-dev-css.md`.
 - Only one Quill runs at a time (fixed provider ports 19876/19877); stop an
   installed Quill first. `QUILL_PORT`/`QUILL_CONTEXT_PORT` override.
 - Sandboxed demo against dummy data: `scripts/run_quill_demo.sh`.

@@ -85,6 +85,7 @@ const RANGE_DURATION_MS: Record<string, number> = {
   "7d": 7 * D,
   "14d": 14 * D,
   "30d": 30 * D,
+  "90d": 90 * D,
 };
 
 /** Read the `range` IPC argument, falling back to the app's default window. */
@@ -238,6 +239,7 @@ const TOKEN_HISTORY_GEOMETRY: Record<string, { count: number; stepMs: number }> 
   // Fifteen inclusive daily boundaries cover the 7d window and prior period.
   "14d": { count: 15, stepMs: D },
   "30d": { count: 30, stepMs: D },
+  "90d": { count: 90, stepMs: D },
 };
 const DEFAULT_TOKEN_HISTORY = { count: 48, stepMs: H };
 
@@ -302,6 +304,7 @@ const CODE_HISTORY_GEOMETRY: Record<string, { count: number; stepMs: number }> =
   "12h": { count: 17, stepMs: 45 * M },
   "2d": { count: 17, stepMs: 3 * H },
   "14d": { count: 15, stepMs: D },
+  "90d": { count: 90, stepMs: D },
 };
 const DEFAULT_CODE_HISTORY = { count: 14, stepMs: D };
 
@@ -759,6 +762,7 @@ const MODEL_RANGE_MS: Record<ModelRange, number> = {
   "24h": D,
   "7d": 7 * D,
   "30d": 30 * D,
+  "90d": 90 * D,
 };
 
 const modelProviders = new Set(providerStatuses.map(({ provider }) => provider));
@@ -1434,7 +1438,7 @@ function readModelRange(args: Record<string, unknown> | undefined): ModelRange {
   ) {
     return rejectModelAnalytics(
       "invalid_range",
-      "Range must be one of 1h, 24h, 7d, or 30d.",
+      "Range must be one of 1h, 6h, 24h, 7d, 30d, or 90d.",
     );
   }
   return range as ModelRange;
@@ -1583,6 +1587,7 @@ const ACTIVITY_BUCKET_SECONDS: Record<ModelRange, number> = {
   "24h": 60 * 60,
   "7d": 24 * 60 * 60,
   "30d": 24 * 60 * 60,
+  "90d": 24 * 60 * 60,
 };
 
 const OVERVIEW_MATRIX_PROJECT_LIMIT = 8;

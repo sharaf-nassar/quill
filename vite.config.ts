@@ -54,30 +54,74 @@ function liveDevCsp(): Plugin {
   };
 }
 
+// `tauri dev` cannot reliably kill this server on Ctrl+C. The CLI's cleanup
+// (tauri-apps/tauri #10343, #2794, #4262) recursively kills its
+// beforeDevCommand child tree, but SIGINT fells the intermediate `npm`/`sh`
+// first, the vite process reparents, and the walk finds an already-broken
+// chain. The orphan keeps port 8181 and serves a stale module graph to every
+// later dev run — observed here as an Aug 28 server still answering four days
+// of `tauri dev` sessions. Self-defense: when spawned by the tauri hook chain
+// (TAURI_ENV_* is exported to hook commands), watch for *reparenting*. The
+// orphaned server's exact signature is its dead parent — `process.ppid` flips
+// from the npm/sh chain to init or the user manager — so the poll compares
+// the current ppid against the one recorded at startup and shuts down on any
+// change. That beats polling the original parent's liveness, which an
+// `npx`-style wrapper surviving alongside vite would fool. Manual
+// `npm run dev` outside tauri never sets TAURI_ENV_*, so its lifecycle is
+// untouched, and in-process config-change restarts keep the same ppid.
+function tauriParentWatch(): Plugin {
+  return {
+    name: "quill-tauri-parent-watch",
+    apply: "serve",
+    configureServer(server) {
+      if (!process.env.TAURI_ENV_PLATFORM) return;
+      const parentAtStart = process.ppid;
+      const timer = setInterval(() => {
+        if (process.ppid === parentAtStart) return;
+        clearInterval(timer);
+        console.error(
+          "[quill] tauri dev chain is gone (reparented) — shutting down dev server",
+        );
+        void server.close().finally(() => process.exit(0));
+      }, 2_000);
+      timer.unref();
+      server.httpServer?.on("close", () => clearInterval(timer));
+    },
+  };
+}
+
 // Vite's dependency optimizer has no cross-process locking: it writes
-// `deps_temp_<hash>/` under `cacheDir` and renames it onto `deps/`. Eleven test
-// files call `createServer()` and one calls `build()`, each loading this config
-// and each defaulting to `node_modules/.vite` — the very directory a running
-// `npm run tauri -- dev` owns. Their config hash differs from the dev server's,
-// so they re-optimize into the shared cache and race that rename, leaving
-// orphaned temporaries and no `deps/` at all. Vite then serves modules whose
-// pre-bundled dependencies 404, which shows up as the app rendering with its
-// CSS silently missing — the dev server "not reloading".
+// `deps_temp_<hash>/` under `cacheDir` and renames it onto `deps/`. Any second
+// process loading this config against the default `node_modules/.vite` — the
+// very directory a running `npm run tauri -- dev` owns — re-optimizes into the
+// shared cache and races that rename, leaving orphaned temporaries and no
+// `deps/` at all. Vite then serves modules whose pre-bundled dependencies 404,
+// which shows up as the app rendering with its CSS silently missing — the dev
+// server "not reloading". See
+// docs/solutions/environment/second-vite-server-strips-dev-css.md.
 //
-// Node sets `NODE_TEST_CONTEXT` in every `node --test` child; the filename check
-// is a second, repo-owned signal so this keeps holding if that variable ever
-// changes. Either one moves the test servers onto their own cache directory,
-// with no shell prefix that would break on Windows.
+// An allowlist of known offenders (first the test runner, then one-off
+// scripts, then hand-started screenshot servers) kept regressing, so the rule
+// is inverted: only the repo's own entry may share. That entry is the bare
+// `vite` CLI — what `npm run dev` and `tauri dev`'s beforeDevCommand spawn —
+// on its configured strict port. Everything else (programmatic
+// `createServer()`/`build()` in tests and ad-hoc scripts, or a second CLI run
+// with a `--port` override) gets a private per-process cache and cannot touch
+// the dev server's.
 //
-// That directory lives in the OS temp dir rather than under `node_modules`,
-// because these servers set `optimizeDeps.noDiscovery` and never commit a
-// `deps/`: every run leaves its temporaries behind, ~39MB a time. Somewhere the
-// OS reclaims is the right home for a cache nothing reads twice.
-function testCacheDir(): string | undefined {
-  const isTestRunner =
-    Boolean(process.env.NODE_TEST_CONTEXT) ||
-    Boolean(process.argv[1]?.endsWith(".test.mjs"));
-  return isTestRunner ? join(tmpdir(), "quill-vite-test-cache") : undefined;
+// The private directory lives in the OS temp dir rather than under
+// `node_modules`, because these servers set `optimizeDeps.noDiscovery` and
+// never commit a `deps/`: every run leaves its temporaries behind, ~39MB a
+// time. Somewhere the OS reclaims is the right home for a cache nothing reads
+// twice. Per-pid naming isolates even concurrent one-off processes from each
+// other. The check reads `process.argv` only — no shell prefix — so it holds
+// on Windows, where the `.bin/vite` shim still executes `vite/bin/vite.js`.
+function resolveCacheDir(): string | undefined {
+  const entry = (process.argv[1] ?? "").replace(/\\/g, "/");
+  const isViteCli = entry.endsWith("/vite/bin/vite.js") || entry.endsWith("/.bin/vite");
+  const hasPortOverride = process.argv.includes("--port");
+  if (isViteCli && !hasPortOverride) return undefined; // shared node_modules/.vite
+  return join(tmpdir(), `quill-vite-${process.pid}`);
 }
 
 export default defineConfig(({ mode }) => {
@@ -85,8 +129,8 @@ export default defineConfig(({ mode }) => {
   const upload = sentryUpload(!webBuild);
 
   return {
-    plugins: [react(), liveDevCsp(), ...(upload ? [upload] : [])],
-    cacheDir: testCacheDir(),
+    plugins: [react(), liveDevCsp(), tauriParentWatch(), ...(upload ? [upload] : [])],
+    cacheDir: resolveCacheDir(),
     clearScreen: false,
     server: {
       host: "0.0.0.0",

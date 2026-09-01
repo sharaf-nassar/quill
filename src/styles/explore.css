@@ -1,0 +1,529 @@
+/* ─── Explore section (Manage workspace) ───
+ * One large overlay chart plus a series panel. Graphite Stack tokens like the
+ * rest of the Manage window — card surfaces on console black, hairline rules,
+ * roomier density than the widget. */
+
+.explore-root {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  padding: 16px;
+  overflow-y: auto;
+  color: var(--readout);
+}
+
+/* ── Header ── */
+.explore-head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.explore-title h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--readout-bright);
+  letter-spacing: 0.01em;
+}
+
+.explore-title p {
+  margin: 1px 0 0;
+  font-size: 11px;
+  color: var(--label-faint);
+}
+
+.explore-controls {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px 10px;
+  flex-wrap: wrap;
+}
+
+.explore-control-label {
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  color: var(--label-faint);
+}
+
+.explore-seg {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--slate-input);
+  border: 1px solid var(--hairline);
+  border-radius: 5px;
+}
+
+.explore-seg button {
+  padding: 4px 9px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--label);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+
+.explore-seg button:hover {
+  color: var(--readout);
+  background: var(--fill-ghost);
+}
+
+.explore-seg button[aria-pressed="true"] {
+  background: var(--fill-hover);
+  color: var(--readout-bright);
+}
+
+.explore-seg button:focus-visible {
+  outline: 1px solid var(--signal-blue);
+  outline-offset: 1px;
+}
+
+/* ── Layout ── */
+.explore-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 236px;
+  gap: 12px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .explore-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.explore-card {
+  background: var(--card-graphite);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+
+/* ── Chart card ── */
+.explore-chart-card {
+  position: relative;
+  padding: 12px 12px 6px;
+  overflow: hidden;
+}
+
+.explore-chart-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 0 4px 10px;
+}
+
+.explore-chart-total {
+  font-size: 20px;
+  font-weight: 650;
+  color: var(--readout-bright);
+  font-variant-numeric: tabular-nums;
+}
+
+.explore-chart-sub {
+  font-size: 11px;
+  color: var(--label-faint);
+}
+
+.explore-chart-note {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--label-faint);
+}
+
+.explore-chart {
+  position: relative;
+  height: clamp(320px, 52vh, 560px);
+}
+
+.explore-chart svg {
+  display: block;
+  cursor: crosshair;
+}
+
+.explore-chart svg:focus-visible {
+  outline: 1px solid var(--signal-blue);
+  outline-offset: -1px;
+  border-radius: 4px;
+}
+
+.explore-chart-skeleton {
+  border-radius: 4px;
+  background: linear-gradient(
+    100deg,
+    var(--fill-ghost) 40%,
+    var(--fill-hover) 50%,
+    var(--fill-ghost) 60%
+  );
+  background-size: 200% 100%;
+  animation: explore-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes explore-shimmer {
+  to {
+    background-position-x: -200%;
+  }
+}
+
+.explore-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: clamp(320px, 52vh, 560px);
+  font-size: 12px;
+  color: var(--label);
+}
+
+.explore-series-group {
+  transition: opacity 0.14s ease;
+}
+
+.explore-axis-label,
+.explore-tick-label,
+.explore-endpoint-label {
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 9px;
+}
+
+.explore-axis-label {
+  fill: #4b525b;
+}
+
+.explore-tick-label {
+  fill: var(--label-faint);
+  font-size: 10px;
+  font-family: inherit;
+}
+
+.explore-endpoint-label {
+  font-size: 10px;
+}
+
+/* Empty state overlays the chart area, inviting action over a bare grid. */
+.explore-empty {
+  position: absolute;
+  inset: 46px 12px 44px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  text-align: center;
+}
+
+.explore-empty p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--label-faint);
+}
+
+.explore-empty button {
+  padding: 6px 14px;
+  background: rgba(96, 165, 250, 0.08);
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  border-radius: 4px;
+  color: var(--signal-blue);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.explore-empty button:hover {
+  background: rgba(96, 165, 250, 0.16);
+}
+
+/* ── Tooltip ── */
+.explore-tip {
+  position: absolute;
+  z-index: 5;
+  min-width: 178px;
+  padding: 9px 11px;
+  background: rgba(13, 17, 23, 0.96);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.explore-tip-date {
+  margin-bottom: 6px;
+  font-weight: 600;
+  color: var(--readout-bright);
+}
+
+.explore-tip-pin {
+  float: right;
+  margin-left: 10px;
+  padding: 1px 4px;
+  border: 1px solid rgba(96, 165, 250, 0.4);
+  border-radius: 3px;
+  color: var(--signal-blue);
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  transform: translateY(1px);
+}
+
+.explore-tip-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 1.5px 0;
+  color: var(--label);
+}
+
+.explore-tip-row i {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+}
+
+.explore-tip-row b {
+  margin-left: auto;
+  padding-left: 14px;
+  font-weight: 500;
+  color: var(--readout);
+  font-variant-numeric: tabular-nums;
+}
+
+.explore-tip-row[data-hot] {
+  color: var(--readout-bright);
+}
+
+.explore-tip-row[data-hot] b {
+  color: var(--readout-bright);
+  font-weight: 650;
+}
+
+/* ── Correlation strip ── */
+.explore-corr {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding: 10px 4px 4px;
+  border-top: 1px solid var(--hairline);
+}
+
+.explore-corr-key {
+  margin-right: 4px;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  color: var(--label-faint);
+}
+
+.explore-corr-hint {
+  font-size: 11px;
+  color: var(--label-faint);
+}
+
+.explore-corr-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: var(--slate-input);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  color: var(--label);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+
+.explore-corr-pair:hover {
+  border-color: var(--hairline-strong);
+  color: var(--readout);
+}
+
+.explore-corr-pair i {
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+}
+
+.explore-corr-x {
+  font-size: 9px;
+  color: var(--label-faint);
+}
+
+.explore-corr-r {
+  font-weight: 650;
+  color: var(--meter-green);
+  font-variant-numeric: tabular-nums;
+}
+
+.explore-corr-r[data-neg] {
+  color: var(--meter-red);
+}
+
+.explore-corr-restore {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  background: none;
+  border: 1px dashed var(--hairline-strong);
+  border-radius: 4px;
+  color: var(--label);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.explore-corr-restore:hover {
+  border-color: var(--signal-blue);
+  color: var(--readout-bright);
+}
+
+/* ── Series panel ── */
+.explore-panel {
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 12px 10px;
+}
+
+.explore-group h2 {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 6px 5px;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  color: var(--label-faint);
+  text-transform: uppercase;
+}
+
+.explore-group-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.explore-group-actions button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--label-faint);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+}
+
+.explore-group-actions button:hover {
+  color: var(--readout-bright);
+}
+
+.explore-group-empty {
+  margin: 0 6px;
+  font-size: 11px;
+  color: var(--label-faint);
+}
+
+.explore-series-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--readout);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.explore-series-row:hover {
+  background: var(--fill-ghost);
+}
+
+.explore-series-row:focus-visible {
+  outline: 1px solid var(--signal-blue);
+  outline-offset: -1px;
+}
+
+.explore-swatch {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 2.5px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08) inset;
+  transition: opacity 0.12s ease;
+}
+
+.explore-series-label {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.explore-series-total {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--label);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.explore-series-row[data-on="false"] {
+  color: var(--label-faint);
+}
+
+.explore-series-row[data-on="false"] .explore-swatch {
+  opacity: 0.22;
+}
+
+.explore-series-row[data-on="false"] .explore-series-total {
+  visibility: hidden;
+}
+
+.explore-panel-hint {
+  margin: 0 6px;
+  padding-top: 9px;
+  border-top: 1px solid var(--hairline);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--label-faint);
+}
+
+.explore-panel-hint kbd {
+  padding: 0 3px;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  font: 500 9px "Geist Mono", ui-monospace, monospace;
+  color: var(--label);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .explore-root *,
+  .explore-chart-skeleton {
+    transition: none !important;
+    animation: none !important;
+  }
+}

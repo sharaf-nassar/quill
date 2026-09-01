@@ -21,6 +21,7 @@ import "../styles/manage.css";
 
 // Lazy-load sections so only the active chunk is fetched.
 const SessionsSection = lazy(() => import("./SessionsWindowView"));
+const ExploreSection = lazy(() => import("./ExploreWindowView"));
 const LearningSection = lazy(() => import("./LearningWindow"));
 const SettingsSection = lazy(() => import("./SettingsWindowView"));
 
@@ -44,6 +45,13 @@ const SessionsIcon = () => (
   <svg {...SVG}>
     <circle cx="6" cy="6" r="3.4" />
     <line x1="8.6" y1="8.6" x2="11.6" y2="11.6" />
+  </svg>
+);
+const ExploreIcon = () => (
+  <svg {...SVG}>
+    <path d="M1.5 11.5L5 6.5l2.5 3L12.5 3" />
+    <line x1="1.5" y1="1.5" x2="1.5" y2="12.5" />
+    <line x1="1.5" y1="12.5" x2="12.5" y2="12.5" />
   </svg>
 );
 const LearningIcon = () => (
@@ -80,6 +88,7 @@ const CloseIcon = () => (
 
 export type ManageSection =
   | "sessions"
+  | "explore"
   | "learning"
   | "settings";
 
@@ -95,6 +104,11 @@ const SECTIONS: SectionDef[] = [
     id: "sessions",
     label: "Sessions",
     Icon: SessionsIcon,
+  },
+  {
+    id: "explore",
+    label: "Explore",
+    Icon: ExploreIcon,
   },
   {
     id: "learning",
@@ -368,6 +382,8 @@ function ManageWindowView() {
               />
             ) : active === "sessions" ? (
               <SessionsSection />
+            ) : active === "explore" ? (
+              <ExploreSection />
             ) : active === "learning" ? (
               <LearningSection />
             ) : (

@@ -1,0 +1,770 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Quill — Usage Explorer (mockup)</title>
+<style>
+  /* Real app fonts, loaded relative to mockups/ */
+  @font-face {
+    font-family: "Geist";
+    src: url("../src/assets/fonts/Geist-Variable.woff2") format("woff2");
+    font-weight: 100 900; font-display: swap;
+  }
+  @font-face {
+    font-family: "Geist Mono";
+    src: url("../src/assets/fonts/GeistMono-Variable.woff2") format("woff2");
+    font-weight: 100 900; font-display: swap;
+  }
+
+  /* Tokens lifted from src/styles/index.css (Flat Polish) */
+  :root {
+    --surface: #14181f;
+    --inset: #0f1319;
+    --panel-deep: #0d1117;
+    --line: rgba(255, 255, 255, 0.065);
+    --line-soft: rgba(255, 255, 255, 0.045);
+    --hover: rgba(255, 255, 255, 0.04);
+    --fill-hover: rgba(255, 255, 255, 0.08);
+    --text-hi: #e6edf3;
+    --text: #c9d1d9;
+    --label: #8b949e;
+    --faint: #6e7681;
+    --signal-blue: #60a5fa;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, rgba(96, 165, 250, 0.045), transparent 60%),
+      var(--panel-deep);
+    color: var(--text);
+    font: 13px/1.45 "Geist", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .num { font-family: "Geist Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  button { font: inherit; }
+  button:focus-visible { outline: 1px solid var(--signal-blue); outline-offset: 1px; }
+
+  /* ── Mock of the widget row where the entry button lives ── */
+  .entry-mock {
+    display: flex; align-items: center; gap: 12px;
+    padding: 9px 18px; border-bottom: 1px solid var(--line);
+    background: var(--surface);
+  }
+  .entry-mock .note { color: var(--faint); font-size: 11px; }
+  .entry-arrow { color: var(--signal-blue); font-size: 11px; }
+
+  .seg { display: flex; background: var(--inset); border: 1px solid var(--line); border-radius: 5px; padding: 2px; gap: 2px; }
+  .seg button {
+    background: none; border: none; border-radius: 3px; color: var(--label); cursor: pointer;
+    font-size: 10px; font-weight: 600; letter-spacing: 0.08em; padding: 5px 10px;
+    transition: color 120ms ease, background 120ms ease;
+  }
+  .seg button:hover { color: var(--text); background: var(--hover); }
+  .seg button[aria-pressed="true"] { background: var(--fill-hover); color: var(--text-hi); }
+
+  .explore-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: rgba(96, 165, 250, 0.08); border: 1px solid rgba(96, 165, 250, 0.45);
+    border-radius: 4px; color: var(--signal-blue); cursor: pointer;
+    font-size: 10px; font-weight: 600; letter-spacing: 0.08em; padding: 6px 11px;
+    transition: background 120ms ease;
+  }
+  .explore-btn:hover { background: rgba(96, 165, 250, 0.16); }
+
+  /* ── Explorer page ── */
+  .page { max-width: 1280px; margin: 0 auto; padding: 22px 26px 36px; }
+  header.bar {
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .title-block h1 {
+    font-size: 16px; font-weight: 650; color: var(--text-hi); letter-spacing: 0.01em;
+  }
+  .title-block .sub { color: var(--faint); font-size: 11px; margin-top: 1px; }
+  .controls { margin-left: auto; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  .control { display: flex; align-items: center; gap: 7px; }
+  .control-label { color: var(--faint); font-size: 9px; font-weight: 600; letter-spacing: 0.12em; }
+
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 230px; gap: 14px; align-items: start; }
+  @media (max-width: 940px) { .layout { grid-template-columns: 1fr; } }
+
+  .chart-card {
+    position: relative;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+    padding: 14px 14px 8px; overflow: hidden;
+  }
+  #chart:focus-visible { outline: 1px solid var(--signal-blue); outline-offset: -1px; border-radius: 4px; }
+  .empty-overlay[hidden] { display: none; }
+  .empty-overlay {
+    position: absolute; inset: 46px 14px 44px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 10px; text-align: center;
+  }
+  .empty-overlay p { color: var(--faint); font-size: 12px; }
+  .empty-overlay button {
+    background: rgba(96, 165, 250, 0.08); border: 1px solid rgba(96, 165, 250, 0.45);
+    border-radius: 4px; color: var(--signal-blue); cursor: pointer;
+    font-size: 11px; font-weight: 600; padding: 6px 14px;
+  }
+  .empty-overlay button:hover { background: rgba(96, 165, 250, 0.16); }
+  .chart-head {
+    display: flex; align-items: baseline; gap: 10px; padding: 0 4px 10px;
+  }
+  .chart-head .big { font-size: 20px; font-weight: 650; color: var(--text-hi); }
+  .chart-head .unit { color: var(--faint); font-size: 11px; }
+  .chart-head .delta { font-size: 11px; color: #34d399; }
+  .chart-head .scale-note { margin-left: auto; color: var(--faint); font-size: 10px; }
+  #chart { display: block; width: 100%; height: clamp(380px, 54vh, 560px); cursor: crosshair; }
+
+  /* Series panel */
+  aside.series {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 10px; display: flex; flex-direction: column; gap: 14px;
+    position: sticky; top: 16px;
+  }
+  .group h2 {
+    font-size: 9px; font-weight: 650; letter-spacing: 0.12em; color: var(--faint);
+    text-transform: uppercase; margin: 0 6px 5px;
+    display: flex; align-items: baseline; gap: 8px;
+  }
+  .group h2 .mini {
+    font-weight: 500; letter-spacing: 0; text-transform: none; cursor: pointer;
+    color: var(--faint); border-bottom: 1px dotted transparent;
+  }
+  .group h2 .mini:hover { color: var(--text-hi); }
+  .series-row {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    background: none; border: none; color: var(--text); cursor: pointer;
+    text-align: left; padding: 5px 6px; border-radius: 5px;
+    transition: background 120ms ease, color 120ms ease;
+  }
+  .series-row:hover { background: var(--hover); }
+  .series-row .swatch {
+    width: 9px; height: 9px; border-radius: 2.5px; flex: none;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08) inset;
+    transition: opacity 120ms ease;
+  }
+  .series-row .name { font-size: 12px; }
+  .series-row[data-on="false"] { color: var(--faint); }
+  .series-row[data-on="false"] .swatch { opacity: 0.22; }
+  .series-row .val { margin-left: auto; color: var(--label); font-size: 10.5px; }
+  .series-row[data-on="false"] .val { visibility: hidden; }
+  .panel-hint {
+    margin: 0 6px; color: var(--faint); font-size: 10px; line-height: 1.5;
+    border-top: 1px solid var(--line-soft); padding-top: 9px;
+  }
+  .panel-hint kbd {
+    font: 500 9px "Geist Mono", monospace; color: var(--label);
+    border: 1px solid var(--line); border-radius: 3px; padding: 0 3px;
+  }
+
+  /* Tooltip */
+  #tip {
+    position: fixed; pointer-events: none; display: none; z-index: 10;
+    background: rgba(15, 19, 25, 0.96); border: 1px solid var(--line); border-radius: 6px;
+    padding: 9px 11px; font-size: 11px; min-width: 178px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+  }
+  #tip .date { color: var(--text-hi); font-weight: 600; margin-bottom: 6px; font-size: 11px; }
+  #tip .row { display: flex; align-items: center; gap: 7px; padding: 1.5px 0; color: var(--label); }
+  #tip .row i { width: 7px; height: 7px; border-radius: 2px; flex: none; }
+  #tip .row b { margin-left: auto; font-weight: 500; color: var(--text); padding-left: 14px; }
+  #tip .row[data-hot] { color: var(--text-hi); }
+  #tip .row[data-hot] b { color: var(--text-hi); font-weight: 650; }
+
+  /* Correlation strip */
+  .corr {
+    margin-top: 10px; padding: 10px 4px 4px; border-top: 1px solid var(--line);
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .corr .k { color: var(--faint); font-size: 9px; font-weight: 600; letter-spacing: 0.12em; margin-right: 4px; }
+  .corr .pair {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--label);
+    background: var(--inset); border: 1px solid var(--line-soft); border-radius: 4px;
+    padding: 4px 8px; cursor: pointer; transition: border-color 120ms ease, color 120ms ease;
+  }
+  .corr .pair:hover { border-color: var(--fill-hover); color: var(--text); }
+  .corr .pair i { width: 7px; height: 7px; border-radius: 2px; display: inline-block; }
+  .corr .pair .x { color: var(--faint); font-size: 9px; }
+  .corr .r { font-weight: 650; color: #34d399; }
+  .corr .r[data-neg] { color: #f87171; }
+  .corr .hint { color: var(--faint); font-size: 11px; }
+  .corr .restore {
+    display: inline-flex; align-items: center; gap: 5px; font-size: 11px;
+    background: none; border: 1px dashed var(--fill-hover); border-radius: 4px;
+    color: var(--label); padding: 4px 8px; cursor: pointer;
+  }
+  .corr .restore:hover { color: var(--text-hi); border-color: var(--signal-blue); }
+
+  #tip .pin-badge {
+    float: right; margin-left: 10px; color: var(--signal-blue); font-size: 8px;
+    font-weight: 650; letter-spacing: 0.1em; border: 1px solid rgba(96, 165, 250, 0.4);
+    border-radius: 3px; padding: 1px 4px; transform: translateY(1px);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Entry point mock: where the button would live in the widget -->
+<div class="entry-mock">
+  <span class="note">widget · usage view (existing)</span>
+  <div class="seg" role="group">
+    <button type="button">CLI</button>
+    <button type="button">PROVIDER</button>
+    <button type="button" aria-pressed="true">MODEL</button>
+  </div>
+  <button type="button" class="explore-btn">⤢ EXPLORE</button>
+  <span class="entry-arrow">← new button, opens the page below in its own window</span>
+</div>
+
+<div class="page">
+  <header class="bar">
+    <div class="title-block">
+      <h1>Usage Explorer</h1>
+      <div class="sub">every metric on one graph — toggle, rescale, correlate</div>
+    </div>
+    <div class="controls">
+      <div class="control"><span class="control-label">RANGE</span><div class="seg" id="range-seg" role="group" aria-label="Time range"></div></div>
+      <div class="control"><span class="control-label">SCALE</span><div class="seg" id="scale-seg" role="group" aria-label="Scale mode"></div></div>
+      <div class="control"><span class="control-label">SMOOTH</span><div class="seg" id="smooth-seg" role="group" aria-label="Smoothing"></div></div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <div class="chart-card">
+      <div class="chart-head" id="chart-head" aria-live="polite"></div>
+      <svg id="chart" tabindex="0" aria-label="Usage chart. Use arrow keys to inspect days, Enter to pin, Escape to release."></svg>
+      <div class="empty-overlay" id="empty" hidden>
+        <p>No series selected — pick some on the right, or</p>
+        <button type="button" id="empty-restore">Show all series</button>
+      </div>
+      <div class="corr" id="corr"></div>
+    </div>
+    <aside class="series" id="series-panel"></aside>
+  </div>
+</div>
+
+<div id="tip"></div>
+
+<script>
+"use strict";
+
+/* ── Deterministic fake data, 180 days, intentionally correlated ── */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const DAYS = 180;
+const rnd = mulberry32(42);
+const today = new Date(); today.setHours(0, 0, 0, 0);
+const dates = Array.from({ length: DAYS }, (_, i) => {
+  const d = new Date(today); d.setDate(d.getDate() - (DAYS - 1 - i)); return d;
+});
+// Base "work intensity": weekly rhythm + slow trend + noise. Most series follow it.
+const work = dates.map((d, i) => {
+  const dow = d.getDay();
+  const weekend = dow === 0 || dow === 6 ? 0.35 : 1;
+  const trend = 0.7 + 0.6 * (i / DAYS);
+  const wave = 1 + 0.25 * Math.sin(i / 9);
+  return Math.max(0.05, weekend * trend * wave * (0.7 + 0.6 * rnd()));
+});
+const n = (v) => v.map((x) => Math.max(0, x));
+
+const fmtTokens = (v) => v >= 1e9 ? (v / 1e9).toFixed(2) + "B" : v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : Math.round(v / 1e3) + "K";
+const fmtHours = (v) => v.toFixed(1) + "h";
+const fmtInt = (v) => String(Math.round(v));
+const fmtSigned = (v) => (v > 0 ? "+" : "") + Math.round(v).toLocaleString();
+
+const SERIES = [
+  // Tokens by model — hues echo the widget chart legend
+  { id: "opus",  group: "Tokens by model", label: "Opus",             color: "#fb923c", fmt: fmtTokens, on: true,
+    values: n(work.map((w, i) => w * 9e8 * (0.8 + 0.5 * Math.sin(i / 14) + 0.3 * rnd()))) },
+  { id: "fable", group: "Tokens by model", label: "Fable",            color: "#fbbf24", fmt: fmtTokens, on: true,
+    values: n(work.map((w, i) => w * 5e8 * (i > 110 ? 1.6 : 0.4) * (0.7 + 0.6 * rnd()))) },
+  { id: "sol",   group: "Tokens by model", label: "Sol",              color: "#c084fc", fmt: fmtTokens, on: true,
+    values: n(work.map((w) => w * 2.5e8 * (0.6 + 0.8 * rnd()))) },
+  { id: "terra", group: "Tokens by model", label: "Terra",            color: "#34d399", fmt: fmtTokens, on: true,
+    values: n(work.map((w, i) => w * 1.8e8 * (0.5 + 0.5 * Math.cos(i / 20) + 0.4 * rnd()))) },
+  { id: "pi",    group: "Tokens by model", label: "Pi / unattributed", color: "#f87171", fmt: fmtTokens, on: false,
+    values: n(work.map((w) => w * 6e7 * (0.5 + rnd()))) },
+  // Readout metrics — exact widget hues
+  { id: "runtime",  group: "Metrics", label: "Runtime",   color: "#22d3ee", fmt: fmtHours, on: true,
+    values: n(work.map((w) => w * 7 * (0.85 + 0.3 * rnd()))) },
+  { id: "tokloc",   group: "Metrics", label: "Tok / LOC", color: "#a78bfa", fmt: fmtInt, on: false,
+    values: n(work.map((w, i) => 18000 + 14000 * Math.sin(i / 25) + 8000 * rnd())) },
+  { id: "lochr",    group: "Metrics", label: "LOC / hr",  color: "#f472b6", fmt: fmtInt, on: false,
+    values: n(work.map((w, i) => 900 - 500 * Math.sin(i / 25) + 300 * rnd())) },
+  { id: "sessions", group: "Metrics", label: "Sessions",  color: "#818cf8", fmt: fmtInt, on: true,
+    values: n(work.map((w) => w * 34 * (0.8 + 0.4 * rnd()))) },
+  { id: "projects", group: "Metrics", label: "Projects",  color: "#2dd4bf", fmt: fmtInt, on: false,
+    values: n(work.map((w) => 2 + w * 9 * (0.7 + 0.6 * rnd()))) },
+  { id: "netlines", group: "Metrics", label: "Net lines", color: "#a3e635", fmt: fmtSigned, on: true,
+    values: work.map((w, i) => w * 9000 * (0.6 + 0.8 * rnd()) - (rnd() < 0.08 ? 12000 * rnd() : 0)) },
+];
+
+/* ── State ── */
+const RANGES = [["14", "2W"], ["30", "1M"], ["90", "3M"], ["180", "6M"]];
+const SCALES = [["norm", "Normalized"], ["index", "Indexed"]];
+const SMOOTHS = [["0", "Off"], ["7", "7d avg"]];
+const state = { range: 30, scale: "norm", smooth: 0, pinned: null };
+
+/* Customization survives reopening the page. */
+const LS_KEY = "usage-explorer-mock";
+try {
+  const saved = JSON.parse(localStorage.getItem(LS_KEY) || "null");
+  if (saved) {
+    if ([14, 30, 90, 180].includes(saved.range)) state.range = saved.range;
+    if (["norm", "index"].includes(saved.scale)) state.scale = saved.scale;
+    if ([0, 7].includes(saved.smooth)) state.smooth = saved.smooth;
+    if (Array.isArray(saved.on)) SERIES.forEach((s) => (s.on = saved.on.includes(s.id)));
+  }
+} catch {}
+function persist() {
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify({
+      range: state.range, scale: state.scale, smooth: state.smooth,
+      on: SERIES.filter((s) => s.on).map((s) => s.id),
+    }));
+  } catch {}
+}
+
+function segControl(el, options, get, set) {
+  el.innerHTML = "";
+  for (const [value, label] of options) {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = label;
+    b.setAttribute("aria-pressed", String(get() === value));
+    b.onclick = () => { set(value); render(); };
+    el.appendChild(b);
+  }
+}
+function renderControls() {
+  segControl(document.getElementById("range-seg"), RANGES,
+    () => String(state.range), (v) => { state.range = Number(v); });
+  segControl(document.getElementById("scale-seg"), SCALES,
+    () => state.scale, (v) => { state.scale = v; });
+  segControl(document.getElementById("smooth-seg"), SMOOTHS,
+    () => String(state.smooth), (v) => { state.smooth = Number(v); });
+}
+
+/* ── Series panel ── */
+let prevSet = null; // selection before the last solo, so solo is reversible
+function soloSeries(ids) {
+  const current = SERIES.filter((s) => s.on).map((s) => s.id);
+  if (current.join() !== ids.join()) prevSet = current;
+  for (const s of SERIES) s.on = ids.includes(s.id);
+}
+function restorePrev() {
+  if (!prevSet) return;
+  SERIES.forEach((s) => (s.on = prevSet.includes(s.id)));
+  prevSet = null;
+  render();
+}
+function renderPanel() {
+  const panel = document.getElementById("series-panel");
+  panel.innerHTML = "";
+  const groups = [...new Set(SERIES.map((s) => s.group))];
+  for (const group of groups) {
+    const wrap = document.createElement("div");
+    wrap.className = "group";
+    const h = document.createElement("h2");
+    h.textContent = group + " ";
+    const all = document.createElement("span");
+    all.className = "mini"; all.textContent = "all";
+    all.onclick = () => { SERIES.filter((s) => s.group === group).forEach((s) => (s.on = true)); render(); };
+    const none = document.createElement("span");
+    none.className = "mini"; none.textContent = "none";
+    none.onclick = () => { SERIES.filter((s) => s.group === group).forEach((s) => (s.on = false)); render(); };
+    h.append(all, none);
+    wrap.appendChild(h);
+    for (const s of SERIES.filter((x) => x.group === group)) {
+      const row = document.createElement("button");
+      row.type = "button"; row.className = "series-row"; row.dataset.on = String(s.on);
+      row.setAttribute("aria-pressed", String(s.on));
+      const sw = document.createElement("i"); sw.className = "swatch"; sw.style.background = s.color;
+      const name = document.createElement("span"); name.className = "name"; name.textContent = s.label;
+      const val = document.createElement("span"); val.className = "val num";
+      const slice = s.values.slice(-state.range);
+      const total = slice.reduce((a, b) => a + b, 0);
+      val.textContent = s.fmt === fmtHours ? fmtHours(total) : s.fmt === fmtTokens ? fmtTokens(total) : s.fmt(total);
+      row.append(sw, name, val);
+      row.onclick = (ev) => {
+        if (ev.altKey) soloSeries([s.id]); else s.on = !s.on;
+        render();
+      };
+      row.onmouseenter = () => emphasize(s.id);
+      row.onmouseleave = () => emphasize(null);
+      wrap.appendChild(row);
+    }
+    panel.appendChild(wrap);
+  }
+  const hint = document.createElement("p");
+  hint.className = "panel-hint";
+  hint.innerHTML = "Click to toggle · <kbd>⌥ click</kbd> to solo · click the chart to pin a day · <kbd>Esc</kbd> releases / restores";
+  panel.appendChild(hint);
+}
+
+/* ── Chart math ── */
+function movingAvg(values, w) {
+  if (w <= 1) return values;
+  return values.map((_, i) => {
+    const from = Math.max(0, i - w + 1);
+    const win = values.slice(from, i + 1);
+    return win.reduce((a, b) => a + b, 0) / win.length;
+  });
+}
+// Scale each series to 0..1 for the shared plane.
+function scaled(values, mode) {
+  if (mode === "norm") {
+    const min = Math.min(...values), max = Math.max(...values);
+    const span = max - min || 1;
+    return values.map((v) => (v - min) / span);
+  }
+  // Indexed: 0.5 = series mean; swings shown relative to it.
+  const mean = values.reduce((a, b) => a + b, 0) / values.length || 1;
+  const rel = values.map((v) => v / Math.abs(mean));
+  const max = Math.max(...rel.map(Math.abs), 2);
+  return rel.map((v) => 0.5 + (v - 1) / (2 * max));
+}
+function pearson(a, b) {
+  const len = Math.min(a.length, b.length);
+  const ma = a.reduce((x, y) => x + y, 0) / len, mb = b.reduce((x, y) => x + y, 0) / len;
+  let num = 0, da = 0, db = 0;
+  for (let i = 0; i < len; i++) {
+    num += (a[i] - ma) * (b[i] - mb);
+    da += (a[i] - ma) ** 2; db += (b[i] - mb) ** 2;
+  }
+  const den = Math.sqrt(da * db);
+  return den === 0 ? 0 : num / den;
+}
+// Catmull-Rom → cubic bezier path for smooth modern lines.
+function smoothPath(pts) {
+  if (pts.length < 3) return "M" + pts.map((p) => p.join(",")).join("L");
+  let d = `M${pts[0][0]},${pts[0][1]}`;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+    const c1 = [p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6];
+    const c2 = [p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6];
+    d += `C${c1[0].toFixed(1)},${c1[1].toFixed(1)} ${c2[0].toFixed(1)},${c2[1].toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
+  }
+  return d;
+}
+
+/* ── Chart render ── */
+const svg = document.getElementById("chart");
+const NS = "http://www.w3.org/2000/svg";
+const PAD = { l: 34, r: 74, t: 12, b: 26 };
+let plotted = []; // { series, slice, points, group, hoverDot }
+let crossEl = null;
+let geom = null;
+
+function el(name, attrs) {
+  const node = document.createElementNS(NS, name);
+  for (const k in attrs) node.setAttribute(k, attrs[k]);
+  return node;
+}
+// ids: null (all full), one id, or an array (e.g. a correlation pair preview).
+function emphasize(ids) {
+  const set = ids == null ? null : Array.isArray(ids) ? ids : [ids];
+  for (const p of plotted) {
+    const on = set === null || set.includes(p.series.id);
+    p.group.style.opacity = on ? 1 : 0.18;
+    p.line.setAttribute("stroke-width", set !== null && on ? 2.4 : 1.7);
+  }
+}
+
+function hideHover() {
+  if (crossEl) crossEl.setAttribute("visibility", "hidden");
+  document.getElementById("tip").style.display = "none";
+  emphasize(null);
+  for (const p of plotted) p.hoverDot.setAttribute("visibility", "hidden");
+}
+
+/* Draw crosshair + dots + tooltip at day index i. `mouse` anchors the tooltip
+   to the cursor; without it (keyboard, pin re-render) it anchors to the point. */
+function showAt(i, hot, mouse) {
+  const tip = document.getElementById("tip");
+  const pinned = state.pinned !== null;
+  crossEl.setAttribute("x1", geom.x(i)); crossEl.setAttribute("x2", geom.x(i));
+  crossEl.setAttribute("stroke-dasharray", pinned ? "none" : "3 3");
+  crossEl.setAttribute("stroke", pinned ? "rgba(96,165,250,0.55)" : "rgba(255,255,255,0.22)");
+  crossEl.setAttribute("visibility", "visible");
+  emphasize(hot);
+  for (const p of plotted) {
+    p.hoverDot.setAttribute("cx", p.points[i][0]);
+    p.hoverDot.setAttribute("cy", p.points[i][1]);
+    p.hoverDot.setAttribute("visibility", hot === null || hot === p.series.id ? "visible" : "hidden");
+  }
+  const rect = svg.getBoundingClientRect();
+  const ax = mouse ? mouse.x + 16 : rect.left + geom.x(i) + 16;
+  const ay = mouse ? mouse.y + 16 : rect.top + 34;
+  tip.style.display = "block";
+  tip.style.left = Math.min(window.innerWidth - 210, ax) + "px";
+  tip.style.top = Math.min(window.innerHeight - 24 * plotted.length - 56, ay) + "px";
+  let html = `<div class="date">${geom.sliceDates[i].toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}` +
+    (pinned ? `<span class="pin-badge">PINNED</span>` : "") + `</div>`;
+  const rows = [...plotted].sort((a, b) => a.points[i][1] - b.points[i][1]);
+  for (const p of rows) {
+    html += `<div class="row"${p.series.id === hot ? " data-hot" : ""}><i style="background:${p.series.color}"></i>${p.series.label}<b class="num">${p.series.fmt(p.slice[i])}</b></div>`;
+  }
+  tip.innerHTML = html;
+}
+
+function renderChart() {
+  const W = svg.clientWidth, H = svg.clientHeight;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = "";
+  const iw = W - PAD.l - PAD.r, ih = H - PAD.t - PAD.b;
+  const count = state.range;
+  const sliceDates = dates.slice(-count);
+  const x = (i) => PAD.l + (i / (count - 1)) * iw;
+  const y = (v) => PAD.t + (1 - v) * ih;
+  geom = { x, iw, count, sliceDates };
+
+  const defs = el("defs", {});
+  svg.appendChild(defs);
+
+  // Weekend bands — the weekly rhythm reads at a glance
+  const dayW = iw / (count - 1);
+  for (let i = 0; i < count; i++) {
+    const dow = sliceDates[i].getDay();
+    if (dow !== 6) continue; // start of Sat+Sun block
+    const from = Math.max(PAD.l, x(i) - dayW / 2);
+    const to = Math.min(W - PAD.r, x(Math.min(count - 1, i + 1)) + dayW / 2);
+    svg.appendChild(el("rect", { x: from, y: PAD.t, width: Math.max(0, to - from), height: ih,
+      fill: "rgba(255,255,255,0.018)" }));
+  }
+
+  // Grid: horizontal quarters with faint % labels (normalized) or mean line (indexed)
+  for (const f of [0, 0.25, 0.5, 0.75, 1]) {
+    const mid = state.scale === "index" && f === 0.5;
+    svg.appendChild(el("line", { x1: PAD.l, x2: W - PAD.r, y1: y(f), y2: y(f),
+      stroke: mid ? "rgba(255,255,255,0.14)" : "rgba(255,255,255,0.05)",
+      "stroke-width": 1, "stroke-dasharray": mid ? "2 4" : "none" }));
+    if (state.scale === "norm") {
+      const t = el("text", { x: PAD.l - 7, y: y(f) + 3, fill: "#4b525b",
+        "font-size": 9, "text-anchor": "end", "font-family": "Geist Mono, monospace" });
+      t.textContent = Math.round(f * 100) + "%";
+      svg.appendChild(t);
+    } else if (mid) {
+      const t = el("text", { x: PAD.l - 7, y: y(f) + 3, fill: "#6e7681",
+        "font-size": 9, "text-anchor": "end", "font-family": "Geist Mono, monospace" });
+      t.textContent = "avg";
+      svg.appendChild(t);
+    }
+  }
+  const tickEvery = count > 90 ? 30 : count > 30 ? 14 : count > 14 ? 7 : 2;
+  for (let i = 0; i < count; i++) {
+    if (i % tickEvery !== 0) continue;
+    const t = el("text", { x: x(i), y: H - 8, fill: "#6e7681",
+      "font-size": 10, "text-anchor": "middle", "font-family": "inherit" });
+    t.textContent = sliceDates[i].toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    svg.appendChild(t);
+    svg.appendChild(el("line", { x1: x(i), x2: x(i), y1: PAD.t, y2: H - PAD.b,
+      stroke: "rgba(255,255,255,0.03)", "stroke-width": 1 }));
+  }
+
+  plotted = [];
+  const active = SERIES.filter((s) => s.on);
+  // Fills fade as more series stack, so the midfield stays readable.
+  const fillAlpha = Math.min(0.14, 0.36 / Math.max(1, active.length));
+  for (const s of active) {
+    const slice = movingAvg(s.values.slice(-count), state.smooth);
+    const norm = scaled(slice, state.scale);
+    const pts = norm.map((v, i) => [x(i), y(Math.max(0, Math.min(1, v)))]);
+    const group = el("g", {});
+    group.style.transition = "opacity 140ms ease";
+
+    // Gradient area fill under the line
+    const gradId = `grad-${s.id}`;
+    const grad = el("linearGradient", { id: gradId, x1: 0, y1: 0, x2: 0, y2: 1 });
+    const stop1 = el("stop", { offset: "0%", "stop-color": s.color, "stop-opacity": fillAlpha });
+    const stop2 = el("stop", { offset: "100%", "stop-color": s.color, "stop-opacity": 0 });
+    grad.append(stop1, stop2);
+    defs.appendChild(grad);
+    const lineD = smoothPath(pts);
+    const areaD = `${lineD}L${pts[pts.length - 1][0]},${y(0)}L${pts[0][0]},${y(0)}Z`;
+    group.appendChild(el("path", { d: areaD, fill: `url(#${gradId})`, stroke: "none" }));
+
+    const line = el("path", { d: lineD, fill: "none", stroke: s.color, "stroke-width": 1.7,
+      "stroke-linejoin": "round", "stroke-linecap": "round" });
+    group.appendChild(line);
+
+    const last = pts[pts.length - 1];
+    group.appendChild(el("circle", { cx: last[0], cy: last[1], r: 2.6, fill: s.color }));
+    const hoverDot = el("circle", { r: 3, fill: s.color, stroke: "#0d1117", "stroke-width": 1.5,
+      visibility: "hidden" });
+    group.appendChild(hoverDot);
+
+    svg.appendChild(group);
+    plotted.push({ series: s, slice, points: pts, group, line, hoverDot, lastY: last[1] });
+  }
+
+  // Endpoint value labels at the right edge, nudged apart on collision
+  const labels = plotted
+    .map((p) => ({ p, y: p.lastY }))
+    .sort((a, b) => a.y - b.y);
+  for (let i = 1; i < labels.length; i++) {
+    if (labels[i].y - labels[i - 1].y < 12) labels[i].y = labels[i - 1].y + 12;
+  }
+  for (const entry of labels) {
+    const t = el("text", { x: W - PAD.r + 8, y: entry.y + 3, fill: entry.p.series.color,
+      "font-size": 10, "font-family": "Geist Mono, monospace" });
+    t.textContent = entry.p.series.fmt(entry.p.slice[entry.p.slice.length - 1]);
+    entry.p.group.appendChild(t);
+  }
+
+  // Crosshair + hit layer
+  crossEl = el("line", { y1: PAD.t, y2: H - PAD.b, stroke: "rgba(255,255,255,0.22)",
+    "stroke-width": 1, "stroke-dasharray": "3 3", visibility: "hidden" });
+  svg.appendChild(crossEl);
+  const hit = el("rect", { x: 0, y: 0, width: W, height: H, fill: "transparent" });
+  svg.appendChild(hit);
+
+  const idxFromEvent = (ev) => {
+    const rect = svg.getBoundingClientRect();
+    const px = ev.clientX - rect.left;
+    return Math.max(0, Math.min(count - 1, Math.round(((px - PAD.l) / iw) * (count - 1))));
+  };
+  hit.addEventListener("mousemove", (ev) => {
+    if (state.pinned !== null) return; // pinned: readout is frozen for comparison
+    const i = idxFromEvent(ev);
+    const py = ev.clientY - svg.getBoundingClientRect().top;
+    let hot = null, best = 28;
+    for (const p of plotted) {
+      const d = Math.abs(p.points[i][1] - py);
+      if (d < best) { best = d; hot = p.series.id; }
+    }
+    showAt(i, hot, { x: ev.clientX, y: ev.clientY });
+  });
+  hit.addEventListener("click", (ev) => {
+    const i = idxFromEvent(ev);
+    state.pinned = state.pinned === i ? null : i;
+    if (state.pinned === null) hideHover(); else showAt(i, null);
+  });
+  hit.addEventListener("mouseleave", () => {
+    if (state.pinned === null) hideHover();
+  });
+
+  // Empty state: all series off should invite action, not show a bare grid.
+  document.getElementById("empty").hidden = plotted.length > 0;
+
+  // A pinned day survives re-renders (series toggles, resize); range may shrink it.
+  if (state.pinned !== null) {
+    state.pinned = Math.min(state.pinned, count - 1);
+    if (plotted.length > 0) showAt(state.pinned, null); else { state.pinned = null; hideHover(); }
+  }
+}
+
+/* ── Chart headline ── */
+function renderHead() {
+  const head = document.getElementById("chart-head");
+  const tokenSeries = plotted.filter((p) => p.series.fmt === fmtTokens);
+  const total = tokenSeries.reduce((sum, p) => sum + p.slice.reduce((a, b) => a + b, 0), 0);
+  const scaleNote = state.scale === "norm"
+    ? "each line scaled to its own min–max"
+    : "each line relative to its own average";
+  head.innerHTML =
+    `<span class="big num">${fmtTokens(total)}</span><span class="unit">tokens · ${state.range}d` +
+    ` · ${plotted.length} series</span><span class="scale-note">${scaleNote}</span>`;
+}
+
+/* ── Correlation strip ── */
+function renderCorr() {
+  const box = document.getElementById("corr");
+  const on = plotted;
+  if (on.length < 2) {
+    box.innerHTML = `<span class="k">CORRELATION</span><span class="hint">turn on two or more series to compare</span>`;
+    return;
+  }
+  const pairs = [];
+  for (let a = 0; a < on.length; a++)
+    for (let b = a + 1; b < on.length; b++)
+      pairs.push({ a: on[a].series, b: on[b].series, r: pearson(on[a].slice, on[b].slice) });
+  pairs.sort((p, q) => Math.abs(q.r) - Math.abs(p.r));
+  box.innerHTML = `<span class="k">STRONGEST CORRELATIONS · ${state.range}D</span>`;
+  for (const p of pairs.slice(0, 4)) {
+    const chip = document.createElement("button");
+    chip.type = "button"; chip.className = "pair";
+    chip.title = "Click to view just these two series";
+    chip.innerHTML = `<i style="background:${p.a.color}"></i>${p.a.label}<span class="x">×</span><i style="background:${p.b.color}"></i>${p.b.label} <span class="r num"${p.r < 0 ? " data-neg" : ""}>${p.r.toFixed(2)}</span>`;
+    chip.onclick = () => { soloSeries([p.a.id, p.b.id]); render(); };
+    // Preview the pair on hover/focus before committing to the solo view.
+    chip.onmouseenter = () => emphasize([p.a.id, p.b.id]);
+    chip.onmouseleave = () => emphasize(null);
+    chip.onfocus = chip.onmouseenter;
+    chip.onblur = chip.onmouseleave;
+    box.appendChild(chip);
+  }
+  if (prevSet) {
+    const back = document.createElement("button");
+    back.type = "button"; back.className = "restore";
+    back.innerHTML = "↩ restore selection";
+    back.title = "Bring back the series that were visible before the solo (Esc)";
+    back.onclick = restorePrev;
+    box.appendChild(back);
+  }
+}
+
+function render() {
+  renderControls();
+  renderPanel();
+  renderChart();
+  renderHead();
+  renderCorr();
+  persist();
+}
+window.addEventListener("resize", () => { renderChart(); renderHead(); renderCorr(); });
+
+/* Keyboard: arrows walk days on the focused chart, Enter pins, Esc releases. */
+let keyIndex = null;
+svg.addEventListener("keydown", (ev) => {
+  if (plotted.length === 0) return;
+  const count = geom.count;
+  const step = { ArrowLeft: -1, ArrowRight: 1 }[ev.key];
+  if (step !== undefined) {
+    keyIndex = Math.max(0, Math.min(count - 1, (keyIndex ?? state.pinned ?? count - 1) + step));
+    if (state.pinned !== null) state.pinned = keyIndex;
+    showAt(keyIndex, null);
+    ev.preventDefault();
+  } else if (ev.key === "Home" || ev.key === "End") {
+    keyIndex = ev.key === "Home" ? 0 : count - 1;
+    if (state.pinned !== null) state.pinned = keyIndex;
+    showAt(keyIndex, null);
+    ev.preventDefault();
+  } else if (ev.key === "Enter" || ev.key === " ") {
+    if (keyIndex !== null) {
+      state.pinned = state.pinned === keyIndex ? null : keyIndex;
+      showAt(keyIndex, null);
+    }
+    ev.preventDefault();
+  }
+});
+svg.addEventListener("blur", () => { if (state.pinned === null) hideHover(); });
+
+/* Esc anywhere: first release the pin, then undo the last solo. */
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Escape") return;
+  if (state.pinned !== null) { state.pinned = null; hideHover(); }
+  else if (prevSet) restorePrev();
+});
+
+document.getElementById("empty-restore").onclick = () => {
+  SERIES.forEach((s) => (s.on = true));
+  render();
+};
+
+render();
+</script>
+</body>
+</html>
