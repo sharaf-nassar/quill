@@ -1192,6 +1192,8 @@ Migration and persistence tests protect the source boundary between native and C
 
 Migration 36 must preserve legacy snapshots as direct usage, reopen idempotently, isolate CPA cache reads, and purge CPA rows from raw and hourly storage without deleting native rows.
 
+The legacy fixture row is stamped relative to the test clock, because a production `Storage::init` runs the 30-day usage retention sweep after migrating and a fixed date would eventually age out of that window before the migration was measured.
+
 #### Token Tracking
 
 Tables for recording per-session token consumption and hourly host-level aggregates with provider provenance.

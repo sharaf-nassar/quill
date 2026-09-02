@@ -34204,7 +34204,11 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
 
         // Build a complete v35 fixture by initializing the current schema,
-        // then removing only migration 36's additive surface.
+        // then removing only migration 36's additive surface. The legacy row
+        // is stamped relative to now: `Storage::init` runs the 30-day usage
+        // retention sweep after migrating, so a fixed date would fall out of
+        // the window and vanish before the migration is ever measured.
+        let legacy_timestamp = (Utc::now() - TimeDelta::days(1)).to_rfc3339();
         let storage = init_storage_in(&dir);
         {
             let conn = storage.conn.lock().unwrap();
@@ -34212,13 +34216,15 @@ mod tests {
                 "DELETE FROM schema_version WHERE version >= 36;
                  ALTER TABLE usage_snapshots DROP COLUMN source;
                  ALTER TABLE usage_snapshots DROP COLUMN account_label;
-                 ALTER TABLE usage_snapshots DROP COLUMN account_id;
-                 INSERT INTO usage_snapshots
+                 ALTER TABLE usage_snapshots DROP COLUMN account_id;",
+            )
+            .expect("prepare v35 usage schema");
+            conn.execute(
+                "INSERT INTO usage_snapshots
                      (timestamp, provider, bucket_key, bucket_label,
                       utilization, resets_at)
-                 VALUES
-                     ('2026-08-01T00:00:00Z', 'claude', 'five_hour',
-                      '5 hours', 25.0, NULL);",
+                 VALUES (?1, 'claude', 'five_hour', '5 hours', 25.0, NULL)",
+                params![legacy_timestamp],
             )
             .expect("prepare v35 usage fixture");
         }
