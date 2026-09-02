@@ -383,8 +383,6 @@ const WIDGET_MIN_HEIGHT: f64 = 200.0;
 const LIVE_USAGE_INTERVAL_MIN_SECS: i64 = 60;
 const LIVE_USAGE_INTERVAL_MAX_SECS: i64 = 600;
 
-const TRANSCRIPT_RESCAN_INTERVAL_SECS: u64 = 120;
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct RetainedLiveSourceKey {
     provider: &'static str,
@@ -803,92 +801,6 @@ fn spawn_startup_model_source_reconciliation(app: tauri::AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
         sessions::enqueue_startup_model_source_reconciliation(&app);
     });
-}
-
-/// Periodically rescan retained transcript roots and feed changed sources into
-/// the same live-reconcile queues the notify hook uses.
-///
-/// Live coverage no longer depends solely on the per-session notify hook: a
-/// session created after startup whose hook never fires (e.g. a long-running
-/// orchestrator mid-turn) is still ingested. Each tick enumerates candidates
-/// and enqueues only those whose mtime advanced past the previous tick's
-/// watermark. Both analytics queues retain their own source-key coalescing and
-/// freshness behavior, so occasional over-enqueueing stays cheap.
-fn spawn_transcript_rescan_loop(app: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        // Seed the watermark with startup time so the first tick does not redo
-        // the work the startup full walk already covered.
-        let mut watermark = std::time::SystemTime::now();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(
-                TRANSCRIPT_RESCAN_INTERVAL_SECS,
-            ))
-            .await;
-
-            // Capture the tick start before enumerating so a source modified
-            // during the walk is caught by this tick or the next, never lost.
-            let tick_start = std::time::SystemTime::now();
-            let previous = watermark;
-            let result = tauri::async_runtime::spawn_blocking(move || {
-                let roots = sessions::enumerate_retained_jsonl_source_roots();
-                collect_rescan_changed_sources_from_roots(previous, &roots)
-            })
-            .await;
-            let changed = match result {
-                Ok(changed) => changed,
-                Err(error) => {
-                    log::warn!("Transcript rescan worker failed: {error}");
-                    continue;
-                }
-            };
-            watermark = tick_start;
-
-            if changed.is_empty() {
-                continue;
-            }
-            let mut claude = 0usize;
-            let mut codex = 0usize;
-            let mut pi = 0usize;
-            for source in &changed {
-                match source.provider {
-                    integrations::IntegrationProvider::Claude => claude += 1,
-                    integrations::IntegrationProvider::Codex => codex += 1,
-                    integrations::IntegrationProvider::Pi => pi += 1,
-                    integrations::IntegrationProvider::MiniMax => {}
-                }
-            }
-            for source in changed {
-                if let Err(error) = enqueue_retained_live_source(&app, source) {
-                    log::warn!("Transcript rescan failed to enqueue retained source: {error}");
-                }
-            }
-            log::info!(
-                "Transcript rescan enqueued {} changed sources (claude={claude} codex={codex} pi={pi})",
-                claude + codex + pi,
-            );
-        }
-    });
-}
-
-fn collect_rescan_changed_sources_from_roots(
-    watermark: std::time::SystemTime,
-    roots: &[sessions::ProviderSourceRoot],
-) -> Vec<sessions::DiscoveredRetainedJsonlSource> {
-    let mut changed = Vec::new();
-    for root in roots {
-        for source in &root.sources {
-            let Ok(metadata) = std::fs::metadata(&source.canonical_path) else {
-                continue;
-            };
-            let Ok(modified) = metadata.modified() else {
-                continue;
-            };
-            if modified > watermark {
-                changed.push(source.clone());
-            }
-        }
-    }
-    changed
 }
 
 fn spawn_transcript_analytics_live_queue_drain(
@@ -6063,10 +5975,6 @@ fn finish_setup(app: &tauri::AppHandle, storage: &'static Storage) -> tauri::Res
         log::error!("Could not schedule runtime rollup backfill: {error}");
     }
     transcript_watcher::start(app.clone());
-    // Always-on incremental rescan so live coverage no longer depends
-    // solely on the per-session notify hook. Feeds changed sources into
-    // the same live-reconcile queue; spawned async to never block setup.
-    spawn_transcript_rescan_loop(app.clone());
 
     // Migration 28 starts pending. A prior process can also leave a
     // committed running state behind; reset that run to a fresh
@@ -6781,36 +6689,6 @@ mod tests {
         assert!(!repeated_schedule.model && !repeated_schedule.transcript);
         assert!(state.take_ready(RetainedLiveDomain::Model, 1).is_empty());
         assert_eq!(state.take_ready(RetainedLiveDomain::Transcript, 2).len(), 1);
-    }
-
-    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Recovery]]
-    #[test]
-    fn periodic_rescan_admits_persisted_pi_source() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("session.jsonl");
-        std::fs::write(&path, "{}\n").expect("write changed source");
-        let canonical_path = std::fs::canonicalize(&path).expect("canonical source");
-        let source = sessions::DiscoveredRetainedJsonlSource {
-            provider: integrations::IntegrationProvider::Pi,
-            source_root_key: "pi:sessions",
-            source_key: "pi-source".to_owned(),
-            filesystem_path: path,
-            canonical_path: canonical_path.clone(),
-            layout_hint: sessions::RetainedJsonlSourceLayoutHint::PiTranscript,
-        };
-        let roots = [sessions::ProviderSourceRoot {
-            provider: integrations::IntegrationProvider::Pi,
-            source_root_key: "pi:sessions",
-            resolved_root_path: temp.path().to_path_buf(),
-            canonical_root_path: Some(std::fs::canonicalize(temp.path()).expect("canonical root")),
-            outcome: sessions::ProviderRootEnumerationOutcome::Complete,
-            sources: vec![source.clone()],
-        }];
-
-        assert_eq!(
-            collect_rescan_changed_sources_from_roots(std::time::SystemTime::UNIX_EPOCH, &roots),
-            vec![source]
-        );
     }
 
     // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Live Source Coordinator Test Specs#Independent Domain Retry]]

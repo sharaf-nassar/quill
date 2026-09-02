@@ -48,6 +48,12 @@ The schema-8 rebuild cost is measured on the pinned audit-window corpus rather t
 
 `sessions::tests::measure_session_index_schema_rebuild_on_pinned_corpus` is an ignored measurement that reindexes 14,030 documents — including 655 injected-context documents — through one writer and one commit, and reports wall time. Recorded evidence lives in `specs/030-pi-analytics-migration-measurement.md`.
 
+## Registry Backed Context Lookup
+
+Result context resolves a Pi hit or a Claude sub-agent chain to its exact retained transcript through the analytics source registry, never by walking or parsing the corpus.
+
+`sessions::tests::registry_lookup_resolves_pi_and_subagent_chains_without_walking` registers one Pi source and one Claude sub-agent through live reconciliation, then requires the Pi header id and the agent chain id each to resolve to their own canonical path and an unknown id to resolve to nothing. `sessions::tests::claude_parent_lookup_resolves_by_filename_without_reading_transcripts` pins the one non-registry fallback: a Claude parent resolves by its `<session-id>.jsonl` name, and a sub-agent chain id or a missing id does not.
+
 ## Compact AI Results
 
 Compact search responses return snippet and identity fields — including the nullable `session_name` — without full content, stopping before the serialized response exceeds 32 KiB.

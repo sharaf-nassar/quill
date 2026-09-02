@@ -83,12 +83,6 @@ pub(crate) enum RetainedNotifySourceValidationError {
     Unavailable(&'static str),
 }
 
-#[derive(Default)]
-struct TranscriptCandidateCollection {
-    candidates: Vec<DiscoveredSessionFile>,
-    search_error: Option<String>,
-}
-
 /// Validate one notified path without walking either provider transcript tree.
 ///
 /// Claude and Codex source identity comes only from the configured provider
@@ -456,7 +450,7 @@ fn enumerate_provider_source_root(
         &Path,
         IntegrationProvider,
         &mut Option<String>,
-    ) -> TranscriptCandidateCollection,
+    ) -> Vec<DiscoveredSessionFile>,
 ) -> ProviderSourceRoot {
     let mut diagnostic = None;
 
@@ -550,7 +544,7 @@ fn enumerate_provider_source_root(
         }
     };
 
-    let candidates = collect_candidates(&resolved_root_path, provider, &mut diagnostic).candidates;
+    let candidates = collect_candidates(&resolved_root_path, provider, &mut diagnostic);
     let pi_hostname = (provider == IntegrationProvider::Pi).then(SessionIndex::local_hostname);
     let mut sources = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -667,14 +661,10 @@ fn collect_claude_jsonl_candidates(
     projects_dir: &Path,
     provider: IntegrationProvider,
     diagnostic: &mut Option<String>,
-) -> TranscriptCandidateCollection {
-    let mut collection = TranscriptCandidateCollection::default();
-    let project_entries = match read_directory_entries(projects_dir, provider, diagnostic) {
-        Ok(entries) => entries,
-        Err(error) => {
-            collection.search_error = Some(format!("Read projects dir: {error}"));
-            return collection;
-        }
+) -> Vec<DiscoveredSessionFile> {
+    let mut candidates = Vec::new();
+    let Ok(project_entries) = read_directory_entries(projects_dir, provider, diagnostic) else {
+        return candidates;
     };
 
     for project_entry in project_entries {
@@ -682,19 +672,8 @@ fn collect_claude_jsonl_candidates(
         if !path_is_directory(&project_dir, provider, diagnostic, true) {
             continue;
         }
-        let project_dir_name = project_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("unknown");
-        let default_project = SessionIndex::project_display_name(project_dir_name);
-        let project_entries = match read_directory_entries(&project_dir, provider, diagnostic) {
-            Ok(entries) => entries,
-            Err(error) => {
-                collection
-                    .search_error
-                    .get_or_insert_with(|| format!("Read project dir: {error}"));
-                continue;
-            }
+        let Ok(project_entries) = read_directory_entries(&project_dir, provider, diagnostic) else {
+            continue;
         };
 
         for entry in project_entries {
@@ -704,10 +683,8 @@ fn collect_claude_jsonl_candidates(
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
             {
-                collection.candidates.push(DiscoveredSessionFile {
-                    provider,
+                candidates.push(DiscoveredSessionFile {
                     path: path.clone(),
-                    default_project: default_project.clone(),
                     is_subagent: false,
                 });
             }
@@ -738,10 +715,8 @@ fn collect_claude_jsonl_candidates(
                     if path_is_directory(&subagent_path, provider, diagnostic, true) {
                         stack.push(subagent_path);
                     } else if is_claude_subagent_transcript(&subagent_path) {
-                        collection.candidates.push(DiscoveredSessionFile {
-                            provider,
+                        candidates.push(DiscoveredSessionFile {
                             path: subagent_path,
-                            default_project: default_project.clone(),
                             is_subagent: true,
                         });
                     }
@@ -750,15 +725,15 @@ fn collect_claude_jsonl_candidates(
         }
     }
 
-    collection
+    candidates
 }
 
 fn collect_codex_jsonl_candidates(
     sessions_dir: &Path,
     provider: IntegrationProvider,
     diagnostic: &mut Option<String>,
-) -> TranscriptCandidateCollection {
-    let mut collection = TranscriptCandidateCollection::default();
+) -> Vec<DiscoveredSessionFile> {
+    let mut candidates = Vec::new();
 
     for entry in walkdir::WalkDir::new(sessions_dir)
         .sort_by_file_name()
@@ -783,23 +758,21 @@ fn collect_codex_jsonl_candidates(
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
         {
-            collection.candidates.push(DiscoveredSessionFile {
-                provider,
+            candidates.push(DiscoveredSessionFile {
                 path: entry.into_path(),
-                default_project: "unknown".to_string(),
                 is_subagent: false,
             });
         }
     }
 
-    collection
+    candidates
 }
 
 fn collect_pi_jsonl_candidates(
     sessions_dir: &Path,
     provider: IntegrationProvider,
     diagnostic: &mut Option<String>,
-) -> TranscriptCandidateCollection {
+) -> Vec<DiscoveredSessionFile> {
     collect_codex_jsonl_candidates(sessions_dir, provider, diagnostic)
 }
 
@@ -815,7 +788,6 @@ pub(crate) fn discover_claude_transcripts_in(projects_dir: &Path) -> Vec<(PathBu
     }
     let mut diagnostic = None;
     collect_claude_jsonl_candidates(projects_dir, IntegrationProvider::Claude, &mut diagnostic)
-        .candidates
         .into_iter()
         .map(|candidate| (candidate.path, candidate.is_subagent))
         .collect()
@@ -831,7 +803,6 @@ pub(crate) fn discover_codex_transcripts_in(sessions_dir: &Path) -> Vec<PathBuf>
     }
     let mut diagnostic = None;
     collect_codex_jsonl_candidates(sessions_dir, IntegrationProvider::Codex, &mut diagnostic)
-        .candidates
         .into_iter()
         .map(|candidate| candidate.path)
         .collect()
@@ -848,7 +819,6 @@ pub(crate) fn discover_pi_transcripts_in(sessions_dir: &Path) -> Vec<PathBuf> {
     }
     let mut diagnostic = None;
     collect_pi_jsonl_candidates(sessions_dir, IntegrationProvider::Pi, &mut diagnostic)
-        .candidates
         .into_iter()
         .map(|candidate| candidate.path)
         .collect()
@@ -1091,33 +1061,31 @@ pub struct SessionSchema {
 }
 
 // ---------------------------------------------------------------------------
-// Index state -- tracks which files have been indexed and their fingerprints
+// Index state -- tracks which sources have been indexed and their fingerprints
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum SessionFileFingerprint {
-    Current { mtime_ns: i64, size_bytes: i64 },
-    LegacySeconds(u64),
+/// What the sweep remembers about one indexed source.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct IndexedSource {
+    /// Nanosecond mtime and size at the time of the last extraction.
+    #[serde(flatten)]
+    pub(crate) fingerprint: ModelSourceFastFingerprint,
+    /// Provider-native session id the last extraction produced; empty when
+    /// identity never resolved, in which case there is nothing to prune.
+    pub(crate) session_id: String,
 }
 
-impl From<ModelSourceFastFingerprint> for SessionFileFingerprint {
-    fn from(value: ModelSourceFastFingerprint) -> Self {
-        Self::Current {
-            mtime_ns: value.mtime_ns(),
-            size_bytes: value.size_bytes(),
-        }
-    }
-}
-
+/// Persisted beside the Tantivy segments as `index_state.json`.
+///
+/// Keyed by canonical retained source key, the same identity analytics and
+/// the live coordinator use, so a provider is recoverable from the key prefix
+/// and a moved or re-mounted root does not orphan every entry. The index
+/// directory is rebuilt whenever `SCHEMA_VERSION` moves, so this shape never
+/// needs to read an older layout.
 #[derive(Serialize, Deserialize, Default)]
 pub struct IndexState {
-    /// Map of JSONL file path -> nanosecond mtime and file size.
-    /// Legacy numeric mtimes deserialize but never match a current fingerprint.
-    pub file_mtimes: HashMap<String, SessionFileFingerprint>,
-    /// Provider-native session id last extracted from each indexed file.
     #[serde(default)]
-    file_session_ids: HashMap<String, String>,
+    pub(crate) sources: HashMap<String, IndexedSource>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,7 +1102,7 @@ pub struct SessionIndex {
 }
 
 impl SessionIndex {
-    const SCHEMA_VERSION: u32 = 8;
+    const SCHEMA_VERSION: u32 = 9;
     const PRODUCTION_WRITER_HEAP_BYTES: usize = 50_000_000;
     #[cfg(test)]
     const TEST_WRITER_HEAP_BYTES: usize = 15_000_000;
@@ -1523,154 +1491,78 @@ impl SessionIndex {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    /// Test-friendly variant: enumerate Claude transcripts (parent + sub-agent)
-    /// under the supplied `projects_dir`. Two explicit passes per project:
-    /// first picks up `<projectSlug>/*.jsonl` (parents), second recurses the
-    /// whole `<projectSlug>/<session-uuid>/subagents/` subtree for every
-    /// `agent-*.jsonl` at any depth — both flat `subagents/agent-*.jsonl` and
-    /// Workflow-nested `subagents/workflows/wf_<id>/agent-*.jsonl`. We avoid
-    /// walkdir and stay bounded to that subtree so unrelated JSONLs nested
-    /// elsewhere never sneak in.
-    fn discover_claude_session_files_in(
-        projects_dir: &Path,
-    ) -> Result<Vec<DiscoveredSessionFile>, String> {
-        if !projects_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut diagnostic = None;
-        let collection = collect_claude_jsonl_candidates(
-            projects_dir,
-            IntegrationProvider::Claude,
-            &mut diagnostic,
-        );
-        collection
-            .search_error
-            .map_or_else(|| Ok(collection.candidates), Err)
-    }
-
-    fn discover_codex_session_files_in(
-        sessions_dir: &Path,
-    ) -> Result<Vec<DiscoveredSessionFile>, String> {
-        if !sessions_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut diagnostic = None;
-        Ok(collect_codex_jsonl_candidates(
-            sessions_dir,
-            IntegrationProvider::Codex,
-            &mut diagnostic,
-        )
-        .candidates)
-    }
-
-    /// Scan retained Claude, Codex, and Pi JSONL files and index changes.
-    /// Returns the number of newly indexed messages.
-    pub fn startup_scan(
-        &self,
-        app_handle: &tauri::AppHandle,
-        storage: Option<&crate::storage::Storage>,
-    ) -> Result<usize, String> {
+    /// Sync the index with every retained Claude, Codex, and Pi transcript.
+    ///
+    /// Runs on every watcher pass and on the `sync_search_index` command, not
+    /// only at startup. Returns the number of newly indexed messages.
+    pub fn sync(&self, app_handle: &tauri::AppHandle) -> Result<usize, String> {
         let roots = enumerate_retained_jsonl_source_roots();
-        self.startup_scan_with_roots(app_handle, storage, &roots)
+        self.sync_with_roots(app_handle, &roots)
     }
 
-    pub(crate) fn startup_scan_with_roots(
+    pub(crate) fn sync_with_roots(
         &self,
         app_handle: &tauri::AppHandle,
-        storage: Option<&crate::storage::Storage>,
         roots: &[ProviderSourceRoot],
     ) -> Result<usize, String> {
         use tauri::Emitter;
 
-        let total_indexed = self.startup_scan_inner(storage, roots)?;
+        let total_indexed = self.sync_inner(roots)?;
         let _ = app_handle.emit("sessions-index-updated", total_indexed);
         Ok(total_indexed)
     }
 
     #[cfg(test)]
-    pub(crate) fn startup_scan_without_emit(
-        &self,
-        storage: Option<&crate::storage::Storage>,
-    ) -> Result<usize, String> {
+    pub(crate) fn sync_without_emit(&self) -> Result<usize, String> {
         let roots = enumerate_retained_jsonl_source_roots();
-        self.startup_scan_inner(storage, &roots)
+        self.sync_inner(&roots)
     }
 
-    fn startup_scan_inner(
-        &self,
-        storage: Option<&crate::storage::Storage>,
-        roots: &[ProviderSourceRoot],
-    ) -> Result<usize, String> {
+    /// One pass over the retained inventory: prune documents of sources that
+    /// vanished from a completely enumerated root, then re-extract every
+    /// source whose mtime or size moved since it was last indexed.
+    ///
+    /// Derived analytics rows are owned by retained reconciliation, so this
+    /// sweep never consults migration re-ingest markers: a schema bump on the
+    /// index directory is the one way to force a full re-extract.
+    // @lat: [[data-flow#Session Indexing Pipeline]]
+    fn sync_inner(&self, roots: &[ProviderSourceRoot]) -> Result<usize, String> {
         let mut total_indexed = 0usize;
         let mut index_changed = false;
         let mut state = self.state.lock().unwrap();
         let hostname = Self::local_hostname();
         let mut writer = self.writer.lock().unwrap();
-        let discovered_paths = roots
+        let discovered_keys = roots
             .iter()
             .flat_map(|root| &root.sources)
-            .map(|source| source.filesystem_path.to_string_lossy().into_owned())
+            .map(|source| source.source_key.as_str())
             .collect::<HashSet<_>>();
+        let complete_roots = roots
+            .iter()
+            .filter(|root| matches!(root.outcome, ProviderRootEnumerationOutcome::Complete))
+            .map(|root| (root.provider, root.source_root_key))
+            .collect::<Vec<_>>();
 
-        for file_key in state.file_mtimes.keys().cloned().collect::<Vec<_>>() {
-            if discovered_paths.contains(&file_key) {
-                continue;
-            }
-
-            let tracked_path = Path::new(&file_key);
-            let Some((provider, layout_hint)) = roots.iter().find_map(|root| {
-                if !matches!(root.outcome, ProviderRootEnumerationOutcome::Complete) {
-                    return None;
-                }
-                let layout_hint = retained_jsonl_source_layout_hint(
-                    root.provider,
-                    &root.resolved_root_path,
-                    tracked_path,
-                )
-                .or_else(|| {
-                    root.canonical_root_path
-                        .as_deref()
-                        .and_then(|canonical_root| {
-                            retained_jsonl_source_layout_hint(
-                                root.provider,
-                                canonical_root,
-                                tracked_path,
-                            )
-                        })
-                })?;
-                Some((root.provider, layout_hint))
-            }) else {
-                continue;
-            };
-
-            let session_id =
-                state
-                    .file_session_ids
-                    .get(&file_key)
-                    .cloned()
-                    .or_else(|| match layout_hint {
-                        RetainedJsonlSourceLayoutHint::ClaudeParent { .. } => {
-                            claude_root_session_id(tracked_path, false)
-                        }
-                        RetainedJsonlSourceLayoutHint::ClaudeSubagent { .. } => {
-                            claude_root_session_id(tracked_path, true)
-                        }
-                        RetainedJsonlSourceLayoutHint::CodexTranscript => {
-                            codex_thread_id(tracked_path)
-                        }
-                        RetainedJsonlSourceLayoutHint::PiTranscript => tracked_path
-                            .file_stem()
-                            .and_then(|stem| stem.to_str())
-                            .map(str::to_owned),
-                    });
-            let Some(session_id) = session_id else {
-                continue;
-            };
-
+        // A source key names its provider through the root-key prefix, so a
+        // tracked entry outside the discovered set can be attributed to the
+        // root whose enumeration proved it absent.
+        let vanished = state
+            .sources
+            .iter()
+            .filter(|(source_key, _)| !discovered_keys.contains(String::as_str(source_key)))
+            .filter_map(|(source_key, indexed)| {
+                complete_roots
+                    .iter()
+                    .find(|(_, root_key)| source_key.starts_with(root_key))
+                    .map(|(provider, _)| {
+                        (source_key.clone(), *provider, indexed.session_id.clone())
+                    })
+            })
+            .collect::<Vec<_>>();
+        for (source_key, provider, session_id) in vanished {
             match self.delete_session_docs_with_writer(&writer, provider, &session_id) {
                 Ok(()) => {
-                    state.file_mtimes.remove(&file_key);
-                    state.file_session_ids.remove(&file_key);
+                    state.sources.remove(&source_key);
                     index_changed = true;
                 }
                 Err(error) => {
@@ -1679,272 +1571,102 @@ impl SessionIndex {
             }
         }
 
-        // Migration 20 backfill hook: when storage signals a pending sub-agent
-        // re-ingest, drop the mtime cache so every transcript is re-extracted
-        // in this boot. The migration already truncated response_times /
-        // tool_actions; this re-scan repopulates them with the new
-        // is_sidechain / agent_id / parent_uuid columns set. The pending flag
-        // is cleared only after every file succeeds and the writer commits;
-        // logged per-file failures leave it set so the next boot retries.
-        let subagent_reingest_pending = storage
-            .and_then(|s| s.get_setting("subagent_reingest_pending").ok().flatten())
-            .is_some();
-        let skill_usage_reingest_pending = storage
-            .and_then(|s| s.get_setting("skill_usage_reingest_pending").ok().flatten())
-            .is_some();
-        // Feature 008: migration 26 sets `runtime_event_reingest_pending`
-        // so the next mtime sweep reprocesses every transcript and populates
-        // `session_events`. Same shape as the migration-20 / 21 handlers.
-        let runtime_event_reingest_pending = storage
-            .and_then(|s| {
-                s.get_setting("runtime_event_reingest_pending")
-                    .ok()
-                    .flatten()
-            })
-            .is_some();
-        // Feature 009: migration 27 sets `hook_invocation_reingest_pending`
-        // so the next mtime sweep re-extracts hook fires from every
-        // Claude transcript and populates `hook_invocations`. Codex has
-        // no historical hook data to backfill — its rows arrive live
-        // via `POST /api/v1/hooks/observed` — so the sweep is a no-op
-        // for Codex even when the flag is set.
-        let hook_invocation_reingest_pending = storage
-            .and_then(|s| {
-                s.get_setting("hook_invocation_reingest_pending")
-                    .ok()
-                    .flatten()
-            })
-            .is_some();
-        let codex_agent_identity_reingest_pending = storage
-            .and_then(|s| {
-                s.get_setting("codex_agent_identity_reingest_pending")
-                    .ok()
-                    .flatten()
-            })
-            .is_some();
-        let codex_reingest_started =
-            codex_agent_identity_reingest_pending.then(std::time::Instant::now);
-        let codex_inventory_complete = roots
-            .iter()
-            .filter(|root| root.provider == IntegrationProvider::Codex)
-            .all(|root| matches!(root.outcome, ProviderRootEnumerationOutcome::Complete));
-        let codex_reingest_files = roots
-            .iter()
-            .flat_map(|root| &root.sources)
-            .filter(|source| source.provider == IntegrationProvider::Codex)
-            .count();
-        let force_reingest = subagent_reingest_pending
-            || skill_usage_reingest_pending
-            || runtime_event_reingest_pending
-            || hook_invocation_reingest_pending;
-        if force_reingest {
-            log::info!(
-                "Session derived-data migration: clearing mtime cache to force full transcript re-ingest"
-            );
-            state.file_mtimes.clear();
-        } else if codex_agent_identity_reingest_pending {
-            for source in roots
-                .iter()
-                .flat_map(|root| &root.sources)
-                .filter(|source| source.provider == IntegrationProvider::Codex)
-            {
-                state
-                    .file_mtimes
-                    .remove(&source.filesystem_path.to_string_lossy().into_owned());
-            }
-            log::info!(
-                "Codex identity migration: invalidated {codex_reingest_files} transcript mtimes"
-            );
-        }
-
-        let discovered_files = roots.iter().flat_map(|root| &root.sources).map(|source| {
-            let (default_project, is_subagent) = match &source.layout_hint {
-                RetainedJsonlSourceLayoutHint::ClaudeParent { default_project } => {
-                    (default_project.clone(), false)
-                }
-                RetainedJsonlSourceLayoutHint::ClaudeSubagent { default_project } => {
-                    (default_project.clone(), true)
-                }
-                RetainedJsonlSourceLayoutHint::CodexTranscript => ("unknown".to_string(), false),
-                RetainedJsonlSourceLayoutHint::PiTranscript => ("unknown".to_string(), false),
-            };
-            DiscoveredSessionFile {
-                provider: source.provider,
-                path: source.filesystem_path.clone(),
-                default_project,
-                is_subagent,
-            }
-        });
-
-        let mut reingest_failures = 0usize;
-        let mut codex_reingest_failures = 0usize;
-        for discovered in discovered_files {
-            let file_key = discovered.path.to_string_lossy().to_string();
-            let fingerprint = match std::fs::metadata(&discovered.path)
+        for source in roots.iter().flat_map(|root| &root.sources) {
+            let fingerprint = match std::fs::metadata(&source.filesystem_path)
                 .map_err(crate::transcript_identity::StableTranscriptReadError::Read)
                 .and_then(|metadata| model_source_fast_fingerprint(&metadata))
             {
-                Ok(fingerprint) => Some(SessionFileFingerprint::from(fingerprint)),
+                Ok(fingerprint) => Some(fingerprint),
                 Err(error) => {
                     log::warn!(
                         "Failed to fingerprint session transcript {}: {error}",
-                        discovered.path.display()
+                        source.filesystem_path.display()
                     );
                     None
                 }
             };
-
-            if fingerprint
-                .as_ref()
-                .is_some_and(|fingerprint| state.file_mtimes.get(&file_key) == Some(fingerprint))
-            {
+            if fingerprint.is_some_and(|fingerprint| {
+                state
+                    .sources
+                    .get(&source.source_key)
+                    .is_some_and(|indexed| indexed.fingerprint == fingerprint)
+            }) {
                 continue;
             }
 
-            let extracted = extract_messages_from_jsonl(discovered.provider, &discovered.path);
-            // A terminal failure (identity unresolvable, malformed record) is
-            // deterministic for this file's current content -- retrying
-            // cannot succeed, so it must not count toward the re-ingest
-            // tally below or the flag it gates would stay set forever. Its
-            // fingerprint is still cached below like any other attempted
-            // file, so it is skipped on every later sweep unless its content
-            // changes -- counted as permanently skipped, not pending.
-            let terminal_failure = extracted.terminal_failure;
-            let mut file_failed = !extracted.extraction_succeeded || fingerprint.is_none();
+            let default_project = match &source.layout_hint {
+                RetainedJsonlSourceLayoutHint::ClaudeParent { default_project }
+                | RetainedJsonlSourceLayoutHint::ClaudeSubagent { default_project } => {
+                    default_project.as_str()
+                }
+                RetainedJsonlSourceLayoutHint::CodexTranscript
+                | RetainedJsonlSourceLayoutHint::PiTranscript => "unknown",
+            };
+            let extracted = extract_messages_from_jsonl(source.provider, &source.filesystem_path);
             let project_name = extracted
                 .project_name
-                .clone()
+                .as_deref()
                 .filter(|project| !project.is_empty())
-                .unwrap_or_else(|| discovered.default_project.clone());
+                .unwrap_or(default_project);
 
             // Always delete-then-reinsert per session, even on first sight of a
             // file. Hook-driven /sessions/notify may have already indexed this
-            // session before the mtime sweep first sees the file; gating delete
-            // on known_mtime would let those docs stack up on top of fresh
+            // session before the sweep first sees the file; gating delete on a
+            // known fingerprint would let those docs stack up on top of fresh
             // inserts. delete_query is a no-op when no docs match, so this is
             // safe for genuinely new files.
             if !extracted.session_id.is_empty() {
-                if let Err(e) = self.delete_session_docs_with_writer(
+                match self.delete_session_docs_with_writer(
                     &writer,
-                    discovered.provider,
+                    source.provider,
                     &extracted.session_id,
                 ) {
-                    log::warn!("Failed to delete old session docs: {e}");
-                    file_failed = true;
-                } else {
-                    index_changed = true;
+                    Ok(()) => index_changed = true,
+                    Err(e) => log::warn!("Failed to delete old session docs: {e}"),
                 }
             }
 
             for msg in &extracted.messages {
-                if let Err(e) = self.add_message_to_writer(
+                match self.add_message_to_writer(
                     &writer,
-                    discovered.provider,
+                    source.provider,
                     msg,
-                    &project_name,
+                    project_name,
                     &hostname,
                 ) {
-                    log::warn!("Failed to index message: {e}");
-                    file_failed = true;
-                } else {
-                    index_changed = true;
+                    Ok(()) => index_changed = true,
+                    Err(e) => log::warn!("Failed to index message: {e}"),
                 }
             }
 
             total_indexed += extracted.messages.len();
-            if !extracted.session_id.is_empty() {
-                state
-                    .file_session_ids
-                    .insert(file_key.clone(), extracted.session_id);
-            }
+            // A source whose identity never resolved has no documents to prune
+            // later, so it is remembered by fingerprint alone and retried only
+            // when its bytes change.
             if let Some(fingerprint) = fingerprint {
-                state.file_mtimes.insert(file_key, fingerprint);
-            }
-            if force_reingest && file_failed && !terminal_failure {
-                reingest_failures += 1;
-            }
-            if codex_agent_identity_reingest_pending
-                && discovered.provider == IntegrationProvider::Codex
-                && file_failed
-                && !terminal_failure
-            {
-                codex_reingest_failures += 1;
+                state.sources.insert(
+                    source.source_key.clone(),
+                    IndexedSource {
+                        fingerprint,
+                        session_id: extracted.session_id,
+                    },
+                );
             }
         }
 
-        // Commit all changes
         if index_changed {
             writer.commit().map_err(|e| format!("Commit index: {e}"))?;
         }
-        if reingest_failures > 0 {
-            log::warn!(
-                "Session derived-data migration: retaining re-ingest flags after {reingest_failures} transcript failures"
-            );
-        }
-
-        // The writer committed without a per-file failure — safe to clear the
-        // migration-20 backfill flag. Otherwise it stays set for the next scan.
-        if subagent_reingest_pending
-            && reingest_failures == 0
-            && let Some(storage) = storage
-            && let Err(e) = storage.delete_setting("subagent_reingest_pending")
-        {
-            log::warn!("Failed to clear subagent_reingest_pending flag: {e}");
-        }
-        if skill_usage_reingest_pending
-            && reingest_failures == 0
-            && let Some(storage) = storage
-            && let Err(e) = storage.delete_setting("skill_usage_reingest_pending")
-        {
-            log::warn!("Failed to clear skill_usage_reingest_pending flag: {e}");
-        }
-        // Feature 008: clear the migration-26 backfill flag once the
-        // sweep and writer commit complete without per-file failures.
-        // @lat: [[data-flow#Session Indexing Pipeline]]
-        if runtime_event_reingest_pending
-            && reingest_failures == 0
-            && let Some(storage) = storage
-            && let Err(e) = storage.delete_setting("runtime_event_reingest_pending")
-        {
-            log::warn!("Failed to clear runtime_event_reingest_pending flag: {e}");
-        }
-        // Feature 009: clear the migration-27 backfill flag once the
-        // sweep and writer commit complete without per-file failures (same
-        // semantics as the feature 008 flag above).
-        // @lat: [[backend#Database#Schema#Hook Invocations]]
-        if hook_invocation_reingest_pending
-            && reingest_failures == 0
-            && let Some(storage) = storage
-            && let Err(e) = storage.delete_setting("hook_invocation_reingest_pending")
-        {
-            log::warn!("Failed to clear hook_invocation_reingest_pending flag: {e}");
-        }
-        if codex_agent_identity_reingest_pending
-            && codex_inventory_complete
-            && codex_reingest_failures == 0
-            && let Some(storage) = storage
-            && let Err(e) = storage.delete_setting("codex_agent_identity_reingest_pending")
-        {
-            log::warn!("Failed to clear codex_agent_identity_reingest_pending flag: {e}");
-        }
-        if let Some(started) = codex_reingest_started {
-            log::info!(
-                "Codex identity re-ingest sweep: files={codex_reingest_files} failures={codex_reingest_failures} inventory_complete={codex_inventory_complete} duration_ms={}",
-                started.elapsed().as_millis(),
-            );
-        }
 
         drop(writer);
-
         // Must drop state lock before save_state which acquires it
         drop(state);
 
         self.save_state()?;
 
-        log::info!("Session index scan complete: {total_indexed} messages indexed");
+        log::info!("Session index sync complete: {total_indexed} messages indexed");
         Ok(total_indexed)
     }
-
     // -------------------------------------------------------------------
     // Search
     // -------------------------------------------------------------------
@@ -2517,9 +2239,7 @@ pub struct SessionContext {
 
 #[derive(Debug)]
 struct DiscoveredSessionFile {
-    provider: IntegrationProvider,
     path: PathBuf,
-    default_project: String,
     /// True when this file lives under `<session>/subagents/agent-*.jsonl`.
     /// Hints the extractor to expect every record to carry isSidechain=true
     /// and lets the indexer treat sub-agent rows as part of the parent
@@ -2629,18 +2349,11 @@ pub struct ExtractedMessage {
 }
 
 pub struct ExtractedSession {
+    /// Provider-native session id; empty when identity could not be resolved
+    /// from the file, in which case `messages` is empty too.
     pub session_id: String,
     pub project_name: Option<String>,
     pub messages: Vec<ExtractedMessage>,
-    extraction_succeeded: bool,
-    /// Set only when `extraction_succeeded` is false and the failure is
-    /// deterministic for this file's current content -- provider identity
-    /// unresolvable, or a malformed/unsupported record -- rather than
-    /// environmental (I/O error, partial write, locked file). The mtime
-    /// sweep must not let a terminal failure hold re-ingest flags set
-    /// forever; a retryable failure must keep the flag set so the file is
-    /// retried on the next sweep.
-    terminal_failure: bool,
     /// Per-event timeline emitted alongside [`messages`] for the active-
     /// interval runtime pipeline (feature 008). Populated by
     /// [`extract_claude_messages_from_jsonl`] and
@@ -3864,15 +3577,10 @@ fn extract_pi_messages(
 ) -> ExtractedSession {
     match parsed {
         Ok(Some(session)) => extract_pi_session(path, session),
-        Ok(None) => unsupported_extracted_session(path, false),
+        Ok(None) => unsupported_extracted_session(),
         Err(error) => {
             log::warn!("Failed to parse Pi JSONL {}: {error}", path.display());
-            // A read failure may resolve on retry; an unsupported version or
-            // a malformed quill-tracking entry is deterministic for this
-            // content and must not hold re-ingest flags set forever.
-            let terminal_failure =
-                !matches!(error, crate::pi_session::PiSessionParseError::Read { .. });
-            unsupported_extracted_session(path, terminal_failure)
+            unsupported_extracted_session()
         }
     }
 }
@@ -4143,8 +3851,6 @@ pub(crate) fn extract_pi_session(
         session_id,
         project_name,
         messages,
-        extraction_succeeded: true,
-        terminal_failure: false,
         events,
         hook_invocations: Vec::new(),
     }
@@ -4293,17 +3999,11 @@ fn pi_message_text(content: &serde_json::Value) -> String {
     }
 }
 
-fn unsupported_extracted_session(path: &Path, terminal_failure: bool) -> ExtractedSession {
+fn unsupported_extracted_session() -> ExtractedSession {
     ExtractedSession {
-        session_id: path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or_default()
-            .to_string(),
+        session_id: String::new(),
         project_name: None,
         messages: Vec::new(),
-        extraction_succeeded: false,
-        terminal_failure,
         events: Vec::new(),
         hook_invocations: Vec::new(),
     }
@@ -4329,8 +4029,6 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
                     .and_then(|name| name.to_str())
                     .map(SessionIndex::project_display_name),
                 messages: Vec::new(),
-                extraction_succeeded: false,
-                terminal_failure: false,
                 events: Vec::new(),
                 hook_invocations: Vec::new(),
             };
@@ -4752,8 +4450,6 @@ fn extract_claude_messages_from_jsonl_records(
             .and_then(|name| name.to_str())
             .map(SessionIndex::project_display_name),
         messages,
-        extraction_succeeded: true,
-        terminal_failure: false,
         events,
         hook_invocations,
     }
@@ -4768,8 +4464,6 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                 session_id: String::new(),
                 project_name: None,
                 messages: Vec::new(),
-                extraction_succeeded: false,
-                terminal_failure: false,
                 events: Vec::new(),
                 hook_invocations: Vec::new(),
             };
@@ -4792,8 +4486,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                 session_id: String::new(),
                 project_name: None,
                 messages,
-                extraction_succeeded: false,
-                terminal_failure: true,
                 events,
                 hook_invocations: Vec::new(),
             };
@@ -5230,8 +4922,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
         session_id,
         project_name: cwd.as_deref().and_then(project_name_from_cwd),
         messages,
-        extraction_succeeded: true,
-        terminal_failure: false,
         events,
         hook_invocations: Vec::new(),
     }
@@ -5251,14 +4941,26 @@ fn unique_session_path(
     Ok(paths.drain().next())
 }
 
-fn registered_codex_session_path(session_id: &str) -> Result<Option<PathBuf>, String> {
-    let Some(storage) = crate::STORAGE.get() else {
+/// Resolve a provider-native session or chain id to its retained transcript
+/// through the analytics source registry, then re-validate that path against
+/// the configured root so a stale registry row cannot open an arbitrary file.
+///
+/// An exact `chain_id` / `source_session_id` match wins over a root match, so
+/// a sub-agent chain opens its own transcript rather than its parent's. The
+/// registry is the one place every provider's identity already lives, which
+/// is what keeps this a single indexed query instead of a corpus parse.
+fn registered_session_path(
+    storage: &crate::storage::Storage,
+    provider: IntegrationProvider,
+    session_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some((_, source_root_key)) = retained_jsonl_source_root_identities()
+        .into_iter()
+        .find(|(root_provider, _)| *root_provider == provider)
+    else {
         return Ok(None);
     };
-    let sources = storage.list_transcript_analytics_sources_for_root(
-        IntegrationProvider::Codex,
-        CODEX_SOURCE_ROOT_KEY,
-    )?;
+    let sources = storage.list_transcript_analytics_sources_for_root(provider, source_root_key)?;
     let mut exact = Vec::new();
     let mut rooted = Vec::new();
     for source in sources {
@@ -5274,51 +4976,35 @@ fn registered_codex_session_path(session_id: &str) -> Result<Option<PathBuf>, St
         }
     }
     let path = if exact.is_empty() {
-        unique_session_path(IntegrationProvider::Codex, session_id, rooted)?
+        unique_session_path(provider, session_id, rooted)?
     } else {
-        unique_session_path(IntegrationProvider::Codex, session_id, exact)?
+        unique_session_path(provider, session_id, exact)?
     };
     let Some(path) = path else {
         return Ok(None);
     };
-    match validate_retained_notify_source(IntegrationProvider::Codex, &path) {
-        Ok(Some(source)) if source.provider == IntegrationProvider::Codex => {
-            Ok(Some(source.canonical_path))
-        }
+    match validate_retained_notify_source(provider, &path) {
+        Ok(Some(source)) if source.provider == provider => Ok(Some(source.canonical_path)),
         Ok(_) | Err(_) => Ok(None),
     }
 }
 
-fn find_claude_session_path_in(
-    projects_dir: &Path,
-    session_id: &str,
-) -> Result<Option<PathBuf>, String> {
-    let canonical_root = match std::fs::canonicalize(projects_dir) {
-        Ok(root) => root,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("Canonicalize Claude projects dir: {error}")),
-    };
-    let mut matches = Vec::new();
-    for source in SessionIndex::discover_claude_session_files_in(projects_dir)? {
-        let Ok(path) = std::fs::canonicalize(&source.path) else {
-            continue;
-        };
-        if !path.starts_with(&canonical_root) {
-            continue;
-        }
-        let matches_identity = if source.is_subagent {
-            extract_messages_from_jsonl(IntegrationProvider::Claude, &path)
-                .messages
-                .iter()
-                .any(|message| message.session_id == session_id)
-        } else {
-            path.file_stem().and_then(|stem| stem.to_str()) == Some(session_id)
-        };
-        if matches_identity {
-            matches.push(path);
-        }
-    }
-    unique_session_path(IntegrationProvider::Claude, session_id, matches)
+/// A Claude parent transcript is named by its session id, so a session that
+/// predates the analytics registry still resolves without walking the tree.
+fn claude_parent_session_path(projects_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    let canonical_root = std::fs::canonicalize(projects_dir).ok()?;
+    let file_name = format!("{session_id}.jsonl");
+    let mut matches = std::fs::read_dir(projects_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|project| project.path().join(&file_name))
+        .filter(|path| {
+            std::fs::canonicalize(path).is_ok_and(|canonical| {
+                canonical.starts_with(&canonical_root) && canonical.is_file()
+            })
+        });
+    let path = matches.next()?;
+    matches.next().is_none().then_some(path)
 }
 
 // `pub(crate)` so the learning pipeline's Stream C can resolve parent
@@ -5327,41 +5013,19 @@ pub(crate) fn find_session_path(
     provider: IntegrationProvider,
     session_id: &str,
 ) -> Result<Option<PathBuf>, String> {
-    match provider {
-        IntegrationProvider::Claude => {
-            let projects_dir = crate::data_paths::resolve_claude_projects_dir();
-            find_claude_session_path_in(&projects_dir, session_id)
-        }
-        IntegrationProvider::Codex => {
-            if let Some(path) = registered_codex_session_path(session_id)? {
-                return Ok(Some(path));
-            }
-            let sessions_dir = crate::data_paths::resolve_codex_sessions_dir();
-            find_codex_session_path_in(&sessions_dir, session_id)
-        }
-        IntegrationProvider::Pi => Ok(None),
-        IntegrationProvider::MiniMax => Ok(None),
+    if provider == IntegrationProvider::MiniMax {
+        return Ok(None);
     }
-}
-
-fn find_codex_session_path_in(
-    sessions_dir: &Path,
-    session_id: &str,
-) -> Result<Option<PathBuf>, String> {
-    let expected_suffix = format!("{session_id}.jsonl");
-    unique_session_path(
-        IntegrationProvider::Codex,
-        session_id,
-        SessionIndex::discover_codex_session_files_in(sessions_dir)?
-            .into_iter()
-            .filter(|source| {
-                source
-                    .path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().ends_with(&expected_suffix))
-            })
-            .map(|source| source.path),
-    )
+    if let Some(storage) = crate::STORAGE.get()
+        && let Some(path) = registered_session_path(storage, provider, session_id)?
+    {
+        return Ok(Some(path));
+    }
+    if provider == IntegrationProvider::Claude {
+        let projects_dir = crate::data_paths::resolve_claude_projects_dir();
+        return Ok(claude_parent_session_path(&projects_dir, session_id));
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -5452,8 +5116,7 @@ pub async fn sync_search_index(
     state: tauri::State<'_, SessionIndexState>,
 ) -> Result<usize, String> {
     let idx = state.0.clone();
-    let storage = crate::STORAGE.get();
-    crate::run_blocking(move || idx.startup_scan(&app, storage))
+    crate::run_blocking(move || idx.sync(&app))
 }
 
 #[cfg(test)]
@@ -5539,9 +5202,7 @@ mod tests {
         let index_dir = root.path().join("index");
         let index = SessionIndex::open_or_create_for_tests(&index_dir).expect("open index");
         assert_eq!(
-            index
-                .startup_scan_without_emit(None)
-                .expect("scan persisted sources"),
+            index.sync_without_emit().expect("scan persisted sources"),
             1
         );
         index.reader.reload().expect("reload startup index");
@@ -5659,8 +5320,13 @@ mod tests {
     #[test]
     fn discover_finds_parent_and_subagent_jsonls() {
         let fixture = make_fixture();
-        let files =
-            SessionIndex::discover_claude_session_files_in(fixture.path()).expect("discover ok");
+        let mut diagnostic = None;
+        let files = collect_claude_jsonl_candidates(
+            fixture.path(),
+            IntegrationProvider::Claude,
+            &mut diagnostic,
+        );
+        assert_eq!(diagnostic, None);
 
         assert_eq!(
             files.len(),
@@ -5677,7 +5343,6 @@ mod tests {
             .find(|f| f.is_subagent)
             .expect("missing sub-agent entry");
 
-        assert_eq!(parent.provider, IntegrationProvider::Claude);
         assert!(parent.path.to_string_lossy().ends_with(".jsonl"));
         assert!(
             !parent
@@ -5687,7 +5352,6 @@ mod tests {
             "parent path should not traverse subagents/"
         );
 
-        assert_eq!(subagent.provider, IntegrationProvider::Claude);
         assert!(
             subagent
                 .path
@@ -5699,23 +5363,18 @@ mod tests {
             !subagent.path.to_string_lossy().ends_with("meta.json"),
             ".meta.json sidecars must be filtered out"
         );
-        assert_eq!(
-            parent.default_project, subagent.default_project,
-            "sub-agent inherits its parent transcript's project name"
-        );
     }
 
     #[test]
     fn extraction_uses_native_subagent_session_identity() {
         let fixture = make_fixture();
-        let files =
-            SessionIndex::discover_claude_session_files_in(fixture.path()).expect("discover ok");
+        let files = discover_claude_transcripts_in(fixture.path());
 
-        let subagent_file = files
+        let (subagent_path, _) = files
             .iter()
-            .find(|f| f.is_subagent)
+            .find(|(_, is_subagent)| *is_subagent)
             .expect("sub-agent file");
-        let extracted = extract_messages_from_jsonl(subagent_file.provider, &subagent_file.path);
+        let extracted = extract_messages_from_jsonl(IntegrationProvider::Claude, subagent_path);
 
         assert!(
             !extracted.messages.is_empty(),
@@ -5737,8 +5396,12 @@ mod tests {
         );
 
         // Sanity: parent transcript records remain top-level.
-        let parent_file = files.iter().find(|f| !f.is_subagent).expect("parent file");
-        let parent_extracted = extract_messages_from_jsonl(parent_file.provider, &parent_file.path);
+        let (parent_path, _) = files
+            .iter()
+            .find(|(_, is_subagent)| !*is_subagent)
+            .expect("parent file");
+        let parent_extracted =
+            extract_messages_from_jsonl(IntegrationProvider::Claude, parent_path);
         for msg in &parent_extracted.messages {
             assert_eq!(msg.session_id, parent_extracted.session_id);
         }
@@ -5787,8 +5450,13 @@ mod tests {
         fs::write(workflow_dir.join("journal.jsonl"), r#"{"entries":[]}"#)
             .expect("write workflow journal");
 
-        let files =
-            SessionIndex::discover_claude_session_files_in(tmp.path()).expect("discover ok");
+        let mut diagnostic = None;
+        let files = collect_claude_jsonl_candidates(
+            tmp.path(),
+            IntegrationProvider::Claude,
+            &mut diagnostic,
+        );
+        assert_eq!(diagnostic, None);
 
         assert_eq!(
             files.len(),
@@ -5877,19 +5545,29 @@ mod tests {
         }));
     }
 
+    /// A Claude parent transcript is named by its session id, so it resolves
+    /// by filename without opening a single transcript; sub-agent chains are
+    /// only ever resolved through the analytics registry.
+    // @lat: [[session-search-tests#Session Search Test Specs#Registry Backed Context Lookup]]
     #[test]
-    fn codex_session_lookup_uses_the_supplied_sessions_root() {
-        let tmp = TempDir::new().expect("tempdir");
-        let session_id = "72acc77e-e91c-451f-80b2-748e85fffa1f";
-        let nested = tmp.path().join("2026").join("08").join("03");
-        fs::create_dir_all(&nested).expect("mkdir rollout tree");
-        let rollout = nested.join(format!("rollout-2026-08-03T12-00-00-{session_id}.jsonl"));
-        fs::write(&rollout, "{}\n").expect("write rollout");
+    fn claude_parent_lookup_resolves_by_filename_without_reading_transcripts() {
+        let fixture = make_fixture();
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let expected = fixture
+            .path()
+            .join("-home-test-proj")
+            .join(format!("{session_id}.jsonl"));
 
         assert_eq!(
-            find_codex_session_path_in(tmp.path(), session_id).expect("lookup"),
-            Some(rollout)
+            claude_parent_session_path(fixture.path(), session_id),
+            Some(expected)
         );
+        assert_eq!(
+            claude_parent_session_path(fixture.path(), "aaaabbbbccccdddd"),
+            None,
+            "a sub-agent chain id is not a parent filename"
+        );
+        assert_eq!(claude_parent_session_path(fixture.path(), "missing"), None);
     }
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#No Root Scan]]
@@ -5916,6 +5594,98 @@ mod tests {
         );
     }
 
+    /// Result context for a Pi hit or a Claude sub-agent chain resolves the
+    /// exact retained transcript through the analytics registry: one indexed
+    /// query, no corpus walk, no transcript parse, and never a path outside
+    /// the configured root.
+    // @lat: [[session-search-tests#Session Search Test Specs#Registry Backed Context Lookup]]
+    #[test]
+    #[serial]
+    fn registry_lookup_resolves_pi_and_subagent_chains_without_walking() {
+        let root = TempDir::new().expect("tempdir");
+        let claude = root.path().join("claude");
+        let codex = root.path().join("codex");
+        let pi = root.path().join("pi");
+        for directory in [&claude, &codex, &pi] {
+            fs::create_dir(directory).expect("create transcript root");
+        }
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let agent_id = "aaaabbbbccccdddd";
+        let subagents = claude
+            .join("-home-test-proj")
+            .join(session_id)
+            .join("subagents");
+        fs::create_dir_all(&subagents).expect("mkdir subagents");
+        let agent_path = subagents.join(format!("agent-{agent_id}.jsonl"));
+        fs::write(
+            &agent_path,
+            format!(
+                "{{\"type\":\"user\",\"isSidechain\":true,\"agentId\":\"{agent_id}\",\"parentUuid\":null,\"uuid\":\"s1\",\"sessionId\":\"{session_id}\",\"timestamp\":\"2026-05-09T10:00:10Z\",\"cwd\":\"/home/test/proj\",\"message\":{{\"role\":\"user\",\"content\":\"do task\"}}}}\n"
+            ),
+        )
+        .expect("write sub-agent transcript");
+        let pi_dir = pi.join("--work-quill--");
+        fs::create_dir_all(&pi_dir).expect("mkdir Pi project");
+        let pi_path = pi_dir.join("different-name.jsonl");
+        fs::write(
+            &pi_path,
+            concat!(
+                r#"{"type":"session","version":3,"id":"pi-header-id","timestamp":"2026-08-14T08:00:00Z","cwd":"/work/quill"}"#,
+                "\n",
+                r#"{"type":"message","id":"entry","parentId":null,"timestamp":"2026-08-14T08:00:01Z","message":{"role":"user","content":"context"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write Pi transcript");
+
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_DATA_DIR", root.path());
+            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", &claude);
+            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", &codex);
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
+        }
+        let storage = crate::storage::Storage::init().expect("init storage");
+        let hostname = SessionIndex::local_hostname();
+        for (provider, path) in [
+            (IntegrationProvider::Claude, &agent_path),
+            (IntegrationProvider::Pi, &pi_path),
+        ] {
+            let source = validate_retained_notify_source(provider, path)
+                .expect("validate retained source")
+                .expect("retained source");
+            crate::transcript_analytics::reconcile_live_transcript_source(
+                &storage, &source, &hostname,
+            )
+            .expect("register source");
+        }
+
+        assert_eq!(
+            registered_session_path(&storage, IntegrationProvider::Pi, "pi-header-id")
+                .expect("Pi lookup"),
+            Some(fs::canonicalize(&pi_path).expect("canonical Pi path"))
+        );
+        assert_eq!(
+            registered_session_path(&storage, IntegrationProvider::Claude, agent_id)
+                .expect("sub-agent lookup"),
+            Some(fs::canonicalize(&agent_path).expect("canonical agent path")),
+            "a sub-agent chain id opens its own transcript, not the parent's"
+        );
+        assert_eq!(
+            registered_session_path(&storage, IntegrationProvider::Claude, "unknown")
+                .expect("unknown lookup"),
+            None
+        );
+
+        unsafe {
+            std::env::remove_var("QUILL_DEMO_MODE");
+            std::env::remove_var("QUILL_DATA_DIR");
+            std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
+            std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
+            std::env::remove_var("QUILL_PI_SESSIONS_DIR");
+        }
+    }
+
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Message Extraction]]
     #[test]
     fn pi_extraction_uses_header_identity_and_deduplicates_entry_ids() {
@@ -5936,7 +5706,6 @@ mod tests {
             transcript,
         );
 
-        assert!(extracted.extraction_succeeded);
         assert_eq!(extracted.session_id, "pi-session");
         assert_eq!(extracted.project_name.as_deref(), Some("quill"));
         assert_eq!(extracted.messages.len(), 2);
@@ -6726,7 +6495,11 @@ mod tests {
     #[test]
     fn search_schema_change_rebuilds_existing_index() {
         let temp = TempDir::new().expect("tempdir");
-        fs::write(temp.path().join("schema_version.txt"), "7").expect("write old version");
+        fs::write(
+            temp.path().join("schema_version.txt"),
+            (SessionIndex::SCHEMA_VERSION - 1).to_string(),
+        )
+        .expect("write old version");
         let obsolete = temp.path().join("obsolete-index-file");
         fs::write(&obsolete, "old schema").expect("write old index marker");
 
@@ -6734,7 +6507,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(temp.path().join("schema_version.txt")).expect("read version"),
-            "8"
+            SessionIndex::SCHEMA_VERSION.to_string()
         );
         assert!(!obsolete.exists(), "old schema contents must be removed");
     }
@@ -6817,18 +6590,15 @@ mod tests {
     }
 
     /// quill-fqwp regression: a Codex rollout with no `session_meta` record
-    /// can never resolve identity no matter how many times it is retried.
-    /// Before the fix, `reingest_failures` counted this deterministic
-    /// failure the same as a transient one, so
-    /// `codex_agent_identity_reingest_pending` (and the four `force_reingest`
-    /// flags) never reached zero failures and stayed set forever, which in
-    /// turn kept clearing the mtime cache and re-extracting the whole corpus
-    /// every sweep. See docs/solutions/runtime-errors/
-    /// live-rails-degrade-when-retained-ingest-loops.md.
+    /// can never resolve identity. It must be fingerprinted like any other
+    /// attempted file and skipped on every later sweep, so one poisoned
+    /// transcript cannot make the sweep re-extract the corpus each pass. A
+    /// source that disappears from a completely enumerated root has its
+    /// documents pruned by the session id remembered for it.
     // @lat: [[data-flow#Session Indexing Pipeline]]
     #[test]
     #[serial]
-    fn terminal_codex_identity_failure_clears_reingest_flags_after_one_sweep() {
+    fn sweep_fingerprints_unresolvable_sources_once_and_prunes_vanished_ones() {
         let root = TempDir::new().expect("tempdir");
         let claude = root.path().join("claude");
         let codex = root.path().join("codex");
@@ -6862,7 +6632,7 @@ mod tests {
                 serde_json::json!({
                     "type": "event_msg",
                     "timestamp": "2026-08-03T12:00:00Z",
-                    "payload": {"type": "agent_message", "message": format!("ok-{index}")}
+                    "payload": {"type": "agent_message", "message": format!("needle-{index}")}
                 })
                 .to_string(),
             ]
@@ -6880,124 +6650,56 @@ mod tests {
             std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
         }
 
-        let storage = crate::storage::Storage::init().expect("init storage");
-        storage
-            .set_setting("codex_agent_identity_reingest_pending", "1")
-            .expect("seed Codex reingest flag");
-        storage
-            .set_setting("subagent_reingest_pending", "1")
-            .expect("seed subagent reingest flag");
-
         let index_dir = root.path().join("index");
         let index = SessionIndex::open_or_create_for_tests(&index_dir).expect("open index");
 
-        index
-            .startup_scan_without_emit(Some(&storage))
-            .expect("first sweep");
-
-        assert!(
-            storage
-                .get_setting("codex_agent_identity_reingest_pending")
-                .expect("read flag")
-                .is_none(),
-            "a permanently-unresolvable transcript must not hold the Codex identity flag set"
-        );
-        assert!(
-            storage
-                .get_setting("subagent_reingest_pending")
-                .expect("read flag")
-                .is_none(),
-            "a permanently-unresolvable transcript must not hold the subagent reingest flag set"
-        );
-
-        let mtimes_after_first_sweep = index.state.lock().unwrap().file_mtimes.clone();
+        assert_eq!(index.sync_without_emit().expect("first sweep"), 3);
+        let sources_after_first_sweep = index.state.lock().unwrap().sources.clone();
         assert_eq!(
-            mtimes_after_first_sweep.len(),
+            sources_after_first_sweep.len(),
             4,
             "every discovered transcript, including the poisoned one, is fingerprinted"
         );
-
-        let second_sweep_indexed = index
-            .startup_scan_without_emit(Some(&storage))
-            .expect("second sweep");
         assert_eq!(
-            second_sweep_indexed, 0,
-            "flags are clear, so the second sweep must not re-extract any transcript"
-        );
-        assert_eq!(
-            index.state.lock().unwrap().file_mtimes,
-            mtimes_after_first_sweep,
-            "second sweep must not clear the mtime cache"
+            sources_after_first_sweep
+                .values()
+                .filter(|indexed| indexed.session_id.is_empty())
+                .count(),
+            1,
+            "the unresolvable source is remembered without a session id"
         );
 
-        unsafe {
-            std::env::remove_var("QUILL_DEMO_MODE");
-            std::env::remove_var("QUILL_DATA_DIR");
-            std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
-            std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
-            std::env::remove_var("QUILL_PI_SESSIONS_DIR");
-        }
-    }
-
-    /// quill-fqwp regression: the protection the pre-fix code provided must
-    /// survive the terminal/retryable split -- a transient I/O failure (here,
-    /// an unreadable file standing in for a lock or partial write) must keep
-    /// the re-ingest flag set so the file is retried on the next sweep.
-    // @lat: [[data-flow#Session Indexing Pipeline]]
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn retryable_codex_read_failure_keeps_reingest_flag_set() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = TempDir::new().expect("tempdir");
-        let claude = root.path().join("claude");
-        let codex = root.path().join("codex");
-        let pi = root.path().join("pi");
-        for directory in [&claude, &codex, &pi] {
-            fs::create_dir(directory).expect("create transcript root");
-        }
-
-        let locked = codex.join("rollout-locked.jsonl");
-        fs::write(
-            &locked,
-            format!(
-                "{}\n",
-                serde_json::json!({"type": "session_meta", "payload": {"id": "locked-1"}})
-            ),
-        )
-        .expect("write Codex transcript");
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))
-            .expect("lock Codex transcript for reading");
-
-        unsafe {
-            std::env::set_var("QUILL_DEMO_MODE", "1");
-            std::env::set_var("QUILL_DATA_DIR", root.path());
-            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", &claude);
-            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", &codex);
-            std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
-        }
-
-        let storage = crate::storage::Storage::init().expect("init storage");
-        storage
-            .set_setting("codex_agent_identity_reingest_pending", "1")
-            .expect("seed Codex reingest flag");
-
-        let index_dir = root.path().join("index");
-        let index = SessionIndex::open_or_create_for_tests(&index_dir).expect("open index");
-        index
-            .startup_scan_without_emit(Some(&storage))
-            .expect("sweep with an unreadable transcript");
-
         assert_eq!(
-            storage
-                .get_setting("codex_agent_identity_reingest_pending")
-                .expect("read flag"),
-            Some("1".to_string()),
-            "a retryable I/O failure must keep the re-ingest flag set for the next sweep"
+            index.sync_without_emit().expect("second sweep"),
+            0,
+            "the second sweep must not re-extract any transcript"
+        );
+        assert_eq!(
+            index.state.lock().unwrap().sources,
+            sources_after_first_sweep,
+            "second sweep must not disturb the fingerprints"
         );
 
-        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o644));
+        fs::remove_file(codex.join("rollout-healthy-1.jsonl")).expect("remove one transcript");
+        assert_eq!(index.sync_without_emit().expect("third sweep"), 0);
+        assert_eq!(index.state.lock().unwrap().sources.len(), 3);
+        index.reader.reload().expect("reload index");
+        assert_eq!(
+            index
+                .search("needle-1", &SearchFilters::default(), "relevance", 0, 10)
+                .expect("search pruned session")
+                .total_hits,
+            0,
+            "a vanished source's documents are pruned"
+        );
+        assert_eq!(
+            index
+                .search("needle-0", &SearchFilters::default(), "relevance", 0, 10)
+                .expect("search retained session")
+                .total_hits,
+            1
+        );
+
         unsafe {
             std::env::remove_var("QUILL_DEMO_MODE");
             std::env::remove_var("QUILL_DATA_DIR");

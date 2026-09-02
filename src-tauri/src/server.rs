@@ -13,7 +13,6 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
@@ -66,7 +65,6 @@ const MAX_RESULT_IMAGE_COUNT: i64 = MAX_REMOTE_EVIDENCE_LEN as i64;
 const MAX_MESSAGES_PER_REQUEST: usize = 500;
 const REMOTE_ASSISTANT_TOOL_USE_TYPE: &str = "assistant_tool_use";
 const SESSION_NOTIFY_DEBOUNCE_MS: u64 = 250;
-const RETAINED_VALIDATE_RETRY_CAP: u32 = 5;
 const PI_SPOOL_RETIRE_INTERVAL: Duration = Duration::from_secs(15);
 const PI_SPOOL_RETIRE_GAP: &str = "spool_retired_without_import";
 const PI_REPORTER_ENABLED_KEY: &str = "pi_reporter.enabled";
@@ -75,36 +73,6 @@ struct PendingSessionNotify {
     generation: u64,
     updated_at: Instant,
     latest: SessionNotifyPayload,
-}
-struct PendingValidationRetry {
-    payload: SessionNotifyPayload,
-    generation: u64,
-    wake: Arc<tokio::sync::Notify>,
-}
-
-enum ValidationRetryOutcome {
-    Promote(sessions::DiscoveredRetainedJsonlSource),
-    SearchOnly,
-    DropInvalid(&'static str),
-    RetryUnavailable(&'static str),
-}
-
-fn classify_validation_retry(
-    result: Result<
-        Option<sessions::DiscoveredRetainedJsonlSource>,
-        sessions::RetainedNotifySourceValidationError,
-    >,
-) -> ValidationRetryOutcome {
-    match result {
-        Ok(Some(source)) => ValidationRetryOutcome::Promote(source),
-        Ok(None) => ValidationRetryOutcome::SearchOnly,
-        Err(sessions::RetainedNotifySourceValidationError::Invalid(message)) => {
-            ValidationRetryOutcome::DropInvalid(message)
-        }
-        Err(sessions::RetainedNotifySourceValidationError::Unavailable(message)) => {
-            ValidationRetryOutcome::RetryUnavailable(message)
-        }
-    }
 }
 struct ServerState {
     storage: &'static Storage,
@@ -115,7 +83,6 @@ struct ServerState {
     session_rate_limiter: Mutex<VecDeque<Instant>>,
     pi_session_rate_limiter: Mutex<VecDeque<Instant>>,
     pending_session_notifies: Mutex<HashMap<String, PendingSessionNotify>>,
-    pending_validation_retries: Mutex<HashMap<String, PendingValidationRetry>>,
     app_handle: tauri::AppHandle,
     session_index: Option<Arc<sessions::SessionIndex>>,
     live_tracker: Arc<crate::live_tracker::LiveTracker>,
@@ -196,7 +163,6 @@ pub async fn start_server(
         session_rate_limiter: Mutex::new(VecDeque::new()),
         pi_session_rate_limiter: Mutex::new(VecDeque::new()),
         pending_session_notifies: Mutex::new(HashMap::new()),
-        pending_validation_retries: Mutex::new(HashMap::new()),
         app_handle,
         session_index,
         live_tracker,
@@ -814,15 +780,6 @@ fn session_notify_key(payload: &SessionNotifyPayload) -> String {
     format!("{}:{}", payload.provider.as_str(), payload.session_id)
 }
 
-fn validation_retry_source_hash(payload: &SessionNotifyPayload) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(payload.provider.as_str().as_bytes());
-    hasher.update([0]);
-    hasher.update(payload.jsonl_path.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    digest[..16].to_owned()
-}
-
 fn queue_session_notify(state: Arc<ServerState>, payload: SessionNotifyPayload) {
     let key = session_notify_key(&payload);
     let should_spawn = {
@@ -850,164 +807,6 @@ fn queue_session_notify(state: Arc<ServerState>, payload: SessionNotifyPayload) 
 
     if should_spawn {
         tauri::async_runtime::spawn(drain_session_notify_queue(state, key));
-    }
-}
-
-fn queue_validation_retry(state: Arc<ServerState>, payload: SessionNotifyPayload) {
-    let key = format!("{}:{}", payload.provider.as_str(), payload.jsonl_path);
-    let should_spawn = {
-        let mut retries = state.pending_validation_retries.lock().unwrap();
-        if let Some(entry) = retries.get_mut(&key) {
-            entry.generation = entry.generation.saturating_add(1);
-            entry.payload = payload;
-            entry.wake.notify_one();
-            false
-        } else {
-            retries.insert(
-                key.clone(),
-                PendingValidationRetry {
-                    payload,
-                    generation: 0,
-                    wake: Arc::new(tokio::sync::Notify::new()),
-                },
-            );
-            true
-        }
-    };
-    if should_spawn {
-        tauri::async_runtime::spawn(async move {
-            let mut observed_generation = None;
-            let mut attempts = 0_u32;
-            loop {
-                let pending = {
-                    state
-                        .pending_validation_retries
-                        .lock()
-                        .unwrap()
-                        .get(&key)
-                        .map(|entry| {
-                            (
-                                entry.generation,
-                                entry.payload.clone(),
-                                Arc::clone(&entry.wake),
-                            )
-                        })
-                };
-                let Some((generation, payload, wake)) = pending else {
-                    return;
-                };
-                if observed_generation != Some(generation) {
-                    observed_generation = Some(generation);
-                    attempts = 0;
-                }
-                if attempts >= RETAINED_VALIDATE_RETRY_CAP {
-                    log::warn!(
-                        "Retained transcript validation exhausted {} attempts for provider={} source_hash={}",
-                        RETAINED_VALIDATE_RETRY_CAP,
-                        payload.provider.as_str(),
-                        validation_retry_source_hash(&payload),
-                    );
-                    remove_validation_retry(&state, &key, generation);
-                    if state
-                        .pending_validation_retries
-                        .lock()
-                        .unwrap()
-                        .contains_key(&key)
-                    {
-                        continue;
-                    }
-                    return;
-                }
-                let attempt = attempts;
-                tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(1u64 << attempt.min(5))) => {
-                        attempts = attempts.saturating_add(1);
-                    }
-                    () = wake.notified() => continue,
-                }
-                let current_generation = {
-                    state
-                        .pending_validation_retries
-                        .lock()
-                        .unwrap()
-                        .get(&key)
-                        .map(|entry| entry.generation)
-                };
-                if current_generation != Some(generation) {
-                    continue;
-                }
-                let path = PathBuf::from(&payload.jsonl_path);
-                let provider = payload.provider;
-                let result = tokio::task::spawn_blocking(move || {
-                    sessions::validate_retained_notify_source(provider, &path)
-                })
-                .await;
-                match result.map(classify_validation_retry) {
-                    Ok(ValidationRetryOutcome::Promote(source)) => {
-                        enqueue_validated_retained_source(&state, source);
-                        if state.session_index.is_some() {
-                            queue_session_notify(state.clone(), payload);
-                        }
-                        remove_validation_retry(&state, &key, generation);
-                        if state
-                            .pending_validation_retries
-                            .lock()
-                            .unwrap()
-                            .contains_key(&key)
-                        {
-                            continue;
-                        }
-                        return;
-                    }
-                    Ok(ValidationRetryOutcome::SearchOnly) => {
-                        if state.session_index.is_some() {
-                            queue_session_notify(state.clone(), payload);
-                        }
-                        remove_validation_retry(&state, &key, generation);
-                        if state
-                            .pending_validation_retries
-                            .lock()
-                            .unwrap()
-                            .contains_key(&key)
-                        {
-                            continue;
-                        }
-                        return;
-                    }
-                    Ok(ValidationRetryOutcome::DropInvalid(message)) => {
-                        log::debug!(
-                            "Dropping invalid retained transcript validation retry: {message}"
-                        );
-                        remove_validation_retry(&state, &key, generation);
-                        if state
-                            .pending_validation_retries
-                            .lock()
-                            .unwrap()
-                            .contains_key(&key)
-                        {
-                            continue;
-                        }
-                        return;
-                    }
-                    Ok(ValidationRetryOutcome::RetryUnavailable(message)) => {
-                        log::warn!("Retained transcript validation remains unavailable: {message}");
-                    }
-                    Err(error) => {
-                        log::error!("Retained transcript validation retry task failed: {error}");
-                    }
-                }
-            }
-        });
-    }
-}
-
-fn remove_validation_retry(state: &ServerState, key: &str, generation: u64) {
-    let mut retries = state.pending_validation_retries.lock().unwrap();
-    if retries
-        .get(key)
-        .is_some_and(|entry| entry.generation == generation)
-    {
-        retries.remove(key);
     }
 }
 
@@ -2014,8 +1813,10 @@ async fn post_session_notify(
             queue_session_notify(state.clone(), payload);
             return (StatusCode::ACCEPTED, "queued".to_string());
         }
+        // A transiently unreadable root is not retried here: the filesystem
+        // watcher and the 120-second whole-root recovery re-admit any changed
+        // source once the root is reachable again.
         Ok(Err(sessions::RetainedNotifySourceValidationError::Unavailable(message))) => {
-            queue_validation_retry(state.clone(), payload.clone());
             if allows_unvalidated_search_notify(provider) && state.session_index.is_some() {
                 queue_session_notify(state.clone(), payload);
                 return (
@@ -2027,7 +1828,6 @@ async fn post_session_notify(
         }
         Err(error) => {
             log::error!("Session notify source validation task failed: {error}");
-            queue_validation_retry(state.clone(), payload.clone());
             if allows_unvalidated_search_notify(provider) && state.session_index.is_some() {
                 queue_session_notify(state.clone(), payload);
                 return (

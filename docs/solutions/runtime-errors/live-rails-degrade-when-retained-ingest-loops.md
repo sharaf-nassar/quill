@@ -62,12 +62,20 @@ all, so during the same window their sessions silently go stale.
 
 ## Fix
 
-Filed as two beads, unlanded as of this writing:
+Filed as two beads:
 
 - `quill-fqwp` (P0) — separate terminal from retryable extraction failures so
   a permanently-unparseable transcript cannot hold the re-ingest flags set.
 - `quill-ppbv` (P1) — move `sync_search_index` and `reconcile_all` off the
   watcher thread so no long retained-side scan can starve live folding again.
+
+The flag mechanism itself was later removed. The Session Search sweep no
+longer reads any `*_reingest_pending` marker: it derives no analytics rows
+(retained reconciliation owns those and carries its own marker), and it
+remembers every attempted source, including one whose identity never
+resolves, under its canonical source key with an empty session id, so the
+failing file is skipped until its bytes change. There is no cache to clear
+and nothing left to loop on.
 
 `quill-w5bu` (P3) separately decides whether the chip may show a role at all;
 it is deliberately blocked on the two above, because the fallback only looks

@@ -282,7 +282,9 @@ Full-text search across Claude Code, Codex, and Pi session transcripts, powered 
 
 ### Indexing
 
-Opening Session Search syncs transcripts using nanosecond mtime plus file size, including removal of search documents for transcripts proven absent by complete source discovery. Metadata failures remain uncached for retry.
+Every watcher recovery pass and the Session Search window sync transcripts using nanosecond mtime plus file size, including removal of search documents for transcripts proven absent by complete source discovery.
+
+The sweep remembers each source under its canonical source key, so a transcript whose identity never resolves is skipped until its bytes change instead of re-extracting the corpus every pass. Metadata failures remain uncached for retry.
 
 Incomplete discovery preserves indexed data. Hook endpoints can also ingest updates; Pi indexes only user and assistant messages, while Claude and Codex retain intentional provider-native search roles. Tool calls add code_changes, commands_run, tool_details, and files_modified metadata; Pi tool results attach as bounded output instead of standalone messages. Parent and child chains keep distinct provider-native identities, so result context resolves the exact retained transcript without crossing providers or choosing an ambiguous source.
 

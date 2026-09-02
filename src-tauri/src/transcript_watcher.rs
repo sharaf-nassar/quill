@@ -287,9 +287,17 @@ pub(crate) fn start(app: tauri::AppHandle) {
     let scan_recovery = Arc::clone(&scans.recovery);
     let scan_app = app.clone();
     std::thread::spawn(move || {
+        // Seed the watermark with startup time so the first recovery pass
+        // does not re-admit the sources the startup inventory already covers.
+        let mut watermark = std::time::SystemTime::now();
         run_retained_scan_worker(scan_receiver, scan_recovery, |recovery| {
+            // Capture the pass start before enumerating so a source modified
+            // during the walk is admitted by this pass or the next, never lost.
+            let pass_start = std::time::SystemTime::now();
             let roots = crate::sessions::enumerate_retained_jsonl_source_roots();
             if recovery {
+                admit_changed_sources(&scan_app, watermark, &roots);
+                watermark = pass_start;
                 reconcile_all(&scan_app, &roots);
             }
             sync_search_index(&scan_app, &roots);
@@ -478,20 +486,10 @@ fn finish_pending(
 
 fn sync_search_index(app: &tauri::AppHandle, roots: &[crate::sessions::ProviderSourceRoot]) {
     if let Some(index) = app.try_state::<crate::sessions::SessionIndexState>()
-        && let Err(error) = index
-            .0
-            .startup_scan_with_roots(app, crate::STORAGE.get(), roots)
+        && let Err(error) = index.0.sync_with_roots(app, roots)
     {
         log::warn!("Transcript watcher search-index sync failed: {error}");
     }
-}
-
-#[cfg(test)]
-fn sync_search_index_for_test(
-    index: &crate::sessions::SessionIndex,
-    storage: Option<&crate::storage::Storage>,
-) -> Result<usize, String> {
-    index.startup_scan_without_emit(storage)
 }
 
 fn live_tracker(app: &tauri::AppHandle) -> Option<Arc<LiveTracker>> {
@@ -503,6 +501,48 @@ fn sweep_live_tracker(app: &tauri::AppHandle) {
     if let Some(tracker) = live_tracker(app) {
         tracker.sweep(chrono::Utc::now());
     }
+}
+
+/// Sources whose mtime advanced past `watermark`, from an inventory already
+/// enumerated for this pass.
+fn changed_sources_since(
+    watermark: std::time::SystemTime,
+    roots: &[crate::sessions::ProviderSourceRoot],
+) -> Vec<crate::sessions::DiscoveredRetainedJsonlSource> {
+    roots
+        .iter()
+        .flat_map(|root| &root.sources)
+        .filter(|source| {
+            std::fs::metadata(&source.canonical_path)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified > watermark)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Admit every source changed since the previous recovery pass to the live
+/// coordinator, so a session whose notify hook never fires is still
+/// reconciled in both analytics domains. Whole-root reconciliation covers the
+/// transcript domain on its own, but Claude/Codex model work has no other
+/// periodic admission. The coordinator coalesces by source key and each
+/// domain keeps its own freshness check, so over-admission stays a stat.
+fn admit_changed_sources(
+    app: &tauri::AppHandle,
+    watermark: std::time::SystemTime,
+    roots: &[crate::sessions::ProviderSourceRoot],
+) {
+    let changed = changed_sources_since(watermark, roots);
+    if changed.is_empty() {
+        return;
+    }
+    let count = changed.len();
+    for source in changed {
+        if let Err(error) = crate::enqueue_retained_live_source(app, source) {
+            log::warn!("Transcript watcher failed to admit changed source: {error}");
+        }
+    }
+    log::info!("Transcript watcher admitted {count} changed retained sources");
 }
 
 fn reconcile_all(app: &tauri::AppHandle, roots: &[crate::sessions::ProviderSourceRoot]) {
@@ -943,7 +983,7 @@ mod tests {
             crate::sessions::SessionIndex::open_or_create_for_tests(&temp.path().join("index"))
                 .expect("open watcher search index");
 
-        assert_eq!(sync_search_index_for_test(&index, None), Ok(3));
+        assert_eq!(index.sync_without_emit(), Ok(3));
         index.reader.reload().expect("reload watcher search index");
         for (query, provider) in [
             ("claudewatcherrecoveryneedle", IntegrationProvider::Claude),
@@ -967,6 +1007,38 @@ mod tests {
                 1,
             );
         }
+    }
+
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Watcher Recovery]]
+    #[test]
+    fn recovery_pass_admits_sources_changed_since_the_watermark() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(&path, "{}\n").expect("write changed source");
+        let canonical_path = std::fs::canonicalize(&path).expect("canonical source");
+        let source = crate::sessions::DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: "pi:sessions",
+            source_key: "pi-source".to_owned(),
+            filesystem_path: path,
+            canonical_path: canonical_path.clone(),
+            layout_hint: crate::sessions::RetainedJsonlSourceLayoutHint::PiTranscript,
+        };
+        let roots = [crate::sessions::ProviderSourceRoot {
+            provider: IntegrationProvider::Pi,
+            source_root_key: "pi:sessions",
+            resolved_root_path: temp.path().to_path_buf(),
+            canonical_root_path: Some(std::fs::canonicalize(temp.path()).expect("canonical root")),
+            outcome: crate::sessions::ProviderRootEnumerationOutcome::Complete,
+            sources: vec![source.clone()],
+        }];
+
+        assert_eq!(
+            changed_sources_since(std::time::SystemTime::UNIX_EPOCH, &roots),
+            vec![source]
+        );
+        let future = std::time::SystemTime::now() + Duration::from_secs(3600);
+        assert!(changed_sources_since(future, &roots).is_empty());
     }
 
     // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Transcript Watcher Test Specs#Provider Paths And Burst Coalescing]]

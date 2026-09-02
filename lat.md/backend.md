@@ -1436,7 +1436,7 @@ rewind can record version 35 without colliding with already-current objects.
 
 Recognized `SKILL.md` loads derived during the same Session Indexing extraction pass, keyed for analytics drilldowns by skill, provider, project, and host.
 
-- **skill_usages** — One row per recognized skill load (provider, session_id, message_id, skill_name, skill_path, timestamp, tool_name, cwd, hostname). Unique on (provider, session_id, message_id, skill_name, skill_path, timestamp). Indexed on provider+timestamp, provider+session, skill+timestamp, and the migration-22 skill+cwd pair that powers per-project drilldowns. Migration 23 re-arms `skill_usage_reingest_pending` so historical sessions are replayed against the updated extractor without any schema change.
+- **skill_usages** — One row per recognized skill load (provider, session_id, message_id, skill_name, skill_path, timestamp, tool_name, cwd, hostname). Unique on (provider, session_id, message_id, skill_name, skill_path, timestamp). Indexed on provider+timestamp, provider+session, skill+timestamp, and the migration-22 skill+cwd pair that powers per-project drilldowns. Migration 23 set `skill_usage_reingest_pending` for the extractor of its day; that marker and its siblings from migrations 20, 21, 22, 26, 27, 39, and 41 are inert settings rows now, because the Session Search sweep no longer derives analytics rows and retained reconciliation owns replay through its own `transcript_analytics_reingest_pending` marker.
 
 [[src-tauri/src/sessions.rs#extract_skill_accesses_from_tool_action]] recognizes five ingest shapes: Codex `exec_command` calls that read a `SKILL.md` path with `cat`/`head`/`tail`/etc., Claude `Read` calls against a `SKILL.md` path, Claude `Skill` tool calls, and Pi's lowercase `read` and `bash` spellings of the first two. Pi has no `Skill` tool, so reading the file is the only way one of its skill loads is ever observable. The `Skill` arm normalizes the `skill` input via [[src-tauri/src/sessions.rs#skill_access_from_skill_tool_input]] by stripping any `plugin:` prefix so Claude rows merge with Codex's bare folder names (e.g. Claude `superpowers:using-superpowers` collapses onto Codex `using-superpowers`), and synthesizes a `skill://<raw>` path that preserves the original identifier for forensic drilldowns without colliding with filesystem paths.
 
@@ -1504,7 +1504,7 @@ Carry-forward is limited to rows this machine can never rebuild from a local tra
 
 Migration 31 added `project_path_renames` plus `(provider, chain_id, timestamp)` runtime ordering support. The manage-data rename command and its ingest reader were later removed; migration 38 drops the orphan table without rewriting migration 31 for databases that already recorded it.
 
-Migration 39 adds nullable `model_observation_sources.agent_nickname`, deletes only replayable Codex transcript analytics and model rollups, and sets `codex_agent_identity_reingest_pending`. Hook observations and retention aggregates remain untouched.
+Migration 39 adds nullable `model_observation_sources.agent_nickname`, deletes only replayable Codex transcript analytics and model rollups, and sets the now-inert `codex_agent_identity_reingest_pending` marker. Hook observations and retention aggregates remain untouched.
 
 Missing Codex source rows force the independent transcript and model reconciliation passes to rebuild from retained rollouts. The Sessions search sweep invalidates only Codex mtimes, retains the marker across failed or incomplete inventory, clears it after a fully committed pass, and logs elapsed time.
 
@@ -1642,7 +1642,7 @@ Sibling sub-agents whose windows overlap in wall-clock time must not be merged i
 
 ##### Workflow-Nested Sub-Agent Discovery
 
-[[src-tauri/src/sessions.rs#SessionIndex#discover_claude_session_files_in]] recurses the whole `subagents/` subtree, so Workflow-spawned agents nested at `subagents/workflows/wf_<id>/agent-*.jsonl` are discovered alongside flat `subagents/agent-*.jsonl`.
+[[src-tauri/src/sessions.rs#collect_claude_jsonl_candidates]] recurses the whole `subagents/` subtree, so Workflow-spawned agents nested at `subagents/workflows/wf_<id>/agent-*.jsonl` are discovered alongside flat `subagents/agent-*.jsonl`.
 
 A real projects dir with a parent `<uuid>.jsonl`, a flat sub-agent, and a workflow-nested sub-agent (leaner first record: no `cwd`/`gitBranch`/`version`) returns all three, tags only the two agents `is_subagent`, and excludes a nested `journal.jsonl`. This is the discovery stage the direct-DB runtime test cannot exercise.
 
@@ -2190,9 +2190,11 @@ Most read and trigger commands accept an optional provider filter for Claude, Co
 
 ### Session Indexing Commands (4)
 
-`search_sessions`, `get_session_context`, `get_search_facets`, and `sync_search_index` all operate on a unified Claude-plus-Codex index. Search and context requests include provider identity so session collisions do not bleed across providers.
+`search_sessions`, `get_session_context`, `get_search_facets`, and `sync_search_index` all operate on one Claude, Codex, and Pi index. Search and context requests include provider identity so session collisions do not bleed across providers.
 
-`sync_search_index` runs a fingerprint-based incremental sweep — not a wipe-and-rebuild — so a true rebuild requires deleting the on-disk index dir while the app is closed (or bumping `SCHEMA_VERSION` in [[src-tauri/src/sessions.rs]]).
+`get_session_context` locates the hit's transcript through [[src-tauri/src/sessions.rs#find_session_path]], which reads the analytics source registry for every provider and never walks or parses the corpus; a Pi hit and a Claude sub-agent chain therefore open their own retained file.
+
+`sync_search_index` runs [[src-tauri/src/sessions.rs#SessionIndex#sync]], a fingerprint-based incremental sweep — not a wipe-and-rebuild — so a true rebuild requires deleting the on-disk index dir while the app is closed (or bumping `SCHEMA_VERSION` in [[src-tauri/src/sessions.rs]]).
 
 ### UI Commands (4)
 
@@ -2252,7 +2254,7 @@ Indicator state payloads use the explicit status vocabulary `ready`, `degraded`,
 
 The Tantivy index stores provider, identity, content, and enrichment fields for shared session search.
 
-Fields include provider, message_id, session_id, content, role, custom_type, project, project_path, host, timestamp, git_branch, tools_used, files_modified, code_changes, commands_run, tool_details, and display text. Provider/project/host support facets, project and host are stored for hit metadata, and project_path keeps exact cwd identity. Pi search admits user, assistant, and `custom_message` documents; Claude and Codex retain intentional provider-native roles. Pi `custom_message` entries index their extension-injected context under a bounded 10 KiB content cap with their `customType` as an exact-match `custom_type` term, regardless of Pi's `display` flag; non-context `custom` entries stay excluded. Pi tool calls attach to assistant enrichment, while matching tool results are capped at 10 KiB in `ToolAction.full_output` and never become documents. Stored at `~/.local/share/com.quilltoolkit.app/session-index/`; schema version 8 rebuilds the full index directory when opening older indexes, at a measured cost recorded in `specs/030-pi-analytics-migration-measurement.md`.
+Fields include provider, message_id, session_id, content, role, custom_type, project, project_path, host, timestamp, git_branch, tools_used, files_modified, code_changes, commands_run, tool_details, and display text. Provider/project/host support facets, project and host are stored for hit metadata, and project_path keeps exact cwd identity. Pi search admits user, assistant, and `custom_message` documents; Claude and Codex retain intentional provider-native roles. Pi `custom_message` entries index their extension-injected context under a bounded 10 KiB content cap with their `customType` as an exact-match `custom_type` term, regardless of Pi's `display` flag; non-context `custom` entries stay excluded. Pi tool calls attach to assistant enrichment, while matching tool results are capped at 10 KiB in `ToolAction.full_output` and never become documents. Stored at `~/.local/share/com.quilltoolkit.app/session-index/`; schema version 9 rebuilds the full index directory, including the source-keyed `index_state.json`, when opening older indexes, at a cost measured for the schema-8 rebuild in `specs/030-pi-analytics-migration-measurement.md`.
 
 Search and context responses carry a nullable `session_name`. Names are not indexed: [[src-tauri/src/sessions.rs#attach_session_names]] joins them from `transcript_analytics_sources` after the index query, one deduplicated batch per response, so a rename costs one registry row instead of a document rewrite.
 

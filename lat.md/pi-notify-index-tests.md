@@ -32,6 +32,8 @@ Pi notify rejects a transcript outside the configured Pi session root and never 
 
 The filesystem watcher registers the configured Pi root with Claude and Codex, preserves provider identity through debounced changed-source admission, and uses whole-root recovery for remove, rename, overflow, late-root, and periodic rescan signals.
 
+Each recovery pass also admits the sources whose mtime advanced since the previous pass, from the inventory it already enumerated, and a watermark ahead of every file admits nothing.
+
 ## Startup Search Recovery
 
 Session Search startup inventory scans persisted Pi files without requiring a prior notify, indexes each supported user/assistant message once, and retains Pi provider/session identity.

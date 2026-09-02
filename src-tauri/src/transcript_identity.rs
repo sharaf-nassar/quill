@@ -7,6 +7,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -16,8 +17,9 @@ use crate::integrations::IntegrationProvider;
 pub(crate) const RETAINED_TRANSCRIPT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STABLE_READ_MAX_ATTEMPTS: usize = 3;
 
-/// Filesystem metadata used by both retained analytics fast paths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Filesystem metadata used by both retained analytics fast paths and the
+/// Session Search sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ModelSourceFastFingerprint {
     pub(crate) mtime_ns: i64,
     pub(crate) size_bytes: i64,
