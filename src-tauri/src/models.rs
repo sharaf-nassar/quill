@@ -293,6 +293,45 @@ pub struct ActivitySeriesResponse {
     pub project_counts: Vec<i64>,
 }
 
+/// Range totals and per-bucket series for the widget's activity readouts:
+/// tool calls with their failure evidence, LLM turns, user prompts, and
+/// reasoning tokens. One bucket grid shared with [`ActivitySeriesResponse`].
+///
+/// Every optional figure is a measurement, never a default: `tool_error_*`
+/// count only rows carrying `is_error` evidence, so a range whose providers
+/// record no outcome reads as unmeasured rather than as a 0% failure rate,
+/// and `reasoning_tokens` is `None` when no turn in range reported the
+/// dimension.
+#[derive(Serialize, Clone, Debug)]
+pub struct WidgetActivityStats {
+    pub range: String,
+    pub bucket_secs: i64,
+    pub timestamps: Vec<String>,
+    /// Every `tool_actions` row in range, any category.
+    pub tool_calls: i64,
+    /// Rows carrying an `is_error` flag: the denominator for the error rate.
+    pub tool_error_evidence: i64,
+    /// Rows with `is_error = 1`.
+    pub tool_errors: i64,
+    pub tool_call_counts: Vec<i64>,
+    /// Turn observations under active model sources: one per assistant
+    /// message, every chain. The same population the Models view counts.
+    pub turns: i64,
+    pub turn_counts: Vec<i64>,
+    /// Root-chain `user_text` events: what the operator typed.
+    pub prompts: i64,
+    /// Distinct sessions with at least one prompt in range.
+    pub prompt_sessions: i64,
+    pub prompt_counts: Vec<i64>,
+    /// Sum of reported reasoning tokens over turn observations, or `None`
+    /// when no in-range turn reported the dimension.
+    pub reasoning_tokens: Option<i64>,
+    /// Output tokens over the same turns that reported reasoning, so the
+    /// share never compares a Pi numerator against every provider's output.
+    pub reasoning_output_tokens: i64,
+    pub reasoning_counts: Vec<i64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UsageBucket {
     pub provider: IntegrationProvider,

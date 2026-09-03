@@ -787,6 +787,7 @@ monitor surface:
 | `get_session_breakdown` | Sessions breakdown and live overlay |
 | `get_skill_breakdown` | Skills breakdown |
 | `get_token_history` | Token/code comparison insight |
+| `get_widget_activity_stats` | Tools, Turns, Prompts, and Reasoning readouts |
 
 Every other command is denied, including `fetch_usage_data`,
 `refresh_usage_data`, every setter or maintenance command, and every `plugin:*`

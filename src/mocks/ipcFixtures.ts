@@ -6,6 +6,7 @@
 import { emit } from "@tauri-apps/api/event";
 import type {
   ActivitySeriesResponse,
+  WidgetActivityStats,
   CodeStats,
   CodeStatsHistoryPoint,
   ContextPreservationStatus,
@@ -2534,6 +2535,48 @@ function activitySeries(range: string, buckets: number): ActivitySeriesResponse 
   };
 }
 
+const TOOL_CALL_CURVE = [140, 210, 180, 260, 240, 310, 290, 350, 330, 400, 380, 420, 460] as const;
+const TURN_CURVE = [110, 160, 140, 200, 190, 240, 220, 270, 250, 310, 290, 330, 360] as const;
+const PROMPT_CURVE = [3, 5, 4, 7, 6, 8, 7, 9, 8, 11, 10, 12, 14] as const;
+const REASONING_CURVE = [21_000, 34_000, 28_000, 41_000, 39_000, 52_000, 47_000, 58_000, 55_000, 66_000, 61_000, 70_000, 76_000] as const;
+
+/**
+ * Tool-call, prompt, and reasoning figures whose totals scale with the
+ * window like the runtime fixture does, and whose series sum to the total.
+ * Error evidence covers every call (the Pi ingest shape), at a 4% rate.
+ */
+function widgetActivityStats(range: string, buckets: number): WidgetActivityStats {
+  const days = (RANGE_DURATION_MS[range] ?? D) / D;
+  const scale = (curve: readonly number[], perDay: number) => {
+    const shape = resample(curve, buckets);
+    const shapeTotal = shape.reduce((sum, value) => sum + value, 0);
+    const total = Math.max(1, Math.round(days * perDay));
+    const counts = shape.map((value) => Math.round((value / shapeTotal) * total));
+    return { total: counts.reduce((sum, value) => sum + value, 0), counts };
+  };
+  const tools = scale(TOOL_CALL_CURVE, 3_025);
+  const turns = scale(TURN_CURVE, 2_350);
+  const prompts = scale(PROMPT_CURVE, 131);
+  const reasoning = scale(REASONING_CURVE, 526_000);
+  return {
+    range,
+    bucket_secs: bucketSecs(range, buckets),
+    timestamps: bucketTimestamps(range, buckets),
+    tool_calls: tools.total,
+    tool_error_evidence: tools.total,
+    tool_errors: Math.round(tools.total * 0.041),
+    tool_call_counts: tools.counts,
+    turns: turns.total,
+    turn_counts: turns.counts,
+    prompts: prompts.total,
+    prompt_sessions: Math.max(1, Math.round(prompts.total / 4.2)),
+    prompt_counts: prompts.counts,
+    reasoning_tokens: reasoning.total,
+    reasoning_output_tokens: Math.round(reasoning.total / 0.23),
+    reasoning_counts: reasoning.counts,
+  };
+}
+
 // --- Command → fixture map ----------------------------------------------------
 
 type FixtureHandler = (args?: Record<string, unknown>) => unknown;
@@ -2614,6 +2657,8 @@ const fixtures: Record<string, FixtureHandler> = {
   get_token_stats: () => tokenStats,
   get_activity_series: (args) =>
     activitySeries(rangeArg(args), bucketsArg(args, ACTIVITY_SERIES_BUCKETS)),
+  get_widget_activity_stats: (args) =>
+    widgetActivityStats(rangeArg(args), bucketsArg(args, ACTIVITY_SERIES_BUCKETS)),
   // code
   get_code_stats: () => codeStats,
   get_code_stats_history: (args) => codeHistory(rangeArg(args)),

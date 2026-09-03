@@ -66,7 +66,7 @@ use models::{
     ProviderErrorKind, ProviderStatus, RuntimeSettings, SessionBreakdown, SessionCodeStats,
     SessionModelHistoryResponse, SessionRef, SessionStats, SkillBreakdown, SkillProjectBreakdown,
     StatusIndicatorState, TokenDataPoint, TokenStats, ToolCount, TurnOutcomesResponse, UsageBucket,
-    UsageData, UsageProviderError, UsageSource,
+    UsageData, UsageProviderError, UsageSource, WidgetActivityStats,
 };
 use rand::RngCore;
 use rollup_backfill::{
@@ -3654,6 +3654,17 @@ async fn get_activity_series(
     run_blocking(move || storage.get_activity_series(&range, buckets))
 }
 
+/// Tool-call, prompt, and reasoning totals plus their series for the widget's
+/// activity readouts, on the same bucket grid as `get_activity_series`.
+#[tauri::command]
+async fn get_widget_activity_stats(
+    range: String,
+    buckets: Option<u32>,
+) -> Result<WidgetActivityStats, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_widget_activity_stats(&range, buckets))
+}
+
 #[tauri::command]
 async fn get_token_hostnames() -> Result<Vec<String>, String> {
     let storage = get_storage()?;
@@ -6475,6 +6486,7 @@ pub fn run() {
             get_token_history,
             get_token_stats,
             get_activity_series,
+            get_widget_activity_stats,
             get_token_hostnames,
             get_host_breakdown,
             get_project_breakdown,

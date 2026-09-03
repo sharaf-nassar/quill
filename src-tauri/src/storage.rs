@@ -98,7 +98,7 @@ use crate::models::{
     SessionModelChain, SessionModelChainKind, SessionModelHistoryResponse, SessionModelSegment,
     SessionRef, SessionStats, SessionTurnOutcomes, SkillBreakdown, SkillProjectBreakdown,
     TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, TurnOutcomeCounts,
-    TurnOutcomesResponse, UsageBucket, UsageSource, WindowTurnOutcomes,
+    TurnOutcomesResponse, UsageBucket, UsageSource, WidgetActivityStats, WindowTurnOutcomes,
 };
 
 /// Highest migration this build knows how to apply. Every migration gate is a
@@ -15311,6 +15311,182 @@ impl Storage {
         })
     }
 
+    /// Tool-call, turn, prompt, and reasoning totals for the widget's activity
+    /// readouts, each with its series on the shared widget bucket grid.
+    ///
+    /// Three grouped reads in one deferred snapshot. Tool calls and prompts
+    /// read raw `tool_actions` / `session_events`, which retention prunes no
+    /// sooner than 30 days back while `range_to_duration` caps every widget
+    /// range at 30 days, so no in-range row is ever missing. Turns and
+    /// reasoning read `model_usage_observations` under the same active-source
+    /// predicate as every other model-evidence aggregate, so a deleted
+    /// session's turns do not leak back into the count or the share.
+    pub fn get_widget_activity_stats(
+        &self,
+        range: &str,
+        buckets: Option<u32>,
+    ) -> Result<WidgetActivityStats, String> {
+        let window = {
+            let conn = self.conn.lock().unwrap();
+            token_series_window(&conn, range, buckets)?
+        };
+        let start_ms = window.start_epoch.saturating_mul(1_000);
+        let bucket_ms = window.bucket_secs.saturating_mul(1_000);
+
+        let mut conn = self.open_view_reader()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("Begin widget activity read snapshot: {error}"))?;
+
+        let mut tool_call_counts = vec![0i64; window.bucket_count];
+        let mut tool_calls = 0i64;
+        let mut tool_error_evidence = 0i64;
+        let mut tool_errors = 0i64;
+        {
+            let mut stmt = tx
+                .prepare(&format!(
+                    "SELECT {SERIES_BUCKET_EXPR},
+                            COUNT(*),
+                            COUNT(is_error),
+                            COUNT(CASE WHEN is_error = 1 THEN 1 END)
+                     FROM tool_actions
+                     WHERE timestamp >= ?1
+                     GROUP BY 1"
+                ))
+                .map_err(|e| format!("Prepare widget tool-call series: {e}"))?;
+            let rows = stmt
+                .query_map(
+                    params![&window.from, window.start_epoch, window.bucket_secs],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .map_err(|e| format!("Query widget tool-call series: {e}"))?;
+            for row in rows {
+                let (bucket, calls, evidence, errors) =
+                    row.map_err(|e| format!("Widget tool-call row: {e}"))?;
+                tool_call_counts[window.bucket_index(bucket)] += calls;
+                tool_calls += calls;
+                tool_error_evidence += evidence;
+                tool_errors += errors;
+            }
+        }
+
+        let mut prompt_counts = vec![0i64; window.bucket_count];
+        let mut prompts = 0i64;
+        {
+            let mut stmt = tx
+                .prepare(&format!(
+                    "SELECT {SERIES_BUCKET_EXPR}, COUNT(*)
+                     FROM session_events
+                     WHERE timestamp >= ?1 AND kind = 'user_text' AND is_sidechain = 0
+                     GROUP BY 1"
+                ))
+                .map_err(|e| format!("Prepare widget prompt series: {e}"))?;
+            let rows = stmt
+                .query_map(
+                    params![&window.from, window.start_epoch, window.bucket_secs],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(|e| format!("Query widget prompt series: {e}"))?;
+            for row in rows {
+                let (bucket, count) = row.map_err(|e| format!("Widget prompt row: {e}"))?;
+                prompt_counts[window.bucket_index(bucket)] += count;
+                prompts += count;
+            }
+        }
+        let prompt_sessions: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                     SELECT provider, session_id FROM session_events
+                     WHERE timestamp >= ?1 AND kind = 'user_text' AND is_sidechain = 0
+                     GROUP BY provider COLLATE BINARY, session_id COLLATE BINARY
+                 )",
+                params![&window.from],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Query widget prompt sessions: {e}"))?;
+
+        let mut turn_counts = vec![0i64; window.bucket_count];
+        let mut turns = 0i64;
+        let mut reasoning_counts = vec![0i64; window.bucket_count];
+        let mut reasoning_tokens: Option<i64> = None;
+        let mut reasoning_output_tokens = 0i64;
+        {
+            // Bucketed in milliseconds rather than through `strftime`, because
+            // observations are keyed by `observed_at_ms`, not a text timestamp.
+            // `SUM(reasoning_tokens)` is NULL for a bucket with no reasoning
+            // evidence, which is what keeps the range total `None` rather
+            // than a fabricated zero.
+            let mut stmt = tx
+                .prepare(&format!(
+                    "SELECT (observation.observed_at_ms - ?1) / ?2,
+                            COUNT(*),
+                            SUM(observation.reasoning_tokens),
+                            SUM(CASE WHEN observation.reasoning_tokens IS NOT NULL
+                                     THEN COALESCE(observation.output_tokens, 0) END)
+                     FROM model_usage_observations AS observation
+                          INDEXED BY idx_model_observations_observed_provider
+                     JOIN model_observation_sources AS source
+                       ON source.provider = observation.provider
+                      AND source.source_key = observation.source_key
+                     WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                       AND observation.observed_at_ms >= ?1
+                       AND observation.observation_kind = 'turn'
+                     GROUP BY 1"
+                ))
+                .map_err(|e| format!("Prepare widget turn series: {e}"))?;
+            let rows = stmt
+                .query_map(params![start_ms, bucket_ms.max(1)], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                })
+                .map_err(|e| format!("Query widget turn series: {e}"))?;
+            for row in rows {
+                let (bucket, count, reasoning, output) =
+                    row.map_err(|e| format!("Widget turn row: {e}"))?;
+                let index = window.bucket_index(bucket);
+                turn_counts[index] += count;
+                turns += count;
+                if let Some(reasoning) = reasoning {
+                    reasoning_counts[index] += reasoning;
+                    reasoning_tokens = Some(reasoning_tokens.unwrap_or(0) + reasoning);
+                    reasoning_output_tokens += output.unwrap_or(0);
+                }
+            }
+        }
+
+        tx.commit()
+            .map_err(|error| format!("Commit widget activity read snapshot: {error}"))?;
+
+        Ok(WidgetActivityStats {
+            range: range.to_string(),
+            bucket_secs: window.bucket_secs,
+            timestamps: window.timestamps,
+            tool_calls,
+            tool_error_evidence,
+            tool_errors,
+            tool_call_counts,
+            turns,
+            turn_counts,
+            prompts,
+            prompt_sessions,
+            prompt_counts,
+            reasoning_tokens,
+            reasoning_output_tokens,
+            reasoning_counts,
+        })
+    }
+
     pub fn store_context_savings_events(
         &self,
         events: &[ContextSavingsEventPayload],
@@ -25720,7 +25896,7 @@ mod tests {
     /// retained row with no live coverage never showed the model its own
     /// recorded usage names — quill-ihbn's repro once a session ages out of
     /// the live window and the overlay no longer touches its row.
-    // @lat: [[backend#Backend#Tauri IPC Commands#Usage and Token Commands (14)]]
+    // @lat: [[backend#Backend#Tauri IPC Commands#Usage and Token Commands (15)]]
     #[test]
     #[serial]
     fn retained_session_breakdown_carries_its_ranked_primary_model() {
@@ -38619,6 +38795,137 @@ mod tests {
             "covered zero-duration chain must not become unknown"
         );
 
+        clear_env();
+    }
+
+    /// Break: without explicit denominators the widget would read a range
+    /// whose providers record no tool outcomes as a 0% failure rate, count a
+    /// subagent's prompts as the operator's, and fabricate a zero reasoning
+    /// total where no turn reported the dimension.
+    // @lat: [[widget-readout-tests#Widget Readout Test Specs#Activity Stats Denominators]]
+    #[test]
+    #[serial]
+    fn widget_activity_stats_keep_measured_denominators() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        // `token_series_window` reads the wall clock, so seed relative to it.
+        let now = Utc::now();
+        let at = |minutes: i64| (now - TimeDelta::minutes(minutes)).to_rfc3339();
+        let at_ms = |minutes: i64| (now - TimeDelta::minutes(minutes)).timestamp_millis();
+        {
+            let conn = storage.conn.lock().unwrap();
+            // Four tool calls: two with outcome evidence (one failed), one
+            // unmeasured, one outside the range.
+            for (key, minutes, is_error) in [
+                ("a", 5, Some(1)),
+                ("b", 10, Some(0)),
+                ("c", 20, None),
+                ("d", 90, Some(1)),
+            ] {
+                conn.execute(
+                    "INSERT INTO tool_actions (
+                         provider, source_key, action_key, message_id, session_id,
+                         chain_id, tool_name, category, summary, timestamp,
+                         is_sidechain, is_error
+                     ) VALUES ('pi', 'src', ?1, ?1, 'sess', 'sess', 'bash',
+                               'command', 'seed', ?2, 0, ?3)",
+                    params![key, at(minutes), is_error],
+                )
+                .expect("seed tool action");
+            }
+            // Three root prompts across two sessions plus one subagent prompt,
+            // which is the agent's message, not the operator's.
+            for (key, session, minutes, sidechain) in [
+                ("p1", "sess", 4, 0),
+                ("p2", "sess", 12, 0),
+                ("p3", "other", 30, 0),
+                ("p4", "sess", 6, 1),
+            ] {
+                conn.execute(
+                    "INSERT INTO session_events (
+                         provider, source_key, event_key, session_id, chain_id,
+                         parent_chain_id, agent_id, is_sidechain, timestamp,
+                         kind, uuid, parent_uuid
+                     ) VALUES ('pi', 'src', ?1, ?2, ?2, NULL, NULL, ?3, ?4,
+                               'user_text', ?1, NULL)",
+                    params![key, session, sidechain, at(minutes)],
+                )
+                .expect("seed prompt event");
+            }
+        }
+
+        let stats = storage
+            .get_widget_activity_stats("1h", Some(4))
+            .expect("activity stats");
+        assert_eq!(stats.tool_calls, 3);
+        assert_eq!(stats.tool_error_evidence, 2);
+        assert_eq!(stats.tool_errors, 1);
+        assert_eq!(stats.tool_call_counts.iter().sum::<i64>(), 3);
+        assert_eq!(stats.prompts, 3, "subagent prompts are not the operator's");
+        assert_eq!(stats.prompt_sessions, 2);
+        assert_eq!(stats.prompt_counts.iter().sum::<i64>(), 3);
+        assert_eq!(stats.turns, 0);
+        assert_eq!(
+            stats.reasoning_tokens, None,
+            "no turn reported reasoning, so the total is unmeasured, not zero"
+        );
+
+        // One turn without reasoning and one with: the share denominator is
+        // only the reporting turn's output, never the whole range's.
+        seed_outcome_observation(
+            &storage,
+            "pi-src",
+            "turn-0",
+            0,
+            "sess",
+            "turn",
+            Some("claude-sonnet-5"),
+            at_ms(8),
+            100,
+            Some("stop"),
+            Some(0),
+        );
+        seed_outcome_observation(
+            &storage,
+            "pi-src",
+            "turn-1",
+            1,
+            "sess",
+            "turn",
+            Some("claude-sonnet-5"),
+            at_ms(3),
+            100,
+            Some("stop"),
+            Some(0),
+        );
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE model_usage_observations SET output_tokens = 400
+                 WHERE source_record_key = 'turn-0'",
+                [],
+            )
+            .expect("plain turn output");
+            conn.execute(
+                "UPDATE model_usage_observations
+                 SET output_tokens = 1000, reasoning_tokens = 250
+                 WHERE source_record_key = 'turn-1'",
+                [],
+            )
+            .expect("reasoning turn output");
+        }
+        let stats = storage
+            .get_widget_activity_stats("1h", Some(4))
+            .expect("activity stats with turns");
+        assert_eq!(stats.turns, 2);
+        assert_eq!(stats.turn_counts.iter().sum::<i64>(), 2);
+        assert_eq!(stats.reasoning_tokens, Some(250));
+        assert_eq!(
+            stats.reasoning_output_tokens, 1000,
+            "the share compares against reporting turns only"
+        );
+        assert_eq!(stats.reasoning_counts.iter().sum::<i64>(), 250);
         clear_env();
     }
 }

@@ -49,6 +49,10 @@ pub fn is_permitted_command(command: &str) -> bool {
         "get_skill_breakdown" => true,
         // `Storage::get_token_history` — reads `token_usage` points.
         "get_token_history" => true,
+        // `Storage::get_widget_activity_stats` — tool-call, prompt, and
+        // reasoning counts over `tool_actions`, `session_events`, and model
+        // observations.
+        "get_widget_activity_stats" => true,
         _ => false,
     }
 }
@@ -77,6 +81,7 @@ mod tests {
             "get_session_breakdown",
             "get_skill_breakdown",
             "get_token_history",
+            "get_widget_activity_stats",
         ] {
             assert!(is_permitted_command(command), "permitted: {command}");
         }

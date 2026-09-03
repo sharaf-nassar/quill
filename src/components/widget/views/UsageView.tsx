@@ -24,7 +24,7 @@ import { useEffect, useMemo, useState } from "react";
 import { AreaChart, bucketTotals, Sparkline, type VizSeries } from "../viz";
 import { chartSeriesFor } from "../chartDimensions";
 import { selectInsightLine } from "./insightLine";
-import { useActivitySeries } from "../../../hooks/useWidgetSeries";
+import { useWidgetActivityStats } from "../../../hooks/useWidgetSeries";
 import { useBreakdownData } from "../../../hooks/useBreakdownData";
 import { queryRangeMs, shouldLoadSecondaryProjects } from "../../../hooks/widgetQueryPlan";
 import { useCodeInsights } from "../../../hooks/useCodeInsights";
@@ -100,6 +100,34 @@ function formatCount(value: number): string {
 function formatNetLines(value: number): string {
   if (value > 0) return `+${formatNumber(value)}`;
   return formatNumber(value);
+}
+
+/**
+ * Runtime as a multiple of the selected window: two hours of runtime in a
+ * `1h` range is `2×`, thirty minutes is `0.5×`. Above `1×` means parallel
+ * sessions, which the total alone cannot show.
+ */
+function formatRuntimeMultiplier(runtimeSecs: number, range: RangeType): string {
+  const ratio = runtimeSecs / (queryRangeMs(range) / 1000);
+  if (ratio > 0 && ratio < 0.05) return "<0.1×";
+  return `${Math.round(ratio * 10) / 10}×`;
+}
+
+/**
+ * A share as a whole percent, floored to `<1%` rather than rounded to a `0%`
+ * that would deny the numerator exists. Null when there is no denominator.
+ */
+function formatShare(numerator: number, denominator: number): string | null {
+  if (denominator <= 0) return null;
+  const percent = (numerator / denominator) * 100;
+  if (percent > 0 && percent < 1) return "<1%";
+  return `${Math.round(percent)}%`;
+}
+
+/** `4.2` prompts per session; one decimal, tabular. */
+function formatPerSession(prompts: number, sessions: number): string | null {
+  if (sessions <= 0) return null;
+  return `${(Math.round((prompts / sessions) * 10) / 10).toLocaleString()}/s`;
 }
 
 /** Last path segment of a project path; null when there is no path at all. */
@@ -191,19 +219,38 @@ interface ReadoutProps {
   /** Already formatted; `—` when the metric has nothing to report yet. */
   value: string;
   hue: string;
-  values: readonly number[];
+  /** Series under the label; the secondary tier draws none. */
+  values?: readonly number[];
+  /**
+   * Small top-right figure beside the value, e.g. the runtime multiplier.
+   * Shown only when it fits on the value line; see `.wg-cell-aside`.
+   */
+  aside?: { text: string; title: string };
+  /** Hover title for the whole cell, stating what the value measures. */
+  title?: string;
 }
 
-/** One cell of the 3x2 grid: hue-linked value, label, and series. */
-function Readout({ label, value, hue, values }: ReadoutProps) {
+/**
+ * One readout cell: hue-linked value with its optional chip, label, and
+ * (primary tier) series. The tier is the parent grid's: `.wg-grid--primary`
+ * cells carry a sparkline, `.wg-grid--secondary` cells are value and label.
+ */
+function Readout({ label, value, hue, values, aside, title }: ReadoutProps) {
   return (
-    <div className="wg-cell wg-cell--metric" style={{ color: hue }}>
-      <span className="wg-cell-value">{value}</span>
+    <div className="wg-cell wg-cell--metric" style={{ color: hue }} title={title}>
+      <span className="wg-cell-value">
+        {value}
+        {aside && (
+          <span className="wg-cell-aside" title={aside.title}>
+            {aside.text}
+          </span>
+        )}
+      </span>
       <span className="wg-cell-key">
         <i className="wg-cell-swatch" style={{ background: hue }} aria-hidden="true" />
         {label}
       </span>
-      <Sparkline values={values} color={hue} className="wg-cell-spark" />
+      {values && <Sparkline values={values} color={hue} className="wg-cell-spark" />}
     </div>
   );
 }
@@ -690,7 +737,7 @@ function UsageView({ range, webSurface = false }: UsageViewProps) {
   );
 
   const { overview } = useModelAnalytics(range, null, true);
-  const activity = useActivitySeries(range);
+  const activityStats = useWidgetActivityStats(range);
   const runtime = useLlmRuntimeStats(range);
   const insights = useCodeInsights(range, runtime);
   const code = useCodeStats(range);
@@ -768,6 +815,24 @@ function UsageView({ range, webSurface = false }: UsageViewProps) {
         : 0,
     [mode, breakdown.data, nowMs],
   );
+
+  const stats = activityStats.data;
+  // Denominator-aware: a range whose providers record no tool outcomes reads
+  // as unmeasured, never as a 0% failure rate.
+  const toolErrorRate =
+    stats === null ? null : formatShare(stats.tool_errors, stats.tool_error_evidence);
+  const promptsPerSession =
+    stats === null ? null : formatPerSession(stats.prompts, stats.prompt_sessions);
+  const reasoningShare =
+    stats?.reasoning_tokens == null
+      ? null
+      : formatShare(stats.reasoning_tokens, stats.reasoning_output_tokens);
+  // Active runtime spread over LLM turns. Runtime's own `turn_count` is its
+  // idle-split active intervals, not LLM calls, so it is not the divisor.
+  const avgTurnSecs =
+    runtime.totalRuntimeSecs !== null && stats !== null && stats.turns > 0
+      ? runtime.totalRuntimeSecs / stats.turns
+      : null;
 
   const modelTotals = overview.data?.totals ?? null;
   const cachePercent = cacheHitRate(modelTotals);
@@ -910,50 +975,129 @@ function UsageView({ range, webSurface = false }: UsageViewProps) {
         )}
       </div>
 
-      <div className="wg-grid wg-num">
+      {/* Two tiers, one grammar. The primary row is what moves every minute
+          of a live session: time, agent activity, LLM calls, code output.
+          Each carries a sparkline and a secondary figure. The second row is
+          the slower context: value and label only. */}
+      <div className="wg-grid wg-grid--primary wg-num">
         <Readout
           label="Runtime"
           value={runtime.totalRuntimeSecs === null ? "—" : formatDurationSecs(runtime.totalRuntimeSecs)}
           hue="var(--metric-runtime)"
           values={runtime.sparkline.map((point) => point.value)}
-        />
-        <Readout
-          label="Tok / LOC"
-          value={
-            insights.efficiency.tokensPerLoc === null
-              ? "—"
-              : formatNumber(insights.efficiency.tokensPerLoc)
+          title="Active LLM time across every session and agent in this range"
+          aside={
+            runtime.totalRuntimeSecs === null
+              ? undefined
+              : {
+                  text: formatRuntimeMultiplier(runtime.totalRuntimeSecs, range),
+                  title: `Runtime as a multiple of the ${range} window`,
+                }
           }
-          hue="var(--metric-tok-per-loc)"
-          values={insights.efficiency.sparkline.map((point) => point.value)}
         />
         <Readout
-          label="LOC / hr"
-          value={
-            insights.velocity.locPerHour === null
-              ? "—"
-              : formatNumber(insights.velocity.locPerHour)
+          label="Tools"
+          value={stats === null ? "—" : formatCount(stats.tool_calls)}
+          hue="var(--metric-tool-calls)"
+          values={stats?.tool_call_counts ?? []}
+          title="Tool calls in this range: shell, edits, reads, searches, and MCP"
+          aside={
+            toolErrorRate === null
+              ? undefined
+              : {
+                  text: toolErrorRate,
+                  title: `${formatNumber(stats?.tool_errors ?? 0)} of ${formatNumber(
+                    stats?.tool_error_evidence ?? 0,
+                  )} tool calls with recorded outcomes failed`,
+                }
           }
-          hue="var(--metric-loc-per-hr)"
-          values={insights.velocity.sparkline.map((point) => point.value)}
         />
         <Readout
-          label="Sessions"
-          value={runtime.loading ? "—" : formatNumber(runtime.sessionCount)}
-          hue="var(--metric-sessions)"
-          values={activity.data?.session_counts ?? []}
-        />
-        <Readout
-          label="Projects"
-          value={projects.loading ? "—" : formatNumber(projects.data.length)}
-          hue="var(--metric-projects)"
-          values={activity.data?.project_counts ?? []}
+          label="Turns"
+          value={stats === null ? "—" : formatCount(stats.turns)}
+          hue="var(--metric-turns)"
+          values={stats?.turn_counts ?? []}
+          title="LLM turns in this range across every provider and agent"
+          aside={
+            avgTurnSecs === null
+              ? undefined
+              : {
+                  text: formatDurationSecs(avgTurnSecs),
+                  title: "Active runtime per turn",
+                }
+          }
         />
         <Readout
           label="Net lines"
           value={code.stats === null ? "—" : formatNetLines(code.stats.net_change)}
           hue="var(--metric-net-lines)"
           values={netLines}
+          title="Lines added minus lines removed by agent edits in this range"
+        />
+      </div>
+      <div className="wg-grid wg-grid--secondary wg-num">
+        <Readout
+          label="Prompts"
+          value={stats === null ? "—" : formatCount(stats.prompts)}
+          hue="var(--metric-prompts)"
+          title={
+            stats === null
+              ? undefined
+              : `${formatNumber(stats.prompts)} messages you sent across ${formatNumber(
+                  stats.prompt_sessions,
+                )} sessions`
+          }
+          aside={
+            promptsPerSession === null
+              ? undefined
+              : { text: promptsPerSession, title: "Prompts per session" }
+          }
+        />
+        <Readout
+          label="Reasoning"
+          value={reasoningShare ?? "—"}
+          hue="var(--metric-reasoning)"
+          title="Share of output tokens spent on reasoning, over the turns that report it; only Pi records this dimension today"
+          aside={
+            stats?.reasoning_tokens == null
+              ? undefined
+              : {
+                  text: formatTokenCount(stats.reasoning_tokens),
+                  title: "Reasoning tokens on turns that report them",
+                }
+          }
+        />
+        <Readout
+          label="Tok / LOC"
+          value={
+            insights.efficiency.tokensPerLoc === null
+              ? "—"
+              : formatCount(insights.efficiency.tokensPerLoc)
+          }
+          hue="var(--metric-tok-per-loc)"
+          title="Tokens spent per line of code changed"
+        />
+        <Readout
+          label="LOC / hr"
+          value={
+            insights.velocity.locPerHour === null
+              ? "—"
+              : formatCount(insights.velocity.locPerHour)
+          }
+          hue="var(--metric-loc-per-hr)"
+          title="Lines of code changed per hour of active runtime"
+        />
+        <Readout
+          label="Sessions"
+          value={runtime.loading ? "—" : formatCount(runtime.sessionCount)}
+          hue="var(--metric-sessions)"
+          title="Distinct sessions with activity in this range"
+        />
+        <Readout
+          label="Projects"
+          value={projects.loading ? "—" : formatCount(projects.data.length)}
+          hue="var(--metric-projects)"
+          title="Distinct projects with activity in this range"
         />
       </div>
 

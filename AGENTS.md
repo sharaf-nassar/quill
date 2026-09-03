@@ -48,6 +48,16 @@ CI (`.github/workflows/ci.yml`) enforces the same and a macOS check.
 
 - Use `npm run tauri -- dev`. Never `cargo tauri dev` — it skips
   `tauri.dev.conf.json` and writes production state.
+- While a dev server is running, do not touch it at all: no HTTP probes of
+  `localhost:8181` (a `?t=` cache-buster permanently adds a module-graph node,
+  and pruning any duplicate CSS node removes the one shared `<style>` element,
+  which is the unstyled-widget failure), no `touch`ing watched files to force a
+  reload, and no `npm test` / `npm run knip` / other Vite-loading tooling
+  against the live checkout. Verify rendering by copying the stylesheet plus a
+  fixture into a scratch directory and rendering that in headless Chrome.
+  Recovery when it does break: `touch src/styles/index.css`, or restart dev to
+  also clear accumulated `?t=` nodes. See
+  `docs/solutions/environment/second-vite-server-strips-dev-css.md`.
 - While a dev server is running, do not edit `vite.config.ts`, install
   packages, or start extra Vite processes against this checkout. A config
   save restarts the server and re-optimizes its dependency cache — open

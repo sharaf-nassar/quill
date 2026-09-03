@@ -137,6 +137,58 @@ Rules and mitigations:
   latch prevents loops and clears on success. The unstyled-widget symptom now
   recovers in under a second instead of persisting until a manual reload.
 
+## A fourth trigger: an agent probing the live dev server over HTTP
+
+Observed 2026-09-02, repeatedly, during one agent session. The widget rendered
+unstyled several times while the operator ran `tauri dev` normally and changed
+nothing themselves.
+
+The agent had been verifying its own edits by curling the running dev server:
+
+```bash
+curl http://localhost:8181/src/styles/index.css                 # what a reload gets
+curl "http://localhost:8181/src/styles/index.css?t=$(date +%s)"  # force a fresh transform
+```
+
+Both are destructive against a live server.
+
+- **`?t=` creates a permanent module node.** Vite's `ensureEntryFromUrl` keys
+  the module graph by URL, so every distinct cache-buster adds another node for
+  the same file. The operator's log shows them accumulating:
+  `hmr update /src/styles/index.css, /src/styles/index.css?t=1788388480,
+  /src/styles/index.css?t=1788388885, /src/styles/index.css?t=1788389777169680046`
+  — the last is a `date +%s%N` from the agent's own command.
+- **Duplicate CSS nodes fight over one style element.** The dev CSS module ends
+  with `import.meta.hot.prune(() => __vite__removeStyle(__vite__id))` where
+  `__vite__id` is the *file path*, shared by every duplicate node. Pruning any
+  one of them removes the `<style>` the real module owns, so the whole
+  stylesheet disappears while React keeps rendering — the exact unstyled-widget
+  symptom this document opens with.
+- **Separately, a bare-URL transform can cache empty.** Twice the bare URL
+  served a 0-byte module (`const __vite__css = ""`, ETag
+  `W/"0-2jmj7l5rSw0yVb/vlWAYkK/YBwk"` — the sha1 of the empty string) while the
+  `?t=` URL served the full 84KB. A page reload fetches the bare URL, so it
+  reloads into an empty stylesheet and stays broken. `UsageView.tsx` hit the
+  same thing at 171 bytes, which left the webview rendering a component two
+  edits stale while CSS HMR kept working — indistinguishable from "the agent's
+  fix did not apply."
+
+Recovery, no restart needed:
+
+```bash
+touch src/styles/index.css   # forces one clean re-transform; verify with the bare URL
+```
+
+A dev-server restart also clears the accumulated `?t=` nodes, which `touch`
+does not.
+
+**Rule for agents (now in `AGENTS.md`): never touch the operator's running dev
+server.** Do not curl it, with or without a cache-buster; do not `touch` watched
+files to force a reload; do not run `npm test`, `knip`, or any other Vite-loading
+tooling against the live checkout mid-session. To verify rendering, copy the
+stylesheet and a fixture into a scratch directory and render *that* in headless
+Chrome — it needs no dev server and cannot perturb one.
+
 ## Why orphans existed at all: Ctrl+C does not kill the tauri dev chain
 
 The stray servers were not operator carelessness. `tauri dev`'s cleanup

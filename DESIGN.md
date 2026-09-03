@@ -276,15 +276,23 @@ neutral. Identity is always rendered swatch + raw id — a shade never stands
 alone — and the same model keeps the same shade on every surface of a view.
 
 ### Metric Identity
-Six fixed hues that name the six readouts, plus three that name the context
+Ten fixed hues that name the ten readouts, plus three that name the context
 categories. Within metric readouts, they are permitted on the **primary value,
 text label, swatch, sparkline stroke, endpoint dot, and split-bar segments.**
 The repeated hue binds each compact readout into one scannable unit; the label,
 swatch, and chart shape keep color from becoming the only cue. Delta text stays
 on the separate status vocabulary. Limit-window labels may reuse metric hues as
 category identifiers under the rule below.
-- Runtime `#22d3ee` · Tokens-per-LOC `#a78bfa` · LOC-per-hour `#f472b6` ·
-  Sessions `#818cf8` · Projects `#2dd4bf` · Net lines `#a3e635`.
+- Primary row: Runtime `#22d3ee` · Tools `#38bdf8` · Turns `#e879f9` ·
+  Net lines `#a3e635`.
+- Secondary tier: Prompts `#ff8f70` · Reasoning `#d8b4fe` · Tokens-per-LOC
+  `#a78bfa` · LOC-per-hour `#f472b6` · Sessions `#818cf8` · Projects `#2dd4bf`.
+- The four added hues sit at least 14° of OKLCH hue from every provider and
+  status colour, and each text mix clears 8:1 on Surface. Tools (sky) is a
+  step off Runtime's cyan because the two read side by side; Prompts (coral)
+  is warm because it is the one figure the operator produced rather than the
+  agent; Reasoning (lilac) is the pale end of the violet family that already
+  names token cost.
 - **Text tints.** The raw hues sit at 0.30–0.65 relative luminance against Text
   Hi's 0.84, so on text their antialiased edges collapse into the plane and the
   glyphs read thinner and smaller than the same type in neutral. Swatches,
@@ -577,9 +585,12 @@ redesign pass moves it onto the flat plane. Until then:
   separate status vocabulary; the named limit-window labels remain the other
   metric-text reuse.
 - **Do** set `font-variant-numeric: tabular-nums` on every live or compared
-  number, and keep type at 8px or above.
+  number, and keep type at 8px or above. One stated exception: the readout
+  grid's secondary tier labels sit at 7px, which is what keeps the longest
+  name a whole word (`REASONING`, not `REASON.`) six across and holds that
+  tier a clear step under the primary row's 9px.
 - **Do** make neutral values bright and labels dim; metric readouts use only
-  their six fixed identity hues, never ad-hoc color.
+  their ten fixed identity hues, never ad-hoc color.
 - **Do** keep motion functional and fast (120ms on state, 0.3s on fills) and
   honor `prefers-reduced-motion`.
 - **Do** expose the value: progressbar roles, live regions, and labeled button

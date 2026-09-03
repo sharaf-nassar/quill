@@ -136,6 +136,36 @@ export interface ActivitySeriesResponse {
   project_counts: number[];
 }
 
+/**
+ * `get_widget_activity_stats`: tool calls, prompts, and reasoning tokens for
+ * the widget's activity readouts on the `get_activity_series` bucket grid.
+ * Error-rate and reasoning fields are measurements with explicit denominators
+ * or `null`, never zeroed defaults.
+ */
+export interface WidgetActivityStats {
+  range: string;
+  bucket_secs: number;
+  timestamps: string[];
+  tool_calls: number;
+  /** Tool rows carrying an `is_error` flag: the error-rate denominator. */
+  tool_error_evidence: number;
+  tool_errors: number;
+  tool_call_counts: number[];
+  /** Turn observations under active model sources, every chain. */
+  turns: number;
+  turn_counts: number[];
+  /** Root-chain user messages. */
+  prompts: number;
+  /** Distinct sessions with a prompt in range. */
+  prompt_sessions: number;
+  prompt_counts: number[];
+  /** Null when no in-range turn reported reasoning tokens. */
+  reasoning_tokens: number | null;
+  /** Output tokens over the turns that reported reasoning. */
+  reasoning_output_tokens: number;
+  reasoning_counts: number[];
+}
+
 export interface HostBreakdown {
   hostname: string;
   total_tokens: number;

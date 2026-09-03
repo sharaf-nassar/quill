@@ -8,7 +8,7 @@ These tests pin the security invariants the browser-facing listener depends on. 
 
 ## Browser command default-deny
 
-The permitted table admits exactly the sixteen monitor reads and refuses everything else.
+The permitted table admits exactly the seventeen monitor reads and refuses everything else.
 
 Refusals cover unknown names, every registered setter and mutation, `fetch_usage_data`, `refresh_usage_data`, retry/backfill and maintenance commands, the whole `plugin:*` namespace, and prefix, suffix, whitespace, or case variants of a permitted name.
 
