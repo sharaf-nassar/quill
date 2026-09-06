@@ -1044,6 +1044,8 @@ fn reconcile_transcript_source_root(
                         | TranscriptAnalyticsError::InvalidSourceMetadata
                         | TranscriptAnalyticsError::SourceTooLarge
                         | TranscriptAnalyticsError::Identity(_)
+                        | TranscriptAnalyticsError::PiSession(_)
+                        | TranscriptAnalyticsError::PiSourceIdentity
                 );
                 record_source_failure(
                     storage,
@@ -1403,6 +1405,18 @@ pub(crate) fn run_transcript_analytics_reconciliation(
                 format!("retained transcript analytics prune failed: {error}"),
             ),
         }
+    }
+    // Recovering rows that nothing proved live inside the idle window are
+    // crashed processes; their end is never coming, so close them here on the
+    // same cadence that recovers everything else about Pi.
+    if pi_roots > 0
+        && let Err(error) =
+            storage.expire_pi_recovering_sessions(chrono::Utc::now().timestamp_millis())
+    {
+        record_summary_failure(
+            &mut summary,
+            format!("retained Pi lifecycle expiry failed: {error}"),
+        );
     }
     summary.completed_all_roots = successful_roots == roots.len();
     let pi_completed = pi_roots > 0 && successful_pi_roots == pi_roots;
@@ -1946,11 +1960,22 @@ fn build_pi_persisted_evidence(
     let mut tracking = Vec::with_capacity(session.tracking_entries.len());
     for entry in &session.tracking_entries {
         let event = &entry.tracking.data.event;
-        if event.session_id != session.header.id
-            || event.normalized_host != normalized_hostname
+        if event.normalized_host != normalized_hostname
             || event.provider != crate::models::PiProtocolV2Provider::Pi
         {
             return Err(TranscriptAnalyticsError::PiSourceIdentity);
+        }
+        // Pi's fork and clone copy the parent's entries, tracking included,
+        // into the child file. Those entries are the parent's history and the
+        // parent's own file already owns them, so they are skipped here rather
+        // than failing the child.
+        if event.session_id != session.header.id {
+            diagnostics.conflicting_identity_records =
+                diagnostics.conflicting_identity_records.saturating_add(1);
+            diagnostics
+                .first_conflict_ordinal
+                .get_or_insert(entry.source_ordinal);
+            continue;
         }
         let occurred_at_ms = pi_timestamp_ms(&event.occurred_at)?;
         pi_timestamp_ms(&event.origin_at)?;
@@ -4216,6 +4241,289 @@ mod tests {
             std::env::remove_var("QUILL_DEMO_MODE");
             std::env::remove_var("QUILL_DATA_DIR");
         }
+    }
+
+    fn pi_start_line(
+        id: &str,
+        parent_id: Option<&str>,
+        session_id: &str,
+        process: &str,
+        sequence: u64,
+        timestamp: &str,
+    ) -> String {
+        pi_tracking_line(
+            id,
+            parent_id,
+            timestamp,
+            json!({
+                "event_uuid": format!("{id}-uuid"),
+                "event": "session_start",
+                "provider": "pi",
+                "normalized_host": TEST_HOSTNAME,
+                "session_id": session_id,
+                "process_instance_id": process,
+                "sequence": sequence,
+                "origin_at": timestamp,
+                "occurred_at": timestamp,
+                "delivery_source": "live",
+                "reason": "startup",
+                "lineage": {"kind": "root"}
+            }),
+        )
+    }
+
+    fn pi_source_for(
+        dir: &Path,
+        session_id: &str,
+        lines: &[String],
+    ) -> DiscoveredRetainedJsonlSource {
+        let path = dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(&path, jsonl_body(lines)).expect("write Pi source");
+        set_mtime_ns(&path, FIXED_MTIME_NS);
+        DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: source_root_key(IntegrationProvider::Pi),
+            source_key: crate::storage::pi_source_key(TEST_HOSTNAME, session_id)
+                .expect("canonical Pi source key"),
+            filesystem_path: path.clone(),
+            canonical_path: path,
+            layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
+        }
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Forked Session Tracking Tolerance]]
+    #[test]
+    #[serial]
+    fn pi_fork_skips_copied_parent_tracking_instead_of_failing_the_child() {
+        clear_env();
+        let data_dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&data_dir);
+        let transcripts = TempDir::new().expect("tempdir");
+        // Pi's fork copies the parent's entries, its tracking included, under
+        // the child's own header.
+        let lines = vec![
+            json!({
+                "type": "session",
+                "version": 3,
+                "id": "session-child",
+                "timestamp": "2026-08-18T02:00:10.000Z",
+                "cwd": "/work/quill",
+                "parentSession": "/sessions/session-parent.jsonl"
+            })
+            .to_string(),
+            pi_start_line(
+                "parent-start",
+                None,
+                "session-parent",
+                "process-parent",
+                1,
+                "2026-08-18T02:00:01.000Z",
+            ),
+            pi_start_line(
+                "child-start",
+                Some("parent-start"),
+                "session-child",
+                "process-child",
+                1,
+                "2026-08-18T02:00:11.000Z",
+            ),
+        ];
+        let source = pi_source_for(transcripts.path(), "session-child", &lines);
+        let parsed = parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+            .expect("a fork parses under its own identity");
+        assert_eq!(parsed.diagnostics.conflicting_identity_records, 1);
+        assert_eq!(parsed.diagnostics.first_conflict_ordinal, Some(1));
+        let evidence = parsed.snapshot.pi_evidence.as_ref().expect("Pi evidence");
+        assert_eq!(
+            evidence
+                .receipts
+                .iter()
+                .map(|receipt| receipt.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session-child"]
+        );
+        assert_eq!(
+            evidence
+                .lifecycle
+                .as_ref()
+                .map(|row| row.process_instance_id.as_str()),
+            Some("process-child")
+        );
+
+        // A file that truly cannot parse fails once per content, not per sweep:
+        // the recorded fingerprint short-circuits the next pass.
+        let broken_lines = vec![
+            lines[0].clone(),
+            pi_tracking_line(
+                "self-resume",
+                None,
+                "2026-08-18T02:00:12.000Z",
+                json!({
+                    "event_uuid": "self-resume-uuid",
+                    "event": "session_start",
+                    "provider": "pi",
+                    "normalized_host": TEST_HOSTNAME,
+                    "session_id": "session-child",
+                    "process_instance_id": "process-child",
+                    "sequence": 3,
+                    "origin_at": "2026-08-18T02:00:10.000Z",
+                    "occurred_at": "2026-08-18T02:00:12.000Z",
+                    "delivery_source": "live",
+                    "reason": "resume",
+                    "previous_session_id": "session-child",
+                    "lineage": {"kind": "root"}
+                }),
+            ),
+        ];
+        let broken = pi_source_for(transcripts.path(), "session-broken", &broken_lines);
+        let root = ProviderSourceRoot {
+            provider: IntegrationProvider::Pi,
+            source_root_key: source_root_key(IntegrationProvider::Pi),
+            resolved_root_path: transcripts.path().to_path_buf(),
+            canonical_root_path: Some(transcripts.path().to_path_buf()),
+            outcome: ProviderRootEnumerationOutcome::Complete,
+            sources: vec![source.clone(), broken.clone()],
+        };
+        let first = run_transcript_analytics_reconciliation(
+            &storage,
+            TEST_HOSTNAME,
+            std::slice::from_ref(&root),
+        )
+        .expect("reconcile Pi root");
+        assert_eq!(first.replaced_sources, 1);
+        assert_eq!(first.failed_sources, 1);
+        let stored = storage
+            .list_transcript_analytics_sources_for_root(
+                IntegrationProvider::Pi,
+                source_root_key(IntegrationProvider::Pi),
+            )
+            .expect("list Pi sources");
+        let failed = stored
+            .iter()
+            .find(|row| row.source_key == broken.source_key)
+            .expect("broken source is registered");
+        assert_eq!(failed.processing_status, "failed");
+        assert_eq!(
+            (failed.mtime_ns, failed.size_bytes),
+            (
+                Some(stat_of(&broken.canonical_path).0),
+                Some(stat_of(&broken.canonical_path).1)
+            ),
+            "a content-deterministic Pi failure records its fingerprint"
+        );
+        assert!(
+            stored
+                .iter()
+                .any(|row| row.source_key == source.source_key && row.processing_status == "ok")
+        );
+        assert!(
+            classify_transcript_source_identity(
+                &broken,
+                Some(failed),
+                first_generation(&storage),
+                false
+            )
+            .is_ok_and(|classification| matches!(
+                classification,
+                RootSourceClassification::UnchangedFailure
+            )),
+            "an unchanged broken file is not re-read"
+        );
+        clear_env();
+    }
+
+    fn first_generation(storage: &Storage) -> i64 {
+        storage
+            .begin_transcript_analytics_generation(
+                IntegrationProvider::Pi,
+                source_root_key(IntegrationProvider::Pi),
+            )
+            .expect("advance Pi generation")
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Persisted Source Atomic Replacement]]
+    #[test]
+    #[serial]
+    fn pi_fold_at_the_committed_sequence_keeps_a_live_row_open() {
+        clear_env();
+        let data_dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&data_dir);
+        let transcripts = TempDir::new().expect("tempdir");
+        let lines = vec![
+            json!({
+                "type": "session",
+                "version": 3,
+                "id": "session-live",
+                "timestamp": "2026-08-18T02:00:00.000Z",
+                "cwd": "/work/quill"
+            })
+            .to_string(),
+            pi_start_line(
+                "live-start",
+                None,
+                "session-live",
+                "process-live",
+                1,
+                "2026-08-18T02:00:01.000Z",
+            ),
+        ];
+        let source = pi_source_for(transcripts.path(), "session-live", &lines);
+        // The live wire committed this same start and proved the process live.
+        let start = crate::models::PiProtocolV2Event {
+            event_uuid: "live-start-uuid".to_owned(),
+            provider: crate::models::PiProtocolV2Provider::Pi,
+            normalized_host: TEST_HOSTNAME.to_owned(),
+            session_id: "session-live".to_owned(),
+            process_instance_id: "process-live".to_owned(),
+            sequence: 1,
+            origin_at: "2026-08-18T02:00:01.000Z".to_owned(),
+            occurred_at: "2026-08-18T02:00:01.000Z".to_owned(),
+            delivery_source: crate::models::PiProtocolV2DeliverySource::Live,
+            kind: crate::models::PiProtocolV2EventKind::SessionStart {
+                reason: crate::models::PiProtocolV2StartReason::Startup,
+                previous_session_id: None,
+                lineage: crate::models::PiProtocolV2Lineage::Root,
+                agent_role: None,
+            },
+        };
+        storage
+            .apply_pi_protocol_v2_envelope(&crate::models::PiProtocolV2Envelope {
+                protocol: crate::pi_tracking::PI_PROTOCOL_V2,
+                reporter_version: crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION.to_owned(),
+                quill_build: crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD.to_owned(),
+                capability_digest: crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST.to_owned(),
+                events: vec![start],
+            })
+            .expect("apply live start");
+        let lifecycle_state = || {
+            rusqlite::Connection::open(storage.database_path())
+                .expect("open lifecycle reader")
+                .query_row(
+                    "SELECT lifecycle_state FROM pi_session_lifecycle
+                     WHERE provider='pi' AND session_id='session-live'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read lifecycle state")
+        };
+        assert_eq!(lifecycle_state(), "open");
+
+        let generation = first_generation(&storage);
+        let snapshot = stamp_analytics_root(
+            parse_transcript_analytics_source(&source, TEST_HOSTNAME).expect("parse Pi source"),
+            "session-live",
+            generation,
+        )
+        .expect("stamp Pi snapshot");
+        storage
+            .replace_transcript_analytics_snapshot(&snapshot)
+            .expect("fold the persisted start");
+        assert_eq!(
+            lifecycle_state(),
+            "open",
+            "the fold at the committed sequence carries nothing newer"
+        );
+        clear_env();
     }
 
     // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Claude Identity Anomaly Skipping]]

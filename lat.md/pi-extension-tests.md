@@ -45,6 +45,10 @@ Timeout, `429`, and `503` retry once; `401` reloads config once; `409 unknown_se
 
 Session start appends and sends protocol-v2 lifecycle evidence, resolves one stable parent header id, and notifies indexing only when a transcript path exists.
 
+## Same-file resume
+
+Resuming the session file already open names that file as the previous session; the start omits `previous_session_id` rather than writing the self reference the protocol rejects, and lineage stays root.
+
 ## Deferred transcript notify
 
 Pi names the session file at start but writes it only once the first assistant message lands, so a named-but-absent transcript sends the lifecycle handshake without notifying; turn end delivers the deferred notify once the file exists.
@@ -97,6 +101,12 @@ Typed registration, persistence, transport, protocol, and config failures remain
 
 History and working-context tools preserve loopback hostname semantics, authenticate requests, map parameters, and return typed results.
 
+## Tool time budgets
+
+Execute and fetch tools outlive the 1500 ms lifecycle budget: execute waits its requested server timeout plus a margin, capped at the schema maximum; fetch waits for the remote hop; local reads keep the shared budget.
+
+Pi's abort signal still cancels a long budget immediately, and a timeout, a `403` feature gate, and an unreachable Quill produce distinct bounded messages under the same `quill_unavailable` error type.
+
 ## Bounded History Results
 
 Pi requests compact history responses, removes duplicate detail payloads, and applies the shared byte ceiling even when an older backend returns oversized hits.
@@ -145,4 +155,6 @@ It reports aggregate statistics only, cleans every temporary artifact, and never
 
 ## Real Pi session
 
-Installed Pi 0.84.2 loads the extension, flushes a `quill-tracking` custom entry with the native JSONL, pushes matching tracking/runtime envelopes, and calls `quill_context_stats` in an isolated persisted session.
+The installed Pi loads the extension, flushes a `quill-tracking` custom entry with the native JSONL, pushes matching tracking/runtime envelopes, and calls `quill_context_stats` in an isolated persisted session.
+
+The binary must meet the same 0.84.0 floor the desktop integration enforces. The session itself is the loader-compatibility proof; the version is echoed in the result line, not pinned exactly.

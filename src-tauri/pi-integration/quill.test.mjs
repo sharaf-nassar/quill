@@ -736,6 +736,43 @@ test("session start resolves lineage once and notifies only persisted sessions",
   );
 });
 
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Same-file resume]]
+test("resuming the current file records no previous session", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const file = join(process.env.HOME, "self.jsonl");
+      writeFileSync(
+        file,
+        `${JSON.stringify({ type: "session", id: "self-id" })}\n`,
+      );
+      const pi = fakePi();
+      quill(pi.api);
+      const calls = [];
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        calls.push({ url: String(url), body: JSON.parse(options.body) });
+        return { ok: true, status: 202, body: { cancel: async () => {} } };
+      };
+      try {
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "resume", previousSessionFile: file },
+          context("self-id", { sessionFile: file }),
+        );
+        await flushRequests();
+        const start = calls.find((call) =>
+          call.url.endsWith("/api/v1/pi/track"),
+        ).body.events[0];
+        assert.equal(start.reason, "resume");
+        assert.equal("previous_session_id" in start, false);
+        assert.deepEqual(start.lineage, { kind: "root" });
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Environment Agent Lineage]]
 test("env-marked Pi child reports agent lineage without a parent header", async () => {
   await withHome(
@@ -1264,6 +1301,73 @@ test("tools call the local session and context APIs with typed results", async (
         });
       } finally {
         globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Tool time budgets]]
+test("execute and fetch tools outlive the lifecycle timeout and name their failures", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const budgets = [];
+      const oldFetch = globalThis.fetch;
+      const oldTimeout = AbortSignal.timeout;
+      let response = { ok: true, json: async () => ({ ok: true }) };
+      globalThis.fetch = async (_url, options) => {
+        if (options.signal?.aborted) throw options.signal.reason;
+        return response;
+      };
+      AbortSignal.timeout = (milliseconds) => {
+        budgets.push(milliseconds);
+        return oldTimeout(milliseconds);
+      };
+      const run = (name, params, signal) =>
+        pi.tools.get(name).execute("call", params, signal, undefined, context());
+      try {
+        await run("quill_execute", { command: "true" });
+        await run("quill_execute", { command: "true", timeout_ms: 90000 });
+        await run("quill_execute", { command: "true", timeout_ms: 999999 });
+        await run("quill_fetch_and_index", { url: "https://example.com" });
+        await run("quill_search_context", { query: "needle" });
+        await run("quill_context_stats", {});
+        // Execute waits out the server's own command timeout plus a margin,
+        // capped at the schema maximum; fetch covers the remote hop; local
+        // reads keep the shared lifecycle budget.
+        assert.deepEqual(budgets, [35000, 95000, 125000, 35000, 1500, 1500]);
+
+        // Pi's own abort still cancels a long budget immediately.
+        const controller = new AbortController();
+        controller.abort(new DOMException("stop", "AbortError"));
+        const aborted = await run(
+          "quill_execute",
+          { command: "sleep 60" },
+          controller.signal,
+        );
+        assert.equal(aborted.isError, true);
+        assert.equal(aborted.content[0].text, "Quill is unavailable.");
+
+        // A timeout and a feature gate are named, not reported as a dead Quill.
+        globalThis.fetch = async () => {
+          throw new DOMException("timed out", "TimeoutError");
+        };
+        const timedOut = await run("quill_execute", { command: "sleep 60" });
+        assert.match(timedOut.content[0].text, /time budget/);
+        assert.equal(timedOut.details.error.type, "quill_unavailable");
+        globalThis.fetch = async () => ({ ok: false, status: 403 });
+        const gated = await run("quill_context_stats", {});
+        assert.match(gated.content[0].text, /context preservation is disabled/);
+        assert.equal(gated.details.error.type, "quill_unavailable");
+        response = { ok: false, status: 500 };
+        globalThis.fetch = async () => response;
+        const failed = await run("quill_context_stats", {});
+        assert.equal(failed.content[0].text, "Quill is unavailable.");
+      } finally {
+        globalThis.fetch = oldFetch;
+        AbortSignal.timeout = oldTimeout;
       }
     },
   );
@@ -2100,12 +2204,18 @@ test("sustains telemetry events without turn delay or unbounded RSS", async () =
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Real Pi session]]
-test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", async () => {
+test("installed Pi loads tracking and calls a Quill tool in an isolated session", async () => {
   const piBin = process.env.QUILL_PI_BIN || "pi";
   const piVersion = execFileSync(piBin, ["--version"], {
     encoding: "utf8",
   }).trim();
-  assert.equal(piVersion, "0.84.2");
+  // The same floor the desktop integration enforces (MIN_PI_VERSION in
+  // pi.rs). The session below is the compatibility proof; an exact pin only
+  // proved the binary had not been upgraded since the pin was written.
+  assert.ok(
+    piVersion.localeCompare("0.84.0", undefined, { numeric: true }) >= 0,
+    `real-loader test needs pi >= 0.84.0, found ${piVersion}`,
+  );
   const root = mkdtempSync(join(tmpdir(), "quill-real-pi-"));
   const configDir = join(root, "pi-agent");
   const sessionDir = join(root, "sessions");

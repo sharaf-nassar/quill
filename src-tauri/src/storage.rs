@@ -880,6 +880,41 @@ fn schema_backup_path(path: &Path, version: i32) -> PathBuf {
     PathBuf::from(backup)
 }
 
+/// Read settings from another identity's database without opening it for
+/// writing or running its migrations. A missing table reads as no values, so
+/// a pre-settings or partially initialized database is inert rather than an
+/// error.
+pub(crate) fn read_settings_at(
+    path: &Path,
+    keys: &[&str],
+) -> Result<BTreeMap<String, Option<String>>, String> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("Open settings at {}: {error}", path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("Configure settings read timeout: {error}"))?;
+    let mut settings = BTreeMap::new();
+    let mut stmt = match conn.prepare("SELECT value FROM settings WHERE key = ?1") {
+        Ok(stmt) => stmt,
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("no such table") =>
+        {
+            return Ok(settings);
+        }
+        Err(error) => return Err(format!("Prepare settings read: {error}")),
+    };
+    for key in keys {
+        let value = stmt
+            .query_row(params![key], |row| row.get(0))
+            .optional()
+            .map_err(|error| format!("Read setting {key}: {error}"))?;
+        settings.insert((*key).to_string(), value);
+    }
+    Ok(settings)
+}
+
 fn verify_schema_backup(path: &Path, expected_version: i32) -> Result<(), String> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| format!("Open schema-{expected_version} backup: {error}"))?;
@@ -5989,16 +6024,20 @@ impl Storage {
         Ok(outcomes)
     }
 
-    /// Resolve a session message against the current durable process without letting
-    /// an older process revive or mutate its replacement.
+    /// Resolve same-process liveness evidence against the current durable
+    /// process without letting an older process revive or mutate its
+    /// replacement. Hook telemetry is the only live producer of that evidence
+    /// now that the runtime message push is retired, and every hook request
+    /// names its process.
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Lifecycle Recovery]]
-    pub(crate) fn pi_session_message_disposition(
+    pub(crate) fn prove_pi_session_live(
         &self,
         normalized_host: &str,
         session_id: &str,
-        process_instance_id: Option<&str>,
+        process_instance_id: &str,
         observed_at_ms: i64,
     ) -> Result<PiProtocolV2Outcome, String> {
+        let process_instance_id = Some(process_instance_id);
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
@@ -6038,6 +6077,24 @@ impl Storage {
         tx.commit()
             .map_err(|error| format!("Commit Pi session-message disposition: {error}"))?;
         Ok(outcome)
+    }
+
+    /// Close recovering rows that nothing has proven live inside the idle
+    /// window. A process that died without its end never sends one, and a
+    /// row it left open would otherwise stay `recovering` forever; the idle
+    /// cutoff is the same crash backstop the live fold already applies.
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Lifecycle Recovery]]
+    pub(crate) fn expire_pi_recovering_sessions(&self, now_ms: i64) -> Result<usize, String> {
+        let cutoff = now_ms - crate::live_tracker::IDLE_AFTER.num_milliseconds();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE pi_session_lifecycle
+             SET lifecycle_state='closed', closed_at_ms=?1, updated_at_ms=?1
+             WHERE provider='pi' AND lifecycle_state='recovering'
+               AND MAX(occurred_at_ms, updated_at_ms) < ?2",
+            params![now_ms, cutoff],
+        )
+        .map_err(|error| format!("Expire Pi recovering sessions: {error}"))
     }
 
     /// Mark every durable open Pi row as recovering before repopulating live
@@ -6711,8 +6768,11 @@ impl Storage {
                 .optional()
                 .map(|current| match current {
                     None => true,
+                    // The persisted entry at the committed sequence is the live
+                    // wire's own event replayed from disk; it carries nothing
+                    // newer and must not demote a proven-open row to recovering.
                     Some((process, sequence, _)) if process == incoming.process_instance_id => {
-                        incoming.current_sequence >= sequence
+                        incoming.current_sequence > sequence
                     }
                     Some((_, _, occurred_at_ms)) => {
                         incoming.lifecycle_state != "closed"
@@ -23065,7 +23125,7 @@ mod tests {
         );
         assert_eq!(
             storage
-                .pi_session_message_disposition("host", "missing", None, 3)
+                .prove_pi_session_live("host", "missing", "process-old", 3)
                 .unwrap(),
             PiProtocolV2Outcome::UnknownSession
         );
@@ -23104,17 +23164,44 @@ mod tests {
         let recovered = storage.load_pi_recovering_sessions().unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].process_instance_id, "process-new");
+        let lifecycle_state = |storage: &Storage| {
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT lifecycle_state FROM pi_session_lifecycle
+                     WHERE provider='pi' AND normalized_hostname='host'
+                       AND session_id='session'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(lifecycle_state(&storage), "recovering");
+        // A recovering row inside the idle window is not a crash yet.
+        assert_eq!(storage.expire_pi_recovering_sessions(now + 19).unwrap(), 0);
         assert_eq!(
             storage
-                .pi_session_message_disposition("host", "session", Some("process-old"), now + 20)
+                .prove_pi_session_live("host", "session", "process-old", now + 20)
                 .unwrap(),
             PiProtocolV2Outcome::Stale
         );
+        assert_eq!(lifecycle_state(&storage), "recovering");
         assert_eq!(
             storage
-                .pi_session_message_disposition("host", "session", Some("process-new"), now + 21)
+                .prove_pi_session_live("host", "session", "process-new", now + 21)
                 .unwrap(),
             PiProtocolV2Outcome::Applied
+        );
+        assert_eq!(lifecycle_state(&storage), "open");
+        // Proven-open rows never expire; only silent recovering ones do.
+        let idle = crate::live_tracker::IDLE_AFTER.num_milliseconds();
+        assert_eq!(
+            storage
+                .expire_pi_recovering_sessions(now + 21 + idle + 1)
+                .unwrap(),
+            0
         );
         let child_gap = pi_v2_event(
             "event-child-gap",
@@ -23217,6 +23304,25 @@ mod tests {
         assert_eq!(
             storage.load_pi_recently_closed_sessions().unwrap(),
             vec![("host".to_owned(), "child".to_owned(), now)]
+        );
+
+        // A restart marks the proven-open row recovering again; with no
+        // process left to prove it, the idle window closes it as a crash and
+        // the close instant seeds the tombstone like any reporter end.
+        assert_eq!(storage.load_pi_recovering_sessions().unwrap().len(), 1);
+        assert_eq!(lifecycle_state(&storage), "recovering");
+        let expired_at = now + idle + 60_000;
+        assert_eq!(
+            storage.expire_pi_recovering_sessions(expired_at).unwrap(),
+            1
+        );
+        assert_eq!(lifecycle_state(&storage), "closed");
+        assert!(storage.load_pi_recovering_sessions().unwrap().is_empty());
+        assert_eq!(
+            storage
+                .prove_pi_session_live("host", "session", "process-new", expired_at + 1)
+                .unwrap(),
+            PiProtocolV2Outcome::UnknownSession
         );
         clear_env();
     }

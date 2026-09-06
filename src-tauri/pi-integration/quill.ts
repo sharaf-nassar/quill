@@ -20,6 +20,14 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 // Keep equal to LOCAL_TIMEOUT_MS in ../codex-integration/scripts/lib.cjs.
 const LOCAL_TIMEOUT_MS = 1500;
+// Tool budgets above the lifecycle timeout. Execute waits for the server's
+// own command timeout plus reaping and output indexing; fetch covers the
+// server's 30-second per-hop remote timeout. Everything else is a local
+// SQLite read and keeps the shared local budget.
+const EXECUTE_TIMEOUT_DEFAULT_MS = 30000;
+const EXECUTE_TIMEOUT_MAX_MS = 120000;
+const EXECUTE_TIMEOUT_MARGIN_MS = 5000;
+const FETCH_TIMEOUT_MS = 35000;
 const CONTEXT_PORT = "19877";
 const FEATURES = {
   context_preservation: true,
@@ -121,6 +129,7 @@ const TOOLS = [
     label: "Fetch and index Quill context",
     description: "Fetch a public HTTP(S) URL and index its bounded content.",
     endpoint: "fetch",
+    timeoutMs: () => FETCH_TIMEOUT_MS,
     parameters: objectSchema(
       {
         url: string("HTTP(S) URL to fetch."),
@@ -142,6 +151,13 @@ const TOOLS = [
     description: "Run a bounded local command and index large output.",
     endpoint: "execute",
     withCwd: true,
+    timeoutMs: (params) =>
+      Math.min(
+        Number.isFinite(params.timeout_ms)
+          ? params.timeout_ms
+          : EXECUTE_TIMEOUT_DEFAULT_MS,
+        EXECUTE_TIMEOUT_MAX_MS,
+      ) + EXECUTE_TIMEOUT_MARGIN_MS,
     parameters: objectSchema(
       {
         command: string("Shell command to execute."),
@@ -149,8 +165,8 @@ const TOOLS = [
         timeout_ms: integer(
           "Execution timeout in milliseconds.",
           100,
-          120000,
-          30000,
+          EXECUTE_TIMEOUT_MAX_MS,
+          EXECUTE_TIMEOUT_DEFAULT_MS,
         ),
         max_output_bytes: integer(
           "Maximum stdout and stderr bytes.",
@@ -335,14 +351,20 @@ function reporterNotice(root, code, message) {
   console.warn(`Quill Pi extension inactive: ${code}: ${message}`);
 }
 
-async function fetchJson(config, url, options) {
+async function fetchJson(config, url, options, timeoutMs = LOCAL_TIMEOUT_MS) {
+  const { signal: callerSignal, ...init } = options;
+  const signals = [AbortSignal.timeout(timeoutMs)];
+  if (callerSignal) signals.push(callerSignal);
   const response = await fetch(url, {
-    ...options,
+    ...init,
     headers: headers(config),
-    signal: AbortSignal.timeout(LOCAL_TIMEOUT_MS),
+    signal: AbortSignal.any(signals),
   });
-  if (!response.ok)
-    throw new TransportError(`Quill returned ${response.status}`);
+  if (!response.ok) {
+    const error = new TransportError(`Quill returned ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
   return response.json();
 }
 
@@ -544,13 +566,18 @@ function success(data) {
   };
 }
 
-function unavailable() {
+// A bounded, non-sensitive reason so a timeout or a feature gate does not
+// read as a dead Quill. Status codes name the gate; aborts name the budget.
+function unavailable(error) {
+  const message =
+    error?.name === "TimeoutError"
+      ? "Quill did not answer within the tool's time budget."
+      : error?.status === 403
+        ? "Quill refused: context preservation is disabled."
+        : "Quill is unavailable.";
   return {
-    content: [{ type: "text", text: "Quill is unavailable." }],
-    details: {
-      ok: false,
-      error: { type: "quill_unavailable", message: "Quill is unavailable." },
-    },
+    content: [{ type: "text", text: message }],
+    details: { ok: false, error: { type: "quill_unavailable", message } },
     isError: true,
   };
 }
@@ -1127,13 +1154,16 @@ function resolveStart(event, info) {
         : "parent_header_unavailable",
     };
   }
+  // Resuming the current file names itself as the previous session; the
+  // protocol rejects a self reference, so a same-file resume has none.
   let previousSessionId;
   if (
     ["new", "resume", "fork"].includes(event.reason) &&
     event.previousSessionFile
   ) {
     try {
-      previousSessionId = resolveId(event.previousSessionFile);
+      const previous = resolveId(event.previousSessionFile);
+      if (previous !== info.id) previousSessionId = previous;
     } catch (error) {
       previousSessionId = undefined;
     }
@@ -1708,13 +1738,14 @@ function configureExtension(pi, config) {
           label: tool.label,
           description: tool.description,
           parameters: tool.parameters,
-          async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+          async execute(_toolCallId, params, signal, _onUpdate, ctx) {
             try {
               if (tool.kind === "history") {
                 return success(
                   compactHistory(
                     await fetchJson(config, historyUrl(config, params), {
                       method: "GET",
+                      signal,
                     }),
                   ),
                 );
@@ -1727,11 +1758,13 @@ function configureExtension(pi, config) {
                 {
                   method: "POST",
                   body: JSON.stringify(payload),
+                  signal,
                 },
+                tool.timeoutMs ? tool.timeoutMs(params) : LOCAL_TIMEOUT_MS,
               );
               return success(data);
             } catch (error) {
-              return unavailable();
+              return unavailable(error);
             }
           },
         });

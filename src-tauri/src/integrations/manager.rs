@@ -73,7 +73,62 @@ fn read_brevity_setting(storage: &Storage, default: bool) -> Result<bool, String
     Ok(resolved)
 }
 
+/// The flags a user sets explicitly. Brevity is excluded: `read_brevity_setting`
+/// persists it on first read as a legacy-key migration, so its presence says
+/// nothing about whether this identity's user ever chose a feature.
+const USER_FEATURE_KEYS: [&str; 3] = [
+    CONTEXT_PRESERVATION_ENABLED_KEY,
+    ACTIVITY_TRACKING_ENABLED_KEY,
+    CONTEXT_TELEMETRY_ENABLED_KEY,
+];
+
+/// A development identity repairs production's providers, so its feature
+/// flags must start as the user's, not the struct defaults. A dev database
+/// that has never persisted a flag copies production's flags once; after that
+/// the dev database owns them like any other identity's.
+///
+/// Without this, a fresh dev launch renders `context_preservation: false`
+/// into the shared Pi extension and every Pi started afterwards loses its
+/// tools and router until production redeploys.
+// @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
+fn inherit_production_features(storage: &Storage) -> Result<(), String> {
+    if crate::data_paths::namespace_for(crate::data_paths::app_identifier()).is_none() {
+        return Ok(());
+    }
+    let Some(production) = crate::data_paths::shared_app_data_dir().map(|dir| dir.join("usage.db"))
+    else {
+        return Ok(());
+    };
+    inherit_features_from(storage, &production)
+}
+
+/// Copy production's persisted feature flags into `storage` when it has none
+/// of its own.
+fn inherit_features_from(storage: &Storage, production: &std::path::Path) -> Result<(), String> {
+    if production == storage.database_path() || !production.is_file() {
+        return Ok(());
+    }
+    let own = storage.get_settings(&USER_FEATURE_KEYS)?;
+    if own.values().any(Option::is_some) {
+        return Ok(());
+    }
+    let inherited = crate::storage::read_settings_at(production, &USER_FEATURE_KEYS)?;
+    let pairs = inherited
+        .iter()
+        .filter_map(|(key, value)| value.as_deref().map(|value| (key.as_str(), value)))
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    log::info!(
+        "Development identity inherited {} integration feature flag(s) from production",
+        pairs.len()
+    );
+    storage.set_settings_atomically(&pairs)
+}
+
 pub fn load_integration_features(storage: &Storage) -> Result<IntegrationFeatures, String> {
+    inherit_production_features(storage)?;
     let defaults = IntegrationFeatures::default();
     Ok(IntegrationFeatures {
         context_preservation: read_bool_setting(
@@ -737,6 +792,61 @@ fn emit_context_preservation_status(app: &AppHandle, status: &ContextPreservatio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
+    #[test]
+    fn development_identity_inherits_production_feature_flags_once() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let production_path = dir.path().join("production.db");
+        let production = Storage::init_at(production_path.clone(), false).expect("production db");
+        production
+            .set_settings_atomically(&[
+                (CONTEXT_PRESERVATION_ENABLED_KEY, "true"),
+                (CONTEXT_TELEMETRY_ENABLED_KEY, "false"),
+            ])
+            .expect("seed production flags");
+        drop(production);
+
+        let dev = Storage::init_at(dir.path().join("dev.db"), false).expect("dev db");
+        // The legacy-brevity migration writes its key on first read; that is
+        // not a user choice and must not block inheritance.
+        assert!(
+            !load_integration_features(&dev)
+                .expect("pre-seed defaults")
+                .brevity
+        );
+        inherit_features_from(&dev, &production_path).expect("inherit");
+        let features = load_integration_features(&dev).expect("load");
+        assert!(
+            features.context_preservation,
+            "production's flag, not the struct default"
+        );
+        assert!(!features.context_telemetry);
+        assert!(features.activity_tracking, "unset keys keep their defaults");
+
+        // Inheritance is a one-time seed: once the dev database owns any flag,
+        // production's later changes do not leak across.
+        dev.set_setting(CONTEXT_PRESERVATION_ENABLED_KEY, "false")
+            .expect("dev toggles its own flag");
+        Storage::init_at(production_path.clone(), false)
+            .expect("reopen production")
+            .set_setting(CONTEXT_TELEMETRY_ENABLED_KEY, "true")
+            .expect("production toggles");
+        inherit_features_from(&dev, &production_path).expect("inherit again");
+        let features = load_integration_features(&dev).expect("reload");
+        assert!(!features.context_preservation);
+        assert!(!features.context_telemetry, "dev keeps its inherited copy");
+
+        // A missing or self-referential production path is inert.
+        let fresh = Storage::init_at(dir.path().join("fresh.db"), false).expect("fresh db");
+        inherit_features_from(&fresh, &dir.path().join("absent.db")).expect("absent is inert");
+        inherit_features_from(&fresh, fresh.database_path()).expect("self is inert");
+        assert!(
+            !load_integration_features(&fresh)
+                .expect("defaults")
+                .context_preservation
+        );
+    }
 
     // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
     #[test]

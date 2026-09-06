@@ -52,6 +52,10 @@ A persistent Pi session sends its start once. Fold sweeps recover local persiste
 
 Durable lifecycle and receipt rows remain for remote-host ordering, idempotency, and lineage; no reporter-health diagnostic row is created.
 
+A row rehydrated as `recovering` leaves that state only through same-process proof or the idle window. Pi hook telemetry carries the reporter's process in `X-Quill-Pi-Process`, so [[src-tauri/src/server.rs#prove_pi_session_from_hook]] resolves each accepted Pi hook through [[src-tauri/src/storage.rs#Storage#prove_pi_session_live]]: the owning process's hook flips the durable row to `open` and clears the tracker's recovering flag, a superseded process is `stale`, an absent or closed row is `unknown_session`, and a hook without a process is audit only. None of those outcomes changes the hook's `202` or its stored audit row.
+
+[[src-tauri/src/storage.rs#Storage#expire_pi_recovering_sessions]] closes recovering rows nothing has proven inside [[src-tauri/src/live_tracker.rs#IDLE_AFTER]], stamping the expiry instant as `closed_at_ms`, on the retained reconciliation cadence. A proven-open row never expires, and an expired row answers later proof with `unknown_session`.
+
 ## Persisted Turn Recovery
 
 Persisted Pi user and assistant messages produce source-owned `response_times`, so removing runtime-message acceleration does not remove turn pairing.

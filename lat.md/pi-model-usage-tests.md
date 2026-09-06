@@ -130,6 +130,14 @@ One persisted Pi snapshot replaces every source-owned evidence family in one SQL
 
 The generic snapshot writer binds runtime, tool, setting, receipt, token, usage, rollup, and registry rows, including the new nullable model/tool fields and registry session name. The retention watermark still filters only runtime events, tool actions, and Pi usage, so setting rows remain unpruned until source replacement or source deletion.
 
-Lifecycle evidence participates only when present and ordered after the committed lifecycle already stored for that session.
+Lifecycle evidence participates only when present and ordered strictly after the committed lifecycle already stored for that session. The persisted start at the sequence the live wire already committed is that wire's own event read back from disk, so folding it leaves a proven-open row `open` instead of demoting it to `recovering`.
 
 A final registry failure rolls every table back, identity drift retains last-good, and an empty replacement clears only its source-owned analytics evidence while preserving both registries, a sibling source, and any newer committed lifecycle when lifecycle evidence is absent. A superseded process cannot close the newer process; a persisted open process rehydrates as `recovering` until its own end appears.
+
+## Forked Session Tracking Tolerance
+
+Pi's fork and clone copy the parent's entries, `quill-tracking` included, under the child's header, so a child file legitimately carries another session's lifecycle.
+
+[[src-tauri/src/transcript_analytics.rs#build_pi_persisted_evidence]] skips entries whose `session_id` is not the header's, counting them as conflicting-identity diagnostics, and derives receipts and lifecycle from the child's own entries only. A host or provider mismatch remains a hard identity failure.
+
+A file whose tracking cannot decode still fails, but as a content-deterministic failure: the registry records its fingerprint, so the next pass classifies the unchanged file as an unchanged failure instead of re-reading and re-logging it every sweep.

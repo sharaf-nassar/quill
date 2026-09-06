@@ -760,18 +760,25 @@ fn store_observation_in_background(storage: &'static Storage, payload: Observati
 // UI (or an operator log scraper) can surface silent ingestion drops —
 // without this signal a misconfigured DB or broken migration would
 // produce an empty Hooks breakdown with no user-visible cue.
+/// The hook fast-acks before any storage work; the audit write and the Pi
+/// liveness proof share one blocking task so neither can delay the `202`.
 fn store_hook_in_background(
-    storage: &'static Storage,
-    app_handle: tauri::AppHandle,
+    state: Arc<ServerState>,
+    pi_process: Option<String>,
     obs: ObservedHookObservation,
 ) {
-    let _task = tokio::task::spawn_blocking(move || match storage.store_hook_observation(&obs) {
-        Ok(()) => {
-            let _ = app_handle.emit("hooks-observed-updated", ());
+    let _task = tokio::task::spawn_blocking(move || {
+        if let Some(process) = pi_process.as_deref() {
+            prove_pi_session_from_hook(state.storage, &state.live_tracker, Some(process), &obs);
         }
-        Err(err) => {
-            log::error!("Failed to store hook observation: {err}");
-            let _ = app_handle.emit("hooks-ingestion-error", err.clone());
+        match state.storage.store_hook_observation(&obs) {
+            Ok(()) => {
+                let _ = state.app_handle.emit("hooks-observed-updated", ());
+            }
+            Err(err) => {
+                log::error!("Failed to store hook observation: {err}");
+                let _ = state.app_handle.emit("hooks-ingestion-error", err.clone());
+            }
         }
     });
 }
@@ -1391,8 +1398,61 @@ async fn post_hook_observed(
         );
     }
 
-    store_hook_in_background(state.storage, state.app_handle.clone(), payload);
+    let pi_process = (payload.provider == IntegrationProvider::Pi)
+        .then(|| {
+            headers
+                .get("x-quill-pi-process")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        })
+        .flatten();
+    store_hook_in_background(state, pi_process, payload);
     (StatusCode::ACCEPTED, "queued".to_string())
+}
+
+/// Pi hook telemetry names its process, so every accepted hook is same-process
+/// evidence that a rehydrated `recovering` row is still live. The disposition
+/// is advisory: a stale or unknown process changes nothing, and the audit row
+/// is stored either way.
+// @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Lifecycle Recovery]]
+fn prove_pi_session_from_hook(
+    storage: &Storage,
+    live_tracker: &crate::live_tracker::LiveTracker,
+    process_instance_id: Option<&str>,
+    payload: &ObservedHookObservation,
+) -> Option<PiProtocolV2Outcome> {
+    let process_instance_id = process_instance_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_STRING_LEN)?;
+    let host = payload
+        .hostname
+        .as_deref()
+        .and_then(crate::live_tracker::normalize_observed_hostname)?;
+    let observed_at = DateTime::parse_from_rfc3339(&payload.ts)
+        .ok()?
+        .with_timezone(&Utc);
+    match storage.prove_pi_session_live(
+        &host,
+        &payload.session_id,
+        process_instance_id,
+        observed_at.timestamp_millis(),
+    ) {
+        Ok(outcome) => {
+            if outcome == PiProtocolV2Outcome::Applied {
+                live_tracker.prove_pi_session(
+                    &payload.session_id,
+                    &host,
+                    process_instance_id,
+                    observed_at,
+                );
+            }
+            Some(outcome)
+        }
+        Err(error) => {
+            log::warn!("Pi hook liveness proof failed: {error}");
+            None
+        }
+    }
 }
 
 fn is_supported_observed_hook_provider(provider: IntegrationProvider) -> bool {
@@ -2051,59 +2111,6 @@ async fn post_session_messages(
             .into_response();
     }
 
-    if payload.provider == IntegrationProvider::Pi {
-        let observed_at = payload
-            .messages
-            .iter()
-            .filter_map(|message| DateTime::parse_from_rfc3339(&message.timestamp).ok())
-            .map(|timestamp| timestamp.timestamp_millis())
-            .max()
-            .unwrap_or_else(|| Utc::now().timestamp_millis());
-        let disposition = match state.storage.pi_session_message_disposition(
-            &payload.host,
-            &payload.session_id,
-            payload.process_instance_id.as_deref(),
-            observed_at,
-        ) {
-            Ok(disposition) => disposition,
-            Err(error) => {
-                log::error!("Pi message lifecycle disposition failed: {error}");
-                return pi_v2_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    PiProtocolV2ErrorCode::Unavailable,
-                    "Pi lifecycle lookup failed",
-                    Some(1500),
-                );
-            }
-        };
-        if disposition == PiProtocolV2Outcome::UnknownSession {
-            return pi_v2_error(
-                StatusCode::CONFLICT,
-                PiProtocolV2ErrorCode::UnknownSession,
-                "Session lifecycle must be reannounced",
-                None,
-            );
-        }
-        if disposition == PiProtocolV2Outcome::Stale {
-            return pi_v2_error(
-                StatusCode::CONFLICT,
-                PiProtocolV2ErrorCode::ReannounceRequired,
-                "A newer Pi process owns this session",
-                None,
-            );
-        }
-        if let Some(process_instance_id) = payload.process_instance_id.as_deref()
-            && let Some(at) = DateTime::<Utc>::from_timestamp_millis(observed_at)
-        {
-            state.live_tracker.prove_pi_session(
-                &payload.session_id,
-                &payload.host,
-                process_instance_id,
-                at,
-            );
-        }
-    }
-
     let analytics_payload = payload.clone();
     let storage = state.storage;
     let analytics_result = tokio::task::spawn_blocking(move || {
@@ -2357,6 +2364,143 @@ async fn get_session_facets(
 #[cfg(test)]
 mod observed_subagent_tests {
     use super::*;
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Lifecycle Recovery]]
+    #[test]
+    fn pi_hook_telemetry_proves_a_rehydrated_session_live() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::init_at(temp.path().join("usage.db"), false).expect("init storage");
+        let start = crate::models::PiProtocolV2Event {
+            event_uuid: "start-uuid".to_owned(),
+            provider: crate::models::PiProtocolV2Provider::Pi,
+            normalized_host: "rip".to_owned(),
+            session_id: "session-live".to_owned(),
+            process_instance_id: "process-live".to_owned(),
+            sequence: 1,
+            origin_at: "2026-08-18T02:00:00Z".to_owned(),
+            occurred_at: "2026-08-18T02:00:01Z".to_owned(),
+            delivery_source: crate::models::PiProtocolV2DeliverySource::Live,
+            kind: crate::models::PiProtocolV2EventKind::SessionStart {
+                reason: crate::models::PiProtocolV2StartReason::Startup,
+                previous_session_id: None,
+                lineage: crate::models::PiProtocolV2Lineage::Root,
+                agent_role: None,
+            },
+        };
+        storage
+            .apply_pi_protocol_v2_envelope(&crate::models::PiProtocolV2Envelope {
+                protocol: crate::pi_tracking::PI_PROTOCOL_V2,
+                reporter_version: crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION.to_owned(),
+                quill_build: crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD.to_owned(),
+                capability_digest: crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST.to_owned(),
+                events: vec![start],
+            })
+            .expect("apply live start");
+        // A restart rehydrates the durable open row as recovering.
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+        tracker.rehydrate_pi_sessions(storage.load_pi_recovering_sessions().expect("rehydrate"));
+        // The stored Sessions row the tracker overlays live lineage onto.
+        let stored_row = crate::models::SessionBreakdown {
+            provider: "pi".to_owned(),
+            session_id: "session-live".to_owned(),
+            parent_session_id: None,
+            pi_lineage: None,
+            ephemeral: false,
+            hostname: "rip".to_owned(),
+            total_tokens: 0,
+            turn_count: 0,
+            first_seen: "2026-08-18T02:00:00Z".to_owned(),
+            last_active: "2026-08-18T02:00:01Z".to_owned(),
+            ended_at: None,
+            project: Some("/work/quill".to_owned()),
+            session_name: None,
+            failed_tool_calls: None,
+            model_id: None,
+            active_runtime_secs: None,
+            agent_count: None,
+            agent_runtime_secs: None,
+            current_turn_runtime_secs: None,
+            current_turn_runtime_active: false,
+            runtime_as_of_ms: None,
+            active_runtime_rate: 0.0,
+            observed_agents: None,
+            live_linked_sessions: None,
+            observed_only: false,
+        };
+        let lineage_of = |tracker: &crate::live_tracker::LiveTracker| {
+            tracker
+                .overlay(
+                    vec![stored_row.clone()],
+                    "2026-08-18T00:00:00Z",
+                    None,
+                    None,
+                    Some(10),
+                )
+                .into_iter()
+                .find(|row| row.session_id == "session-live")
+                .and_then(|row| row.pi_lineage)
+        };
+        assert_eq!(
+            lineage_of(&tracker),
+            Some(PiLineage::Unresolved {
+                reason: "recovering".to_owned()
+            })
+        );
+        let hook = || ObservedHookObservation {
+            provider: IntegrationProvider::Pi,
+            session_id: "session-live".to_owned(),
+            hostname: Some("RIP.local".to_owned()),
+            hook_event: "PreToolUse".to_owned(),
+            tool_name: Some("bash".to_owned()),
+            cwd: None,
+            ts: "2026-08-18T02:05:00Z".to_owned(),
+            hook_matcher: None,
+            agent_id: None,
+        };
+
+        // A hook without a process, or from a superseded process, is audit only.
+        assert_eq!(
+            prove_pi_session_from_hook(&storage, &tracker, None, &hook()),
+            None
+        );
+        assert_eq!(
+            prove_pi_session_from_hook(&storage, &tracker, Some("process-old"), &hook()),
+            Some(PiProtocolV2Outcome::Stale)
+        );
+        assert_eq!(
+            lineage_of(&tracker),
+            Some(PiLineage::Unresolved {
+                reason: "recovering".to_owned()
+            })
+        );
+
+        // The owning process's own telemetry proves the row live in both
+        // durable and in-memory state.
+        assert_eq!(
+            prove_pi_session_from_hook(&storage, &tracker, Some(" process-live "), &hook()),
+            Some(PiProtocolV2Outcome::Applied)
+        );
+        assert_eq!(lineage_of(&tracker), Some(PiLineage::Root));
+        let state = rusqlite::Connection::open(storage.database_path())
+            .expect("open reader")
+            .query_row(
+                "SELECT lifecycle_state FROM pi_session_lifecycle WHERE session_id='session-live'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read state");
+        assert_eq!(state, "open");
+
+        // An unknown session cannot be proven into existence.
+        let unknown = ObservedHookObservation {
+            session_id: "session-missing".to_owned(),
+            ..hook()
+        };
+        assert_eq!(
+            prove_pi_session_from_hook(&storage, &tracker, Some("process-live"), &unknown),
+            Some(PiProtocolV2Outcome::UnknownSession)
+        );
+    }
 
     #[test]
     // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Hook Observation Contract]]
