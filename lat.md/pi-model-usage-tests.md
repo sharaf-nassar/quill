@@ -64,11 +64,17 @@ Retained Pi thinking blocks emit ordered `asst_thinking` events, while `thinking
 
 The active value is the latest `(timestamp, source_ordinal)` at or before an assistant record; state before its first observation is NULL, and repeated levels remain separate rows. `sessions::tests::pi_retained_thinking_events_are_ordered_and_keep_thinking_only_messages` pins event ordering, and `transcript_analytics::tests::pi_thinking_level_changes_replace_atomically_and_order_by_timestamp_ordinal` pins retained parsing, atomic replacement, and the lookup rule.
 
+## Pi Span Receipt Folding
+
+Persisted span receipts fold into `tool_actions.duration_ms` and summed per-message `reasoning_duration_ms`; malformed spans degrade to NULL plus one bounded diagnostic.
+
+Two thinking blocks on one message sum, a repeated receipt for the same block or tool call id replaces the earlier one, an inverted or field-missing span leaves its duration NULL and counts into `malformed_spans` with the first offending source ordinal, and spans never become event receipts. A file from an older reporter carries no spans, so every duration is NULL and the diagnostics stay empty. `transcript_analytics::tests::pi_span_receipts_fold_into_durations_and_malformed_spans_stay_null` pins each rule.
+
 ## Remaining Analytics Evidence Foundation
 
 Later Pi analytics producers remain explicitly empty on the pinned parity corpus.
 
-`reasoning_duration_ms` and tool `is_error`/`details_json`/`result_image_count`/`duration_ms` remain `None` while existing runtime, tool, skill, thinking-event, and setting extraction stays unchanged. The corpus carries no `session_info` entry, so its `session_name` stays NULL as unobserved evidence rather than an empty name. `transcript_analytics::tests::remaining_pi_analytics_evidence_foundation_stays_empty` pins the positive parity-corpus thinking and setting evidence plus the remaining NULL fields.
+`reasoning_duration_ms` and tool `is_error`/`details_json`/`result_image_count`/`duration_ms` remain `None` on this span-less corpus while existing runtime, tool, skill, thinking-event, and setting extraction stays unchanged. The corpus carries no `session_info` entry, so its `session_name` stays NULL as unobserved evidence rather than an empty name. `transcript_analytics::tests::remaining_pi_analytics_evidence_foundation_stays_empty` pins the positive parity-corpus thinking and setting evidence plus the remaining NULL fields.
 
 ## Summary Usage Read Surface
 

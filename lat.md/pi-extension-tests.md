@@ -17,7 +17,7 @@ Invalid config causes no disk writes or registrations and emits one discoverable
 
 ## Tracking registration
 
-The extension registers lifecycle, agent, turn-end, tool-execution, and input handlers; persisted files supply model and assistant-message evidence.
+The extension registers lifecycle, agent, turn-end, tool-execution, message-update, and input handlers; persisted files supply model and assistant-message evidence.
 
 ## Protocol v2 fixture contract
 
@@ -26,6 +26,16 @@ Deterministic TypeScript builders freeze the protocol-v2 lifecycle and persisted
 The checked-in JSONL covers canonical identity, lifecycle occurrence fields, every start/end reason, delivery source, lineage state, optional field, legacy generation metadata, protocol mismatch, and typed outcome. Valid `quill-tracking` entries contain no prompt, message, or tool output. Live emission and persisted entries use protocol 2.
 
 The same file freezes each `/api/v1/pi/track` lifecycle request: exact envelope bytes, lifecycle identity headers, and router status. The records replay in order as one session, so the start opens it and the end closes it.
+
+## Span receipts
+
+Interleaved parallel tools produce one `tool_span` per call id in completion order, and each finalized thinking block produces one `thinking_span` keyed by the persisted message entry id plus content index.
+
+A thinking block that never ends, a tool end without a start, and a turn whose message Pi did not persist produce no receipt. Every receipt carries schema 2, the session id, and the `span-receipts` capability digest, and contains no thinking or tool text.
+
+## Span hot path
+
+A streamed `text_delta` costs one type check: 200,000 deltas run under 1 µs each with under 1 MiB of heap growth and append nothing. The recorded bound is about 10 ns per delta.
 
 ## Persisted lifecycle evidence
 
@@ -157,4 +167,4 @@ It reports aggregate statistics only, cleans every temporary artifact, and never
 
 The installed Pi loads the extension, flushes a `quill-tracking` custom entry with the native JSONL, pushes matching tracking/runtime envelopes, and calls `quill_context_stats` in an isolated persisted session.
 
-The binary must meet the same 0.84.0 floor the desktop integration enforces. The session itself is the loader-compatibility proof; the version is echoed in the result line, not pinned exactly.
+The binary must meet the same 0.84.0 floor the desktop integration enforces. The session itself is the loader-compatibility proof; the version is echoed in the result line, not pinned exactly. The persisted file also carries a `tool_span` naming the probe tool call, proving the real loader's `tool_execution_start`/`tool_execution_end` payloads match the span contract.

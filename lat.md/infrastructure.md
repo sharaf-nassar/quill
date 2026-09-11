@@ -395,6 +395,8 @@ Persistent session start resolves lineage from one bounded parent-header read, a
 
 Every lifecycle and telemetry request uses the shared 1500 ms timeout. Timeout, `429`, and `503` retry once; `401` reloads config once; `409 unknown_session` reannounces the last persisted start once before one lifecycle replay. The folded sweep recovers local sessions, so no 30-second lifecycle reannounce runs. Hot handlers defer work and never await requests; only shutdown awaits its bounded lifecycle send. Process-instance identity and lifecycle sequence survive extension reload inside one Pi process.
 
+Besides lifecycle, the extension appends persisted-only `tool_span`/`thinking_span` receipts described in [[data-flow#Session Indexing Pipeline#Pi Span Receipts]]; they are never sent live.
+
 Tracking failure never creates a second journal. Pi's own session file is the durable local lifecycle/lineage source, while `pi_session_lifecycle` and `pi_event_receipts` remain for remote-host lifecycle, ordering, idempotency, and transactional lineage that local disk folding cannot supply. Expected transport and contained protocol-delivery failures are silent unless `QUILL_DEBUG` is set. Invalid config creates no artifact and prints one notice before remaining inert.
 
 The router ports the canonical Claude/Codex fetch and tainted-read policy to Pi's `bash`, `read`, and fetch tool inputs. It returns Pi's `{ block, reason }` result, persists at most 256 tainted paths per session, and names ready `quill_` replacements in every denial. Turning context preservation off omits the router entirely after `/reload`.

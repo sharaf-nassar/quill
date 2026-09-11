@@ -36,7 +36,7 @@ Exact `quill-tracking` entries are different: malformed or unsupported tracking 
 
 Supported `quill-tracking` entries decode through the exact protocol-v2 validator while preserving entry identity and source ordinal.
 
-Native message usage, model-change, tool, skill, lifecycle, receipt, and search evidence remain available from the same parse; tracking rows never become searchable content, and invalid tracking produces a typed parse failure.
+Native message usage, model-change, tool, skill, lifecycle, receipt, and search evidence remain available from the same parse; tracking rows never become searchable content, and invalid lifecycle tracking produces a typed parse failure. `tool_span`/`thinking_span` entries are routed to the span decoder instead and a malformed span is retained undecoded for the fold's bounded diagnostic.
 
 ## Ephemeral Sessions
 

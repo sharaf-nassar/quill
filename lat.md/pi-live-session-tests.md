@@ -65,6 +65,8 @@ The pure Rust decoder accepts only the exact protocol-v2 generation and persiste
 
 It reads open generation metadata before closed lifecycle/lineage variants, rejects unknown or null optional fields, validates canonical Pi identity and occurrence ordering, and decodes typed accepted, mismatch, and unknown-session responses from the exact TypeScript fixture bytes.
 
+The same fixture freezes `tool_span` and `thinking_span` receipts: both kinds decode through [[src-tauri/src/pi_tracking.rs#decode_protocol_v2_span_receipt]] under the current and a legacy reporter generation, while inverted times, a missing field, or an unknown field reject as `invalid_event`. A span is not a lifecycle event, so the lifecycle decoder still rejects it and the session parser routes on the declared event kind first. Accepted span bytes contain no prompt, message text, or tool output.
+
 ## Tracking Rate Headroom
 
 The independent Pi tracking limiter charges contained events and accepts 4,000 events in one 60-second window, four times the specified stream even when envelopes batch 200 events.

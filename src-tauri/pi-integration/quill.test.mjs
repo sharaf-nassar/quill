@@ -598,10 +598,164 @@ test("registers every production tracking handler", async () => {
       "turn_end",
       "tool_execution_start",
       "tool_execution_end",
+      "message_update",
       "input",
     ]) {
       assert.equal(pi.handlers.get(event)?.length, 1, event);
     }
+  });
+});
+
+function spanContext(sessionId, persistedMessage) {
+  const ctx = context(sessionId);
+  const leaf = {
+    type: "message",
+    id: "assistant-entry",
+    parentId: null,
+    message: persistedMessage,
+  };
+  ctx.sessionManager.getLeafEntry = () => leaf;
+  ctx.sessionManager.getEntry = () => undefined;
+  return ctx;
+}
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Span receipts]]
+test("span receipts cover interleaved tools and every finalized thinking block", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async () => httpResponse(202);
+      const now = Date.now;
+      let clock = 1_000_000;
+      Date.now = () => clock;
+      try {
+        const message = { role: "assistant", content: [] };
+        const ctx = spanContext("span-session", message);
+        const update = (type, contentIndex) =>
+          pi.handlers.get("message_update")[0](
+            {
+              type: "message_update",
+              message,
+              assistantMessageEvent: { type, contentIndex, partial: message },
+            },
+            ctx,
+          );
+        update("thinking_start", 0);
+        clock += 300;
+        update("thinking_delta", 0);
+        update("thinking_end", 0);
+        update("text_start", 1);
+        update("thinking_start", 2);
+        clock += 200;
+        update("thinking_end", 2);
+        // A block that never ends is not a span.
+        update("thinking_start", 3);
+        const start = (toolCallId) =>
+          pi.handlers.get("tool_execution_start")[0](
+            { type: "tool_execution_start", toolCallId, toolName: "read" },
+            ctx,
+          );
+        const end = (toolCallId) =>
+          pi.handlers.get("tool_execution_end")[0](
+            { type: "tool_execution_end", toolCallId, toolName: "read" },
+            ctx,
+          );
+        start("call-a");
+        clock += 50;
+        start("call-b");
+        clock += 100;
+        end("call-b");
+        clock += 100;
+        end("call-a");
+        // An end without a start is never guessed.
+        end("call-unknown");
+        pi.handlers.get("turn_end")[0](
+          { type: "turn_end", message, toolResults: [] },
+          ctx,
+        );
+        await flushRequests();
+
+        const spans = pi.entries
+          .filter((entry) => entry.customType === "quill-tracking")
+          .map(({ data }) => data)
+          .filter((data) => data.event.endsWith("_span"));
+        assert.deepEqual(
+          spans.map((span) => [
+            span.event,
+            span.tool_call_id ?? `${span.message_id}:${span.content_index}`,
+            span.ended_at_ms - span.started_at_ms,
+          ]),
+          [
+            ["tool_span", "call-b", 100],
+            ["tool_span", "call-a", 250],
+            ["thinking_span", "assistant-entry:0", 300],
+            ["thinking_span", "assistant-entry:2", 200],
+          ],
+        );
+        for (const span of spans) {
+          assert.equal(span.schema, 2);
+          assert.equal(span.session_id, "span-session");
+          assert.equal(span.reporter.capability_digest, PI_PROTOCOL_V2_CAPABILITY_DIGEST);
+          assert.doesNotMatch(JSON.stringify(span), /prompt|thinking\"|tool_output/i);
+        }
+        assert.ok(PI_PROTOCOL_V2_CAPABILITIES.includes("span-receipts"));
+
+        // A turn whose message Pi did not persist yields no thinking span.
+        const unpersisted = { role: "assistant", content: [] };
+        const before = pi.entries.length;
+        update("thinking_start", 0);
+        update("thinking_end", 0);
+        pi.handlers.get("turn_end")[0](
+          { type: "turn_end", message: unpersisted, toolResults: [] },
+          ctx,
+        );
+        await flushRequests();
+        assert.equal(pi.entries.length, before);
+      } finally {
+        Date.now = now;
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Span hot path]]
+test("message_update deltas cost only a type check", async () => {
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, () => {
+    const pi = fakePi();
+    quill(pi.api);
+    const handler = pi.handlers.get("message_update")[0];
+    const message = { role: "assistant", content: [] };
+    const ctx = context("hot-path");
+    const delta = {
+      type: "message_update",
+      message,
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: "x",
+        partial: message,
+      },
+    };
+    const iterations = 200_000;
+    for (let i = 0; i < 1_000; i += 1) handler(delta, ctx);
+    const heapBefore = process.memoryUsage().heapUsed;
+    const started = performance.now();
+    for (let i = 0; i < iterations; i += 1) handler(delta, ctx);
+    const perDeltaNs = ((performance.now() - started) * 1e6) / iterations;
+    const heapDelta = process.memoryUsage().heapUsed - heapBefore;
+    assert.equal(pi.entries.length, 0);
+    assert.ok(perDeltaNs < 1_000, `per-delta ${perDeltaNs.toFixed(1)}ns`);
+    assert.ok(
+      heapDelta < 1024 * 1024,
+      `heap grew ${heapDelta} bytes over ${iterations} deltas`,
+    );
+    console.log(
+      `PI_SPAN_HOT_PATH per_delta_ns=${perDeltaNs.toFixed(1)} heap_delta=${heapDelta}`,
+    );
   });
 });
 
@@ -2411,13 +2565,26 @@ test("installed Pi loads tracking and calls a Quill tool in an isolated session"
     assert.ok(
       trackingEntries.some((entry) => entry.data.event === "session_start"),
     );
-    assert.ok(
-      trackingEntries.every((entry) =>
-        trackEvents.some((event) => event.event_uuid === entry.data.event_uuid),
-      ),
+    const spanEntries = trackingEntries.filter((entry) =>
+      entry.data.event.endsWith("_span"),
     );
+    assert.ok(
+      trackingEntries
+        .filter((entry) => !spanEntries.includes(entry))
+        .every((entry) =>
+          trackEvents.some(
+            (event) => event.event_uuid === entry.data.event_uuid,
+          ),
+        ),
+    );
+    // The real loader's tool_execution_{start,end} carry toolCallId as the
+    // span contract expects; the receipt is persisted-only and names the
+    // probe call the model issued.
+    const toolSpan = spanEntries.find((entry) => entry.data.event === "tool_span");
+    assert.equal(toolSpan?.data.tool_call_id, "quill-probe-call");
+    assert.ok(toolSpan.data.ended_at_ms >= toolSpan.data.started_at_ms);
     console.log(
-      `REAL_PI_RESULT version=${piVersion} context_calls=1 session_ms=${sessionMs}`,
+      `REAL_PI_RESULT version=${piVersion} context_calls=1 session_ms=${sessionMs} tool_span_ms=${toolSpan.data.ended_at_ms - toolSpan.data.started_at_ms}`,
     );
   } finally {
     server.closeAllConnections();

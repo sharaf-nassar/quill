@@ -34,7 +34,7 @@ const FEATURES = {
   activity_tracking: true,
   context_telemetry: true,
 };
-export const EXTENSION_VERSION = "0.2.0";
+export const EXTENSION_VERSION = "0.3.0";
 
 export const PI_PROTOCOL_V2 = 2;
 export const PI_PROTOCOL_V2_REPORTER_VERSION = EXTENSION_VERSION;
@@ -45,7 +45,17 @@ export const PI_PROTOCOL_V2_CAPABILITIES = Object.freeze([
   "lifecycle-occurrence",
   "persisted-session-entry",
   "typed-outcomes",
+  "span-receipts",
 ]);
+// Span receipts read `message_update.assistantMessageEvent.{type,contentIndex}`
+// and `tool_execution_{start,end}.toolCallId`; both shapes are verified against
+// the pi-coding-agent 0.84.0 package (dist/core/agent-session.js and pi-ai
+// types.d.ts), the same floor MIN_PI_VERSION in integrations/pi.rs enforces.
+export const PI_SPAN_MIN_PI_VERSION = "0.84.0";
+// Bounded in-memory span buffers: thinking blocks per assistant message and
+// tool calls in flight. Anything past the cap is dropped, never guessed.
+const MAX_THINKING_SPANS_PER_MESSAGE = 32;
+const MAX_PENDING_TOOL_SPANS = 256;
 export const PI_PROTOCOL_V2_CAPABILITY_DIGEST = createHash("sha256")
   .update(PI_PROTOCOL_V2_CAPABILITIES.join("\n"))
   .digest("hex");
@@ -1458,6 +1468,73 @@ export function protocolV2FixtureJsonl() {
     );
   }
 
+  // Span receipts are persisted-only; the same builder that appends them in
+  // production freezes their bytes here.
+  const toolSpan = {
+    session_id: "session-root",
+    event: "tool_span",
+    tool_call_id: "call-1",
+    started_at_ms: 1786694400000,
+    ended_at_ms: 1786694400250,
+  };
+  const thinkingSpan = {
+    session_id: "session-root",
+    event: "thinking_span",
+    message_id: "assistant-1",
+    content_index: 0,
+    started_at_ms: 1786694400000,
+    ended_at_ms: 1786694401500,
+  };
+  add(
+    "span.tool",
+    "span",
+    "accept",
+    ["span:tool_span"],
+    buildQuillTrackingEntry(toolSpan),
+  );
+  add(
+    "span.thinking",
+    "span",
+    "accept",
+    ["span:thinking_span"],
+    buildQuillTrackingEntry(thinkingSpan),
+  );
+  add(
+    "span.legacy_generation",
+    "span",
+    "accept",
+    ["span:generation:legacy-compatible"],
+    buildQuillTrackingEntry(toolSpan, {
+      reporter_version: "0.2.0",
+      quill_build: "0.9.0",
+      capability_digest: "0".repeat(64),
+    }),
+  );
+  add(
+    "span.inverted",
+    "span",
+    "reject",
+    ["span:invalid:inverted"],
+    buildQuillTrackingEntry({ ...toolSpan, ended_at_ms: toolSpan.started_at_ms - 1 }),
+    "invalid_event",
+  );
+  add(
+    "span.missing_field",
+    "span",
+    "reject",
+    ["span:invalid:missing_field"],
+    buildQuillTrackingEntry({ ...thinkingSpan, content_index: undefined }),
+    "invalid_event",
+  );
+  add(
+    "span.unknown_field",
+    "span",
+    "reject",
+    ["span:invalid:field"],
+    buildQuillTrackingEntry({ ...toolSpan, unexpected: true }),
+    "invalid_event",
+  );
+
   add(
     "response.accepted",
     "response",
@@ -1596,6 +1673,51 @@ function trackLifecycle(config, state, info, type, fields = {}) {
   return persistLifecycle(config, state, info, type, fields);
 }
 
+// Span receipts are persisted-only evidence: the retained fold consumes them,
+// nothing is sent live.
+function appendSpanReceipt(config, state, info, span) {
+  const entry = buildQuillTrackingEntry({ session_id: info.id, ...span });
+  try {
+    state.pi.appendEntry(entry.customType, entry.data);
+  } catch (error) {
+    writeLog(
+      config,
+      new PersistenceError("Cannot append Pi span receipt", { cause: error }),
+    );
+  }
+}
+
+// The assistant message Pi persisted for this turn: `appendMessage` stores the
+// same object `turn_end` carries, so identity is the only match; anything else
+// would be a guess.
+function persistedMessageId(ctx, message) {
+  const manager = ctx.sessionManager;
+  let entry = manager.getLeafEntry?.();
+  for (let depth = 0; entry && depth < 64; depth += 1) {
+    if (entry.type === "message" && entry.message === message) return entry.id;
+    entry = entry.parentId ? manager.getEntry?.(entry.parentId) : undefined;
+  }
+  return undefined;
+}
+
+function flushThinkingSpans(config, state, info, ctx, message) {
+  const spans = state.thinkingSpans;
+  state.thinkingSpans = new Map();
+  if (spans.size === 0) return;
+  const messageId = persistedMessageId(ctx, message);
+  if (!messageId) return;
+  for (const [contentIndex, span] of spans) {
+    if (span.ended_at_ms === undefined) continue;
+    appendSpanReceipt(config, state, info, {
+      event: "thinking_span",
+      message_id: messageId,
+      content_index: contentIndex,
+      started_at_ms: span.started_at_ms,
+      ended_at_ms: span.ended_at_ms,
+    });
+  }
+}
+
 function notifySession(config, state, info, lineage) {
   // Pi names the transcript at session start but only writes it once the first
   // assistant message lands, so the path exists before the file does. Notifying
@@ -1650,6 +1772,8 @@ function registerTracking(pi, config, trackingOnlyChild) {
     pi,
     process: lifecycleProcess(config),
     startEnvelope: null,
+    thinkingSpans: new Map(),
+    toolSpans: new Map(),
   };
   const telemetry = (event, ctx, hookEvent) => {
     defer(config, () => {
@@ -1704,16 +1828,54 @@ function registerTracking(pi, config, trackingOnlyChild) {
   registerHandler(pi, config, "input", (event, ctx) =>
     telemetry(event, ctx, EVENT_MAP.input),
   );
-  registerHandler(pi, config, "tool_execution_start", (event, ctx) =>
-    telemetry(event, ctx, EVENT_MAP.tool_execution_start),
-  );
-  registerHandler(pi, config, "tool_execution_end", (event, ctx) =>
-    telemetry(event, ctx, EVENT_MAP.tool_execution_end),
-  );
+  registerHandler(pi, config, "tool_execution_start", (event, ctx) => {
+    if (
+      typeof event.toolCallId === "string" &&
+      state.toolSpans.size < MAX_PENDING_TOOL_SPANS
+    ) {
+      state.toolSpans.set(event.toolCallId, Date.now());
+    }
+    telemetry(event, ctx, EVENT_MAP.tool_execution_start);
+  });
+  registerHandler(pi, config, "tool_execution_end", (event, ctx) => {
+    const startedAt = state.toolSpans.get(event.toolCallId);
+    if (startedAt !== undefined) {
+      state.toolSpans.delete(event.toolCallId);
+      const info = sessionInfo(ctx);
+      if (info.file) {
+        appendSpanReceipt(config, state, info, {
+          event: "tool_span",
+          tool_call_id: event.toolCallId,
+          started_at_ms: startedAt,
+          ended_at_ms: Date.now(),
+        });
+      }
+    }
+    telemetry(event, ctx, EVENT_MAP.tool_execution_end);
+  });
+  // Hot path: every streamed delta lands here, so the only work before the
+  // early return is one property read and a type comparison.
+  registerHandler(pi, config, "message_update", (event) => {
+    const stream = event.assistantMessageEvent;
+    const type = stream?.type;
+    if (type !== "thinking_start" && type !== "thinking_end") return;
+    const spans = state.thinkingSpans;
+    if (type === "thinking_start") {
+      if (spans.size >= MAX_THINKING_SPANS_PER_MESSAGE) return;
+      spans.set(stream.contentIndex, { started_at_ms: Date.now() });
+      return;
+    }
+    const span = spans.get(stream.contentIndex);
+    if (span) span.ended_at_ms = Date.now();
+  });
   registerHandler(pi, config, "turn_end", (event, ctx) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
-      if (!info.file) return;
+      if (!info.file) {
+        state.thinkingSpans = new Map();
+        return;
+      }
+      flushThinkingSpans(config, state, info, ctx, event.message);
       if (state.notify) {
         void notifySession(
           config,

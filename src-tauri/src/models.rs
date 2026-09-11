@@ -45,17 +45,18 @@ pub enum PiLineage {
 }
 
 pub const PI_PROTOCOL_V2: u32 = 2;
-pub const PI_PROTOCOL_V2_REPORTER_VERSION: &str = "0.2.0";
+pub const PI_PROTOCOL_V2_REPORTER_VERSION: &str = "0.3.0";
 pub const PI_PROTOCOL_V2_QUILL_BUILD: &str = env!("CARGO_PKG_VERSION");
 pub const PI_PROTOCOL_V2_TRACKING_SCHEMA: u32 = 2;
-pub const PI_PROTOCOL_V2_CAPABILITIES: [&str; 4] = [
+pub const PI_PROTOCOL_V2_CAPABILITIES: [&str; 5] = [
     "direct-lineage",
     "lifecycle-occurrence",
     "persisted-session-entry",
     "typed-outcomes",
+    "span-receipts",
 ];
 pub const PI_PROTOCOL_V2_CAPABILITY_DIGEST: &str =
-    "5cdd47afab5b26bf604c15338a43944373f40da3dec2543cef662e9988a2f3e7";
+    "21201a853ffb2f89ed362d6924b9198783cdea3c130b46732cad179535025279";
 
 /// Shallow compatibility metadata decoded before closed event variants.
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -184,6 +185,48 @@ pub struct PiProtocolV2TrackingEntry {
     #[serde(rename = "customType")]
     pub custom_type: String,
     pub data: PiProtocolV2TrackingData,
+}
+
+/// Persisted-only wall-clock span receipt. The extension appends one per
+/// finalized tool call or thinking block; the retained fold consumes it into
+/// `tool_actions.duration_ms` or per-message `reasoning_duration_ms`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum PiProtocolV2SpanKind {
+    ToolSpan {
+        tool_call_id: String,
+    },
+    ThinkingSpan {
+        message_id: String,
+        content_index: u64,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PiProtocolV2SpanReceipt {
+    pub session_id: String,
+    #[serde(flatten)]
+    pub kind: PiProtocolV2SpanKind,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PiProtocolV2SpanReceiptData {
+    pub schema: u32,
+    #[serde(flatten)]
+    pub span: PiProtocolV2SpanReceipt,
+    pub reporter: PiProtocolV2Reporter,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PiProtocolV2SpanReceiptEntry {
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    #[serde(rename = "customType")]
+    pub custom_type: String,
+    pub data: PiProtocolV2SpanReceiptData,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]

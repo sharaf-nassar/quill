@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::models::{PiProtocolV2ErrorCode, PiProtocolV2TrackingEntry};
+use crate::models::{PiProtocolV2ErrorCode, PiProtocolV2SpanReceipt, PiProtocolV2TrackingEntry};
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +56,15 @@ pub(crate) struct PiTrackingEntry {
     pub(crate) base: PiSessionEntryBase,
     pub(crate) source_ordinal: u64,
     pub(crate) tracking: PiProtocolV2TrackingEntry,
+}
+
+/// A persisted `tool_span`/`thinking_span` receipt. A malformed span is kept
+/// as `None` so the fold can count it into a bounded diagnostic instead of
+/// rejecting the source or guessing a duration.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PiSpanEntry {
+    pub(crate) source_ordinal: u64,
+    pub(crate) span: Option<PiProtocolV2SpanReceipt>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +125,7 @@ pub(crate) struct PiSession {
     pub(crate) entries: Vec<PiMessageEntry>,
     pub(crate) model_changes: Vec<PiModelChangeEntry>,
     pub(crate) tracking_entries: Vec<PiTrackingEntry>,
+    pub(crate) span_entries: Vec<PiSpanEntry>,
     pub(crate) summary_entries: Vec<PiSummaryEntry>,
     pub(crate) thinking_level_changes: Vec<PiThinkingLevelChangeEntry>,
     pub(crate) session_infos: Vec<PiSessionInfoEntry>,
@@ -230,6 +240,7 @@ pub(crate) fn parse_pi_session_records(
     let mut entries = Vec::new();
     let mut model_changes = Vec::new();
     let mut tracking_entries = Vec::new();
+    let mut span_entries = Vec::new();
     let mut summary_entries = Vec::new();
     let mut thinking_level_changes = Vec::new();
     let mut session_infos = Vec::new();
@@ -286,6 +297,26 @@ pub(crate) fn parse_pi_session_records(
                 }
             }
             Some("custom")
+                if value.get("customType").and_then(Value::as_str) == Some("quill-tracking")
+                    && crate::pi_tracking::tracking_entry_event_kind(&value).is_some_and(
+                        |kind| crate::pi_tracking::PI_SPAN_RECEIPT_KINDS.contains(&kind),
+                    ) =>
+            {
+                let mut wire = value;
+                let object = wire
+                    .as_object_mut()
+                    .expect("custom entry must be an object");
+                object.remove("id");
+                object.remove("parentId");
+                object.remove("timestamp");
+                let bytes =
+                    serde_json::to_vec(&wire).expect("JSON value serialization cannot fail");
+                span_entries.push(PiSpanEntry {
+                    source_ordinal,
+                    span: crate::pi_tracking::decode_protocol_v2_span_receipt(&bytes).ok(),
+                });
+            }
+            Some("custom")
                 if value.get("customType").and_then(Value::as_str) == Some("quill-tracking") =>
             {
                 let base = serde_json::from_value::<PiSessionEntryBase>(value.clone()).map_err(
@@ -324,6 +355,7 @@ pub(crate) fn parse_pi_session_records(
         entries,
         model_changes,
         tracking_entries,
+        span_entries,
         summary_entries,
         thinking_level_changes,
         session_infos,
@@ -459,6 +491,61 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#Persisted Tracking Entries]]
+    #[test]
+    fn span_receipts_route_to_the_span_decoder_and_keep_malformed_spans() {
+        let span = |id: &str, extra: serde_json::Value| {
+            let mut data = serde_json::json!({
+                "schema": crate::pi_tracking::PI_PROTOCOL_V2_TRACKING_SCHEMA,
+                "reporter": {
+                    "protocol": crate::pi_tracking::PI_PROTOCOL_V2,
+                    "version": crate::pi_tracking::PI_PROTOCOL_V2_REPORTER_VERSION,
+                    "quill_build": crate::pi_tracking::PI_PROTOCOL_V2_QUILL_BUILD,
+                    "capability_digest": crate::pi_tracking::PI_PROTOCOL_V2_CAPABILITY_DIGEST
+                },
+                "session_id": "session-v3",
+                "event": "tool_span",
+                "tool_call_id": "call-1"
+            });
+            data.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::json!({
+                "type": "custom",
+                "id": id,
+                "parentId": null,
+                "timestamp": "2026-08-14T08:00:01.000Z",
+                "customType": "quill-tracking",
+                "data": data
+            })
+            .to_string()
+        };
+        let contents = format!(
+            "{}\n{}\n{}\n",
+            V3.lines().next().expect("v3 header"),
+            span(
+                "ok",
+                serde_json::json!({"started_at_ms": 10, "ended_at_ms": 30})
+            ),
+            span(
+                "bad",
+                serde_json::json!({"started_at_ms": 30, "ended_at_ms": 10})
+            ),
+        );
+        let session = parse_pi_session_jsonl(&contents)
+            .expect("spans never fail the parse")
+            .expect("session");
+        assert!(session.tracking_entries.is_empty());
+        assert_eq!(
+            session
+                .span_entries
+                .iter()
+                .map(|entry| (entry.source_ordinal, entry.span.is_some()))
+                .collect::<Vec<_>>(),
+            vec![(1, true), (2, false)]
+        );
     }
 
     // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#Ephemeral Sessions]]

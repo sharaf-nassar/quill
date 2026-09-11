@@ -2267,6 +2267,8 @@ pub struct ToolAction {
     pub is_error: Option<bool>,
     pub details_json: Option<String>,
     pub result_image_count: Option<i64>,
+    /// Wall-clock span from a persisted Pi `tool_span` receipt; NULL elsewhere.
+    pub duration_ms: Option<i64>,
     // Lines added/removed for `code_change` actions, computed at ingest from the
     // FULL (untruncated) tool input before `full_input` is capped at 10KB. NULL
     // for non-code-change actions and legacy rows ingested before migration 33.
@@ -3798,6 +3800,7 @@ pub(crate) fn extract_pi_session(
                     is_error: None,
                     details_json: None,
                     result_image_count: None,
+                    duration_ms: None,
                     lines_added,
                     lines_removed,
                     timestamp: entry.base.timestamp.clone(),
@@ -4253,6 +4256,7 @@ fn extract_claude_messages_from_jsonl_records(
                                 is_error: None,
                                 details_json: None,
                                 result_image_count: None,
+                                duration_ms: None,
                                 lines_added,
                                 lines_removed,
                                 timestamp: timestamp.clone(),
@@ -4729,6 +4733,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             is_error: None,
                             details_json: None,
                             result_image_count: None,
+                            duration_ms: None,
                             lines_added,
                             lines_removed,
                             timestamp: timestamp.clone(),
@@ -4810,6 +4815,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             is_error: None,
                             details_json: None,
                             result_image_count: None,
+                            duration_ms: None,
                             lines_added,
                             lines_removed,
                             timestamp: timestamp.clone(),

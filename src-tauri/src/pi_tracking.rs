@@ -9,9 +9,19 @@ pub use crate::models::{
     PiProtocolV2DeliverySource, PiProtocolV2EndReason, PiProtocolV2Envelope, PiProtocolV2ErrorCode,
     PiProtocolV2Event, PiProtocolV2EventKind, PiProtocolV2Generation, PiProtocolV2Lineage,
     PiProtocolV2OpenEnvelope, PiProtocolV2Outcome, PiProtocolV2Provider, PiProtocolV2Reporter,
-    PiProtocolV2Response, PiProtocolV2StartReason, PiProtocolV2TrackingData,
+    PiProtocolV2Response, PiProtocolV2SpanKind, PiProtocolV2SpanReceipt,
+    PiProtocolV2SpanReceiptEntry, PiProtocolV2StartReason, PiProtocolV2TrackingData,
     PiProtocolV2TrackingEntry,
 };
+
+/// Tracking event kinds that are span receipts rather than lifecycle events.
+pub const PI_SPAN_RECEIPT_KINDS: [&str; 2] = ["tool_span", "thinking_span"];
+
+/// The `event` kind a persisted `quill-tracking` entry declares, so the
+/// session parser can route span receipts away from the lifecycle decoder.
+pub fn tracking_entry_event_kind(value: &Value) -> Option<&str> {
+    value.get("data")?.get("event")?.as_str()
+}
 
 const MAX_EVENTS: usize = 200;
 const MAX_NAME_BYTES: usize = 256;
@@ -180,6 +190,83 @@ pub fn decode_protocol_v2_tracking_entry(
     })?;
     validate_event(&entry.data.event)?;
     Ok(entry)
+}
+
+/// Decode a persisted span receipt. Structure errors (wrong entry shape,
+/// schema or reporter mismatch) are typed like lifecycle entries; a span whose
+/// fields are missing or non-sensical is the caller's bounded diagnostic.
+pub fn decode_protocol_v2_span_receipt(
+    bytes: &[u8],
+) -> Result<PiProtocolV2SpanReceipt, PiProtocolV2DecodeError> {
+    let value = parse_json(bytes)?;
+    let outer = object(&value, PiProtocolV2ErrorCode::InvalidEntry, "span receipt")?;
+    exact_keys(
+        outer,
+        &["type", "customType", "data"],
+        PiProtocolV2ErrorCode::InvalidEntry,
+    )?;
+    let data = object(
+        outer.get("data").unwrap_or(&Value::Null),
+        PiProtocolV2ErrorCode::InvalidEntry,
+        "span data",
+    )?;
+    let schema = data.get("schema").and_then(Value::as_u64).ok_or_else(|| {
+        PiProtocolV2DecodeError::new(
+            PiProtocolV2ErrorCode::InvalidEntry,
+            "Span receipt schema must be an integer",
+        )
+    })?;
+    if schema != u64::from(PI_PROTOCOL_V2_TRACKING_SCHEMA) {
+        return Err(PiProtocolV2DecodeError::new(
+            PiProtocolV2ErrorCode::TrackingSchemaMismatch,
+            format!(
+                "Unsupported tracking schema {schema}; expected {PI_PROTOCOL_V2_TRACKING_SCHEMA}"
+            ),
+        ));
+    }
+    validate_reporter_value(data.get("reporter").unwrap_or(&Value::Null))?;
+    let mut allowed = vec![
+        "schema",
+        "reporter",
+        "event",
+        "session_id",
+        "started_at_ms",
+        "ended_at_ms",
+    ];
+    match data.get("event").and_then(Value::as_str) {
+        Some("tool_span") => allowed.push("tool_call_id"),
+        Some("thinking_span") => allowed.extend(["message_id", "content_index"]),
+        _ => {
+            return Err(PiProtocolV2DecodeError::new(
+                PiProtocolV2ErrorCode::InvalidEvent,
+                "Unknown span receipt kind",
+            ));
+        }
+    }
+    exact_keys(data, &allowed, PiProtocolV2ErrorCode::InvalidEvent)?;
+    let entry: PiProtocolV2SpanReceiptEntry = serde_json::from_slice(bytes).map_err(|error| {
+        PiProtocolV2DecodeError::new(
+            PiProtocolV2ErrorCode::InvalidEvent,
+            format!("Invalid span receipt: {error}"),
+        )
+    })?;
+    let span = entry.data.span;
+    validate_name(&span.session_id, "session_id")?;
+    match &span.kind {
+        PiProtocolV2SpanKind::ToolSpan { tool_call_id } => {
+            validate_name(tool_call_id, "tool_call_id")?
+        }
+        PiProtocolV2SpanKind::ThinkingSpan { message_id, .. } => {
+            validate_name(message_id, "message_id")?
+        }
+    }
+    if span.started_at_ms < 0 || span.ended_at_ms < span.started_at_ms {
+        return Err(PiProtocolV2DecodeError::new(
+            PiProtocolV2ErrorCode::InvalidEvent,
+            "Span must end at or after it starts",
+        ));
+    }
+    Ok(span)
 }
 
 pub fn decode_protocol_v2_response(
@@ -553,6 +640,7 @@ mod tests {
     enum FixtureKind {
         Envelope,
         Entry,
+        Span,
         Response,
         Wire,
     }
@@ -597,6 +685,9 @@ mod tests {
                 }
                 FixtureKind::Entry => {
                     decode_protocol_v2_tracking_entry(case.wire.as_bytes()).map(|_| ())
+                }
+                FixtureKind::Span => {
+                    decode_protocol_v2_span_receipt(case.wire.as_bytes()).map(|_| ())
                 }
                 FixtureKind::Response => {
                     decode_protocol_v2_response(case.wire.as_bytes()).map(|_| ())
@@ -672,9 +763,58 @@ mod tests {
             "outcome:stale",
             "outcome:unknown_session",
             "handshake:accepted",
+            "span:tool_span",
+            "span:thinking_span",
+            "span:generation:legacy-compatible",
+            "span:invalid:inverted",
+            "span:invalid:missing_field",
+            "span:invalid:field",
         ] {
             assert!(coverage.contains(required), "missing {required}");
         }
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Protocol v2 decoder contract]]
+    #[test]
+    fn span_receipts_decode_typed_kinds_and_reject_lifecycle_decoding() {
+        let cases = cases();
+        let tool = cases
+            .iter()
+            .find(|case| case.name == "span.tool")
+            .expect("tool span case");
+        let span = decode_protocol_v2_span_receipt(tool.wire.as_bytes()).expect("tool span");
+        assert_eq!(
+            span.kind,
+            PiProtocolV2SpanKind::ToolSpan {
+                tool_call_id: "call-1".to_owned()
+            }
+        );
+        assert_eq!(span.ended_at_ms - span.started_at_ms, 250);
+        let thinking = cases
+            .iter()
+            .find(|case| case.name == "span.thinking")
+            .expect("thinking span case");
+        let span =
+            decode_protocol_v2_span_receipt(thinking.wire.as_bytes()).expect("thinking span");
+        assert_eq!(
+            span.kind,
+            PiProtocolV2SpanKind::ThinkingSpan {
+                message_id: "assistant-1".to_owned(),
+                content_index: 0
+            }
+        );
+        // A span is not a lifecycle event: the lifecycle decoder still rejects
+        // it, which is why the session parser routes on the event kind first.
+        assert_eq!(
+            decode_protocol_v2_tracking_entry(tool.wire.as_bytes())
+                .expect_err("span is not lifecycle")
+                .code,
+            PiProtocolV2ErrorCode::InvalidEvent
+        );
+        assert_eq!(
+            tracking_entry_event_kind(&serde_json::from_str(&tool.wire).expect("json")),
+            Some("tool_span")
+        );
     }
 
     #[test]
@@ -683,10 +823,11 @@ mod tests {
         assert_eq!(crate::hex_encode(digest), PI_PROTOCOL_V2_CAPABILITY_DIGEST);
 
         for case in cases().into_iter().filter(|case| {
-            matches!(case.kind, FixtureKind::Entry)
+            matches!(case.kind, FixtureKind::Entry | FixtureKind::Span)
                 && case.expectation == FixtureExpectation::Accept
         }) {
-            let wire = case.wire.to_ascii_lowercase();
+            // A thinking span names its owning entry id, never its text.
+            let wire = case.wire.to_ascii_lowercase().replace("message_id", "");
             assert!(!wire.contains("prompt"));
             assert!(!wire.contains("message"));
             assert!(!wire.contains("tool_output"));

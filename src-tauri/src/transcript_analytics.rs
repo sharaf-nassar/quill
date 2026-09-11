@@ -240,7 +240,7 @@ pub(crate) fn owned_tool_rows(
                 is_error: action.is_error,
                 details_json: action.details_json.clone(),
                 result_image_count: action.result_image_count,
-                duration_ms: None,
+                duration_ms: action.duration_ms,
                 lines_added: action.lines_added,
                 lines_removed: action.lines_removed,
                 timestamp: action.timestamp.clone(),
@@ -397,6 +397,11 @@ pub(crate) struct TranscriptRecordDiagnostics {
     pub(crate) unknown_stop_reasons: usize,
     /// Source ordinal of the first future Pi stop reason.
     pub(crate) first_unknown_stop_reason_ordinal: Option<u64>,
+    /// Pi span receipts whose fields were missing or non-sensical; their
+    /// durations stay NULL instead of being guessed.
+    pub(crate) malformed_spans: usize,
+    /// Source ordinal of the first malformed Pi span receipt.
+    pub(crate) first_malformed_span_ordinal: Option<u64>,
 }
 
 impl TranscriptRecordDiagnostics {
@@ -406,8 +411,61 @@ impl TranscriptRecordDiagnostics {
     }
 
     fn is_empty(&self) -> bool {
-        self.skipped_records() == 0 && self.unknown_stop_reasons == 0
+        self.skipped_records() == 0 && self.unknown_stop_reasons == 0 && self.malformed_spans == 0
     }
+}
+
+/// Wall-clock durations folded from persisted Pi span receipts, keyed by the
+/// tool call id or the owning assistant message entry id.
+#[derive(Debug, Default)]
+struct PiSpanDurations {
+    tool_ms: HashMap<String, i64>,
+    thinking_ms: HashMap<String, i64>,
+}
+
+// @lat: [[data-flow#Session Indexing Pipeline#Pi Span Receipts]]
+fn pi_span_durations(
+    session: &crate::pi_session::PiSession,
+    diagnostics: &mut TranscriptRecordDiagnostics,
+) -> PiSpanDurations {
+    let mut durations = PiSpanDurations::default();
+    // Entries arrive in file order, so a repeated tool call id or thinking
+    // block keeps its last receipt.
+    let mut thinking_blocks = HashMap::<(String, u64), i64>::new();
+    for entry in &session.span_entries {
+        let Some(span) = &entry.span else {
+            diagnostics.malformed_spans = diagnostics.malformed_spans.saturating_add(1);
+            diagnostics
+                .first_malformed_span_ordinal
+                .get_or_insert(entry.source_ordinal);
+            continue;
+        };
+        if span.session_id != session.header.id {
+            diagnostics.conflicting_identity_records =
+                diagnostics.conflicting_identity_records.saturating_add(1);
+            diagnostics
+                .first_conflict_ordinal
+                .get_or_insert(entry.source_ordinal);
+            continue;
+        }
+        let duration = span.ended_at_ms.saturating_sub(span.started_at_ms);
+        match &span.kind {
+            crate::models::PiProtocolV2SpanKind::ToolSpan { tool_call_id } => {
+                durations.tool_ms.insert(tool_call_id.clone(), duration);
+            }
+            crate::models::PiProtocolV2SpanKind::ThinkingSpan {
+                message_id,
+                content_index,
+            } => {
+                thinking_blocks.insert((message_id.clone(), *content_index), duration);
+            }
+        }
+    }
+    for ((message_id, _), duration) in thinking_blocks {
+        let total = durations.thinking_ms.entry(message_id).or_default();
+        *total = total.saturating_add(duration);
+    }
+    durations
 }
 
 fn log_record_diagnostics(
@@ -418,7 +476,7 @@ fn log_record_diagnostics(
         return;
     }
     log::warn!(
-        "Retained transcript analytics source retained bounded anomalies: provider={} source={} conflicting_identity_records={} layout_hint_conflicts={} first_conflict_ordinal={:?} unknown_stop_reasons={} first_unknown_stop_reason_ordinal={:?}",
+        "Retained transcript analytics source retained bounded anomalies: provider={} source={} conflicting_identity_records={} layout_hint_conflicts={} first_conflict_ordinal={:?} unknown_stop_reasons={} first_unknown_stop_reason_ordinal={:?} malformed_spans={} first_malformed_span_ordinal={:?}",
         source.provider.as_str(),
         source.source_key,
         diagnostics.conflicting_identity_records,
@@ -426,6 +484,8 @@ fn log_record_diagnostics(
         diagnostics.first_conflict_ordinal,
         diagnostics.unknown_stop_reasons,
         diagnostics.first_unknown_stop_reason_ordinal,
+        diagnostics.malformed_spans,
+        diagnostics.first_malformed_span_ordinal,
     );
 }
 
@@ -1945,6 +2005,7 @@ fn build_pi_persisted_evidence(
     source_key: &str,
     hostname: &str,
     diagnostics: &mut TranscriptRecordDiagnostics,
+    thinking_ms: &HashMap<String, i64>,
 ) -> Result<PiPersistedEvidence, TranscriptAnalyticsError> {
     let normalized_hostname = crate::live_tracker::normalize_observed_hostname(hostname)
         .ok_or(TranscriptAnalyticsError::PiSourceIdentity)?;
@@ -2163,7 +2224,7 @@ fn build_pi_persisted_evidence(
             ),
             had_error: Some(entry.message.get("errorMessage").is_some()),
             tokens_before: None,
-            reasoning_duration_ms: None,
+            reasoning_duration_ms: thinking_ms.get(entry.base.id.as_str()).copied(),
             input_cost: pi_usage_cost(native_usage, "input")?,
             output_cost: pi_usage_cost(native_usage, "output")?,
             cache_read_cost: pi_usage_cost(native_usage, "cacheRead")?,
@@ -2270,12 +2331,24 @@ fn parse_transcript_analytics_source_bytes(
             .ok_or_else(|| TranscriptAnalyticsError::PiSession("missing session header".into()))?;
             let native_identity = resolve_pi_native_identity(&session)?;
             let mut diagnostics = TranscriptRecordDiagnostics::default();
-            let pi_evidence =
-                build_pi_persisted_evidence(&session, &source_key, hostname, &mut diagnostics)?;
+            let spans = pi_span_durations(&session, &mut diagnostics);
+            let pi_evidence = build_pi_persisted_evidence(
+                &session,
+                &source_key,
+                hostname,
+                &mut diagnostics,
+                &spans.thinking_ms,
+            )?;
             let setting_events =
                 pi_thinking_level_setting_events(&session, &source_key, &native_identity)?;
             let session_name = pi_session_name(&session);
-            let extracted = crate::sessions::extract_pi_session(&source.canonical_path, session);
+            let mut extracted =
+                crate::sessions::extract_pi_session(&source.canonical_path, session);
+            for message in &mut extracted.messages {
+                for action in &mut message.tool_actions {
+                    action.duration_ms = spans.tool_ms.get(&action.tool_use_id).copied();
+                }
+            }
             (
                 native_identity,
                 diagnostics,
@@ -3131,6 +3204,164 @@ mod tests {
             "timestamp": "2026-08-14T08:00:00.000Z",
             "cwd": "/work/quill"
         })
+    }
+
+    fn pi_span_line(id: &str, timestamp: &str, session_id: &str, span: Value) -> String {
+        let mut span = span.as_object().expect("span object").clone();
+        span.insert("session_id".to_owned(), json!(session_id));
+        pi_tracking_line(id, None, timestamp, Value::Object(span))
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Pi Span Receipt Folding]]
+    #[test]
+    fn pi_span_receipts_fold_into_durations_and_malformed_spans_stay_null() {
+        let transcript_dir = TempDir::new().expect("transcript directory");
+        let session_id = "pi-span-receipts";
+        let assistant = |id: &str, calls: &[&str]| {
+            json!({
+                "type": "message",
+                "id": id,
+                "parentId": null,
+                "timestamp": "2026-08-14T08:00:02.000Z",
+                "message": {
+                    "role": "assistant",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-5",
+                    "content": calls.iter().map(|call| json!({
+                        "type": "toolCall", "id": call, "name": "read", "arguments": {}
+                    })).collect::<Vec<_>>(),
+                    "usage": {"input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 0,
+                        "totalTokens": 3, "cost": {"input": 0, "output": 0,
+                        "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+                    "stopReason": "stop"
+                }
+            })
+        };
+        let span = |id: &str, span: Value| -> Value {
+            serde_json::from_str(&pi_span_line(
+                id,
+                "2026-08-14T08:00:03.000Z",
+                session_id,
+                span,
+            ))
+            .expect("span line")
+        };
+        let lines = vec![
+            pi_session_header(session_id),
+            assistant("assistant-1", &["call-a", "call-b", "call-c"]),
+            assistant("assistant-2", &[]),
+            // Two thinking blocks on one message sum; a second receipt for the
+            // same block replaces the first.
+            span(
+                "s1",
+                json!({"event": "thinking_span", "message_id": "assistant-1",
+                "content_index": 0, "started_at_ms": 1000, "ended_at_ms": 1300}),
+            ),
+            span(
+                "s2",
+                json!({"event": "thinking_span", "message_id": "assistant-1",
+                "content_index": 1, "started_at_ms": 2000, "ended_at_ms": 2200}),
+            ),
+            span(
+                "s3",
+                json!({"event": "thinking_span", "message_id": "assistant-1",
+                "content_index": 1, "started_at_ms": 2000, "ended_at_ms": 2400}),
+            ),
+            // Duplicate call id: last write wins.
+            span(
+                "s4",
+                json!({"event": "tool_span", "tool_call_id": "call-a",
+                "started_at_ms": 1000, "ended_at_ms": 1100}),
+            ),
+            span(
+                "s5",
+                json!({"event": "tool_span", "tool_call_id": "call-a",
+                "started_at_ms": 1000, "ended_at_ms": 1250}),
+            ),
+            // Malformed: inverted span degrades to NULL plus a diagnostic.
+            span(
+                "s6",
+                json!({"event": "tool_span", "tool_call_id": "call-b",
+                "started_at_ms": 5000, "ended_at_ms": 4000}),
+            ),
+            // Malformed: missing field.
+            span(
+                "s7",
+                json!({"event": "thinking_span", "message_id": "assistant-2",
+                "started_at_ms": 1, "ended_at_ms": 2}),
+            ),
+        ];
+        let source = pi_source_from_lines(transcript_dir.path(), session_id, &lines);
+        let parsed =
+            parse_transcript_analytics_source(&source, TEST_HOSTNAME).expect("parse Pi source");
+
+        let mut tool_durations = parsed
+            .snapshot
+            .tool_actions
+            .iter()
+            .map(|row| (row.action_key.as_str(), row.duration_ms))
+            .collect::<Vec<_>>();
+        tool_durations.sort();
+        assert_eq!(
+            tool_durations,
+            vec![("call-a", Some(250)), ("call-b", None), ("call-c", None)]
+        );
+        let usage = &parsed
+            .snapshot
+            .pi_evidence
+            .as_ref()
+            .expect("Pi evidence")
+            .usage;
+        assert_eq!(
+            usage
+                .iter()
+                .map(|row| (row.turn_id.as_str(), row.reasoning_duration_ms))
+                .collect::<Vec<_>>(),
+            vec![("assistant-1", Some(700)), ("assistant-2", None)]
+        );
+        assert_eq!(parsed.diagnostics.malformed_spans, 2);
+        assert_eq!(parsed.diagnostics.first_malformed_span_ordinal, Some(8));
+        assert!(
+            parsed
+                .snapshot
+                .pi_evidence
+                .as_ref()
+                .expect("Pi evidence")
+                .receipts
+                .is_empty(),
+            "span receipts are consumed at parse time, never stored as event receipts"
+        );
+
+        // An older reporter appends no spans: every duration is NULL and the
+        // source parses without any diagnostic.
+        let plain = pi_source_from_lines(
+            transcript_dir.path(),
+            session_id,
+            &[
+                pi_session_header(session_id),
+                assistant("assistant-1", &["call-a"]),
+            ],
+        );
+        let parsed =
+            parse_transcript_analytics_source(&plain, TEST_HOSTNAME).expect("parse plain source");
+        assert!(
+            parsed
+                .snapshot
+                .tool_actions
+                .iter()
+                .all(|row| row.duration_ms.is_none())
+        );
+        assert!(
+            parsed
+                .snapshot
+                .pi_evidence
+                .as_ref()
+                .expect("Pi evidence")
+                .usage
+                .iter()
+                .all(|row| row.reasoning_duration_ms.is_none())
+        );
+        assert_eq!(parsed.diagnostics, TranscriptRecordDiagnostics::default());
     }
 
     // @lat: [[session-search-tests#Session Search Test Specs#Pi Session Name Capture]]
@@ -5267,6 +5498,7 @@ mod tests {
                 is_error: Some(true),
                 details_json: Some(r#"{"detail":"fixture"}"#.to_owned()),
                 result_image_count: Some(2),
+                duration_ms: None,
                 lines_added: None,
                 lines_removed: None,
                 timestamp: TEST_TIMESTAMP.to_owned(),
