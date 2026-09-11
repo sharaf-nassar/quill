@@ -297,35 +297,22 @@ pub(crate) fn parse_pi_session_records(
                 }
             }
             Some("custom")
-                if value.get("customType").and_then(Value::as_str) == Some("quill-tracking")
-                    && crate::pi_tracking::tracking_entry_event_kind(&value).is_some_and(
-                        |kind| crate::pi_tracking::PI_SPAN_RECEIPT_KINDS.contains(&kind),
-                    ) =>
-            {
-                let mut wire = value;
-                let object = wire
-                    .as_object_mut()
-                    .expect("custom entry must be an object");
-                object.remove("id");
-                object.remove("parentId");
-                object.remove("timestamp");
-                let bytes =
-                    serde_json::to_vec(&wire).expect("JSON value serialization cannot fail");
-                span_entries.push(PiSpanEntry {
-                    source_ordinal,
-                    span: crate::pi_tracking::decode_protocol_v2_span_receipt(&bytes).ok(),
-                });
-            }
-            Some("custom")
                 if value.get("customType").and_then(Value::as_str) == Some("quill-tracking") =>
             {
-                let base = serde_json::from_value::<PiSessionEntryBase>(value.clone()).map_err(
-                    |error| PiSessionParseError::InvalidTrackingEntry {
+                let is_span = matches!(
+                    value.pointer("/data/event").and_then(Value::as_str),
+                    Some("tool_span" | "thinking_span")
+                );
+                // Lifecycle entries keep their id/parent/timestamp base; a
+                // span receipt is consumed by ordinal alone.
+                let base = (!is_span)
+                    .then(|| serde_json::from_value::<PiSessionEntryBase>(value.clone()))
+                    .transpose()
+                    .map_err(|error| PiSessionParseError::InvalidTrackingEntry {
                         source_ordinal,
                         code: PiProtocolV2ErrorCode::InvalidEntry,
                         message: error.to_string(),
-                    },
-                )?;
+                    })?;
                 let mut wire = value;
                 let object = wire
                     .as_object_mut()
@@ -335,17 +322,27 @@ pub(crate) fn parse_pi_session_records(
                 object.remove("timestamp");
                 let bytes =
                     serde_json::to_vec(&wire).expect("JSON value serialization cannot fail");
-                let tracking = crate::pi_tracking::decode_protocol_v2_tracking_entry(&bytes)
-                    .map_err(|error| PiSessionParseError::InvalidTrackingEntry {
+                match base {
+                    None => span_entries.push(PiSpanEntry {
                         source_ordinal,
-                        code: error.code,
-                        message: error.message,
-                    })?;
-                tracking_entries.push(PiTrackingEntry {
-                    base,
-                    source_ordinal,
-                    tracking,
-                });
+                        span: crate::pi_tracking::decode_protocol_v2_span_receipt(&bytes).ok(),
+                    }),
+                    Some(base) => {
+                        let tracking =
+                            crate::pi_tracking::decode_protocol_v2_tracking_entry(&bytes).map_err(
+                                |error| PiSessionParseError::InvalidTrackingEntry {
+                                    source_ordinal,
+                                    code: error.code,
+                                    message: error.message,
+                                },
+                            )?;
+                        tracking_entries.push(PiTrackingEntry {
+                            base,
+                            source_ordinal,
+                            tracking,
+                        });
+                    }
+                }
             }
             _ => {}
         }

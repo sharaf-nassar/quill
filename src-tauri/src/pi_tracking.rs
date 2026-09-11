@@ -9,19 +9,9 @@ pub use crate::models::{
     PiProtocolV2DeliverySource, PiProtocolV2EndReason, PiProtocolV2Envelope, PiProtocolV2ErrorCode,
     PiProtocolV2Event, PiProtocolV2EventKind, PiProtocolV2Generation, PiProtocolV2Lineage,
     PiProtocolV2OpenEnvelope, PiProtocolV2Outcome, PiProtocolV2Provider, PiProtocolV2Reporter,
-    PiProtocolV2Response, PiProtocolV2SpanKind, PiProtocolV2SpanReceipt,
-    PiProtocolV2SpanReceiptEntry, PiProtocolV2StartReason, PiProtocolV2TrackingData,
-    PiProtocolV2TrackingEntry,
+    PiProtocolV2Response, PiProtocolV2SpanKind, PiProtocolV2SpanReceipt, PiProtocolV2StartReason,
+    PiProtocolV2TrackingData, PiProtocolV2TrackingEntry,
 };
-
-/// Tracking event kinds that are span receipts rather than lifecycle events.
-pub const PI_SPAN_RECEIPT_KINDS: [&str; 2] = ["tool_span", "thinking_span"];
-
-/// The `event` kind a persisted `quill-tracking` entry declares, so the
-/// session parser can route span receipts away from the lifecycle decoder.
-pub fn tracking_entry_event_kind(value: &Value) -> Option<&str> {
-    value.get("data")?.get("event")?.as_str()
-}
 
 const MAX_EVENTS: usize = 200;
 const MAX_NAME_BYTES: usize = 256;
@@ -127,59 +117,9 @@ pub fn decode_protocol_v2_envelope(
 pub fn decode_protocol_v2_tracking_entry(
     bytes: &[u8],
 ) -> Result<PiProtocolV2TrackingEntry, PiProtocolV2DecodeError> {
-    let value = parse_json(bytes)?;
-    let outer = object(
-        &value,
-        PiProtocolV2ErrorCode::InvalidEntry,
-        "tracking entry",
-    )?;
-    exact_keys(
-        outer,
-        &["type", "customType", "data"],
-        PiProtocolV2ErrorCode::InvalidEntry,
-    )?;
-    if outer.get("type").and_then(Value::as_str) != Some("custom")
-        || outer.get("customType").and_then(Value::as_str) != Some("quill-tracking")
-    {
-        return Err(PiProtocolV2DecodeError::new(
-            PiProtocolV2ErrorCode::InvalidEntry,
-            "Expected a quill-tracking custom entry",
-        ));
-    }
-
-    let data = object(
-        outer.get("data").unwrap_or(&Value::Null),
-        PiProtocolV2ErrorCode::InvalidEntry,
-        "tracking data",
-    )?;
-    let mut event = data.clone();
-    let schema = event.remove("schema").ok_or_else(|| {
-        PiProtocolV2DecodeError::new(
-            PiProtocolV2ErrorCode::InvalidEntry,
-            "Tracking data is missing schema",
-        )
-    })?;
-    let reporter = event.remove("reporter").ok_or_else(|| {
-        PiProtocolV2DecodeError::new(
-            PiProtocolV2ErrorCode::InvalidEntry,
-            "Tracking data is missing reporter metadata",
-        )
-    })?;
-    let schema = schema.as_u64().ok_or_else(|| {
-        PiProtocolV2DecodeError::new(
-            PiProtocolV2ErrorCode::InvalidEntry,
-            "Tracking schema must be an integer",
-        )
-    })?;
-    if schema != u64::from(PI_PROTOCOL_V2_TRACKING_SCHEMA) {
-        return Err(PiProtocolV2DecodeError::new(
-            PiProtocolV2ErrorCode::TrackingSchemaMismatch,
-            format!(
-                "Unsupported tracking schema {schema}; expected {PI_PROTOCOL_V2_TRACKING_SCHEMA}"
-            ),
-        ));
-    }
-    validate_reporter_value(&reporter)?;
+    let mut event = quill_tracking_data(bytes)?;
+    event.remove("schema");
+    event.remove("reporter");
     validate_event_value(&Value::Object(event))?;
 
     let entry: PiProtocolV2TrackingEntry = serde_json::from_slice(bytes).map_err(|error| {
@@ -198,33 +138,7 @@ pub fn decode_protocol_v2_tracking_entry(
 pub fn decode_protocol_v2_span_receipt(
     bytes: &[u8],
 ) -> Result<PiProtocolV2SpanReceipt, PiProtocolV2DecodeError> {
-    let value = parse_json(bytes)?;
-    let outer = object(&value, PiProtocolV2ErrorCode::InvalidEntry, "span receipt")?;
-    exact_keys(
-        outer,
-        &["type", "customType", "data"],
-        PiProtocolV2ErrorCode::InvalidEntry,
-    )?;
-    let data = object(
-        outer.get("data").unwrap_or(&Value::Null),
-        PiProtocolV2ErrorCode::InvalidEntry,
-        "span data",
-    )?;
-    let schema = data.get("schema").and_then(Value::as_u64).ok_or_else(|| {
-        PiProtocolV2DecodeError::new(
-            PiProtocolV2ErrorCode::InvalidEntry,
-            "Span receipt schema must be an integer",
-        )
-    })?;
-    if schema != u64::from(PI_PROTOCOL_V2_TRACKING_SCHEMA) {
-        return Err(PiProtocolV2DecodeError::new(
-            PiProtocolV2ErrorCode::TrackingSchemaMismatch,
-            format!(
-                "Unsupported tracking schema {schema}; expected {PI_PROTOCOL_V2_TRACKING_SCHEMA}"
-            ),
-        ));
-    }
-    validate_reporter_value(data.get("reporter").unwrap_or(&Value::Null))?;
+    let data = quill_tracking_data(bytes)?;
     let mut allowed = vec![
         "schema",
         "reporter",
@@ -243,14 +157,16 @@ pub fn decode_protocol_v2_span_receipt(
             ));
         }
     }
-    exact_keys(data, &allowed, PiProtocolV2ErrorCode::InvalidEvent)?;
-    let entry: PiProtocolV2SpanReceiptEntry = serde_json::from_slice(bytes).map_err(|error| {
-        PiProtocolV2DecodeError::new(
-            PiProtocolV2ErrorCode::InvalidEvent,
-            format!("Invalid span receipt: {error}"),
-        )
-    })?;
-    let span = entry.data.span;
+    exact_keys(&data, &allowed, PiProtocolV2ErrorCode::InvalidEvent)?;
+    // `PiProtocolV2SpanReceipt` flattens its kind and ignores the already
+    // validated `schema` and `reporter` keys.
+    let span: PiProtocolV2SpanReceipt =
+        serde_json::from_value(Value::Object(data)).map_err(|error| {
+            PiProtocolV2DecodeError::new(
+                PiProtocolV2ErrorCode::InvalidEvent,
+                format!("Invalid span receipt: {error}"),
+            )
+        })?;
     validate_name(&span.session_id, "session_id")?;
     match &span.kind {
         PiProtocolV2SpanKind::ToolSpan { tool_call_id } => {
@@ -267,6 +183,53 @@ pub fn decode_protocol_v2_span_receipt(
         ));
     }
     Ok(span)
+}
+
+/// The `data` object of a persisted `quill-tracking` custom entry, after the
+/// checks every such entry shares: exact outer keys, `type`/`customType`,
+/// the tracking schema, and the reporter generation.
+fn quill_tracking_data(bytes: &[u8]) -> Result<Map<String, Value>, PiProtocolV2DecodeError> {
+    let Value::Object(mut outer) = parse_json(bytes)? else {
+        return Err(PiProtocolV2DecodeError::new(
+            PiProtocolV2ErrorCode::InvalidEntry,
+            "tracking entry must be a JSON object",
+        ));
+    };
+    exact_keys(
+        &outer,
+        &["type", "customType", "data"],
+        PiProtocolV2ErrorCode::InvalidEntry,
+    )?;
+    if outer.get("type").and_then(Value::as_str) != Some("custom")
+        || outer.get("customType").and_then(Value::as_str) != Some("quill-tracking")
+    {
+        return Err(PiProtocolV2DecodeError::new(
+            PiProtocolV2ErrorCode::InvalidEntry,
+            "Expected a quill-tracking custom entry",
+        ));
+    }
+    let Some(Value::Object(data)) = outer.remove("data") else {
+        return Err(PiProtocolV2DecodeError::new(
+            PiProtocolV2ErrorCode::InvalidEntry,
+            "tracking data must be a JSON object",
+        ));
+    };
+    let schema = data.get("schema").and_then(Value::as_u64).ok_or_else(|| {
+        PiProtocolV2DecodeError::new(
+            PiProtocolV2ErrorCode::InvalidEntry,
+            "Tracking schema must be an integer",
+        )
+    })?;
+    if schema != u64::from(PI_PROTOCOL_V2_TRACKING_SCHEMA) {
+        return Err(PiProtocolV2DecodeError::new(
+            PiProtocolV2ErrorCode::TrackingSchemaMismatch,
+            format!(
+                "Unsupported tracking schema {schema}; expected {PI_PROTOCOL_V2_TRACKING_SCHEMA}"
+            ),
+        ));
+    }
+    validate_reporter_value(data.get("reporter").unwrap_or(&Value::Null))?;
+    Ok(data)
 }
 
 pub fn decode_protocol_v2_response(
@@ -811,9 +774,13 @@ mod tests {
                 .code,
             PiProtocolV2ErrorCode::InvalidEvent
         );
+        // And a span is only a span inside a quill-tracking custom entry.
+        let foreign = tool.wire.replace("quill-tracking", "other-tracking");
         assert_eq!(
-            tracking_entry_event_kind(&serde_json::from_str(&tool.wire).expect("json")),
-            Some("tool_span")
+            decode_protocol_v2_span_receipt(foreign.as_bytes())
+                .expect_err("foreign custom entry")
+                .code,
+            PiProtocolV2ErrorCode::InvalidEntry
         );
     }
 

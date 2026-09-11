@@ -50,8 +50,7 @@ export const PI_PROTOCOL_V2_CAPABILITIES = Object.freeze([
 // Span receipts read `message_update.assistantMessageEvent.{type,contentIndex}`
 // and `tool_execution_{start,end}.toolCallId`; both shapes are verified against
 // the pi-coding-agent 0.84.0 package (dist/core/agent-session.js and pi-ai
-// types.d.ts), the same floor MIN_PI_VERSION in integrations/pi.rs enforces.
-export const PI_SPAN_MIN_PI_VERSION = "0.84.0";
+// types.d.ts); src-tauri/src/integrations/pi.rs owns that version floor.
 // Bounded in-memory span buffers: thinking blocks per assistant message and
 // tool calls in flight. Anything past the cap is dropped, never guessed.
 const MAX_THINKING_SPANS_PER_MESSAGE = 32;
@@ -1691,13 +1690,10 @@ function appendSpanReceipt(config, state, info, span) {
 // same object `turn_end` carries, so identity is the only match; anything else
 // would be a guess.
 function persistedMessageId(ctx, message) {
-  const manager = ctx.sessionManager;
-  let entry = manager.getLeafEntry?.();
-  for (let depth = 0; entry && depth < 64; depth += 1) {
-    if (entry.type === "message" && entry.message === message) return entry.id;
-    entry = entry.parentId ? manager.getEntry?.(entry.parentId) : undefined;
-  }
-  return undefined;
+  return ctx.sessionManager
+    .getBranch?.()
+    .find((entry) => entry.type === "message" && entry.message === message)
+    ?.id;
 }
 
 function flushThinkingSpans(config, state, info, ctx, message) {

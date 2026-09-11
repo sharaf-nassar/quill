@@ -211,24 +211,6 @@ pub struct PiProtocolV2SpanReceipt {
     pub ended_at_ms: i64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct PiProtocolV2SpanReceiptData {
-    pub schema: u32,
-    #[serde(flatten)]
-    pub span: PiProtocolV2SpanReceipt,
-    pub reporter: PiProtocolV2Reporter,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PiProtocolV2SpanReceiptEntry {
-    #[serde(rename = "type")]
-    pub entry_type: String,
-    #[serde(rename = "customType")]
-    pub custom_type: String,
-    pub data: PiProtocolV2SpanReceiptData,
-}
-
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PiProtocolV2Outcome {

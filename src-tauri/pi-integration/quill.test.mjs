@@ -614,8 +614,7 @@ function spanContext(sessionId, persistedMessage) {
     parentId: null,
     message: persistedMessage,
   };
-  ctx.sessionManager.getLeafEntry = () => leaf;
-  ctx.sessionManager.getEntry = () => undefined;
+  ctx.sessionManager.getBranch = () => [leaf];
   return ctx;
 }
 
