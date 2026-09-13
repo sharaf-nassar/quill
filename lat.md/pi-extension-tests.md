@@ -113,9 +113,9 @@ History and working-context tools preserve loopback hostname semantics, authenti
 
 ## Tool time budgets
 
-Execute and fetch tools outlive the 1500 ms lifecycle budget: execute waits its requested server timeout plus a margin, capped at the schema maximum; fetch waits for the remote hop; local reads keep the shared budget.
+Execute and fetch tools outlive the 1500 ms lifecycle budget: execute waits its requested server timeout plus a margin, capped at the schema maximum; fetch waits for the remote hop; history and local context reads get 10 s.
 
-Pi's abort signal still cancels a long budget immediately, and a timeout, a `403` feature gate, and an unreachable Quill produce distinct bounded messages under the same `quill_unavailable` error type.
+Pi's abort signal still cancels a long budget immediately, and a timeout, a `403` feature gate, and an unreachable Quill produce distinct bounded messages under the same `quill_unavailable` error type. A non-2xx whose body carries a string `error` surfaces that reason with the status, whitespace-collapsed and capped under 350 characters; a non-JSON body falls back to the unavailable message.
 
 ## Bounded History Results
 

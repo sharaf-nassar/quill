@@ -23,7 +23,8 @@ const LOCAL_TIMEOUT_MS = 1500;
 // Tool budgets above the lifecycle timeout. Execute waits for the server's
 // own command timeout plus reaping and output indexing; fetch covers the
 // server's 30-second per-hop remote timeout. Everything else is a local
-// SQLite read and keeps the shared local budget.
+// SQLite read (FTS over tens of thousands of chunks) and gets 10 s.
+const TOOL_TIMEOUT_MS = 10000;
 const EXECUTE_TIMEOUT_DEFAULT_MS = 30000;
 const EXECUTE_TIMEOUT_MAX_MS = 120000;
 const EXECUTE_TIMEOUT_MARGIN_MS = 5000;
@@ -372,6 +373,17 @@ async function fetchJson(config, url, options, timeoutMs = LOCAL_TIMEOUT_MS) {
   if (!response.ok) {
     const error = new TransportError(`Quill returned ${response.status}`);
     error.status = response.status;
+    // Server bodies are `{"error": "<reason>"}`; keep the reason bounded so
+    // the model sees why (404 upstream, bad cwd, oversized input) without a
+    // dump of the body.
+    let body;
+    try {
+      body = await response.json();
+    } catch {
+      body = undefined;
+    }
+    if (typeof body?.error === "string")
+      error.detail = body.error.replace(/\s+/g, " ").trim().slice(0, 300);
     throw error;
   }
   return response.json();
@@ -583,7 +595,9 @@ function unavailable(error) {
       ? "Quill did not answer within the tool's time budget."
       : error?.status === 403
         ? "Quill refused: context preservation is disabled."
-        : "Quill is unavailable.";
+        : error?.detail
+          ? `Quill rejected the request (${error.status}): ${error.detail}`
+          : "Quill is unavailable.";
   return {
     content: [{ type: "text", text: message }],
     details: { ok: false, error: { type: "quill_unavailable", message } },
@@ -1901,10 +1915,12 @@ function configureExtension(pi, config) {
               if (tool.kind === "history") {
                 return success(
                   compactHistory(
-                    await fetchJson(config, historyUrl(config, params), {
-                      method: "GET",
-                      signal,
-                    }),
+                    await fetchJson(
+                      config,
+                      historyUrl(config, params),
+                      { method: "GET", signal },
+                      TOOL_TIMEOUT_MS,
+                    ),
                   ),
                 );
               }
@@ -1918,7 +1934,7 @@ function configureExtension(pi, config) {
                   body: JSON.stringify(payload),
                   signal,
                 },
-                tool.timeoutMs ? tool.timeoutMs(params) : LOCAL_TIMEOUT_MS,
+                tool.timeoutMs ? tool.timeoutMs(params) : TOOL_TIMEOUT_MS,
               );
               return success(data);
             } catch (error) {

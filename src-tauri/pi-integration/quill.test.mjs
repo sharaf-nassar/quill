@@ -1489,8 +1489,8 @@ test("execute and fetch tools outlive the lifecycle timeout and name their failu
         await run("quill_context_stats", {});
         // Execute waits out the server's own command timeout plus a margin,
         // capped at the schema maximum; fetch covers the remote hop; local
-        // reads keep the shared lifecycle budget.
-        assert.deepEqual(budgets, [35000, 95000, 125000, 35000, 1500, 1500]);
+        // reads get a 10 s tool budget above the 1500 ms lifecycle budget.
+        assert.deepEqual(budgets, [35000, 95000, 125000, 35000, 10000, 10000]);
 
         // Pi's own abort still cancels a long budget immediately.
         const controller = new AbortController();
@@ -1518,6 +1518,41 @@ test("execute and fetch tools outlive the lifecycle timeout and name their failu
         globalThis.fetch = async () => response;
         const failed = await run("quill_context_stats", {});
         assert.equal(failed.content[0].text, "Quill is unavailable.");
+
+        // A server-side rejection carries its bounded reason so the model can
+        // correct the next call instead of treating Quill as dead.
+        globalThis.fetch = async () => ({
+          ok: false,
+          status: 400,
+          json: async () => ({
+            error: "Context fetch returned 404 Not Found\n  extra   whitespace",
+          }),
+        });
+        const rejected = await run("quill_fetch_and_index", {
+          url: "https://example.com/missing",
+        });
+        assert.equal(rejected.isError, true);
+        assert.equal(rejected.details.error.type, "quill_unavailable");
+        assert.equal(
+          rejected.content[0].text,
+          "Quill rejected the request (400): Context fetch returned 404 Not Found extra whitespace",
+        );
+        globalThis.fetch = async () => ({
+          ok: false,
+          status: 400,
+          json: async () => ({ error: "x".repeat(1000) }),
+        });
+        const long = await run("quill_context_stats", {});
+        assert.ok(long.content[0].text.length < 350);
+        globalThis.fetch = async () => ({
+          ok: false,
+          status: 400,
+          json: async () => {
+            throw new SyntaxError("not json");
+          },
+        });
+        const opaque = await run("quill_context_stats", {});
+        assert.equal(opaque.content[0].text, "Quill is unavailable.");
       } finally {
         globalThis.fetch = oldFetch;
         AbortSignal.timeout = oldTimeout;
