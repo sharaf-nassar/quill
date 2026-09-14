@@ -1064,6 +1064,23 @@ pub struct SessionSchema {
 // Index state -- tracks which sources have been indexed and their fingerprints
 // ---------------------------------------------------------------------------
 
+/// Notify-only display evidence; absence of the entire hint set means watcher
+/// admission and preserves the last applied hints. A supplied None parent clears it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SearchSourceHints {
+    pub(crate) parent_session_id: Option<String>,
+    pub(crate) git_branch: Option<String>,
+    pub(crate) project: Option<String>,
+    pub(crate) host: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SourceSearch<'a> {
+    pub(crate) index: &'a SessionIndex,
+    pub(crate) hints: Option<&'a SearchSourceHints>,
+    pub(crate) indexed: Option<&'a std::cell::Cell<usize>>,
+}
+
 /// What the sweep remembers about one indexed source.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct IndexedSource {
@@ -1073,6 +1090,10 @@ pub(crate) struct IndexedSource {
     /// Provider-native session id the last extraction produced; empty when
     /// identity never resolved, in which case there is nothing to prune.
     pub(crate) session_id: String,
+    #[serde(default)]
+    pub(crate) hints: Option<SearchSourceHints>,
+    #[serde(default)]
+    pub(crate) canonical_path: Option<PathBuf>,
 }
 
 /// Persisted beside the Tantivy segments as `index_state.json`.
@@ -1507,9 +1528,53 @@ impl SessionIndex {
     ) -> Result<usize, String> {
         use tauri::Emitter;
 
-        let total_indexed = self.sync_inner(roots)?;
+        let (mut total_indexed, analytics_changed) = crate::get_storage()
+            .map(|storage| self.sync_retained_sources(storage, roots))
+            .unwrap_or_default();
+        total_indexed += self.sync_inner(roots)?;
+        if analytics_changed {
+            let _ = app_handle.emit(crate::TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ());
+        }
         let _ = app_handle.emit("sessions-index-updated", total_indexed);
         Ok(total_indexed)
+    }
+
+    fn sync_retained_sources(
+        &self,
+        storage: &crate::storage::Storage,
+        roots: &[ProviderSourceRoot],
+    ) -> (usize, bool) {
+        let mut total_indexed = 0;
+        let mut analytics_changed = false;
+        for source in roots.iter().flat_map(|root| &root.sources) {
+            // Recovery owns analytics-only retries. An unchanged Search
+            // sweep must not issue a live registry refresh for every source.
+            if std::fs::metadata(&source.canonical_path)
+                .ok()
+                .and_then(|metadata| model_source_fast_fingerprint(&metadata).ok())
+                .is_some_and(|fingerprint| self.source_is_current(source, fingerprint))
+            {
+                continue;
+            }
+            let (analytics, search) = crate::transcript_analytics::reconcile_retained_source(
+                storage,
+                source,
+                &Self::local_hostname(),
+                Some(self),
+            );
+            match analytics {
+                Ok(crate::transcript_analytics::TranscriptSourceResult::Replaced) => {
+                    analytics_changed = true
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("Retained source analytics retry: {error}"),
+            }
+            match search {
+                Ok(count) => total_indexed += count,
+                Err(error) => log::warn!("Retained source Search retry: {error}"),
+            }
+        }
+        (total_indexed, analytics_changed)
     }
 
     #[cfg(test)]
@@ -1527,145 +1592,244 @@ impl SessionIndex {
     /// index directory is the one way to force a full re-extract.
     // @lat: [[data-flow#Session Indexing Pipeline]]
     fn sync_inner(&self, roots: &[ProviderSourceRoot]) -> Result<usize, String> {
-        let mut total_indexed = 0usize;
-        let mut index_changed = false;
-        let mut state = self.state.lock().unwrap();
-        let hostname = Self::local_hostname();
-        let mut writer = self.writer.lock().unwrap();
-        let discovered_keys = roots
-            .iter()
-            .flat_map(|root| &root.sources)
-            .map(|source| source.source_key.as_str())
-            .collect::<HashSet<_>>();
-        let complete_roots = roots
-            .iter()
-            .filter(|root| matches!(root.outcome, ProviderRootEnumerationOutcome::Complete))
-            .map(|root| (root.provider, root.source_root_key))
-            .collect::<Vec<_>>();
-
-        // A source key names its provider through the root-key prefix, so a
-        // tracked entry outside the discovered set can be attributed to the
-        // root whose enumeration proved it absent.
-        let vanished = state
-            .sources
-            .iter()
-            .filter(|(source_key, _)| !discovered_keys.contains(String::as_str(source_key)))
-            .filter_map(|(source_key, indexed)| {
-                complete_roots
-                    .iter()
-                    .find(|(_, root_key)| source_key.starts_with(root_key))
-                    .map(|(provider, _)| {
-                        (source_key.clone(), *provider, indexed.session_id.clone())
-                    })
-            })
-            .collect::<Vec<_>>();
-        for (source_key, provider, session_id) in vanished {
-            match self.delete_session_docs_with_writer(&writer, provider, &session_id) {
-                Ok(()) => {
-                    state.sources.remove(&source_key);
-                    index_changed = true;
+        // Pruning uses only a complete inventory, never a parse failure.
+        {
+            let mut state = self.state.lock().unwrap();
+            let discovered = roots
+                .iter()
+                .flat_map(|root| &root.sources)
+                .map(|source| source.source_key.as_str())
+                .collect::<HashSet<_>>();
+            let vanished = state
+                .sources
+                .iter()
+                .filter_map(|(key, indexed)| {
+                    roots
+                        .iter()
+                        .find(|root| {
+                            matches!(root.outcome, ProviderRootEnumerationOutcome::Complete)
+                                && key.starts_with(root.source_root_key)
+                                && !discovered.contains(key.as_str())
+                                // A live commit may postdate this inventory. Only
+                                // proven absence can prune its new checkpoint.
+                                && !indexed.canonical_path.as_ref().is_some_and(|path| {
+                                    path.starts_with(root.canonical_root_path.as_ref().unwrap_or(&root.resolved_root_path))
+                                        && !matches!(path.try_exists(), Ok(false))
+                                        && (root.provider != IntegrationProvider::Pi
+                                            || crate::pi_session::read_pi_session_header(path)
+                                                .is_none_or(|header| header.id == indexed.session_id))
+                                })
+                        })
+                        .map(|root| (key.clone(), root.provider, indexed.session_id.clone()))
+                })
+                .collect::<Vec<_>>();
+            if !vanished.is_empty() {
+                let mut writer = self.writer.lock().unwrap();
+                let result = (|| {
+                    for (_, provider, session_id) in &vanished {
+                        self.delete_session_docs_with_writer(&writer, *provider, session_id)?;
+                    }
+                    writer
+                        .commit()
+                        .map_err(|error| format!("Commit index prune: {error}"))?;
+                    Ok::<_, String>(())
+                })();
+                if let Err(error) = result {
+                    writer
+                        .rollback()
+                        .map_err(|rollback| format!("{error}; rollback: {rollback}"))?;
+                    return Err(error);
                 }
-                Err(error) => {
-                    log::warn!("Failed to prune vanished session docs: {error}");
+                for (key, _, _) in vanished {
+                    state.sources.remove(&key);
                 }
             }
         }
-
+        let mut total_indexed = 0;
         for source in roots.iter().flat_map(|root| &root.sources) {
-            let fingerprint = match std::fs::metadata(&source.filesystem_path)
-                .map_err(crate::transcript_identity::StableTranscriptReadError::Read)
-                .and_then(|metadata| model_source_fast_fingerprint(&metadata))
-            {
-                Ok(fingerprint) => Some(fingerprint),
-                Err(error) => {
-                    log::warn!(
-                        "Failed to fingerprint session transcript {}: {error}",
-                        source.filesystem_path.display()
-                    );
-                    None
-                }
-            };
-            if fingerprint.is_some_and(|fingerprint| {
-                state
-                    .sources
-                    .get(&source.source_key)
-                    .is_some_and(|indexed| indexed.fingerprint == fingerprint)
-            }) {
-                continue;
-            }
-
-            let default_project = match &source.layout_hint {
-                RetainedJsonlSourceLayoutHint::ClaudeParent { default_project }
-                | RetainedJsonlSourceLayoutHint::ClaudeSubagent { default_project } => {
-                    default_project.as_str()
-                }
-                RetainedJsonlSourceLayoutHint::CodexTranscript
-                | RetainedJsonlSourceLayoutHint::PiTranscript => "unknown",
-            };
-            let extracted = extract_messages_from_jsonl(source.provider, &source.filesystem_path);
-            let project_name = extracted
-                .project_name
-                .as_deref()
-                .filter(|project| !project.is_empty())
-                .unwrap_or(default_project);
-
-            // Always delete-then-reinsert per session, even on first sight of a
-            // file. Hook-driven /sessions/notify may have already indexed this
-            // session before the sweep first sees the file; gating delete on a
-            // known fingerprint would let those docs stack up on top of fresh
-            // inserts. delete_query is a no-op when no docs match, so this is
-            // safe for genuinely new files.
-            if !extracted.session_id.is_empty() {
-                match self.delete_session_docs_with_writer(
-                    &writer,
-                    source.provider,
-                    &extracted.session_id,
-                ) {
-                    Ok(()) => index_changed = true,
-                    Err(e) => log::warn!("Failed to delete old session docs: {e}"),
-                }
-            }
-
-            for msg in &extracted.messages {
-                match self.add_message_to_writer(
-                    &writer,
-                    source.provider,
-                    msg,
-                    project_name,
-                    &hostname,
-                ) {
-                    Ok(()) => index_changed = true,
-                    Err(e) => log::warn!("Failed to index message: {e}"),
-                }
-            }
-
-            total_indexed += extracted.messages.len();
-            // A source whose identity never resolved has no documents to prune
-            // later, so it is remembered by fingerprint alone and retried only
-            // when its bytes change.
-            if let Some(fingerprint) = fingerprint {
-                state.sources.insert(
-                    source.source_key.clone(),
-                    IndexedSource {
-                        fingerprint,
-                        session_id: extracted.session_id,
-                    },
-                );
+            match self.sync_source(source, &Self::local_hostname()) {
+                Ok(count) => total_indexed += count,
+                Err(error) => log::warn!("Search source retained last-good documents: {error}"),
             }
         }
-
-        if index_changed {
-            writer.commit().map_err(|e| format!("Commit index: {e}"))?;
-        }
-
-        drop(writer);
-        // Must drop state lock before save_state which acquires it
-        drop(state);
-
         self.save_state()?;
-
-        log::info!("Session index sync complete: {total_indexed} messages indexed");
         Ok(total_indexed)
+    }
+
+    pub(crate) fn source_is_current(
+        &self,
+        source: &DiscoveredRetainedJsonlSource,
+        fingerprint: ModelSourceFastFingerprint,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .sources
+            .get(&source.source_key)
+            .is_some_and(|indexed| {
+                indexed.fingerprint == fingerprint
+                    && indexed.canonical_path.as_ref() == Some(&source.canonical_path)
+            })
+    }
+
+    pub(crate) fn sync_source(
+        &self,
+        source: &DiscoveredRetainedJsonlSource,
+        hostname: &str,
+    ) -> Result<usize, String> {
+        self.sync_source_with_hints(source, hostname, None)
+    }
+
+    pub(crate) fn sync_source_with_hints(
+        &self,
+        source: &DiscoveredRetainedJsonlSource,
+        hostname: &str,
+        hints: Option<&SearchSourceHints>,
+    ) -> Result<usize, String> {
+        crate::transcript_work::with_source(|| {
+            let fingerprint = std::fs::metadata(&source.canonical_path)
+                .map_err(|error| error.to_string())
+                .and_then(|metadata| {
+                    model_source_fast_fingerprint(&metadata).map_err(|error| error.to_string())
+                })?;
+            if self.source_is_current(source, fingerprint)
+                && hints.is_none_or(|hints| {
+                    self.state
+                        .lock()
+                        .unwrap()
+                        .sources
+                        .get(&source.source_key)
+                        .is_some_and(|indexed| indexed.hints.as_ref() == Some(hints))
+                })
+            {
+                return Ok(0);
+            }
+            let (mut extracted, fingerprint) =
+                read_extracted_session(source.provider, &source.canonical_path)?;
+            self.replace_retained_source(source, fingerprint, &mut extracted, hostname, hints)
+        })
+    }
+
+    /// The shared notify/sweep checkpoint advances only after a committed stable replacement.
+    pub(crate) fn replace_retained_source(
+        &self,
+        source: &DiscoveredRetainedJsonlSource,
+        fingerprint: ModelSourceFastFingerprint,
+        extracted: &mut ExtractedSession,
+        hostname: &str,
+        hints: Option<&SearchSourceHints>,
+    ) -> Result<usize, String> {
+        let observed = std::fs::metadata(&source.canonical_path)
+            .map_err(|error| error.to_string())
+            .and_then(|metadata| {
+                model_source_fast_fingerprint(&metadata).map_err(|error| error.to_string())
+            })?;
+        if observed != fingerprint {
+            return Err("Search source changed before replacement".into());
+        }
+        let mut state = self.state.lock().unwrap();
+        if extracted.session_id.is_empty() {
+            if state
+                .sources
+                .get(&source.source_key)
+                .is_some_and(|previous| !previous.session_id.is_empty())
+            {
+                return Err("Search source lost its native identity".into());
+            }
+            state.sources.insert(
+                source.source_key.clone(),
+                IndexedSource {
+                    fingerprint,
+                    session_id: String::new(),
+                    hints: hints.cloned(),
+                    canonical_path: Some(source.canonical_path.clone()),
+                },
+            );
+            drop(state);
+            self.save_state()?;
+            return Ok(0);
+        }
+        let hints = hints.cloned().or_else(|| {
+            state
+                .sources
+                .get(&source.source_key)
+                .and_then(|indexed| indexed.hints.clone())
+        });
+        if state
+            .sources
+            .get(&source.source_key)
+            .is_some_and(|indexed| {
+                indexed.fingerprint == fingerprint
+                    && indexed.hints == hints
+                    && indexed.canonical_path.as_ref() == Some(&source.canonical_path)
+            })
+        {
+            return Ok(0);
+        }
+        if let Some(hints) = &hints {
+            for message in &mut extracted.messages {
+                if source.provider == IntegrationProvider::Pi {
+                    message
+                        .parent_session_id
+                        .clone_from(&hints.parent_session_id);
+                }
+                if message.git_branch.is_empty()
+                    && let Some(branch) = &hints.git_branch
+                {
+                    message.git_branch.clone_from(branch);
+                }
+            }
+        }
+        let hostname = hints
+            .as_ref()
+            .and_then(|hints| hints.host.as_deref())
+            .filter(|host| !host.is_empty())
+            .unwrap_or(hostname);
+        let project = hints
+            .as_ref()
+            .and_then(|hints| hints.project.as_deref())
+            .or(extracted.project_name.as_deref())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("unknown");
+        let mut writer = self.writer.lock().unwrap();
+        let result = (|| {
+            if let Some(previous) = state.sources.get(&source.source_key)
+                && previous.session_id != extracted.session_id
+            {
+                self.delete_session_docs_with_writer(
+                    &writer,
+                    source.provider,
+                    &previous.session_id,
+                )?;
+            }
+            self.delete_session_docs_with_writer(&writer, source.provider, &extracted.session_id)?;
+            for message in &extracted.messages {
+                self.add_message_to_writer(&writer, source.provider, message, project, hostname)?;
+            }
+            writer
+                .commit()
+                .map_err(|error| format!("Commit index: {error}"))?;
+            Ok::<_, String>(())
+        })();
+        if let Err(error) = result {
+            writer
+                .rollback()
+                .map_err(|rollback| format!("{error}; rollback: {rollback}"))?;
+            return Err(error);
+        }
+        state.sources.insert(
+            source.source_key.clone(),
+            IndexedSource {
+                fingerprint,
+                session_id: extracted.session_id.clone(),
+                hints,
+                canonical_path: Some(source.canonical_path.clone()),
+            },
+        );
+        drop(writer);
+        drop(state);
+        self.save_state()?;
+        Ok(extracted.messages.len())
     }
     // -------------------------------------------------------------------
     // Search
@@ -2055,51 +2219,58 @@ impl SessionIndex {
         message_id: &str,
         window: usize,
     ) -> Result<SessionContext, String> {
-        let path = find_session_path(provider, session_id)?
-            .ok_or_else(|| format!("JSONL file not found for session {session_id}"))?;
-        let extracted = extract_messages_from_jsonl(provider, &path);
-        let project_name = extracted.project_name.unwrap_or_default();
-        let messages = extracted.messages;
+        crate::transcript_work::with_source(|| {
+            let path = find_session_path(provider, session_id)?
+                .ok_or_else(|| format!("JSONL file not found for session {session_id}"))?;
+            let (extracted, _) = read_extracted_session(provider, &path)?;
+            let project_name = extracted.project_name.unwrap_or_default();
+            let messages = extracted.messages;
 
-        // Find the index of the target message
-        let target_idx = messages
-            .iter()
-            .position(|m| m.uuid == message_id)
-            .unwrap_or(0);
+            // Find the index of the target message
+            let target_idx = messages
+                .iter()
+                .position(|m| m.uuid == message_id)
+                .unwrap_or(0);
 
-        let start = target_idx.saturating_sub(window);
-        let end = (target_idx + window + 1).min(messages.len());
+            let start = target_idx.saturating_sub(window);
+            let end = target_idx
+                .saturating_add(window)
+                .saturating_add(1)
+                .min(messages.len());
 
-        let context_messages: Vec<ContextMessage> = messages[start..end]
-            .iter()
-            .map(|m| {
-                let tool_summary = m
-                    .code_changes
-                    .iter()
-                    .chain(m.commands_run.iter())
-                    .chain(m.tool_details.iter())
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n");
+            let context_messages: Vec<ContextMessage> = messages[start..end]
+                .iter()
+                .map(|m| {
+                    let tool_summary = m
+                        .code_changes
+                        .iter()
+                        .chain(m.commands_run.iter())
+                        .chain(m.tool_details.iter())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n");
 
-                ContextMessage {
-                    message_id: m.uuid.clone(),
-                    role: m.role.clone(),
-                    content: m.content.clone(),
-                    tool_summary,
-                    tools_used: m.tools_used.join(" "),
-                    timestamp: m.timestamp.clone(),
-                    is_match: m.uuid == message_id,
-                }
+                    ContextMessage {
+                        message_id: m.uuid.clone(),
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                        tool_summary,
+                        tools_used: m.tools_used.join(" "),
+                        timestamp: m.timestamp.clone(),
+                        is_match: m.uuid == message_id,
+                    }
+                })
+                .collect();
+
+            // Transfer the explicitly requested wire response, not the raw
+            // transcript/other rows. Response byte limits remain an API concern.
+            Ok(SessionContext {
+                provider,
+                session_id: session_id.to_string(),
+                project: project_name,
+                session_name: None,
+                messages: context_messages,
             })
-            .collect();
-
-        Ok(SessionContext {
-            provider,
-            session_id: session_id.to_string(),
-            project: project_name,
-            session_name: None,
-            messages: context_messages,
         })
     }
 }
@@ -2350,6 +2521,7 @@ pub struct ExtractedMessage {
     pub custom_type: Option<String>,
 }
 
+#[derive(Default)]
 pub struct ExtractedSession {
     /// Provider-native session id; empty when identity could not be resolved
     /// from the file, in which case `messages` is empty too.
@@ -2358,8 +2530,8 @@ pub struct ExtractedSession {
     pub messages: Vec<ExtractedMessage>,
     /// Per-event timeline emitted alongside [`messages`] for the active-
     /// interval runtime pipeline (feature 008). Populated by
-    /// [`extract_claude_messages_from_jsonl`] and
-    /// [`extract_codex_messages_from_jsonl`] in the same parse pass.
+    /// [`extract_claude_messages_from_jsonl_records`] and
+    /// [`extract_codex_messages_from_jsonl_records`] in the same parse pass.
     pub events: Vec<ExtractedEvent>,
     /// Observed lifecycle-hook fires emitted alongside [`messages`] and
     /// [`events`] (feature 009). Populated only by the Claude extractor,
@@ -2872,6 +3044,7 @@ pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<Skill
 /// fan-out cannot drift. Pi chain identity is flat: every row is the session's
 /// own.
 // @lat: [[data-flow#Session Indexing Pipeline#Enrichment]]
+#[cfg(test)]
 pub(crate) fn pi_transcript_tool_rows(
     session_id: &str,
     hostname: &str,
@@ -3528,15 +3701,40 @@ struct ToolUseEntry {
 }
 
 /// Extract indexable messages from a provider session transcript.
+///
+/// Production callers must hold `transcript_work::with_source` through both
+/// extraction and consumption/drop of the returned rows. Decoder serialization
+/// alone does not bound outputs retained by callers.
 pub fn extract_messages_from_jsonl(provider: IntegrationProvider, path: &Path) -> ExtractedSession {
-    match provider {
-        IntegrationProvider::Claude => extract_claude_messages_from_jsonl(path),
-        IntegrationProvider::Codex => extract_codex_messages_from_jsonl(path),
-        IntegrationProvider::Pi => {
-            extract_pi_messages(path, crate::pi_session::parse_pi_session_file(Some(path)))
+    match read_extracted_session(provider, path) {
+        Ok((extracted, _)) => extracted,
+        Err(error) => {
+            log::warn!("Failed to extract JSONL {}: {error}", path.display());
+            unsupported_extracted_session()
         }
-        IntegrationProvider::MiniMax => unreachable!("MiniMax has no transcript source"),
     }
+}
+
+/// Bounded stable reads fail explicitly so writers retain last-known-good docs.
+fn read_extracted_session(
+    provider: IntegrationProvider,
+    path: &Path,
+) -> Result<(ExtractedSession, ModelSourceFastFingerprint), String> {
+    let path = path.to_path_buf();
+    crate::transcript_work::decode(move || {
+        let (bytes, fingerprint) = crate::transcript_identity::read_stable_transcript(&path)
+            .map_err(|error| error.to_string())?;
+        let contents = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
+        let extracted = if provider == IntegrationProvider::Pi {
+            let session = crate::pi_session::parse_pi_session_jsonl(contents)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Missing supported Pi session header".to_owned())?;
+            extract_pi_session(&path, session)
+        } else {
+            extract_messages_from_jsonl_contents(provider, &path, contents)
+        };
+        Ok((extracted, fingerprint))
+    })
 }
 
 /// Parse already-read retained JSONL content without touching persistence.
@@ -3561,14 +3759,9 @@ pub(crate) fn extract_messages_from_jsonl_records(
     match provider {
         IntegrationProvider::Claude => extract_claude_messages_from_jsonl_records(path, records),
         IntegrationProvider::Codex => extract_codex_messages_from_jsonl_records(records),
-        IntegrationProvider::Pi => extract_pi_messages(
-            path,
-            crate::pi_session::parse_pi_session_records(
-                records
-                    .iter()
-                    .map(|record| (record.ordinal, record.value.clone())),
-            ),
-        ),
+        IntegrationProvider::Pi => {
+            unreachable!("Pi is decoded directly into owned PiSession entries")
+        }
         IntegrationProvider::MiniMax => unreachable!("MiniMax has no transcript source"),
     }
 }
@@ -4012,35 +4205,6 @@ fn unsupported_extracted_session() -> ExtractedSession {
     }
 }
 
-/// Extract indexable messages from a Claude Code JSONL session file.
-/// Only "user" and "assistant" type messages are extracted.
-/// isMeta messages and messages with empty content are skipped.
-fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("Failed to read JSONL {}: {e}", path.display());
-            return ExtractedSession {
-                session_id: path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                project_name: path
-                    .parent()
-                    .and_then(|parent| parent.file_name())
-                    .and_then(|name| name.to_str())
-                    .map(SessionIndex::project_display_name),
-                messages: Vec::new(),
-                events: Vec::new(),
-                hook_invocations: Vec::new(),
-            };
-        }
-    };
-
-    extract_messages_from_jsonl_contents(IntegrationProvider::Claude, path, &contents)
-}
-
 fn extract_claude_messages_from_jsonl_records(
     path: &Path,
     records: &[JsonlRecord],
@@ -4457,24 +4621,6 @@ fn extract_claude_messages_from_jsonl_records(
         events,
         hook_invocations,
     }
-}
-
-fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("Failed to read JSONL {}: {e}", path.display());
-            return ExtractedSession {
-                session_id: String::new(),
-                project_name: None,
-                messages: Vec::new(),
-                events: Vec::new(),
-                hook_invocations: Vec::new(),
-            };
-        }
-    };
-
-    extract_messages_from_jsonl_contents(IntegrationProvider::Codex, path, &contents)
 }
 
 fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> ExtractedSession {
@@ -5549,6 +5695,581 @@ mod tests {
                     RetainedJsonlSourceLayoutHint::ClaudeSubagent { .. }
                 )
         }));
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Search Checkpoint Compatibility]]
+    #[test]
+    fn old_search_checkpoint_deserializes_without_hints_or_canonical_path() {
+        let state: IndexState = serde_json::from_str(r#"{"sources":{"pi:sessions:test":{"mtime_ns":1,"size_bytes":2,"session_id":"native"}}}"#).unwrap();
+        let indexed = &state.sources["pi:sessions:test"];
+        assert_eq!(indexed.session_id, "native");
+        assert!(indexed.hints.is_none());
+        assert!(
+            indexed.canonical_path.is_none(),
+            "old checkpoints revalidate their canonical path once"
+        );
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Search Prune Proof]]
+    #[test]
+    fn search_prune_does_not_erase_a_live_commit_newer_than_inventory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("new.jsonl");
+        fs::write(&path, r#"{"type":"user","sessionId":"new-session","uuid":"new-message","timestamp":"2026-08-14T08:00:00Z","message":{"role":"user","content":"newneedle"}}
+"#).unwrap();
+        let source = DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Claude,
+            source_root_key: CLAUDE_SOURCE_ROOT_KEY,
+            source_key: "claude:projects:new".into(),
+            canonical_path: path.clone(),
+            filesystem_path: path.clone(),
+            layout_hint: RetainedJsonlSourceLayoutHint::ClaudeParent {
+                default_project: "test".into(),
+            },
+        };
+        let index = SessionIndex::open_or_create_for_tests(&dir.path().join("index")).unwrap();
+        let inventory = ProviderSourceRoot {
+            provider: IntegrationProvider::Claude,
+            source_root_key: CLAUDE_SOURCE_ROOT_KEY,
+            resolved_root_path: dir.path().to_owned(),
+            canonical_root_path: Some(dir.path().to_owned()),
+            outcome: ProviderRootEnumerationOutcome::Complete,
+            sources: Vec::new(),
+        };
+        index.sync_source(&source, "host").unwrap();
+        index.sync_inner(std::slice::from_ref(&inventory)).unwrap();
+        assert!(
+            index
+                .state
+                .lock()
+                .unwrap()
+                .sources
+                .contains_key(&source.source_key)
+        );
+        fs::remove_file(path).unwrap();
+        index.sync_inner(&[inventory]).unwrap();
+        assert!(index.state.lock().unwrap().sources.is_empty());
+        index.reader.reload().unwrap();
+        assert_eq!(
+            index
+                .search("newneedle", &Default::default(), "relevance", 0, 10)
+                .unwrap()
+                .total_hits,
+            0
+        );
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Pi Header Replacement Prune]]
+    #[test]
+    fn search_prune_distinguishes_a_live_pi_source_from_replaced_header_identity() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pi.jsonl");
+        let body = |id: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session","version":3,"id":id,"cwd":"/work/test","timestamp":"2026-08-14T08:00:00Z"})
+            )
+        };
+        fs::write(&path, body("old-native")).unwrap();
+        let source = DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: PI_SOURCE_ROOT_KEY,
+            source_key: "pi:sessions:old-native".into(),
+            canonical_path: path.clone(),
+            filesystem_path: path.clone(),
+            layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
+        };
+        let index = SessionIndex::open_or_create_for_tests(&dir.path().join("index")).unwrap();
+        let root = ProviderSourceRoot {
+            provider: IntegrationProvider::Pi,
+            source_root_key: PI_SOURCE_ROOT_KEY,
+            resolved_root_path: dir.path().to_owned(),
+            canonical_root_path: Some(dir.path().to_owned()),
+            outcome: ProviderRootEnumerationOutcome::Complete,
+            sources: Vec::new(),
+        };
+        index.sync_source(&source, "host").unwrap();
+        index.sync_inner(std::slice::from_ref(&root)).unwrap();
+        assert!(
+            index
+                .state
+                .lock()
+                .unwrap()
+                .sources
+                .contains_key(&source.source_key),
+            "an existing matching source survives an older inventory"
+        );
+        fs::write(path, body("new-native")).unwrap();
+        index.sync_inner(&[root]).unwrap();
+        assert!(
+            index.state.lock().unwrap().sources.is_empty(),
+            "a new valid header proves the old native source was replaced even though its path remains"
+        );
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Unchanged Sweep Isolation]]
+    #[test]
+    fn unchanged_search_sweep_does_not_refresh_analytics_but_recovery_still_runs() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("source.jsonl");
+        fs::write(&path, r#"{"type":"user","sessionId":"session","uuid":"message","timestamp":"2026-08-14T08:00:00Z","message":{"role":"user","content":"needle"}}
+"#).unwrap();
+        let source = DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Claude,
+            source_root_key: CLAUDE_SOURCE_ROOT_KEY,
+            source_key: "claude:projects:source".into(),
+            canonical_path: path.clone(),
+            filesystem_path: path,
+            layout_hint: RetainedJsonlSourceLayoutHint::ClaudeParent {
+                default_project: "test".into(),
+            },
+        };
+        let root = ProviderSourceRoot {
+            provider: IntegrationProvider::Claude,
+            source_root_key: CLAUDE_SOURCE_ROOT_KEY,
+            resolved_root_path: dir.path().to_owned(),
+            canonical_root_path: Some(dir.path().to_owned()),
+            outcome: ProviderRootEnumerationOutcome::Complete,
+            sources: vec![source.clone()],
+        };
+        let index = SessionIndex::open_or_create_for_tests(&dir.path().join("index")).unwrap();
+        let storage = crate::storage::Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let generation_key = "transcript_analytics_generation:claude:claude:projects";
+        storage.set_setting(generation_key, "41").unwrap();
+        index.sync_source(&source, "host").unwrap();
+        assert_eq!(
+            index.sync_retained_sources(&storage, std::slice::from_ref(&root)),
+            (0, false)
+        );
+        assert_eq!(
+            storage.get_setting(generation_key).unwrap().as_deref(),
+            Some("41"),
+            "unchanged sweep never begins a live root generation or registry refresh"
+        );
+        assert!(
+            storage
+                .list_transcript_analytics_sources_for_root(
+                    IntegrationProvider::Claude,
+                    CLAUDE_SOURCE_ROOT_KEY
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let recovery = crate::transcript_analytics::run_transcript_analytics_reconciliation(
+            &storage,
+            "host",
+            &[root],
+        )
+        .unwrap();
+        assert_eq!(
+            recovery.replaced_sources, 1,
+            "analytics-only work remains owned by recovery"
+        );
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Context Ownership And Errors]]
+    #[test]
+    #[serial]
+    fn context_extreme_window_does_not_overflow_and_read_failures_are_errors() {
+        let fixture = make_fixture();
+        let session = "11111111-2222-3333-4444-555555555555";
+        let path = fixture
+            .path()
+            .join("-home-test-proj")
+            .join(format!("{session}.jsonl"));
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", fixture.path());
+        }
+        let index = SessionIndex::open_or_create_for_tests(&fixture.path().join("index")).unwrap();
+        let context = index
+            .get_context(IntegrationProvider::Claude, session, "p2", usize::MAX)
+            .unwrap();
+        assert_eq!(context.messages.len(), 2);
+        assert_eq!(context.messages[1].content, "hi back");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(crate::transcript_identity::RETAINED_TRANSCRIPT_MAX_BYTES + 1)
+            .unwrap();
+        assert!(
+            index
+                .get_context(IntegrationProvider::Claude, session, "p2", 5)
+                .unwrap_err()
+                .contains("256 MiB")
+        );
+        fs::write(&path, [0xff]).unwrap();
+        assert!(
+            index
+                .get_context(IntegrationProvider::Claude, session, "p2", 5)
+                .is_err()
+        );
+        unsafe {
+            std::env::remove_var("QUILL_DEMO_MODE");
+            std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
+        }
+    }
+
+    /// Allocation-dense source, three overlapping real owners, fresh retained
+    /// caller threads each round. Run alone; XML samples are read-only accounting.
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Dense Overlapping Owning Benchmark]]
+    #[test]
+    #[ignore = "allocation-dense overlapping owning-path memory benchmark"]
+    #[serial]
+    fn dense_pi_transcript_overlapping_owning_paths() {
+        use crate::transcript_analytics::{self, TranscriptSourceResult};
+        use crate::transcript_work::{DECODE_COUNT, decode};
+        use std::io::Write;
+        use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
+        assert!(
+            std::env::var_os("MALLOC_ARENA_MAX").is_none(),
+            "measure default allocator"
+        );
+        assert!(
+            !std::env::var("GLIBC_TUNABLES")
+                .unwrap_or_default()
+                .contains("glibc.malloc")
+        );
+        let mib = std::env::var("QUILL_DENSE_BENCH_MIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32);
+        let rounds = std::env::var("QUILL_DENSE_BENCH_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8);
+        assert!((1..=244).contains(&mib) && (2..=16).contains(&rounds));
+        let dir = TempDir::new().unwrap();
+        let artifacts = std::env::var_os("QUILL_DENSE_BENCH_ARTIFACT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dir.path().join("measurements"));
+        fs::create_dir_all(&artifacts).unwrap();
+        let path = dir.path().join("dense.jsonl");
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(file, "{}", serde_json::json!({"type":"session","version":3,"id":"dense","timestamp":"2026-08-14T08:00:00Z","cwd":"/work/synthetic"})).unwrap();
+        let nested = (0..128).map(|i| serde_json::json!({"i":i,"flags":[true,false],"meta":{"key":"value","tags":["alpha","beta"]},"coords":{"x":i,"y":i+1}})).collect::<Vec<_>>();
+        let append = |file: &mut fs::File, i: usize| {
+            let base = chrono::DateTime::parse_from_rfc3339("2026-08-14T08:00:00Z").unwrap();
+            let time = |offset| {
+                (base + chrono::Duration::milliseconds((i * 3 + offset) as i64)).to_rfc3339()
+            };
+            for row in [
+                serde_json::json!({"type":"message","id":format!("user-{i}"),"parentId":null,"timestamp":time(0),"message":{"role":"user","content":"dense request"}}),
+                serde_json::json!({"type":"message","id":format!("assistant-{i}"),"parentId":format!("user-{i}"),"timestamp":time(1),"message":{"role":"assistant","provider":"synthetic","model":"model","usage":{"input":20,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":25},"content":[{"type":"text","text":"dense reply"},{"type":"toolCall","id":format!("call-{i}"),"name":"bash","arguments":{"command":"printf dense","nested":nested}}]}}),
+                serde_json::json!({"type":"message","id":format!("result-{i}"),"parentId":format!("assistant-{i}"),"timestamp":time(2),"message":{"role":"toolResult","toolCallId":format!("call-{i}"),"toolName":"bash","content":[{"type":"text","text":"dense tool result"}],"details":{"nested":nested},"isError":false}}),
+            ] {
+                writeln!(file, "{row}").unwrap();
+            }
+        };
+        let mut groups = 0;
+        while file.metadata().unwrap().len() < (mib * 1024 * 1024) as u64 {
+            append(&mut file, groups);
+            groups += 1;
+        }
+        let storage =
+            Arc::new(crate::storage::Storage::init_at(dir.path().join("usage.db"), false).unwrap());
+        for marker in [
+            "transcript_analytics_reingest_pending",
+            "pi_transcript_analytics_reingest_pending",
+            "pi_persisted_source_reconciliation_pending",
+        ] {
+            storage.delete_setting(marker).unwrap();
+        }
+        let index =
+            Arc::new(SessionIndex::open_or_create_for_tests(&dir.path().join("index")).unwrap());
+        let hostname = SessionIndex::local_hostname();
+        let source = Arc::new(DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: PI_SOURCE_ROOT_KEY,
+            source_key: crate::storage::pi_source_key(&hostname, "dense").unwrap(),
+            canonical_path: path.clone(),
+            filesystem_path: path.clone(),
+            layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
+        });
+        let roots = Arc::new(vec![ProviderSourceRoot {
+            provider: IntegrationProvider::Pi,
+            source_root_key: PI_SOURCE_ROOT_KEY,
+            resolved_root_path: dir.path().to_owned(),
+            canonical_root_path: Some(dir.path().to_owned()),
+            outcome: ProviderRootEnumerationOutcome::Complete,
+            sources: vec![source.as_ref().clone()],
+        }]);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut owners = Vec::new();
+        let mut decoder_threads = HashSet::new();
+        let mut owner_threads = HashSet::new();
+        let started = std::time::Instant::now();
+        for round in 0..rounds {
+            let changed = round % 2 == 0;
+            if changed && round > 0 {
+                append(&mut file, groups);
+                groups += 1;
+            }
+            let barrier = Arc::new(Barrier::new(4));
+            let (tx, rx) = mpsc::channel();
+            for owner in 0..3 {
+                let (storage, index, source, roots, hostname, barrier, tx, release) = (
+                    Arc::clone(&storage),
+                    Arc::clone(&index),
+                    Arc::clone(&source),
+                    Arc::clone(&roots),
+                    hostname.clone(),
+                    Arc::clone(&barrier),
+                    tx.clone(),
+                    Arc::clone(&release),
+                );
+                owners.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    let before = DECODE_COUNT.get();
+                    match owner {
+                        0 => { let (analytics, search) = transcript_analytics::reconcile_retained_source(&storage, &source, &hostname, Some(&index)); analytics.unwrap(); search.unwrap(); }
+                        1 => { index.sync_retained_sources(&storage, &roots); index.sync_inner(&roots).unwrap(); }
+                        _ => { let summary = transcript_analytics::run_transcript_analytics_reconciliation_with_search(&storage, &hostname, &roots, Some(&index)).unwrap(); assert_eq!(summary.failed_sources, 0); }
+                    }
+                    let decodes = DECODE_COUNT.get() - before;
+                    let decoder_thread = decode(|| std::thread::current().id());
+                    tx.send((decodes, decoder_thread, std::thread::current().id())).unwrap();
+                    drop(tx);
+                    // Keep retired caller arenas alive, like idle pool workers.
+                    let mut done = release.0.lock().unwrap();
+                    while !*done { done = release.1.wait(done).unwrap(); }
+                }));
+            }
+            drop(tx);
+            barrier.wait();
+            let mut decodes = 0;
+            for (count, decoder, owner) in rx.iter().take(3) {
+                decodes += count;
+                decoder_threads.insert(decoder);
+                owner_threads.insert(owner);
+            }
+            assert_eq!(owner_threads.len(), (round + 1) * 3);
+            assert_eq!(
+                decoder_threads.len(),
+                1,
+                "heavy decoding never rotates onto owners"
+            );
+            if changed {
+                assert!(
+                    (1..=2).contains(&decodes),
+                    "one full extraction, optionally preceded by root identity inventory: {decodes}"
+                );
+            } else {
+                assert_eq!(decodes, 0, "identical overlapping versions never decode");
+            }
+            index.reader.reload().unwrap();
+            assert_eq!(
+                index
+                    .search("", &Default::default(), "relevance", 0, 1)
+                    .unwrap()
+                    .total_hits,
+                (groups * 2) as u64
+            );
+            let conn = rusqlite::Connection::open(dir.path().join("usage.db")).unwrap();
+            for (table, expected) in [
+                ("session_events", groups * 4),
+                ("tool_actions", groups),
+                ("model_usage_observations", groups),
+            ] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    expected as i64,
+                    "{table} complete after round {round}"
+                );
+            }
+            assert_eq!(
+                transcript_analytics::reconcile_live_transcript_source(
+                    &storage, &source, &hostname
+                )
+                .unwrap(),
+                TranscriptSourceResult::SuppressedUnchanged
+            );
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            {
+                let xml_path = artifacts.join(format!("malloc-round-{round}.xml"));
+                let name = std::ffi::CString::new(xml_path.to_str().unwrap()).unwrap();
+                // Read-only malloc_info/mallinfo2; never trim or tune the allocator.
+                unsafe {
+                    let stream = libc::fopen(name.as_ptr(), c"w".as_ptr());
+                    assert!(!stream.is_null());
+                    assert_eq!(libc::malloc_info(0, stream), 0);
+                    assert_eq!(libc::fclose(stream), 0);
+                }
+                let xml = fs::read_to_string(xml_path).unwrap();
+                let heaps = xml
+                    .split("<heap nr=")
+                    .skip(1)
+                    .map(|heap| {
+                        heap.split("</heap>")
+                            .next()
+                            .unwrap()
+                            .split("<system type=\"current\" size=\"")
+                            .nth(1)
+                            .unwrap()
+                            .split('"')
+                            .next()
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let heap = unsafe { libc::mallinfo2() };
+                eprintln!(
+                    "dense-heap round={round} arenas={} arenas_ge_64m={} largest_arena={} arena_system={} arena_free={} allocated_estimate={}",
+                    heaps.len(),
+                    heaps
+                        .iter()
+                        .filter(|bytes| **bytes >= 64 * 1024 * 1024)
+                        .count(),
+                    heaps.iter().max().unwrap(),
+                    heap.arena,
+                    heap.fordblks,
+                    heap.uordblks + heap.hblkhd
+                );
+            }
+            eprintln!(
+                "dense-bench round={round} bytes={} groups={groups} owners={} decoders={} source_decodes={decodes} elapsed_ms={} {}",
+                fs::metadata(&path).unwrap().len(),
+                owner_threads.len(),
+                decoder_threads.len(),
+                started.elapsed().as_millis(),
+                fs::read_to_string("/proc/self/status")
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| line.starts_with("VmRSS:")
+                        || line.starts_with("VmHWM:")
+                        || line.starts_with("VmSwap:"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        for owner in owners {
+            owner.join().unwrap();
+        }
+    }
+
+    /// Run serially in a fresh process with QUILL_TRANSCRIPT_BENCH_MIB=244.
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Large Owning Path Benchmark]]
+    #[test]
+    #[ignore = "large synthetic owning-path memory benchmark"]
+    #[serial]
+    fn repeated_large_pi_transcript_owning_paths() {
+        use std::io::Write;
+        let root = TempDir::new().unwrap();
+        let pi = root.path().join("pi/--work-quill--");
+        fs::create_dir_all(&pi).unwrap();
+        let path = pi.join("bench.jsonl");
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(file, "{}", serde_json::json!({"type":"session","version":3,"id":"bench","timestamp":"2026-08-14T08:00:00Z","cwd":"/work/quill"})).unwrap();
+        let mib = std::env::var("QUILL_TRANSCRIPT_BENCH_MIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32);
+        // Native user content exercises JSON ownership, extraction and Tantivy;
+        // repeated words keep disk/index size modest without hiding heap bytes.
+        let text = "synthetic evidence ".repeat(1024 * 1024 / 19);
+        for i in 0..mib {
+            writeln!(file, "{}", serde_json::json!({"type":"message","id":format!("entry-{i}"),"parentId":null,"timestamp":"2026-08-14T08:00:01Z","message":{"role":"user","content":text}})).unwrap();
+        }
+        drop(text);
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_RULES_DIR", root.path().join("rules"));
+            std::env::set_var("QUILL_DATA_DIR", root.path());
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", root.path().join("pi"));
+        }
+        let storage = crate::storage::Storage::init().unwrap();
+        storage
+            .delete_setting("transcript_analytics_reingest_pending")
+            .unwrap();
+        let index = SessionIndex::open_or_create_for_tests(&root.path().join("index")).unwrap();
+        let source = validate_retained_notify_source(IntegrationProvider::Pi, &path)
+            .unwrap()
+            .unwrap();
+        let roots = vec![ProviderSourceRoot {
+            provider: IntegrationProvider::Pi,
+            source_root_key: source.source_root_key,
+            resolved_root_path: root.path().join("pi"),
+            canonical_root_path: Some(fs::canonicalize(root.path().join("pi")).unwrap()),
+            sources: vec![source.clone()],
+            outcome: ProviderRootEnumerationOutcome::Complete,
+        }];
+        let started = std::time::Instant::now();
+        for round in 0..4 {
+            if round > 0 {
+                writeln!(file, "{}", serde_json::json!({"type":"message","id":format!("append-{round}"),"parentId":null,"timestamp":"2026-08-14T08:00:02Z","message":{"role":"user","content":"appended evidence"}})).unwrap();
+            }
+            let (analytics, search) = crate::transcript_analytics::reconcile_retained_source(
+                &storage,
+                &source,
+                &SessionIndex::local_hostname(),
+                Some(&index),
+            );
+            assert_eq!(
+                analytics.unwrap(),
+                crate::transcript_analytics::TranscriptSourceResult::Replaced
+            );
+            assert_eq!(search.unwrap(), mib + round);
+            let decoded = crate::transcript_work::DECODE_COUNT.get();
+            assert_eq!(index.sync_inner(&roots).unwrap(), 0);
+            assert_eq!(
+                crate::transcript_analytics::reconcile_live_transcript_source(
+                    &storage,
+                    &source,
+                    &SessionIndex::local_hostname()
+                )
+                .unwrap(),
+                crate::transcript_analytics::TranscriptSourceResult::SuppressedUnchanged
+            );
+            assert_eq!(
+                crate::transcript_work::DECODE_COUNT.get(),
+                decoded,
+                "repeat admissions never decode unchanged bytes"
+            );
+            index.reader.reload().unwrap();
+            assert_eq!(
+                index
+                    .search("", &Default::default(), "relevance", 0, 1)
+                    .unwrap()
+                    .total_hits,
+                (mib + round) as u64
+            );
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            {
+                // Read-only allocator accounting, not trimming or allocator tuning.
+                let heap = unsafe { libc::mallinfo2() };
+                eprintln!(
+                    "transcript-heap round={round} allocated_estimate={} arena_free={} arena_system={} decodes={decoded}",
+                    heap.uordblks + heap.hblkhd,
+                    heap.fordblks,
+                    heap.arena
+                );
+            }
+            eprintln!(
+                "transcript-bench round={round} bytes={} elapsed_ms={} {}",
+                fs::metadata(&path).unwrap().len(),
+                started.elapsed().as_millis(),
+                fs::read_to_string("/proc/self/status")
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| line.starts_with("VmRSS:")
+                        || line.starts_with("VmHWM:")
+                        || line.starts_with("VmSwap:"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        unsafe {
+            std::env::remove_var("QUILL_DEMO_MODE");
+            std::env::remove_var("QUILL_RULES_DIR");
+            std::env::remove_var("QUILL_DATA_DIR");
+            std::env::remove_var("QUILL_PI_SESSIONS_DIR");
+        }
     }
 
     /// A Claude parent transcript is named by its session id, so it resolves

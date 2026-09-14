@@ -2085,7 +2085,6 @@ struct StagedModelSource {
     action: StagedSourceAction,
     fast: Option<ModelSourceFastFingerprint>,
     fingerprint: Option<ModelSourceFingerprint>,
-    unchanged_contents: Option<Vec<u8>>,
     parsed: Option<ProviderAdapterParseResult>,
     diagnostic: Option<ModelUsageDiagnostic>,
 }
@@ -2106,7 +2105,6 @@ impl StagedModelSource {
     fn fail(&mut self, diagnostic: ModelUsageDiagnostic) {
         self.action = StagedSourceAction::Fail;
         self.parsed = None;
-        self.unchanged_contents = None;
         self.diagnostic = Some(diagnostic);
     }
 
@@ -2221,7 +2219,7 @@ fn stored_graph_metadata(stored: &StoredModelSource) -> Option<NativeChainIdenti
     })
 }
 
-/// Owned, fully parsed reconciliation work for one complete inventory snapshot.
+/// Owned native identities and fingerprints for one complete inventory snapshot.
 ///
 /// Keeping every graph decision in this plan lets the runner commit bounded
 /// batches and yield without dropping ancestors needed to resolve descendants.
@@ -2244,7 +2242,8 @@ impl PreparedModelSourceReconciliation {
 
 /// Stage one inventory into an owned plan before starting any write transaction.
 ///
-/// All changed/forced sources are read, hashed, parsed, and root-resolved here.
+/// Changed/forced sources are read and root-resolved here, then their payloads
+/// are dropped. Commit reparses one source and revalidates its exact fingerprint.
 /// Provider-native parent metadata is the only graph authority; layout hints are
 /// diagnostic only. Descendants whose resolved root changes are force-parsed
 /// before this function returns.
@@ -2320,11 +2319,6 @@ pub(crate) fn prepare_model_source_reconciliation(
         &retain_missing_persisted,
         &hostname,
     );
-    for source in &mut staged {
-        // Equal-content bytes are needed only while deciding forced fan-out.
-        // Parsed replacements retain normalized rows, not full transcript text.
-        source.unchanged_contents = None;
-    }
 
     let total_sources = staged.len();
     Ok(PreparedModelSourceReconciliation {
@@ -2390,10 +2384,6 @@ pub(crate) fn prepare_scoped_model_source_reconciliation(
     }
 
     stabilize_scoped_root_graph(&mut staged, &persisted_by_key, &mut staged_keys, &hostname);
-    for source in &mut staged {
-        // Equal-content bytes are needed only while deciding forced fan-out.
-        source.unchanged_contents = None;
-    }
 
     let total_sources = staged.len();
     Ok(PreparedModelSourceReconciliation {
@@ -2928,7 +2918,6 @@ fn stage_model_source(
         action: StagedSourceAction::Fail,
         fast: None,
         fingerprint: None,
-        unchanged_contents: None,
         parsed: None,
         diagnostic: None,
     };
@@ -2982,6 +2971,10 @@ fn source_fast_fingerprint(
 }
 
 fn stage_source_content(staged: &mut StagedModelSource, hostname: &str) {
+    crate::transcript_work::with_source(|| stage_source_content_inner(staged, hostname));
+}
+
+fn stage_source_content_inner(staged: &mut StagedModelSource, hostname: &str) {
     let Some(expected_fast) = staged.fast else {
         staged.fail(ModelUsageDiagnostic::new(
             ModelUsageDiagnosticKind::SourceReadFailed,
@@ -3012,13 +3005,12 @@ fn stage_source_content(staged: &mut StagedModelSource, hostname: &str) {
     match change {
         ModelSourceChange::ContentUnchanged => {
             staged.action = StagedSourceAction::ContentUnchanged;
-            staged.unchanged_contents = Some(contents);
         }
         ModelSourceChange::SuppressedUnchanged => {
             staged.action = StagedSourceAction::SuppressedUnchanged;
         }
         ModelSourceChange::ContentChanged | ModelSourceChange::SuppressedChanged => {
-            match parse_model_source(&staged.discovered, &contents, hostname) {
+            match parse_model_source(&staged.discovered, contents, hostname, true) {
                 Ok(parsed) => {
                     staged.action = StagedSourceAction::Replace;
                     staged.parsed = Some(parsed);
@@ -3053,6 +3045,25 @@ fn read_stable_source_bytes(
 }
 
 fn parse_model_source(
+    discovered: &DiscoveredRetainedJsonlSource,
+    contents: Vec<u8>,
+    hostname: &str,
+    identity_only: bool,
+) -> Result<ProviderAdapterParseResult, ModelUsageDiagnostic> {
+    let discovered = discovered.clone();
+    let hostname = hostname.to_owned();
+    crate::transcript_work::decode(move || {
+        let mut parsed = parse_model_source_inner(&discovered, &contents, &hostname)?;
+        if identity_only {
+            // The plan needs native graph metadata, not one payload per source.
+            parsed.observations = Vec::new();
+            parsed.diagnostics = Vec::new();
+        }
+        Ok(parsed)
+    })
+}
+
+fn parse_model_source_inner(
     discovered: &DiscoveredRetainedJsonlSource,
     contents: &[u8],
     hostname: &str,
@@ -3273,45 +3284,44 @@ fn build_source_root_graph(
 }
 
 fn force_parse_model_source(source: &mut StagedModelSource, hostname: &str) {
-    let contents = match source.unchanged_contents.take() {
-        Some(contents) => contents,
-        None => {
-            let Some(expected_fast) = source.fast else {
+    crate::transcript_work::with_source(|| {
+        let Some(expected_fast) = source.fast else {
+            source.fail(ModelUsageDiagnostic::new(
+                ModelUsageDiagnosticKind::SourceReadFailed,
+            ));
+            return;
+        };
+        let contents = match read_stable_source_bytes(&source.discovered, expected_fast) {
+            Ok(contents) => contents,
+            Err(error) => {
+                log::warn!("Cannot reread model source for root fan-out: {error}");
                 source.fail(ModelUsageDiagnostic::new(
                     ModelUsageDiagnosticKind::SourceReadFailed,
                 ));
                 return;
-            };
-            match read_stable_source_bytes(&source.discovered, expected_fast) {
-                Ok(contents) => {
-                    source.fingerprint = Some(ModelSourceFingerprint::from_content(
-                        expected_fast,
-                        &contents,
-                    ));
-                    contents
-                }
-                Err(error) => {
-                    log::warn!(
-                        "Failed to reread model source {} for root fan-out: {error}",
-                        source.discovered.canonical_path.display()
-                    );
-                    source.fail(ModelUsageDiagnostic::new(
-                        ModelUsageDiagnosticKind::SourceReadFailed,
-                    ));
-                    return;
-                }
             }
+        };
+        let fingerprint = ModelSourceFingerprint::from_content(expected_fast, &contents);
+        if source
+            .fingerprint
+            .as_ref()
+            .is_some_and(|prior| prior != &fingerprint)
+        {
+            source.fail(ModelUsageDiagnostic::new(
+                ModelUsageDiagnosticKind::SourceReadFailed,
+            ));
+            return;
         }
-    };
-
-    match parse_model_source(&source.discovered, &contents, hostname) {
-        Ok(parsed) => {
-            source.action = StagedSourceAction::Replace;
-            source.parsed = Some(parsed);
-            source.diagnostic = None;
+        source.fingerprint = Some(fingerprint);
+        match parse_model_source(&source.discovered, contents, hostname, true) {
+            Ok(parsed) => {
+                source.action = StagedSourceAction::Replace;
+                source.parsed = Some(parsed);
+                source.diagnostic = None;
+            }
+            Err(diagnostic) => source.fail(diagnostic),
         }
-        Err(diagnostic) => source.fail(diagnostic),
-    }
+    });
 }
 
 /// Build the resolution graph for the scoped live path.
@@ -3621,6 +3631,17 @@ fn commit_staged_model_source(
     generation: i64,
     mode: ModelSourceCommitMode,
 ) -> Result<CommittedModelSource, String> {
+    crate::transcript_work::with_source(|| {
+        commit_staged_model_source_inner(storage, staged, generation, mode)
+    })
+}
+
+fn commit_staged_model_source_inner(
+    storage: &Storage,
+    staged: &StagedModelSource,
+    generation: i64,
+    mode: ModelSourceCommitMode,
+) -> Result<CommittedModelSource, String> {
     // A live fast-unchanged source causes no observation or status change and no
     // refresh event. Its only effect is re-stamping seen_generation/
     // last_attempt_at_ms, which is consumed solely by the backfill prune -- and
@@ -3730,16 +3751,37 @@ fn commit_staged_model_source(
                 .fingerprint
                 .as_ref()
                 .ok_or_else(|| "Replacement source lost its fingerprint".to_string())?;
-            let parsed = staged
+            let inventoried = staged
                 .parsed
                 .as_ref()
-                .ok_or_else(|| "Replacement source lost its parsed output".to_string())?;
+                .ok_or_else(|| "Replacement source lost its native identity".to_string())?;
+            let contents = read_stable_source_bytes(&staged.discovered, fingerprint.fast())?;
+            if ModelSourceFingerprint::from_content(fingerprint.fast(), &contents) != *fingerprint {
+                return Err("Model source changed between inventory and commit".into());
+            }
+            let mut parsed = parse_model_source(
+                &staged.discovered,
+                contents,
+                &crate::sessions::SessionIndex::local_hostname(),
+                false,
+            )
+            .map_err(|error| format!("Model source reparse failed: {error:?}"))?;
+            if let Some(native) = inventoried.valid_native_source() {
+                parsed
+                    .resolve_analytics_root(native.analytics_session_id())
+                    .map_err(|error| error.to_string())?;
+            }
+            if parsed.native_identity != inventoried.native_identity
+                || parsed.counts != inventoried.counts
+            {
+                return Err("Model source identity changed between inventory and commit".into());
+            }
             let observation_count = i64::try_from(parsed.observations.len()).map_err(|_| {
                 "Model source observation count exceeds SQLite INTEGER range".to_string()
             })?;
             let normalized = normalized_source_from_parse(
                 &staged.discovered,
-                parsed,
+                &parsed,
                 fingerprint,
                 generation,
                 attempted_at_ms,
@@ -3941,6 +3983,83 @@ pub(crate) fn emit_model_analytics_updated(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Model Plan Lifetime And Drift]]
+    #[test]
+    #[serial_test::serial]
+    fn model_plan_retains_only_identity_and_refuses_commit_time_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let mut sources = Vec::new();
+        for i in 0..16 {
+            let path = dir.path().join(format!("{i}.jsonl"));
+            std::fs::write(&path, format!("{{\"type\":\"assistant\",\"sessionId\":\"session-{i}\",\"uuid\":\"message-{i}\",\"timestamp\":\"2026-08-14T08:00:01Z\",\"message\":{{\"role\":\"assistant\",\"model\":\"test-model\",\"content\":\"synthetic\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n")).unwrap();
+            sources.push(DiscoveredRetainedJsonlSource {
+                provider: IntegrationProvider::Claude,
+                source_root_key: "claude:projects",
+                source_key: format!("source-{i}"),
+                canonical_path: path.clone(),
+                filesystem_path: path,
+                layout_hint: RetainedJsonlSourceLayoutHint::ClaudeParent {
+                    default_project: "synthetic".into(),
+                },
+            });
+        }
+        let root = ProviderSourceRoot {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "claude:projects",
+            resolved_root_path: dir.path().to_owned(),
+            canonical_root_path: Some(dir.path().to_owned()),
+            outcome: ProviderRootEnumerationOutcome::Complete,
+            sources,
+        };
+        let mut permit = try_acquire_model_usage_runner().unwrap();
+        let generation = storage.get_model_backfill_status().unwrap().generation;
+        let plan = prepare_model_source_reconciliation(&storage, &[root], generation, &mut permit)
+            .unwrap();
+        assert_eq!(plan.pending_sources.len(), 16);
+        for staged in &plan.pending_sources {
+            let parsed = staged.parsed.as_ref().unwrap();
+            assert!(parsed.observations.is_empty());
+            assert!(parsed.diagnostics.is_empty());
+            assert!(parsed.valid_native_source().is_some());
+        }
+        let staged = &plan.pending_sources[0];
+        let committed = commit_staged_model_source(
+            &storage,
+            staged,
+            generation,
+            ModelSourceCommitMode::Backfill,
+        )
+        .unwrap();
+        assert_eq!(committed.result.observations_written, 1);
+        std::fs::write(
+            &staged.discovered.canonical_path,
+            "changed during graph preparation\n",
+        )
+        .unwrap();
+        assert!(
+            commit_staged_model_source(
+                &storage,
+                staged,
+                generation,
+                ModelSourceCommitMode::Backfill
+            )
+            .is_err()
+        );
+        assert!(
+            !plan.is_complete(),
+            "drift cannot produce prune proof from an uncommitted plan"
+        );
+        assert_eq!(
+            storage
+                .list_model_sources_for_root(IntegrationProvider::Claude, "claude:projects")
+                .unwrap()[0]
+                .last_good
+                .observation_count,
+            1
+        );
+    }
 
     fn claude_context<'a>(
         source_key: &'a str,

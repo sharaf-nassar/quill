@@ -493,6 +493,7 @@ pub(crate) struct ParsedTranscriptAnalyticsSource {
     pub(crate) native_identity: NativeChainIdentity,
     pub(crate) diagnostics: TranscriptRecordDiagnostics,
     snapshot: TranscriptAnalyticsSnapshot,
+    extracted: crate::sessions::ExtractedSession,
 }
 
 pub(crate) struct CompletedTranscriptSourceRoot {
@@ -541,8 +542,6 @@ struct PendingUnchangedRefresh {
     mtime_ns: i64,
     size_bytes: i64,
     content_sha256: Option<String>,
-    /// Reported when the row does not update because the generation advanced.
-    stale_generation_error: &'static str,
 }
 
 impl PendingUnchangedRefresh {
@@ -566,11 +565,6 @@ struct UnchangedTranscriptSource {
     previous_root: Option<String>,
     suppressed: bool,
     refresh: PendingUnchangedRefresh,
-}
-
-enum ClassifiedTranscriptSource {
-    Parsed(Box<ParsedTranscriptAnalyticsSource>),
-    Unchanged,
 }
 
 /// Raw bytes of a source that must be re-parsed, read exactly once.
@@ -638,7 +632,6 @@ fn classify_transcript_source_freshness(
                     mtime_ns: stat.mtime_ns(),
                     size_bytes: stat.size_bytes(),
                     content_sha256: None,
-                    stale_generation_error: "unchanged transcript generation advanced during refresh",
                 },
             },
         )));
@@ -667,7 +660,6 @@ fn classify_transcript_source_freshness(
                     mtime_ns: stable_stat.mtime_ns(),
                     size_bytes: stable_stat.size_bytes(),
                     content_sha256: Some(content_sha256),
-                    stale_generation_error: "content-unchanged transcript generation advanced during refresh",
                 },
             },
         )));
@@ -693,43 +685,6 @@ fn read_changed_transcript_source(
         stable_stat,
         content_sha256,
     }))
-}
-
-/// Classify one source and fully parse it when its content changed.
-///
-/// The live notify path uses this so a changed transcript is read exactly once.
-fn classify_transcript_analytics_source(
-    storage: &Storage,
-    source: &DiscoveredRetainedJsonlSource,
-    existing: Option<&StoredTranscriptAnalyticsSource>,
-    hostname: &str,
-    generation: i64,
-    force_full_reparse: bool,
-) -> Result<ClassifiedTranscriptSource, TranscriptAnalyticsError> {
-    match classify_transcript_source_freshness(source, existing, generation, force_full_reparse)? {
-        TranscriptSourceFreshness::Unchanged(unchanged) => {
-            // Exactly one source, so the batched refresh is already one
-            // transaction; no accumulation buys anything here.
-            let refreshed = storage
-                .refresh_unchanged_transcript_analytics_source(unchanged.refresh.descriptor())
-                .map_err(TranscriptAnalyticsError::Storage)?;
-            if !refreshed {
-                return Err(TranscriptAnalyticsError::Storage(
-                    unchanged.refresh.stale_generation_error.into(),
-                ));
-            }
-            Ok(ClassifiedTranscriptSource::Unchanged)
-        }
-        TranscriptSourceFreshness::Changed(changed) => parse_transcript_analytics_source_bytes(
-            source,
-            hostname,
-            changed.bytes,
-            changed.stable_stat,
-            changed.content_sha256,
-        )
-        .map(Box::new)
-        .map(ClassifiedTranscriptSource::Parsed),
-    }
 }
 
 /// Identity-only view of one source used by the startup inventory phase.
@@ -784,6 +739,17 @@ fn classify_transcript_source_identity(
     generation: i64,
     force_full_reparse: bool,
 ) -> Result<RootSourceClassification, TranscriptAnalyticsError> {
+    crate::transcript_work::with_source(|| {
+        classify_transcript_source_identity_inner(source, existing, generation, force_full_reparse)
+    })
+}
+
+fn classify_transcript_source_identity_inner(
+    source: &DiscoveredRetainedJsonlSource,
+    existing: Option<&StoredTranscriptAnalyticsSource>,
+    generation: i64,
+    force_full_reparse: bool,
+) -> Result<RootSourceClassification, TranscriptAnalyticsError> {
     if !force_full_reparse
         && existing.is_some_and(|stored| failed_with_unchanged_fingerprint(source, stored))
     {
@@ -800,12 +766,38 @@ fn classify_transcript_source_identity(
             }),
         )),
         TranscriptSourceFreshness::Changed(changed) => {
-            let contents = std::str::from_utf8(&changed.bytes)
-                .map_err(|_| TranscriptAnalyticsError::InvalidUtf8)?;
-            let records = parse_jsonl_records(contents);
-            let (native_identity, diagnostics) = resolve_native_identity(source, &records)?;
-            drop(records);
-            drop(changed);
+            let discovered = source.clone();
+            let (native_identity, diagnostics) = crate::transcript_work::decode(move || {
+                let contents = std::str::from_utf8(&changed.bytes)
+                    .map_err(|_| TranscriptAnalyticsError::InvalidUtf8)?;
+                if discovered.provider == IntegrationProvider::Pi {
+                    // Validate all tracking entries, but never retain message payloads
+                    // merely to resolve a Pi header's native identity.
+                    let mut first = true;
+                    let session = crate::pi_session::parse_pi_session_records(
+                        contents.lines().enumerate().filter_map(|(ordinal, line)| {
+                            let value = serde_json::from_str::<Value>(line).ok()?;
+                            value.as_object()?;
+                            let keep = std::mem::replace(&mut first, false)
+                                || matches!(
+                                    value.get("type").and_then(Value::as_str),
+                                    Some("session" | "custom")
+                                );
+                            keep.then_some((ordinal as u64, value))
+                        }),
+                    )
+                    .map_err(|error| TranscriptAnalyticsError::PiSession(error.to_string()))?
+                    .ok_or_else(|| {
+                        TranscriptAnalyticsError::PiSession("missing session header".into())
+                    })?;
+                    Ok((
+                        resolve_pi_native_identity(&session)?,
+                        TranscriptRecordDiagnostics::default(),
+                    ))
+                } else {
+                    resolve_native_identity(&discovered, &parse_jsonl_records(contents))
+                }
+            })?;
             log_record_diagnostics(source, &diagnostics);
             Ok(RootSourceClassification::Identity(Box::new(
                 TranscriptSourceIdentity {
@@ -892,20 +884,6 @@ fn record_live_source_failure(
     {
         log::warn!("Could not persist transcript analytics failure: {message}");
     }
-}
-
-fn resolved_snapshot(
-    parsed: ParsedTranscriptAnalyticsSource,
-    graph: &SourceRootGraph,
-    generation: i64,
-) -> Result<TranscriptAnalyticsSnapshot, String> {
-    let root = graph
-        .resolve(
-            parsed.native_identity.provider,
-            &parsed.native_identity.chain_id,
-        )
-        .map_err(|error| error.to_string())?;
-    stamp_analytics_root(parsed, &root, generation).map_err(|error| error.to_string())
 }
 
 fn commit_transcript_snapshot(
@@ -1010,6 +988,7 @@ fn native_identity_matches(left: &NativeChainIdentity, right: &NativeChainIdenti
 }
 
 /// Parse, stamp, and commit exactly one source, then drop its snapshot.
+#[cfg(test)]
 fn commit_reconciled_source(
     storage: &Storage,
     discovered: &DiscoveredRetainedJsonlSource,
@@ -1018,18 +997,84 @@ fn commit_reconciled_source(
     hostname: &str,
     generation: i64,
 ) -> Result<CommittedTranscriptSource, String> {
-    let parsed =
-        parse_transcript_analytics_source(discovered, hostname).map_err(|e| e.to_string())?;
-    // The file can change between inventory and commit. Stamping a root that
-    // was resolved from a different identity would silently reparent rows, so
-    // drift is a source failure that retains last-known-good data instead.
-    if !native_identity_matches(&parsed.native_identity, inventoried) {
-        return Err(TranscriptAnalyticsError::SourceIdentityDrift.to_string());
-    }
+    commit_reconciled_source_with_search(
+        storage,
+        discovered,
+        inventoried,
+        resolved_root,
+        hostname,
+        generation,
+        None,
+    )
+}
+
+fn commit_reconciled_source_with_search(
+    storage: &Storage,
+    discovered: &DiscoveredRetainedJsonlSource,
+    inventoried: &NativeChainIdentity,
+    resolved_root: &str,
+    hostname: &str,
+    generation: i64,
+    index: Option<crate::sessions::SourceSearch<'_>>,
+) -> Result<CommittedTranscriptSource, String> {
+    crate::transcript_work::with_source(|| {
+        let parsed =
+            parse_transcript_analytics_source(discovered, hostname).map_err(|e| e.to_string())?;
+        // The file can change between inventory and commit. Stamping a root that
+        // was resolved from a different identity would silently reparent rows, so
+        // drift is a source failure that retains last-known-good data instead.
+        if !native_identity_matches(&parsed.native_identity, inventoried) {
+            return Err(TranscriptAnalyticsError::SourceIdentityDrift.to_string());
+        }
+        commit_parsed_source(
+            storage,
+            discovered,
+            parsed,
+            resolved_root,
+            hostname,
+            generation,
+            index,
+        )
+    })
+}
+
+fn commit_parsed_source(
+    storage: &Storage,
+    discovered: &DiscoveredRetainedJsonlSource,
+    mut parsed: ParsedTranscriptAnalyticsSource,
+    resolved_root: &str,
+    hostname: &str,
+    generation: i64,
+    index: Option<crate::sessions::SourceSearch<'_>>,
+) -> Result<CommittedTranscriptSource, String> {
     let skipped_records = parsed.diagnostics.skipped_records();
     log_record_diagnostics(discovered, &parsed.diagnostics);
-    let snapshot =
-        stamp_analytics_root(parsed, resolved_root, generation).map_err(|e| e.to_string())?;
+    let mut extracted = std::mem::take(&mut parsed.extracted);
+    let snapshot = stamp_analytics_root(parsed, resolved_root, generation)
+        .map_err(|error| error.to_string())?;
+    if let Some(index) = index {
+        let fingerprint = ModelSourceFastFingerprint {
+            mtime_ns: snapshot.source.mtime_ns,
+            size_bytes: snapshot.source.size_bytes,
+        };
+        match index.index.replace_retained_source(
+            discovered,
+            fingerprint,
+            &mut extracted,
+            hostname,
+            index.hints,
+        ) {
+            Ok(count) => {
+                if let Some(indexed) = index.indexed {
+                    indexed.set(indexed.get() + count);
+                }
+            }
+            Err(error) => {
+                log::warn!("Search replacement failed independently of analytics: {error}")
+            }
+        }
+    }
+    drop(extracted);
     let result = commit_transcript_snapshot(storage, &snapshot)?;
     drop(snapshot);
     Ok(CommittedTranscriptSource {
@@ -1059,6 +1104,7 @@ fn reconcile_transcript_source_root(
     root: &ProviderSourceRoot,
     hostname: &str,
     force_full_reparse: bool,
+    index: Option<&crate::sessions::SessionIndex>,
 ) -> Result<RootReconciliationOutcome, RootReconciliationFault> {
     let generation = storage
         .begin_transcript_analytics_generation(root.provider, root.source_root_key)
@@ -1175,13 +1221,18 @@ fn reconcile_transcript_source_root(
         if !identity.changed && identity.previous_root.as_deref() == Some(resolved_root.as_str()) {
             continue;
         }
-        match commit_reconciled_source(
+        match commit_reconciled_source_with_search(
             storage,
             &identity.discovered,
             &native,
             &resolved_root,
             hostname,
             generation,
+            index.map(|index| crate::sessions::SourceSearch {
+                index,
+                hints: None,
+                indexed: None,
+            }),
         ) {
             Ok(committed) => {
                 if matches!(committed.result, TranscriptSourceResult::Replaced) {
@@ -1211,10 +1262,66 @@ fn reconcile_transcript_source_root(
 
 /// Reconcile one validated retained source for live notifications.
 // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots]]
+#[cfg(test)]
 pub(crate) fn reconcile_live_transcript_source(
     storage: &Storage,
     source: &DiscoveredRetainedJsonlSource,
     hostname: &str,
+) -> Result<TranscriptSourceResult, String> {
+    reconcile_live_transcript_source_with_search(storage, source, hostname, None)
+}
+
+/// Both consumers use the same admission and committed fingerprints. A failed
+/// consumer cannot erase the other consumer's checkpoint or suppress its retry.
+pub(crate) fn reconcile_retained_source(
+    storage: &Storage,
+    source: &DiscoveredRetainedJsonlSource,
+    hostname: &str,
+    index: Option<&crate::sessions::SessionIndex>,
+) -> (
+    Result<TranscriptSourceResult, String>,
+    Result<usize, String>,
+) {
+    reconcile_retained_source_with_hints(
+        storage,
+        source,
+        hostname,
+        index.map(|index| crate::sessions::SourceSearch {
+            index,
+            hints: None,
+            indexed: None,
+        }),
+    )
+}
+
+pub(crate) fn reconcile_retained_source_with_hints(
+    storage: &Storage,
+    source: &DiscoveredRetainedJsonlSource,
+    hostname: &str,
+    search: Option<crate::sessions::SourceSearch<'_>>,
+) -> (
+    Result<TranscriptSourceResult, String>,
+    Result<usize, String>,
+) {
+    let indexed = std::cell::Cell::new(0);
+    let search = search.map(|mut search| {
+        search.indexed = Some(&indexed);
+        search
+    });
+    let analytics = reconcile_live_transcript_source_with_search(storage, source, hostname, search);
+    let search = search.map_or(Ok(0), |search| {
+        search
+            .index
+            .sync_source_with_hints(source, hostname, search.hints)
+    });
+    (analytics, search.map(|count| count + indexed.get()))
+}
+
+fn reconcile_live_transcript_source_with_search(
+    storage: &Storage,
+    source: &DiscoveredRetainedJsonlSource,
+    hostname: &str,
+    index: Option<crate::sessions::SourceSearch<'_>>,
 ) -> Result<TranscriptSourceResult, String> {
     let _permit =
         acquire_transcript_reconciliation([(source.provider, source.source_root_key.to_owned())])?;
@@ -1225,33 +1332,110 @@ pub(crate) fn reconcile_live_transcript_source(
     let existing = persisted
         .iter()
         .find(|stored| stored.source_key == source.source_key);
-    let initial = match classify_transcript_analytics_source(
-        storage,
+    let immediate = crate::transcript_work::with_source(
+        || -> Result<Option<TranscriptSourceResult>, String> {
+            let freshness = classify_transcript_source_freshness(
+                source,
+                existing,
+                generation,
+                reingest_marker_pending(storage, TRANSCRIPT_ANALYTICS_REINGEST_MARKER),
+            )
+            .map_err(|error| error.to_string())?;
+            let changed = match freshness {
+                TranscriptSourceFreshness::Unchanged(unchanged) => {
+                    if !storage.refresh_unchanged_transcript_analytics_source(
+                        unchanged.refresh.descriptor(),
+                    )? {
+                        return Err(
+                            "unchanged transcript generation advanced during refresh".into()
+                        );
+                    }
+                    return Ok(Some(TranscriptSourceResult::SuppressedUnchanged));
+                }
+                TranscriptSourceFreshness::Changed(changed) => changed,
+            };
+            let parsed = parse_transcript_analytics_source_bytes(
+                source,
+                hostname,
+                changed.bytes,
+                changed.stable_stat,
+                changed.content_sha256,
+            )
+            .map_err(|error| error.to_string())?;
+            let mut metadata = vec![parsed.native_identity.clone()];
+            metadata.extend(
+                persisted
+                    .iter()
+                    .filter(|stored| stored.source_key != source.source_key)
+                    .filter_map(stored_native_identity),
+            );
+            let graph = SourceRootGraph::from_metadata(metadata);
+            let root = graph
+                .resolve(
+                    parsed.native_identity.provider,
+                    &parsed.native_identity.chain_id,
+                )
+                .map_err(|error| error.to_string())?;
+            let affects_descendants = persisted.iter().any(|stored| {
+                stored.source_key != source.source_key
+                    && stored.suppressed_sha256.is_none()
+                    && match (&stored.chain_id, &stored.analytics_session_id) {
+                        (Some(chain), Some(previous)) => graph
+                            .resolve(stored.provider, chain)
+                            .is_ok_and(|root| root != *previous),
+                        _ => false,
+                    }
+            });
+            if affects_descendants {
+                // Drop the sole materialized source before inventorying fan-out.
+                // Only this graph-changing case pays the identity/commit reread.
+                return Ok(None);
+            }
+            commit_parsed_source(storage, source, parsed, &root, hostname, generation, index)
+                .map(|committed| Some(committed.result))
+        },
+    )
+    .inspect_err(|error| {
+        record_live_source_failure(storage, source, generation, error);
+    })?;
+    if let Some(result) = immediate {
+        return Ok(result);
+    }
+    let initial = classify_transcript_source_identity(
         source,
         existing,
-        hostname,
         generation,
         reingest_marker_pending(storage, TRANSCRIPT_ANALYTICS_REINGEST_MARKER),
-    ) {
-        Ok(ClassifiedTranscriptSource::Parsed(parsed)) => *parsed,
-        Ok(ClassifiedTranscriptSource::Unchanged) => {
+    )
+    .map_err(|error| {
+        record_live_source_failure(storage, source, generation, &error.to_string());
+        error.to_string()
+    })?;
+    let RootSourceClassification::Identity(initial) = initial else {
+        return Err("Retained source still has a content-deterministic failure".into());
+    };
+    if !initial.changed {
+        // Preserve the live registry refresh contract without materializing rows.
+        if let TranscriptSourceFreshness::Unchanged(unchanged) =
+            classify_transcript_source_freshness(source, existing, generation, false)
+                .map_err(|error| error.to_string())?
+        {
+            if !storage
+                .refresh_unchanged_transcript_analytics_source(unchanged.refresh.descriptor())?
+            {
+                return Err("unchanged transcript generation advanced during refresh".into());
+            }
             return Ok(TranscriptSourceResult::SuppressedUnchanged);
         }
-        Err(error) => {
-            record_live_source_failure(storage, source, generation, &error.to_string());
-            return Err(error.to_string());
-        }
-    };
-    let mut staged = vec![(source.clone(), initial)];
+        // A source appended between the two stats: retry, never acknowledge it.
+        return Err("Retained source changed during freshness check".into());
+    }
+    let mut staged = vec![*initial];
     let mut staged_keys = HashSet::from([source.source_key.clone()]);
-
-    // A changed ancestor can move persisted descendants to a new root. Grow
-    // the staged set only with those descendants, then resolve once the graph
-    // converges. Unrelated sessions under the same provider root stay untouched.
     loop {
         let mut metadata = staged
             .iter()
-            .map(|(_, parsed)| parsed.native_identity.clone())
+            .filter_map(|identity| identity.native_identity.clone())
             .collect::<Vec<_>>();
         metadata.extend(persisted.iter().filter_map(|stored| {
             (!staged_keys.contains(&stored.source_key))
@@ -1259,72 +1443,88 @@ pub(crate) fn reconcile_live_transcript_source(
                 .flatten()
         }));
         let graph = SourceRootGraph::from_metadata(metadata);
-        for (_, parsed) in &staged {
-            graph
-                .resolve(
-                    parsed.native_identity.provider,
-                    &parsed.native_identity.chain_id,
-                )
-                .map_err(|error| error.to_string())?;
+        for identity in &staged {
+            if let Some(native) = &identity.native_identity {
+                graph
+                    .resolve(native.provider, &native.chain_id)
+                    .map_err(|error| error.to_string())?;
+            }
         }
-
         let affected = persisted.iter().find(|stored| {
             if staged_keys.contains(&stored.source_key) || stored.suppressed_sha256.is_some() {
                 return false;
             }
-            let (Some(chain_id), Some(previous_root)) =
-                (&stored.chain_id, &stored.analytics_session_id)
-            else {
-                return false;
-            };
-            graph
-                .resolve(stored.provider, chain_id)
-                .is_ok_and(|resolved| resolved != *previous_root)
+            match (&stored.chain_id, &stored.analytics_session_id) {
+                (Some(chain), Some(previous)) => graph
+                    .resolve(stored.provider, chain)
+                    .is_ok_and(|root| root != *previous),
+                _ => false,
+            }
         });
         let Some(affected) = affected else {
-            let mut replaced = false;
-            let mut stale = false;
-            // Each snapshot is stamped, committed, and dropped in turn so the
-            // staged set never holds more than one materialized row set.
-            for (discovered, parsed) in staged {
-                log_record_diagnostics(&discovered, &parsed.diagnostics);
-                let snapshot = resolved_snapshot(parsed, &graph, generation)?;
-                let committed = commit_transcript_snapshot(storage, &snapshot)?;
-                drop(snapshot);
-                replaced |= matches!(committed, TranscriptSourceResult::Replaced);
-                stale |= matches!(committed, TranscriptSourceResult::StaleGeneration);
+            let mut result = TranscriptSourceResult::SuppressedUnchanged;
+            for identity in staged {
+                let native = identity
+                    .native_identity
+                    .ok_or("Retained source has no native identity")?;
+                let root = graph
+                    .resolve(native.provider, &native.chain_id)
+                    .map_err(|error| error.to_string())?;
+                let search = index.map(|mut search| {
+                    if identity.discovered.source_key != source.source_key {
+                        search.hints = None;
+                    }
+                    search
+                });
+                match commit_reconciled_source_with_search(
+                    storage,
+                    &identity.discovered,
+                    &native,
+                    &root,
+                    hostname,
+                    generation,
+                    search,
+                ) {
+                    Ok(committed) => {
+                        if committed.result == TranscriptSourceResult::Replaced
+                            || result != TranscriptSourceResult::Replaced
+                        {
+                            result = committed.result;
+                        }
+                    }
+                    Err(error) => {
+                        record_live_source_failure(
+                            storage,
+                            &identity.discovered,
+                            generation,
+                            &error,
+                        );
+                        return Err(error);
+                    }
+                }
             }
-            return Ok(if replaced {
-                TranscriptSourceResult::Replaced
-            } else if stale {
-                TranscriptSourceResult::StaleGeneration
-            } else {
-                TranscriptSourceResult::SuppressedUnchanged
-            });
+            return Ok(result);
         };
-
         let discovered = match crate::sessions::validate_retained_notify_source(
             affected.provider,
             &affected.source_path,
         ) {
             Ok(Some(discovered)) if discovered.source_key == affected.source_key => discovered,
-            Ok(Some(_)) => return Err("Affected transcript descendant changed identity".into()),
-            Ok(None) => return Err("Affected transcript descendant is not retained".into()),
-            Err(error) => {
-                return Err(format!(
-                    "Affected transcript descendant cannot be validated: {error:?}"
-                ));
-            }
+            _ => return Err("Affected transcript descendant cannot be validated".into()),
         };
-        let parsed = match parse_transcript_analytics_source(&discovered, hostname) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                record_live_source_failure(storage, &discovered, generation, &error.to_string());
-                return Err(error.to_string());
-            }
+        let identity =
+            classify_transcript_source_identity(&discovered, Some(affected), generation, true)
+                .map_err(|error| {
+                    let message = error.to_string();
+                    record_live_source_failure(storage, &discovered, generation, &message);
+                    message
+                })?;
+        let RootSourceClassification::Identity(identity) = identity else {
+            // UnchangedFailure already has a current diagnostic; do not replace it.
+            return Err("Affected transcript descendant failed".into());
         };
         staged_keys.insert(discovered.source_key.clone());
-        staged.push((discovered, parsed));
+        staged.push(*identity);
         if staged.len() > persisted.len().saturating_add(1) {
             return Err("Transcript analytics root graph did not converge".into());
         }
@@ -1386,10 +1586,20 @@ pub(crate) fn run_startup_transcript_analytics_reconciliation(
     run_transcript_analytics_reconciliation(storage, hostname, &roots)
 }
 
+#[cfg(test)]
 pub(crate) fn run_transcript_analytics_reconciliation(
     storage: &Storage,
     hostname: &str,
     roots: &[ProviderSourceRoot],
+) -> Result<TranscriptAnalyticsReconciliationSummary, String> {
+    run_transcript_analytics_reconciliation_with_search(storage, hostname, roots, None)
+}
+
+pub(crate) fn run_transcript_analytics_reconciliation_with_search(
+    storage: &Storage,
+    hostname: &str,
+    roots: &[ProviderSourceRoot],
+    index: Option<&crate::sessions::SessionIndex>,
 ) -> Result<TranscriptAnalyticsReconciliationSummary, String> {
     let _permit = acquire_transcript_reconciliation(
         retained_jsonl_source_root_identities()
@@ -1410,6 +1620,7 @@ pub(crate) fn run_transcript_analytics_reconciliation(
             root,
             hostname,
             reingest.force_for(root.provider),
+            index,
         ) {
             Ok(outcome) => outcome,
             Err(RootReconciliationFault::RootUnavailable(error)) => {
@@ -1511,7 +1722,6 @@ pub(crate) fn run_transcript_analytics_reconciliation(
 #[derive(Debug)]
 pub(crate) enum TranscriptAnalyticsError {
     Read(std::io::Error),
-    Storage(String),
     InvalidUtf8,
     InvalidSourceMetadata,
     SourceTooLarge,
@@ -1528,7 +1738,6 @@ impl fmt::Display for TranscriptAnalyticsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Read(error) => write!(formatter, "cannot read retained transcript: {error}"),
-            Self::Storage(error) => write!(formatter, "cannot persist transcript state: {error}"),
             Self::InvalidUtf8 => formatter.write_str("retained transcript is not valid UTF-8"),
             Self::InvalidSourceMetadata => {
                 formatter.write_str("retained transcript metadata is invalid")
@@ -1672,19 +1881,7 @@ fn resolve_native_identity(
             resolve_codex_native_identity(records)?,
             TranscriptRecordDiagnostics::default(),
         ),
-        IntegrationProvider::Pi => {
-            let session = crate::pi_session::parse_pi_session_records(
-                records
-                    .iter()
-                    .map(|record| (record.ordinal, record.value.clone())),
-            )
-            .map_err(|error| TranscriptAnalyticsError::PiSession(error.to_string()))?
-            .ok_or_else(|| TranscriptAnalyticsError::PiSession("missing session header".into()))?;
-            (
-                resolve_pi_native_identity(&session)?,
-                TranscriptRecordDiagnostics::default(),
-            )
-        }
+        IntegrationProvider::Pi => unreachable!("Pi identity uses owned header/tracking entries"),
         IntegrationProvider::MiniMax => unreachable!("MiniMax has no retained analytics"),
     };
     // A retained-layout disagreement is one anomalous fact about an otherwise
@@ -2315,20 +2512,42 @@ fn parse_transcript_analytics_source_bytes(
     stable_stat: ModelSourceFastFingerprint,
     content_sha256: String,
 ) -> Result<ParsedTranscriptAnalyticsSource, TranscriptAnalyticsError> {
+    let source = source.clone();
+    let hostname = hostname.to_owned();
+    crate::transcript_work::decode(move || {
+        parse_transcript_analytics_source_bytes_inner(
+            &source,
+            &hostname,
+            bytes,
+            stable_stat,
+            content_sha256,
+        )
+    })
+}
+
+fn parse_transcript_analytics_source_bytes_inner(
+    source: &DiscoveredRetainedJsonlSource,
+    hostname: &str,
+    bytes: Vec<u8>,
+    stable_stat: ModelSourceFastFingerprint,
+    content_sha256: String,
+) -> Result<ParsedTranscriptAnalyticsSource, TranscriptAnalyticsError> {
     let contents =
         std::str::from_utf8(&bytes).map_err(|_| TranscriptAnalyticsError::InvalidUtf8)?;
-    let records = parse_jsonl_records(contents);
-    drop(bytes);
+
     let source_key = source.source_key.clone();
     let (native_identity, diagnostics, extracted, setting_events, session_name, pi_evidence) =
         if source.provider == IntegrationProvider::Pi {
             let session = crate::pi_session::parse_pi_session_records(
-                records
-                    .iter()
-                    .map(|record| (record.ordinal, record.value.clone())),
+                contents.lines().enumerate().filter_map(|(ordinal, line)| {
+                    let value = serde_json::from_str::<Value>(line).ok()?;
+                    value.as_object()?;
+                    Some((ordinal as u64, value))
+                }),
             )
             .map_err(|error| TranscriptAnalyticsError::PiSession(error.to_string()))?
             .ok_or_else(|| TranscriptAnalyticsError::PiSession("missing session header".into()))?;
+            drop(bytes);
             let native_identity = resolve_pi_native_identity(&session)?;
             let mut diagnostics = TranscriptRecordDiagnostics::default();
             let spans = pi_span_durations(&session, &mut diagnostics);
@@ -2358,6 +2577,8 @@ fn parse_transcript_analytics_source_bytes(
                 Some(pi_evidence),
             )
         } else {
+            let records = parse_jsonl_records(contents);
+            drop(bytes);
             let (native_identity, diagnostics) = resolve_native_identity(source, &records)?;
             let extracted = extract_messages_from_jsonl_records(
                 source.provider,
@@ -2449,7 +2670,7 @@ fn parse_transcript_analytics_source_bytes(
         })
         .collect();
 
-    let project = extracted.project_name;
+    let project = extracted.project_name.clone();
     let cwd = native_identity.cwd.clone().or_else(|| {
         extracted
             .messages
@@ -2489,6 +2710,7 @@ fn parse_transcript_analytics_source_bytes(
         native_identity,
         diagnostics,
         snapshot,
+        extracted,
     })
 }
 
@@ -2642,6 +2864,320 @@ mod tests {
         std::fs::write(&path, jsonl_body(lines)).expect("write transcript");
         set_mtime_ns(&path, FIXED_MTIME_NS);
         discovered_source(provider, path, layout_hint)
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Fanout Hint And Failure Ownership]]
+    #[test]
+    #[serial]
+    fn fanout_preserves_descendant_hints_and_records_its_classification_failure() {
+        use crate::sessions::{SearchSourceHints, SessionIndex, SourceSearch};
+        struct RestoreEnv([(&'static str, Option<std::ffi::OsString>); 3]);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("2026/01/01");
+        std::fs::create_dir_all(&day).unwrap();
+        let _restore = RestoreEnv(
+            [
+                "QUILL_DEMO_MODE",
+                "QUILL_DATA_DIR",
+                "QUILL_CODEX_SESSIONS_DIR",
+            ]
+            .map(|key| (key, std::env::var_os(key))),
+        );
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_DATA_DIR", dir.path());
+            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", &root);
+        }
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        storage
+            .delete_setting(TRANSCRIPT_ANALYTICS_REINGEST_MARKER)
+            .unwrap();
+        let index = SessionIndex::open_or_create_for_tests(&dir.path().join("index")).unwrap();
+        let write_source = |path: &Path, id: &str, parent: &str| {
+            std::fs::write(path, jsonl_body(&[
+                json!({"type":"session_meta","timestamp":TEST_TIMESTAMP,"payload":{
+                    "id":id,"cwd":"/fixture","parent_thread_id":parent,"source":"cli"
+                }}).to_string(),
+                json!({"type":"response_item","timestamp":TEST_TIMESTAMP,"payload":{
+                    "type":"message","role":"user","content":[{"type":"input_text","text":"fanoutneedle"}]
+                }}).to_string(),
+            ])).unwrap();
+        };
+        let child_path = day.join("rollout-2026-01-01T00-00-00-child.jsonl");
+        let parent_path = day.join("rollout-2026-01-01T00-00-00-parent.jsonl");
+        write_source(&child_path, "fanout-child", "fanout-parent");
+        write_source(&parent_path, "fanout-parent", "grand-one");
+        let discover = |path: &Path| {
+            crate::sessions::validate_retained_notify_source(IntegrationProvider::Codex, path)
+                .unwrap()
+                .unwrap()
+        };
+        let child = discover(&child_path);
+        let parent = discover(&parent_path);
+        let child_hints = SearchSourceHints {
+            project: Some("child-project".into()),
+            host: Some("child-host".into()),
+            git_branch: Some("child-branch".into()),
+            ..Default::default()
+        };
+        let parent_hints = SearchSourceHints {
+            project: Some("parent-project".into()),
+            host: Some("parent-host".into()),
+            git_branch: Some("parent-branch".into()),
+            ..Default::default()
+        };
+        for (source, hints) in [(&child, &child_hints), (&parent, &parent_hints)] {
+            let (analytics, search) = reconcile_retained_source_with_hints(
+                &storage,
+                source,
+                TEST_HOSTNAME,
+                Some(SourceSearch {
+                    index: &index,
+                    hints: Some(hints),
+                    indexed: None,
+                }),
+            );
+            analytics.unwrap();
+            search.unwrap();
+        }
+        let preserved_hints = index.state.lock().unwrap().sources[&child.source_key]
+            .hints
+            .as_ref()
+            == Some(&child_hints);
+        let before = storage
+            .list_transcript_analytics_sources_for_root(
+                IntegrationProvider::Codex,
+                child.source_root_key,
+            )
+            .unwrap()
+            .into_iter()
+            .find(|row| row.source_key == child.source_key)
+            .unwrap();
+        assert_eq!(before.analytics_session_id.as_deref(), Some("grand-one"));
+
+        write_source(&parent_path, "fanout-parent", "grand-two");
+        set_mtime_ns(&parent_path, FIXED_MTIME_NS + 20);
+        std::fs::write(&child_path, [0xff]).unwrap();
+        let (analytics, search) = reconcile_retained_source_with_hints(
+            &storage,
+            &parent,
+            TEST_HOSTNAME,
+            Some(SourceSearch {
+                index: &index,
+                hints: Some(&parent_hints),
+                indexed: None,
+            }),
+        );
+        assert!(analytics.is_err());
+        search.unwrap();
+        let failed = storage
+            .list_transcript_analytics_sources_for_root(
+                IntegrationProvider::Codex,
+                child.source_root_key,
+            )
+            .unwrap()
+            .into_iter()
+            .find(|row| row.source_key == child.source_key)
+            .unwrap();
+        assert_eq!(
+            (
+                preserved_hints,
+                failed.processing_status == "failed" && failed.last_error.is_some(),
+                failed.analytics_session_id == before.analytics_session_id
+            ),
+            (true, true, true),
+            "fan-out must preserve descendant Search hints, record its own failure, and keep last-good analytics",
+        );
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Shared Source Versions And Retry]]
+    #[test]
+    #[serial]
+    fn shared_notify_sweep_versions_append_hints_and_failures_preserve_both_consumers() {
+        use crate::sessions::{SearchSourceHints, SessionIndex, SourceSearch};
+        use crate::transcript_work::DECODE_COUNT;
+        use std::io::Write;
+        use std::sync::Arc;
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("usage.db");
+        let storage = Arc::new(Storage::init_at(db.clone(), false).unwrap());
+        storage
+            .delete_setting(TRANSCRIPT_ANALYTICS_REINGEST_MARKER)
+            .unwrap();
+        let source = pi_source_from_lines(
+            dir.path(),
+            "memory-source",
+            &[
+                pi_session_header("memory-source"),
+                json!({"type":"message","id":"one","parentId":null,"timestamp":"2026-08-14T08:00:01Z","message":{"role":"user","content":"memoryneedle"}}),
+            ],
+        );
+        let index =
+            Arc::new(SessionIndex::open_or_create_for_tests(&dir.path().join("index")).unwrap());
+        // A blocked real Tantivy commit holds the full source budget. The next
+        // notification carries the append and must not be cleared by this work.
+        let writer = index.writer.lock().unwrap();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                reconcile_retained_source(&storage, &source, TEST_HOSTNAME, Some(&index))
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while index.state.try_lock().is_ok() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first source reached Search commit"
+                );
+                std::thread::yield_now();
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&source.canonical_path)
+                .unwrap();
+            writeln!(file, "{}", json!({"type":"message","id":"two","parentId":"one","timestamp":"2026-08-14T08:00:02Z","message":{"role":"assistant","content":"appendedneedle"}})).unwrap();
+            let next = scope.spawn(|| {
+                reconcile_retained_source(&storage, &source, TEST_HOSTNAME, Some(&index))
+            });
+            drop(writer);
+            let (analytics, search) = first.join().unwrap();
+            assert!(analytics.is_ok());
+            assert!(search.is_ok());
+            let (analytics, search) = next.join().unwrap();
+            assert!(analytics.is_ok());
+            assert!(search.is_ok());
+        });
+        index.reader.reload().unwrap();
+        assert_eq!(
+            index
+                .search("appendedneedle", &Default::default(), "relevance", 0, 10)
+                .unwrap()
+                .total_hits,
+            1
+        );
+        let before = DECODE_COUNT.get();
+        for _ in 0..3 {
+            let (analytics, search) =
+                reconcile_retained_source(&storage, &source, TEST_HOSTNAME, Some(&index));
+            assert_eq!(
+                analytics.unwrap(),
+                TranscriptSourceResult::SuppressedUnchanged
+            );
+            assert_eq!(search.unwrap(), 0);
+        }
+        assert_eq!(
+            DECODE_COUNT.get(),
+            before,
+            "identical source versions perform no decode"
+        );
+        let hints = SearchSourceHints {
+            parent_session_id: Some("pushed-parent".into()),
+            git_branch: Some("topic".into()),
+            ..Default::default()
+        };
+        let target = Some(SourceSearch {
+            index: &index,
+            hints: Some(&hints),
+            indexed: None,
+        });
+        assert_eq!(
+            reconcile_retained_source_with_hints(&storage, &source, TEST_HOSTNAME, target)
+                .0
+                .unwrap(),
+            TranscriptSourceResult::SuppressedUnchanged
+        );
+        assert_eq!(
+            DECODE_COUNT.get(),
+            before + 1,
+            "new metadata reparses Search only"
+        );
+        reconcile_retained_source_with_hints(&storage, &source, TEST_HOSTNAME, target)
+            .1
+            .unwrap();
+        reconcile_retained_source(&storage, &source, TEST_HOSTNAME, Some(&index))
+            .1
+            .unwrap();
+        assert_eq!(
+            DECODE_COUNT.get(),
+            before + 1,
+            "watcher preserves applied hints"
+        );
+        index.reader.reload().unwrap();
+        let hits = index
+            .search("memoryneedle", &Default::default(), "relevance", 0, 10)
+            .unwrap();
+        assert_eq!(
+            hits.hits[0].parent_session_id.as_deref(),
+            Some("pushed-parent")
+        );
+        let checkpoint = index.state.lock().unwrap().sources.clone();
+        let connection = rusqlite::Connection::open(db).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_transcript_insert BEFORE INSERT ON session_events BEGIN SELECT RAISE(FAIL, 'synthetic failure'); END;").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source.canonical_path)
+            .unwrap();
+        writeln!(file, "{}", json!({"type":"message","id":"three","parentId":"two","timestamp":"2026-08-14T08:00:03Z","message":{"role":"user","content":"retryneedle"}})).unwrap();
+        let (analytics, search) =
+            reconcile_retained_source(&storage, &source, TEST_HOSTNAME, Some(&index));
+        assert!(analytics.is_err());
+        assert!(search.is_ok(), "Search survives analytics rollback");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM session_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let successful_search = index.state.lock().unwrap().sources.clone();
+        assert_ne!(successful_search, checkpoint);
+        connection
+            .execute_batch("DROP TRIGGER fail_transcript_insert;")
+            .unwrap();
+        assert_eq!(
+            reconcile_retained_source(&storage, &source, TEST_HOSTNAME, Some(&index))
+                .0
+                .unwrap(),
+            TranscriptSourceResult::Replaced
+        );
+        assert_eq!(
+            index.state.lock().unwrap().sources,
+            successful_search,
+            "analytics retry cannot rewrite successful Search"
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source.canonical_path)
+            .unwrap()
+            .set_len(RETAINED_TRANSCRIPT_MAX_BYTES + 1)
+            .unwrap();
+        let (analytics, search) =
+            reconcile_retained_source(&storage, &source, TEST_HOSTNAME, Some(&index));
+        assert!(analytics.is_err());
+        assert!(search.is_err());
+        assert_eq!(
+            index.state.lock().unwrap().sources,
+            successful_search,
+            "oversized input keeps last-good Search checkpoint"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM session_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
     }
 
     fn pi_usage_evidence_source(dir: &Path) -> DiscoveredRetainedJsonlSource {

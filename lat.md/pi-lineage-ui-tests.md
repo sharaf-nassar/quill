@@ -12,7 +12,9 @@ Pi child search results render accessible parent-session navigation using stable
 
 ## Pushed Search Parent
 
-Pi notify indexing uses the extension's pushed parent id for generic links and explicit agents, while root or unresolved proof clears transcript-derived parents.
+Validated Pi notify identity stays native; pushed lineage remains Search-only display evidence.
+
+For a canonical Pi notify whose session id matches its persisted header, Search uses the extension's pushed parent id for generic links and explicit agents; root, unresolved, or absent lineage clears the prior pushed parent. Analytics/root lineage remains durable-source-backed. Hints are carried by the existing coordinator revision and checkpointed with the successful Search fingerprint. A watcher admission without hints preserves the last applied hints, including across restart; older `index_state.json` entries deserialize without hints. A changed effective hint set may require one Search-only re-extraction of unchanged bytes, but identical source-plus-hints versions never reparse. Host/project/branch hints are Search display evidence and never change canonical local analytics ownership.
 
 ## Immediate Search Input
 

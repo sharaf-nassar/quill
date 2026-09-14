@@ -8,15 +8,19 @@ These tests pin Pi startup, watcher, and extension-notified search indexing, sha
 
 ## Notify Identity And Parent
 
-A Pi notify reads only its named transcript and indexes messages under the pushed session id and lineage parent id.
+Canonical Pi notify identity must match the persisted header; valid pushed parent metadata remains searchable.
+
+A canonical Pi notify reads only its named transcript; its pushed session id must equal the persisted header id. Mismatch returns HTTP 400 before enqueue or either consumer writes, preserving all last-good data. `server::observed_subagent_tests::pi_notify_requires_native_identity_and_preserves_valid_pushed_search_parent` covers rejection and matching-native-ID success with pushed Search parent metadata. This intentionally rejects the former pushed-ID alias behavior; the deployed extension already prefers header identity.
+
+The same test proves oversize host or lineage ID/reason (>256 bytes), or project/cwd/git branch (>4096 bytes), returns HTTP 400 without admission or consumer writes. Project and branch strings above 256 but within 4096 bytes remain accepted; project can be Pi's full cwd. Empty optional hints retain absent/clear semantics. Malformed JSON headers, headerless or empty files, and absent source files are tested separately from native-ID mismatch: none may be admitted or mutate prior Search/analytics state.
 
 ## Notify Tool And Skill Rows
 
-A Pi notify persists parsed `tool_actions` and `skill_usages`, then admits the same validated source to retained reconciliation.
+Canonical Pi notify delivers complete source-owned tool and skill evidence independently of Search availability.
 
-Startup and watcher reconciliation can authoritatively replace those rows later under the same owner.
+A canonical Pi notify admits one retained source to complete reconciliation, which atomically replaces `tool_actions` and `skill_usages` beside the other source-owned evidence. It does not launch a separate two-table fast path or parser. Startup and watcher use the same boundary and canonical owner.
 
-Write and edit inputs carry their line counts through to code stats, a `tool_detail` row keeps its identity while its payload columns drop at the bind, and a SKILL.md read attributes to its skill. Re-notifying the same transcript replaces the rows instead of doubling them, and the fast-path rows still land when the search index is absent. `storage::tests::tool_detail_rows_store_no_payload_while_siblings_keep_theirs` pins that detail rows retain `is_error` and `result_image_count` while all three payload columns are NULL.
+Write and edit inputs carry their line counts through to code stats, a `tool_detail` row keeps its identity while its payload columns drop at the bind, and a SKILL.md read attributes to its skill. Re-notifying the same transcript replaces the rows instead of doubling them, and complete tool/skill evidence still lands when the Search index is absent. `storage::tests::tool_detail_rows_store_no_payload_while_siblings_keep_theirs` pins that detail rows retain `is_error` and `result_image_count` while all three payload columns are NULL.
 
 ## Owned Row Builder Shared With Retained Parsing
 
@@ -40,7 +44,9 @@ Session Search startup inventory scans persisted Pi files without requiring a pr
 
 ## Shared Coordinator Admission
 
-Validated Pi sources enter the existing provider-plus-source coordinator with transcript work armed and model work unarmed. Pi does not create a second queue, permit, retry, or backoff implementation.
+Pi notify and watcher admission share canonical source work, with no parallel parsing queue.
+
+Validated Pi sources enter the existing provider-plus-source coordinator with transcript work armed and model work unarmed. Search shares the transcript job and committed-source freshness checks; Pi creates no parallel source registry or parsed cache. The fixed decoder and source lifetime budget are shared across providers.
 
 ## No Root Scan
 

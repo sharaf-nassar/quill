@@ -820,8 +820,9 @@ fn queue_session_notify(state: Arc<ServerState>, payload: SessionNotifyPayload) 
 fn enqueue_validated_retained_source(
     state: &ServerState,
     source: sessions::DiscoveredRetainedJsonlSource,
+    hints: sessions::SearchSourceHints,
 ) {
-    if let Err(error) = crate::enqueue_retained_live_source(&state.app_handle, source) {
+    if let Err(error) = crate::enqueue_retained_notify_source(&state.app_handle, source, hints) {
         log::error!("Failed to enqueue validated retained transcript: {error}");
     }
 }
@@ -852,9 +853,7 @@ async fn drain_session_notify_queue(state: Arc<ServerState>, key: String) {
             }
         }
 
-        // A missing index no longer abandons the drain: Pi still lands its
-        // low-latency tool/skill replacement, while retained reconciliation
-        // remains authoritative independently of Session Search.
+        // This queue only owns the legacy, non-retained Search fallback.
         let idx = state.session_index.clone();
 
         let app_handle = state.app_handle.clone();
@@ -898,21 +897,104 @@ fn process_session_notify_payload(
     Ok(count)
 }
 
+fn validate_session_notify_hints(payload: &SessionNotifyPayload) -> Result<(), String> {
+    for (value, bound, name) in [
+        (&payload.host, MAX_STRING_LEN, "host"),
+        (&payload.project, MAX_PATH_LEN, "project"),
+        (&payload.cwd, MAX_PATH_LEN, "cwd"),
+        (&payload.git_branch, MAX_PATH_LEN, "git_branch"),
+    ] {
+        if value.as_ref().is_some_and(|value| value.len() > bound) {
+            return Err(format!("{name} exceeds {bound} bytes"));
+        }
+    }
+    let lineage = match &payload.lineage {
+        Some(PiLineage::Linked { parent_session_id } | PiLineage::Agent { parent_session_id }) => {
+            Some(parent_session_id)
+        }
+        Some(PiLineage::Unresolved { reason }) => Some(reason),
+        Some(PiLineage::Root) | None => None,
+    };
+    if lineage.is_some_and(|value| value.len() > MAX_STRING_LEN) {
+        return Err(format!("lineage exceeds {MAX_STRING_LEN} bytes"));
+    }
+    Ok(())
+}
+
+fn admit_validated_retained_notify(
+    payload: &SessionNotifyPayload,
+    source: &sessions::DiscoveredRetainedJsonlSource,
+    admit: impl FnOnce(sessions::SearchSourceHints),
+) -> Result<(), (StatusCode, String)> {
+    validate_pi_notify_identity(payload, source)?;
+    admit(session_notify_search_hints(payload));
+    Ok(())
+}
+
+fn validate_pi_notify_identity(
+    payload: &SessionNotifyPayload,
+    source: &sessions::DiscoveredRetainedJsonlSource,
+) -> Result<(), (StatusCode, String)> {
+    validate_session_notify_hints(payload).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    if payload.provider == IntegrationProvider::Pi
+        && crate::pi_session::read_pi_session_header(&source.canonical_path)
+            .is_none_or(|header| header.id != payload.session_id)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Pi notify identity differs from retained header".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn session_notify_search_hints(payload: &SessionNotifyPayload) -> sessions::SearchSourceHints {
+    sessions::SearchSourceHints {
+        parent_session_id: pushed_pi_parent(payload.lineage.as_ref()),
+        git_branch: payload.git_branch.clone().filter(|value| !value.is_empty()),
+        project: payload.project.clone().filter(|value| !value.is_empty()),
+        host: payload.host.clone().filter(|value| !value.is_empty()),
+    }
+}
+
 fn index_session_notify_payload(
     storage: &Storage,
     session_index: Option<&sessions::SessionIndex>,
     payload: SessionNotifyPayload,
 ) -> Result<usize, String> {
     let path = PathBuf::from(&payload.jsonl_path);
-
-    let mut extracted = sessions::extract_messages_from_jsonl(payload.provider, &path);
-    if payload.provider == IntegrationProvider::Pi {
-        let parent_session_id = pushed_pi_parent(payload.lineage.as_ref());
-        for message in &mut extracted.messages {
-            message.session_id.clone_from(&payload.session_id);
-            message.parent_session_id.clone_from(&parent_session_id);
+    if let Ok(Some(source)) = sessions::validate_retained_notify_source(payload.provider, &path) {
+        validate_pi_notify_identity(&payload, &source).map_err(|(_, message)| message)?;
+        let hints = session_notify_search_hints(&payload);
+        let (analytics, search) = crate::transcript_analytics::reconcile_retained_source_with_hints(
+            storage,
+            &source,
+            &sessions::SessionIndex::local_hostname(),
+            session_index.map(|index| sessions::SourceSearch {
+                index,
+                hints: Some(&hints),
+                indexed: None,
+            }),
+        );
+        if let Err(error) = analytics {
+            log::warn!("Notify analytics retained last-good data: {error}");
         }
+        return search;
     }
+    if payload.provider == IntegrationProvider::Pi {
+        return Err("Pi notify source is not a validated retained transcript".into());
+    }
+    crate::transcript_work::with_source(|| {
+        index_legacy_session_notify_payload(session_index, payload)
+    })
+}
+
+fn index_legacy_session_notify_payload(
+    session_index: Option<&sessions::SessionIndex>,
+    payload: SessionNotifyPayload,
+) -> Result<usize, String> {
+    let path = PathBuf::from(&payload.jsonl_path);
+    let mut extracted = sessions::extract_messages_from_jsonl(payload.provider, &path);
     if let Some(git_branch) = payload
         .git_branch
         .as_deref()
@@ -953,25 +1035,11 @@ fn index_session_notify_payload(
         .clone()
         .filter(|host| !host.is_empty())
         .unwrap_or_else(|| "local".to_string());
-    let session_id =
-        if payload.provider == IntegrationProvider::Pi || extracted.session_id.is_empty() {
-            payload.session_id.clone()
-        } else {
-            extracted.session_id.clone()
-        };
-
-    // Notify keeps Pi tool and skill data low-latency. Retained reconciliation
-    // later replaces the same canonical owner with the complete source snapshot.
-    if payload.provider == IntegrationProvider::Pi {
-        let (tool_actions, skill_usages) =
-            sessions::pi_transcript_tool_rows(&session_id, &host, &extracted.messages);
-        let source_key = crate::storage::pi_source_key(&host, &session_id)?;
-        if let Err(error) =
-            storage.replace_pi_transcript_tool_rows(&source_key, &tool_actions, &skill_usages)
-        {
-            log::error!("Failed to persist Pi transcript tool rows: {error}");
-        }
-    }
+    let session_id = if extracted.session_id.is_empty() {
+        payload.session_id.clone()
+    } else {
+        extracted.session_id.clone()
+    };
 
     let Some(session_index) = session_index else {
         return Ok(0);
@@ -1906,13 +1974,18 @@ async fn post_session_notify(
         // A validated persisted source is the recovery path for an unknown
         // live session, so notify never returns a false accepted no-op.
         // Session Search availability cannot suppress either analytics domain.
-        enqueue_validated_retained_source(&state, source);
+        let validated = admit_validated_retained_notify(&payload, &source, |hints| {
+            enqueue_validated_retained_source(&state, source.clone(), hints);
+        });
+        if let Err(error) = validated {
+            return error;
+        }
+        return (StatusCode::ACCEPTED, "queued".to_string());
     }
 
-    // Pi keeps its low-latency tool/skill replacement even without Search;
-    // the shared retained reconciliation was already queued above. Claude and
-    // Codex have nothing left to do here without an index.
-    if state.session_index.is_none() && provider != IntegrationProvider::Pi {
+    // Only non-retained legacy Search reaches this queue. Canonical sources
+    // already returned after shared admission, regardless of index availability.
+    if state.session_index.is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Session index not available".to_string(),
@@ -2901,9 +2974,18 @@ mod observed_subagent_tests {
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Notify Identity And Parent]]
     #[test]
-    fn pi_notify_indexes_named_transcript_under_pushed_identity_and_parent() {
+    #[serial_test::serial]
+    fn pi_notify_requires_native_identity_and_preserves_valid_pushed_search_parent() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let transcript = temp.path().join("named.jsonl");
+        let pi = temp.path().join("pi");
+        std::fs::create_dir_all(pi.join("--work-quill--")).unwrap();
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_DATA_DIR", temp.path());
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
+            std::env::set_var("QUILL_RULES_DIR", temp.path().join("rules"));
+        }
+        let transcript = pi.join("--work-quill--/named.jsonl");
         std::fs::write(
             &transcript,
             concat!(
@@ -2918,7 +3000,7 @@ mod observed_subagent_tests {
             .expect("open index");
         let payload = SessionNotifyPayload {
             provider: IntegrationProvider::Pi,
-            session_id: "pushed-id".into(),
+            session_id: "header-id".into(),
             jsonl_path: transcript.to_string_lossy().into_owned(),
             host: Some("host".into()),
             process_instance_id: None,
@@ -2932,7 +3014,7 @@ mod observed_subagent_tests {
 
         let storage = Storage::init_at(temp.path().join("usage.db"), false).unwrap();
         assert_eq!(
-            index_session_notify_payload(&storage, Some(&index), payload).unwrap(),
+            index_session_notify_payload(&storage, Some(&index), payload.clone()).unwrap(),
             1
         );
         index.reader.reload().expect("reload index");
@@ -2949,11 +3031,103 @@ mod observed_subagent_tests {
             )
             .expect("search Pi notify result");
         assert_eq!(result.total_hits, 1);
-        assert_eq!(result.hits[0].session_id, "pushed-id");
+        assert_eq!(result.hits[0].session_id, "header-id");
         assert_eq!(
             result.hits[0].parent_session_id.as_deref(),
             Some("pushed-parent")
         );
+        let source =
+            sessions::validate_retained_notify_source(IntegrationProvider::Pi, &transcript)
+                .unwrap()
+                .unwrap();
+        let checkpoint = index.state.lock().unwrap().sources.clone();
+        for field in 0..6 {
+            let mut oversized = payload.clone();
+            match field {
+                0 => oversized.host = Some("h".repeat(MAX_STRING_LEN + 1)),
+                1 => oversized.project = Some("p".repeat(MAX_PATH_LEN + 1)),
+                2 => oversized.cwd = Some("c".repeat(MAX_PATH_LEN + 1)),
+                3 => oversized.git_branch = Some("b".repeat(MAX_PATH_LEN + 1)),
+                4 => {
+                    oversized.lineage = Some(PiLineage::Linked {
+                        parent_session_id: "p".repeat(MAX_STRING_LEN + 1),
+                    })
+                }
+                _ => {
+                    oversized.lineage = Some(PiLineage::Unresolved {
+                        reason: "r".repeat(MAX_STRING_LEN + 1),
+                    })
+                }
+            }
+            assert_eq!(
+                admit_validated_retained_notify(&oversized, &source, |_| panic!(
+                    "oversized hint admitted"
+                ))
+                .unwrap_err()
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+            assert!(index_session_notify_payload(&storage, Some(&index), oversized).is_err());
+            assert_eq!(index.state.lock().unwrap().sources, checkpoint);
+        }
+        let mut long_valid = payload.clone();
+        long_valid.project = Some("p".repeat(MAX_STRING_LEN + 1));
+        long_valid.git_branch = Some("b".repeat(MAX_STRING_LEN + 1));
+        let mut admitted = false;
+        admit_validated_retained_notify(&long_valid, &source, |_| admitted = true).unwrap();
+        assert!(admitted, "valid long paths/refs retain wire compatibility");
+        let mut mismatch = payload.clone();
+        mismatch.session_id = "pushed-alias".into();
+        assert_eq!(
+            validate_pi_notify_identity(&mismatch, &source)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(index_session_notify_payload(&storage, Some(&index), mismatch).is_err());
+        assert_eq!(index.state.lock().unwrap().sources, checkpoint);
+        assert_eq!(
+            storage
+                .list_transcript_analytics_sources_for_root(
+                    IntegrationProvider::Pi,
+                    source.source_root_key
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        let valid_contents = std::fs::read(&transcript).unwrap();
+        for invalid in ["{broken header\n", "{}\n", ""] {
+            std::fs::write(&transcript, invalid).unwrap();
+            assert_eq!(
+                admit_validated_retained_notify(&payload, &source, |_| panic!(
+                    "invalid header admitted"
+                ))
+                .unwrap_err()
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+            assert!(index_session_notify_payload(&storage, Some(&index), payload.clone()).is_err());
+            assert_eq!(index.state.lock().unwrap().sources, checkpoint);
+        }
+        std::fs::remove_file(&transcript).unwrap();
+        assert_eq!(
+            admit_validated_retained_notify(&payload, &source, |_| panic!(
+                "absent source admitted"
+            ))
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(index_session_notify_payload(&storage, Some(&index), payload).is_err());
+        assert_eq!(index.state.lock().unwrap().sources, checkpoint);
+        std::fs::write(&transcript, valid_contents).unwrap();
+        unsafe {
+            std::env::remove_var("QUILL_DEMO_MODE");
+            std::env::remove_var("QUILL_DATA_DIR");
+            std::env::remove_var("QUILL_PI_SESSIONS_DIR");
+            std::env::remove_var("QUILL_RULES_DIR");
+        }
     }
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Notify Tool And Skill Rows]]
@@ -2961,7 +3135,15 @@ mod observed_subagent_tests {
     #[serial_test::serial]
     fn pi_notify_persists_tool_actions_with_line_counts_and_skill_reads() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let transcript = temp.path().join("tools.jsonl");
+        let pi = temp.path().join("pi");
+        std::fs::create_dir_all(pi.join("--work-quill--")).unwrap();
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_DATA_DIR", temp.path());
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi);
+            std::env::set_var("QUILL_RULES_DIR", temp.path().join("rules"));
+        }
+        let transcript = pi.join("--work-quill--/tools.jsonl");
         std::fs::write(
             &transcript,
             concat!(
@@ -2979,7 +3161,7 @@ mod observed_subagent_tests {
         let storage = Storage::init_at(temp.path().join("usage.db"), false).unwrap();
         let payload = SessionNotifyPayload {
             provider: IntegrationProvider::Pi,
-            session_id: "pushed-id".into(),
+            session_id: "header-id".into(),
             jsonl_path: transcript.to_string_lossy().into_owned(),
             host: Some("host".into()),
             process_instance_id: None,
@@ -3013,6 +3195,12 @@ mod observed_subagent_tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].skill_name, "unslop");
         assert_eq!(skills[0].pi_count, 1);
+        unsafe {
+            std::env::remove_var("QUILL_DEMO_MODE");
+            std::env::remove_var("QUILL_DATA_DIR");
+            std::env::remove_var("QUILL_PI_SESSIONS_DIR");
+            std::env::remove_var("QUILL_RULES_DIR");
+        }
     }
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Configured Root Containment]]

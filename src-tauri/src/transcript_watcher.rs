@@ -547,10 +547,12 @@ fn admit_changed_sources(
 
 fn reconcile_all(app: &tauri::AppHandle, roots: &[crate::sessions::ProviderSourceRoot]) {
     let result = crate::get_storage().and_then(|storage| {
-        crate::transcript_analytics::run_transcript_analytics_reconciliation(
+        let index = app.try_state::<crate::sessions::SessionIndexState>();
+        crate::transcript_analytics::run_transcript_analytics_reconciliation_with_search(
             storage,
             &crate::sessions::SessionIndex::local_hostname(),
             roots,
+            index.as_ref().map(|index| index.0.as_ref()),
         )
     });
     match result {

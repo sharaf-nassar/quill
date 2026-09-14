@@ -7,7 +7,9 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -140,6 +142,7 @@ pub(crate) enum PiSessionParseError {
         code: PiProtocolV2ErrorCode,
         message: String,
     },
+    #[cfg(test)]
     Read {
         path: PathBuf,
         source: std::io::Error,
@@ -160,6 +163,7 @@ impl fmt::Display for PiSessionParseError {
                 formatter,
                 "invalid quill-tracking entry at source ordinal {source_ordinal}: {code:?}: {message}"
             ),
+            #[cfg(test)]
             Self::Read { path, source } => {
                 write!(formatter, "read pi session {}: {source}", path.display())
             }
@@ -170,12 +174,14 @@ impl fmt::Display for PiSessionParseError {
 impl std::error::Error for PiSessionParseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            #[cfg(test)]
             Self::Read { source, .. } => Some(source),
             Self::UnsupportedVersion(_) | Self::InvalidTrackingEntry { .. } => None,
         }
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_pi_session_file(
     path: Option<&Path>,
 ) -> Result<Option<PiSession>, PiSessionParseError> {
@@ -265,7 +271,7 @@ pub(crate) fn parse_pi_session_records(
                 }
             }
             Some(entry_type @ ("compaction" | "branch_summary")) => {
-                if let Ok(base) = serde_json::from_value::<PiSessionEntryBase>(value.clone()) {
+                if let Ok(base) = PiSessionEntryBase::deserialize(&value) {
                     summary_entries.push(PiSummaryEntry {
                         base,
                         source_ordinal,
@@ -306,7 +312,7 @@ pub(crate) fn parse_pi_session_records(
                 // Lifecycle entries keep their id/parent/timestamp base; a
                 // span receipt is consumed by ordinal alone.
                 let base = (!is_span)
-                    .then(|| serde_json::from_value::<PiSessionEntryBase>(value.clone()))
+                    .then(|| PiSessionEntryBase::deserialize(&value))
                     .transpose()
                     .map_err(|error| PiSessionParseError::InvalidTrackingEntry {
                         source_ordinal,

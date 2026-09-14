@@ -53,3 +53,4 @@ lat.md/.cache
 .beads-credential-key
 .beads/proxieddb/
 .beads.gate.lock
+.pi/tasks/

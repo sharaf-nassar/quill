@@ -6,6 +6,8 @@ lat:
 
 These tests pin the shared persisted Pi parser used by search indexing and source snapshots, plus bounded notify header probes.
 
+Production decoding consumes owned JSON records line by line without cloning a whole Pi tree; summary/tracking base metadata deserializes by reference. Both owning file readers enforce the stable 256 MiB raw-input cap; full-input tracking/version validation and original source ordinals remain unchanged.
+
 ## V3 Message Entries
 
 V3 parsing retains native message, model-change, and summary evidence with original source order.

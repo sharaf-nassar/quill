@@ -47,6 +47,7 @@ mod storage;
 mod transcript_analytics;
 mod transcript_identity;
 mod transcript_watcher;
+mod transcript_work;
 mod tray_keepalive;
 pub mod web_allowlist;
 mod web_config;
@@ -454,6 +455,7 @@ impl RetainedDomainWork {
 }
 
 struct RetainedLiveSource {
+    search_hints: Option<sessions::SearchSourceHints>,
     source: sessions::DiscoveredRetainedJsonlSource,
     revision: u64,
     model: RetainedDomainWork,
@@ -464,6 +466,7 @@ impl RetainedLiveSource {
     fn new(source: sessions::DiscoveredRetainedJsonlSource) -> Self {
         Self {
             source,
+            search_hints: None,
             revision: 0,
             model: RetainedDomainWork::new(),
             transcript: RetainedDomainWork::new(),
@@ -487,6 +490,7 @@ impl RetainedLiveSource {
 
 #[derive(Clone)]
 struct RetainedDomainJob {
+    search_hints: Option<sessions::SearchSourceHints>,
     key: RetainedLiveSourceKey,
     source: sessions::DiscoveredRetainedJsonlSource,
     revision: u64,
@@ -520,10 +524,20 @@ impl RetainedSourceRunnerState {
         }
     }
 
+    #[cfg(test)]
     fn enqueue_live_source(
         &self,
         source: sessions::DiscoveredRetainedJsonlSource,
         domains: RetainedLiveDomains,
+    ) -> Result<(RetainedLiveQueueAdmission, RetainedDrainSchedule), String> {
+        self.enqueue_live_source_with_hints(source, domains, None)
+    }
+
+    fn enqueue_live_source_with_hints(
+        &self,
+        source: sessions::DiscoveredRetainedJsonlSource,
+        domains: RetainedLiveDomains,
+        hints: Option<sessions::SearchSourceHints>,
     ) -> Result<(RetainedLiveQueueAdmission, RetainedDrainSchedule), String> {
         if !matches!(
             source.provider,
@@ -559,6 +573,9 @@ impl RetainedSourceRunnerState {
             .live_sources
             .get_mut(&key)
             .expect("inserted retained source must be present");
+        if let Some(hints) = hints {
+            queued.search_hints = Some(hints);
+        }
         if domains.model {
             queued.model.arm();
         }
@@ -594,10 +611,12 @@ impl RetainedSourceRunnerState {
             }
             let revision = queued.revision;
             let source = queued.source.clone();
+            let search_hints = queued.search_hints.clone();
             let work = queued.domain_mut(domain);
             work.pending = false;
             work.running_revision = Some(revision);
             jobs.push(RetainedDomainJob {
+                search_hints,
                 key: key.clone(),
                 source,
                 revision,
@@ -777,11 +796,33 @@ fn enqueue_retained_source_domains(
     source: sessions::DiscoveredRetainedJsonlSource,
     domains: RetainedLiveDomains,
 ) -> Result<RetainedLiveQueueAdmission, String> {
+    enqueue_retained_source_domains_with_hints(app_handle, source, domains, None)
+}
+
+pub(crate) fn enqueue_retained_notify_source(
+    app_handle: &tauri::AppHandle,
+    source: sessions::DiscoveredRetainedJsonlSource,
+    hints: sessions::SearchSourceHints,
+) -> Result<RetainedLiveQueueAdmission, String> {
+    let domains = if source.provider == integrations::IntegrationProvider::Pi {
+        RetainedLiveDomains::TRANSCRIPT
+    } else {
+        RetainedLiveDomains::BOTH
+    };
+    enqueue_retained_source_domains_with_hints(app_handle, source, domains, Some(hints))
+}
+
+fn enqueue_retained_source_domains_with_hints(
+    app_handle: &tauri::AppHandle,
+    source: sessions::DiscoveredRetainedJsonlSource,
+    domains: RetainedLiveDomains,
+    hints: Option<sessions::SearchSourceHints>,
+) -> Result<RetainedLiveQueueAdmission, String> {
     let state = app_handle
         .try_state::<Arc<RetainedSourceRunnerState>>()
         .ok_or_else(|| "Retained source runner state is not initialized".to_string())?;
     let state = Arc::clone(state.inner());
-    let (admission, schedule) = state.enqueue_live_source(source, domains)?;
+    let (admission, schedule) = state.enqueue_live_source_with_hints(source, domains, hints)?;
     if schedule.model {
         spawn_model_usage_live_queue_drain(app_handle.clone(), Arc::downgrade(&state));
     }
@@ -843,6 +884,9 @@ async fn drain_transcript_analytics_live_queue(
             continue;
         }
         let retry_batch = batch.clone();
+        let index = app
+            .try_state::<sessions::SessionIndexState>()
+            .map(|index| Arc::clone(&index.0));
         let result = tauri::async_runtime::spawn_blocking(move || {
             let storage = get_storage()?;
             let hostname = sessions::SessionIndex::local_hostname();
@@ -850,12 +894,18 @@ async fn drain_transcript_analytics_live_queue(
                 batch
                     .into_iter()
                     .map(|job| {
-                        let outcome = transcript_analytics::reconcile_live_transcript_source(
-                            storage,
-                            &job.source,
-                            &hostname,
-                        );
-                        (job, outcome)
+                        let (outcome, search) =
+                            transcript_analytics::reconcile_retained_source_with_hints(
+                                storage,
+                                &job.source,
+                                &hostname,
+                                index.as_deref().map(|index| sessions::SourceSearch {
+                                    index,
+                                    hints: job.search_hints.as_ref(),
+                                    indexed: None,
+                                }),
+                            );
+                        (job, outcome, search)
                     })
                     .collect::<Vec<_>>(),
             )
@@ -863,7 +913,17 @@ async fn drain_transcript_analytics_live_queue(
         .await;
         match result {
             Ok(Ok(outcomes)) => {
-                for (job, outcome) in outcomes {
+                for (job, outcome, search) in outcomes {
+                    let search_succeeded = match search {
+                        Ok(count) => {
+                            let _ = app.emit("sessions-index-updated", count);
+                            true
+                        }
+                        Err(error) => {
+                            log::error!("Live Search failed: {error}");
+                            false
+                        }
+                    };
                     let succeeded = match outcome {
                         Ok(transcript_analytics::TranscriptSourceResult::Replaced) => {
                             if let Err(error) = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ()) {
@@ -885,7 +945,11 @@ async fn drain_transcript_analytics_live_queue(
                             false
                         }
                     };
-                    state_ref.finish(RetainedLiveDomain::Transcript, &job, succeeded);
+                    state_ref.finish(
+                        RetainedLiveDomain::Transcript,
+                        &job,
+                        succeeded && search_succeeded,
+                    );
                 }
             }
             Ok(Err(error)) => {
@@ -6733,12 +6797,23 @@ mod tests {
         state
             .enqueue_live_source(source.clone(), RetainedLiveDomains::BOTH)
             .expect("first enqueue");
+        let newer_hints = sessions::SearchSourceHints {
+            parent_session_id: Some("new-parent".into()),
+            ..Default::default()
+        };
         let running = state.take_ready(RetainedLiveDomain::Model, 1);
         let (admission, _) = state
-            .enqueue_live_source(source, RetainedLiveDomains::BOTH)
+            .enqueue_live_source_with_hints(
+                source.clone(),
+                RetainedLiveDomains::BOTH,
+                Some(newer_hints.clone()),
+            )
             .expect("newer enqueue");
         assert_eq!(admission, RetainedLiveQueueAdmission::Coalesced);
 
+        state
+            .enqueue_live_source(source, RetainedLiveDomains::BOTH)
+            .expect("watcher enqueue without hints");
         state.finish(RetainedLiveDomain::Model, &running[0], true);
         let inner = state.inner.lock().unwrap();
         let queued = inner
@@ -6746,7 +6821,8 @@ mod tests {
             .values()
             .next()
             .expect("newer work retained");
-        assert_eq!(queued.revision, 1);
+        assert_eq!(queued.revision, 2);
+        assert_eq!(queued.search_hints.as_ref(), Some(&newer_hints));
         assert!(queued.model.pending);
         assert!(queued.transcript.pending);
         assert!(queued.model.running_revision.is_none());

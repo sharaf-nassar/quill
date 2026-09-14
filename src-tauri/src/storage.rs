@@ -370,6 +370,11 @@ where
     T: Clone,
     F: FnOnce() -> Result<T, String>,
 {
+    // Wall-clock bucket keys otherwise retain every expired payload forever.
+    cache
+        .lock()
+        .unwrap()
+        .retain(|_, entry| entry.inserted_at.elapsed() <= ANALYTICS_CACHE_TTL);
     let versions = match TableVersions::read(probe_connection, source_tables) {
         Ok(versions) => versions,
         Err(error) => {
@@ -386,7 +391,18 @@ where
     }
 
     let payload = compute()?;
-    cache.lock().unwrap().insert(
+    let mut cache = cache.lock().unwrap();
+    // ponytail: FIFO at 64 request variants; no LRU bookkeeping for two small caches.
+    if cache.len() >= 64
+        && !cache.contains_key(&key)
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.inserted_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(
         key,
         CacheEntry {
             payload: payload.clone(),
@@ -17578,6 +17594,7 @@ impl Storage {
     /// Runtime, lifecycle, receipt, token, and model tables are deliberately
     /// untouched here; the shared source coordinator owns their complete
     /// persisted replacement.
+    #[cfg(test)]
     pub(crate) fn replace_pi_transcript_tool_rows(
         &self,
         source_key: &str,
@@ -24500,6 +24517,49 @@ mod tests {
         assert_eq!(result.bytes_before, bytes_before);
         assert!(result.bytes_after > 0);
         clear_env();
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Cache Lifetime]]
+    #[test]
+    fn analytics_cache_evicts_expired_keys_even_on_probe_failure_and_caps_variants() {
+        let conn = Connection::open_in_memory().unwrap();
+        let cache = Mutex::new(HashMap::new());
+        for bucket in 0..80 {
+            let key = CacheKey {
+                command: "memory-regression",
+                range: ModelRange::TwentyFourHours,
+                provider: None,
+                time_bucket: bucket,
+            };
+            assert_eq!(
+                get_or_compute(&cache, key, &conn, &[], || Ok(bucket)),
+                Ok(bucket)
+            );
+        }
+        assert_eq!(cache.lock().unwrap().len(), 64);
+        for entry in cache.lock().unwrap().values_mut() {
+            entry.inserted_at = Instant::now() - ANALYTICS_CACHE_TTL - Duration::from_secs(1);
+        }
+        let key = CacheKey::new(
+            "memory-regression",
+            ModelRange::TwentyFourHours,
+            None,
+            query_now(),
+        );
+        assert_eq!(
+            get_or_compute(
+                &cache,
+                key,
+                &conn,
+                &MODEL_USAGE_OVERVIEW_CACHE_TABLES,
+                || Ok(123)
+            ),
+            Ok(123)
+        );
+        assert!(
+            cache.lock().unwrap().is_empty(),
+            "failed SQL probes still release expired payloads"
+        );
     }
 
     /// Populate the analytics caches through their real read paths, so

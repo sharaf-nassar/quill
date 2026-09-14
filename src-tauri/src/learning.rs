@@ -133,17 +133,19 @@ fn build_session_digests(
         if spent + MIN_DIGEST_BYTES > budget {
             break; // budget exhausted — deterministically drops oldest
         }
-        let Some(raw) = fetch_content(s) else {
+        let cap = per_session.min(budget - spent);
+        let Some(digest) = crate::transcript_work::with_source(|| {
+            let raw = fetch_content(s)?;
+            // Redact BEFORE compression so truncation cannot split a secret.
+            // Only the already-budgeted digest may leave source admission.
+            Some(
+                compress_observation(&crate::redaction::redact(&raw), cap)
+                    .trim()
+                    .to_string(),
+            )
+        }) else {
             continue;
         };
-        let cap = per_session.min(budget - spent);
-        // Redact secrets BEFORE compression (FR-003 / R-1 Decision 3):
-        // truncation-first can split a secret so the anchored regex
-        // misses it, so the canonical redactor must run on the full raw
-        // text before `compress_observation` selects/truncates bytes.
-        let digest = compress_observation(&crate::redaction::redact(&raw), cap)
-            .trim()
-            .to_string();
         if digest.len() < MIN_DIGEST_BYTES {
             continue; // too thin → skip (FR-008 / Edge Case)
         }
@@ -626,6 +628,7 @@ async fn analyze_sessions_stream(
         let path = crate::sessions::find_session_path(prov, &s.session_id)
             .ok()
             .flatten()?;
+        // build_session_digests owns admission through redaction/compression.
         let extracted = crate::sessions::extract_messages_from_jsonl(prov, &path);
         if extracted.messages.is_empty() {
             return None;
@@ -1906,6 +1909,61 @@ pub fn sanitize_rule_content(content: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Learning Digest Ownership]]
+    #[test]
+    fn learning_digest_keeps_fetch_and_compaction_under_source_admission() {
+        use super::*;
+        let session = crate::models::SessionBreakdown {
+            provider: "claude".into(),
+            session_id: "synthetic".into(),
+            parent_session_id: None,
+            pi_lineage: None,
+            ephemeral: false,
+            hostname: "host".into(),
+            total_tokens: 0,
+            turn_count: 0,
+            first_seen: String::new(),
+            last_active: String::new(),
+            ended_at: None,
+            project: None,
+            session_name: None,
+            failed_tool_calls: None,
+            model_id: None,
+            active_runtime_secs: None,
+            agent_count: None,
+            agent_runtime_secs: None,
+            current_turn_runtime_secs: None,
+            current_turn_runtime_active: false,
+            runtime_as_of_ms: None,
+            active_runtime_rate: 0.0,
+            observed_agents: None,
+            live_linked_sessions: None,
+            observed_only: false,
+        };
+        let raw = format!(
+            "API_KEY=sk-ant-api03-LongLivedSecretValue000111\n{}",
+            "error: synthetic failure in /work/test.rs\n".repeat(32 * 1024)
+        );
+        let expected =
+            compress_observation(&crate::redaction::redact(&raw), STREAM_C_CONTEXT_BUDGET)
+                .trim()
+                .to_owned();
+        assert!(!crate::transcript_work::source_admission_held_for_test());
+        let digests = build_session_digests(
+            &[session],
+            |_| {
+                assert!(crate::transcript_work::source_admission_held_for_test());
+                Some(raw.clone())
+            },
+            STREAM_C_CONTEXT_BUDGET,
+        );
+        assert!(!crate::transcript_work::source_admission_held_for_test());
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests[0].digest, expected);
+        assert!(digests[0].digest.len() <= STREAM_C_CONTEXT_BUDGET);
+        assert!(!digests[0].digest.contains("LongLivedSecretValue000111"));
+    }
+
     use super::*;
 
     #[test]
