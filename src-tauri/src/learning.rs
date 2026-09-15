@@ -116,47 +116,51 @@ struct SessionDigest {
 /// prompt-injection-sanitized) so truncation cannot split a secret past
 /// the anchored detector; sessions whose post-compaction digest is too
 /// thin are skipped (FR-008).
-fn build_session_digests(
-    sessions: &[crate::models::SessionBreakdown],
-    fetch_content: impl Fn(&crate::models::SessionBreakdown) -> Option<String>,
+async fn build_session_digests(
+    sessions: Vec<crate::models::SessionBreakdown>,
+    fetch_content: impl Fn(&crate::models::SessionBreakdown) -> Option<String> + Send + 'static,
     budget: usize,
-) -> Vec<SessionDigest> {
-    /// A digest shorter than this contributes no usable signal.
-    const MIN_DIGEST_BYTES: usize = 64;
-    if sessions.is_empty() || budget == 0 {
-        return Vec::new();
-    }
-    let per_session = (budget / sessions.len()).max(4 * MIN_DIGEST_BYTES);
-    let mut spent = 0usize;
-    let mut digests: Vec<SessionDigest> = Vec::new();
-    for s in sessions {
-        if spent + MIN_DIGEST_BYTES > budget {
-            break; // budget exhausted — deterministically drops oldest
+) -> Result<Vec<SessionDigest>, tokio::task::JoinError> {
+    // block_in_place would still suspend sibling tokio::join! streams.
+    tokio::task::spawn_blocking(move || {
+        /// A digest shorter than this contributes no usable signal.
+        const MIN_DIGEST_BYTES: usize = 64;
+        if sessions.is_empty() || budget == 0 {
+            return Vec::new();
         }
-        let cap = per_session.min(budget - spent);
-        let Some(digest) = crate::transcript_work::with_source(|| {
-            let raw = fetch_content(s)?;
-            // Redact BEFORE compression so truncation cannot split a secret.
-            // Only the already-budgeted digest may leave source admission.
-            Some(
-                compress_observation(&crate::redaction::redact(&raw), cap)
-                    .trim()
-                    .to_string(),
-            )
-        }) else {
-            continue;
-        };
-        if digest.len() < MIN_DIGEST_BYTES {
-            continue; // too thin → skip (FR-008 / Edge Case)
+        let per_session = (budget / sessions.len()).max(4 * MIN_DIGEST_BYTES);
+        let mut spent = 0usize;
+        let mut digests: Vec<SessionDigest> = Vec::new();
+        for s in &sessions {
+            if spent + MIN_DIGEST_BYTES > budget {
+                break; // budget exhausted — deterministically drops oldest
+            }
+            let cap = per_session.min(budget - spent);
+            let Some(digest) = crate::transcript_work::with_source(|| {
+                let raw = fetch_content(s)?;
+                // Redact BEFORE compression so truncation cannot split a secret.
+                // Only the already-budgeted digest may leave source admission.
+                Some(
+                    compress_observation(&crate::redaction::redact(&raw), cap)
+                        .trim()
+                        .to_string(),
+                )
+            }) else {
+                continue;
+            };
+            if digest.len() < MIN_DIGEST_BYTES {
+                continue; // too thin → skip (FR-008 / Edge Case)
+            }
+            spent += digest.len();
+            digests.push(SessionDigest {
+                session_id: s.session_id.clone(),
+                project: s.project.clone(),
+                digest,
+            });
         }
-        spent += digest.len();
-        digests.push(SessionDigest {
-            session_id: s.session_id.clone(),
-            project: s.project.clone(),
-            digest,
-        });
-    }
-    digests
+        digests
+    })
+    .await
 }
 
 fn provider_scope_label(provider_scope: &[IntegrationProvider]) -> String {
@@ -664,7 +668,13 @@ async fn analyze_sessions_stream(
         ))
     };
 
-    let digests = build_session_digests(&sessions, fetch, STREAM_C_CONTEXT_BUDGET);
+    let digests = match build_session_digests(sessions, fetch, STREAM_C_CONTEXT_BUDGET).await {
+        Ok(digests) => digests,
+        Err(error) => {
+            stream_log!("Stream C: session digest worker failed: {error}");
+            return (None, logs, None);
+        }
+    };
     if digests.is_empty() {
         stream_log!("Stream C: no sessions produced a usable digest, skipping");
         return (None, logs, None);
@@ -1910,8 +1920,8 @@ pub fn sanitize_rule_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Learning Digest Ownership]]
-    #[test]
-    fn learning_digest_keeps_fetch_and_compaction_under_source_admission() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn learning_digest_keeps_fetch_and_compaction_under_source_admission() {
         use super::*;
         let session = crate::models::SessionBreakdown {
             provider: "claude".into(),
@@ -1949,14 +1959,26 @@ mod tests {
                 .trim()
                 .to_owned();
         assert!(!crate::transcript_work::source_admission_held_for_test());
-        let digests = build_session_digests(
-            &[session],
-            |_| {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let entered = std::sync::Mutex::new(Some(entered));
+        let (release, wait) = std::sync::mpsc::channel();
+        let digest = build_session_digests(
+            vec![session],
+            move |_| {
                 assert!(crate::transcript_work::source_admission_held_for_test());
+                entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                wait.recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("sibling future must progress while digest worker waits");
                 Some(raw.clone())
             },
             STREAM_C_CONTEXT_BUDGET,
         );
+        let sibling = async move {
+            started.await.unwrap();
+            release.send(()).unwrap();
+        };
+        let (digests, ()) = tokio::join!(digest, sibling);
+        let digests = digests.unwrap();
         assert!(!crate::transcript_work::source_admission_held_for_test());
         assert_eq!(digests.len(), 1);
         assert_eq!(digests[0].digest, expected);

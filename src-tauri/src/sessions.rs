@@ -1272,13 +1272,27 @@ impl SessionIndex {
         }
     }
 
-    /// Save the current index state to disk.
+    /// Persist committed checkpoints once at the owning batch boundary.
+    /// Keep serialization and replacement under the same lock so an older
+    /// concurrent flush cannot overwrite newer checkpoints.
     pub fn save_state(&self) -> Result<(), String> {
+        use std::io::Write;
+
         let state_path = self.index_dir.join("index_state.json");
         let state = self.state.lock().unwrap();
-        let json =
-            serde_json::to_string_pretty(&*state).map_err(|e| format!("Serialize state: {e}"))?;
-        std::fs::write(&state_path, json).map_err(|e| format!("Write state: {e}"))?;
+        let mut file = tempfile::NamedTempFile::new_in(&self.index_dir)
+            .map_err(|e| format!("Stage index state: {e}"))?;
+        {
+            let mut output = std::io::BufWriter::new(file.as_file_mut());
+            serde_json::to_writer_pretty(&mut output, &*state)
+                .map_err(|e| format!("Serialize state: {e}"))?;
+            output.flush().map_err(|e| format!("Write state: {e}"))?;
+        }
+        file.as_file()
+            .sync_all()
+            .map_err(|e| format!("Flush state: {e}"))?;
+        file.persist(state_path)
+            .map_err(|e| format!("Replace state: {e}"))?;
         Ok(())
     }
 
@@ -1531,10 +1545,17 @@ impl SessionIndex {
         let (mut total_indexed, analytics_changed) = crate::get_storage()
             .map(|storage| self.sync_retained_sources(storage, roots))
             .unwrap_or_default();
-        total_indexed += self.sync_inner(roots)?;
+        let search = self.sync_inner(roots);
+        // Search or checkpoint failure must not hide an analytics commit.
         if analytics_changed {
             let _ = app_handle.emit(crate::TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ());
         }
+        // A prune error must not discard checkpoints already committed by
+        // sync_retained_sources earlier in this pass.
+        if search.is_err() {
+            self.save_state()?;
+        }
+        total_indexed += search?;
         let _ = app_handle.emit("sessions-index-updated", total_indexed);
         Ok(total_indexed)
     }
@@ -1710,7 +1731,9 @@ impl SessionIndex {
         })
     }
 
-    /// The shared notify/sweep checkpoint advances only after a committed stable replacement.
+    /// The in-memory checkpoint advances only after a committed stable replacement.
+    /// Owning sweep/drain batches persist it with save_state, including partial
+    /// successes. A crash before that flush safely replays idempotent replacements.
     pub(crate) fn replace_retained_source(
         &self,
         source: &DiscoveredRetainedJsonlSource,
@@ -1745,8 +1768,6 @@ impl SessionIndex {
                     canonical_path: Some(source.canonical_path.clone()),
                 },
             );
-            drop(state);
-            self.save_state()?;
             return Ok(0);
         }
         let hints = hints.cloned().or_else(|| {
@@ -1826,9 +1847,6 @@ impl SessionIndex {
                 canonical_path: Some(source.canonical_path.clone()),
             },
         );
-        drop(writer);
-        drop(state);
-        self.save_state()?;
         Ok(extracted.messages.len())
     }
     // -------------------------------------------------------------------
@@ -5270,6 +5288,9 @@ pub async fn sync_search_index(
     let idx = state.0.clone();
     crate::run_blocking(move || idx.sync(&app))
 }
+
+#[cfg(test)]
+mod checkpoint_tests;
 
 #[cfg(test)]
 mod tests {

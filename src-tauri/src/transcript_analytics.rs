@@ -1601,6 +1601,25 @@ pub(crate) fn run_transcript_analytics_reconciliation_with_search(
     roots: &[ProviderSourceRoot],
     index: Option<&crate::sessions::SessionIndex>,
 ) -> Result<TranscriptAnalyticsReconciliationSummary, String> {
+    let result = reconcile_transcript_analytics_roots(storage, hostname, roots, index);
+    // Earlier source commits remain valid even if a later root fails.
+    if let Some(index) = index
+        && let Err(error) = index.save_state()
+    {
+        return Err(match result {
+            Err(prior) => format!("{prior}; persist Search checkpoints: {error}"),
+            Ok(_) => error,
+        });
+    }
+    result
+}
+
+fn reconcile_transcript_analytics_roots(
+    storage: &Storage,
+    hostname: &str,
+    roots: &[ProviderSourceRoot],
+    index: Option<&crate::sessions::SessionIndex>,
+) -> Result<TranscriptAnalyticsReconciliationSummary, String> {
     let _permit = acquire_transcript_reconciliation(
         retained_jsonl_source_root_identities()
             .into_iter()

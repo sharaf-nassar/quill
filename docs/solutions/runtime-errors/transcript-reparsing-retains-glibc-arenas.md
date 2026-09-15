@@ -221,3 +221,70 @@ The installed AppImage was left unchanged by explicit user request. The
 original `quill-protected.service` launch retains its external caps and
 `MALLOC_ARENA_MAX=2`; ordinary desktop relaunch does not inherit them. The fix
 is in the checkout and temporary build, not deployed to that installed binary.
+
+## Review follow-up: checkpoint persistence and async waits
+
+Rechecking the review of `39361c7` identified two concrete defects. A synthetic
+32-source run rewrote `index_state.json` 32 times between source commits,
+writing 147,412 bytes before the final batch flush. Keeping an old checkpoint
+reader open also proved that `fs::write` truncated and rewrote that reader's
+file instead of replacing it atomically. These are measured fixture results,
+not estimates of production write volume or startup duration. After the fix,
+the same 32-source fixture produced zero intermediate writes and one final
+8,941-byte checkpoint, with all documents and checkpoints surviving reopen.
+The open-reader regression also passed. Runtime comparison is not claimed;
+this checks write count/volume and retained results.
+
+Search now persists checkpoints at owning sweep, root-reconciliation, and live
+drain boundaries, including earlier successes when a later source fails.
+Individual Tantivy commits remain intact: changing their granularity would
+change rollback isolation and live visibility, not merely reduce JSON writes.
+Serialization streams through a buffered same-directory temporary file rather
+than allocating a second whole-map String. File synchronization precedes atomic
+replacement under the state mutex. Parent-directory synchronization is not
+promised, so this does not claim complete power-loss durability.
+
+The live drain keeps analytics results/events independent when a checkpoint
+flush fails and retries Search. Legacy notify failures retain their pending
+generation and reuse capped backoff. Older completions cannot remove newer
+payloads. Search invalidation still fires on a possible partial commit, and
+sweep analytics events precede Search-error propagation.
+
+Learning digest construction now awaits `spawn_blocking`, retaining the source
+budget through fetch, redaction, and compression. The current-thread Tokio
+regression requires a sibling `join!` future to release the blocked digest
+worker. Fresh Pi-header admission validation also runs in the blocking pool;
+it is not replaced with a cached source-key comparison.
+
+Several earlier review recommendations were rejected after tracing ownership:
+
+- Legacy checkpoints lacked proof of a successful replacement: the old sweep
+  could log extraction/indexing errors and still record a fingerprint.
+  Treating `canonical_path: None` as automatically current could permanently
+  preserve incomplete documents. One-time source revalidation remains intact.
+- Pi keys do encode host/header identity, but a cached key does not revalidate
+  a file replaced after discovery. Fresh header validation stays.
+- Search errors cannot escape before the independent analytics commit.
+  Combined job retry is intentional: successful consumers skip unchanged work,
+  while the failed consumer keeps its own pending hints.
+- The fallback identity check can observe a file that changed and then reverted.
+  It is not dead code. The legacy drain can also recover a source that became
+  valid after initial request validation.
+- Global source FIFO latency, bounded model-plan reparsing, and scoped test
+  helpers are explicit tradeoffs, not demonstrated correctness defects.
+
+Final follow-up validation passed 580 Rust tests with 11 ignored, 64 Node
+tests, formatting, clippy with warnings denied, typecheck, ESLint, knip,
+repository hooks, backend build, and LAT checks. Independent read-only
+re-review found no remaining blockers. Validation used synthetic data;
+installed application and production state were not modified.
+
+References checked for this follow-up:
+
+- [Tantivy 0.25 IndexWriter](https://docs.rs/tantivy/0.25.0/tantivy/indexer/struct.IndexWriter.html)
+  defines commit durability and rollback scope.
+- [Tokio block_in_place](https://docs.rs/tokio/1.52.1/tokio/task/fn.block_in_place.html)
+  warns that sibling `join!` branches still suspend and recommends
+  `spawn_blocking` for that case.
+- [tempfile NamedTempFile::persist](https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist)
+  documents atomic replacement but no implicit file/directory synchronization.

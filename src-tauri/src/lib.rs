@@ -890,25 +890,34 @@ async fn drain_transcript_analytics_live_queue(
         let result = tauri::async_runtime::spawn_blocking(move || {
             let storage = get_storage()?;
             let hostname = sessions::SessionIndex::local_hostname();
-            Ok::<_, String>(
-                batch
-                    .into_iter()
-                    .map(|job| {
-                        let (outcome, search) =
-                            transcript_analytics::reconcile_retained_source_with_hints(
-                                storage,
-                                &job.source,
-                                &hostname,
-                                index.as_deref().map(|index| sessions::SourceSearch {
-                                    index,
-                                    hints: job.search_hints.as_ref(),
-                                    indexed: None,
-                                }),
-                            );
-                        (job, outcome, search)
-                    })
-                    .collect::<Vec<_>>(),
-            )
+            let mut outcomes = batch
+                .into_iter()
+                .map(|job| {
+                    let (outcome, search) =
+                        transcript_analytics::reconcile_retained_source_with_hints(
+                            storage,
+                            &job.source,
+                            &hostname,
+                            index.as_deref().map(|index| sessions::SourceSearch {
+                                index,
+                                hints: job.search_hints.as_ref(),
+                                indexed: None,
+                            }),
+                        );
+                    (job, outcome, search)
+                })
+                .collect::<Vec<_>>();
+            // Flush successful Search checkpoints even when a sibling source
+            // or analytics failed. Persistence failures rearm Search without
+            // hiding committed analytics updates from the UI.
+            if let Some(index) = index
+                && let Err(error) = index.save_state()
+            {
+                for (_, _, search) in &mut outcomes {
+                    *search = Err(format!("Persist Search checkpoints: {error}"));
+                }
+            }
+            Ok::<_, String>(outcomes)
         })
         .await;
         match result {

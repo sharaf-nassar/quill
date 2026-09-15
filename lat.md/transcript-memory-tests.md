@@ -42,6 +42,24 @@ Old Search checkpoints remain readable without newly added hint and path fields.
 
 `sessions::tests::old_search_checkpoint_deserializes_without_hints_or_canonical_path` decodes the prior JSON shape. Missing hints remain absent; a missing canonical path requires one successful source revalidation, never a guessed path or lost documents.
 
+## Checkpoint Batch Persistence
+
+Committed source checkpoints are persisted at their owning batch boundary instead of rewriting the full map per source.
+
+`sessions::checkpoint_tests::checkpoint_replacements_flush_once_and_survive_reopen` commits 32 synthetic sources and measures intermediate checkpoint writes and bytes. No per-source write is allowed. One final flush must preserve every in-memory checkpoint and all searchable documents after reopening the index. Individual Tantivy commits remain unchanged.
+
+## Checkpoint Atomic Replacement
+
+Checkpoint readers observe complete old or new files, never a truncated rewrite.
+
+`sessions::checkpoint_tests::checkpoint_readers_see_complete_replacements` holds an open reader across a checkpoint replacement. That reader must retain the complete original snapshot while reopening the path yields the new checkpoint. This verifies atomic replacement, not directory durability after power loss.
+
+## Legacy Notify Failure Retry
+
+Legacy notify failures retain their queued payload and use capped backoff instead of acknowledging failed checkpoint persistence.
+
+`server::observed_subagent_tests::legacy_notify_failure_keeps_pending_payload_and_newer_generation` checks failed work requests retry, an older completion cannot clear a newer generation, and only a successful matching completion removes the pending entry. Search invalidation is emitted even if checkpoint persistence follows a successful document commit with an error.
+
 ## Search Prune Proof
 
 Search pruning must not erase a live source committed after the sweep's inventory was taken.
@@ -64,7 +82,7 @@ An unchanged Search inventory must not perform per-source live analytics registr
 
 Learning retains source admission through its existing redaction-before-compression operation, returning only the budgeted digest.
 
-`learning::tests::learning_digest_keeps_fetch_and_compaction_under_source_admission` supplies a large synthetic string with a fake secret, checks admission during fetch and release afterward, and verifies the exact existing redact/compress result under the 48 KiB budget. No truncation-before-redaction or new summary semantics are introduced.
+`learning::tests::learning_digest_keeps_fetch_and_compaction_under_source_admission` supplies a large synthetic string with a fake secret, checks admission during fetch and release afterward, and verifies the exact existing redact/compress result under the 48 KiB budget. On a single-thread Tokio runtime, a sibling `join!` future must release the blocked digest worker; synchronous construction or `block_in_place` would stall that sibling and fail the bounded channel wait. No truncation-before-redaction or new summary semantics are introduced.
 
 ## Context Ownership And Errors
 

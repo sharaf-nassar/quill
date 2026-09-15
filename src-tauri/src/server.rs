@@ -827,7 +827,31 @@ fn enqueue_validated_retained_source(
     }
 }
 
+enum SessionNotifyCompletion {
+    Done,
+    Newer,
+    Retry,
+}
+
+fn finish_session_notify(
+    pending: &mut HashMap<String, PendingSessionNotify>,
+    key: &str,
+    generation: u64,
+    succeeded: bool,
+) -> SessionNotifyCompletion {
+    match pending.get(key) {
+        None => SessionNotifyCompletion::Done,
+        Some(entry) if entry.generation != generation => SessionNotifyCompletion::Newer,
+        Some(_) if !succeeded => SessionNotifyCompletion::Retry,
+        Some(_) => {
+            pending.remove(key);
+            SessionNotifyCompletion::Done
+        }
+    }
+}
+
 async fn drain_session_notify_queue(state: Arc<ServerState>, key: String) {
+    let mut failures: u32 = 0;
     loop {
         let (generation, updated_at, payload) = {
             let pending = state.pending_session_notifies.lock().unwrap();
@@ -858,30 +882,35 @@ async fn drain_session_notify_queue(state: Arc<ServerState>, key: String) {
 
         let app_handle = state.app_handle.clone();
         let storage = state.storage;
-        match tokio::task::spawn_blocking(move || {
+        let succeeded = match tokio::task::spawn_blocking(move || {
             process_session_notify_payload(app_handle, storage, idx, payload)
         })
         .await
         {
-            Ok(Err(err)) => log::error!("Failed to index session notify: {err}"),
-            Err(err) => log::error!("Session notify worker panicked: {err}"),
-            Ok(Ok(_)) => {}
-        }
-
-        let should_stop = {
-            let mut pending = state.pending_session_notifies.lock().unwrap();
-            match pending.get(&key) {
-                Some(entry) if entry.generation == generation => {
-                    pending.remove(&key);
-                    true
-                }
-                Some(_) => false,
-                None => true,
+            Ok(Err(err)) => {
+                log::error!("Failed to index session notify: {err}");
+                false
             }
+            Err(err) => {
+                log::error!("Session notify worker panicked: {err}");
+                false
+            }
+            Ok(Ok(_)) => true,
         };
 
-        if should_stop {
-            break;
+        let completion = finish_session_notify(
+            &mut state.pending_session_notifies.lock().unwrap(),
+            &key,
+            generation,
+            succeeded,
+        );
+        match completion {
+            SessionNotifyCompletion::Done => return,
+            SessionNotifyCompletion::Newer => failures = 0,
+            SessionNotifyCompletion::Retry => {
+                failures = failures.saturating_add(1);
+                tokio::time::sleep(crate::model_usage_failure_retry_delay(failures)).await;
+            }
         }
     }
 }
@@ -892,9 +921,14 @@ fn process_session_notify_payload(
     session_index: Option<Arc<sessions::SessionIndex>>,
     payload: SessionNotifyPayload,
 ) -> Result<usize, String> {
-    let count = index_session_notify_payload(storage, session_index.as_deref(), payload)?;
-    let _ = app_handle.emit("sessions-index-updated", count);
-    Ok(count)
+    let result = index_session_notify_payload(storage, session_index.as_deref(), payload);
+    // A failed checkpoint flush may follow a successful Tantivy commit.
+    // Invalidate the UI even when that flush must be retried.
+    let _ = app_handle.emit(
+        "sessions-index-updated",
+        result.as_ref().copied().unwrap_or(0),
+    );
+    result
 }
 
 fn validate_session_notify_hints(payload: &SessionNotifyPayload) -> Result<(), String> {
@@ -978,6 +1012,9 @@ fn index_session_notify_payload(
         );
         if let Err(error) = analytics {
             log::warn!("Notify analytics retained last-good data: {error}");
+        }
+        if let Some(index) = session_index {
+            index.save_state()?;
         }
         return search;
     }
@@ -1974,11 +2011,24 @@ async fn post_session_notify(
         // A validated persisted source is the recovery path for an unknown
         // live session, so notify never returns a false accepted no-op.
         // Session Search availability cannot suppress either analytics domain.
-        let validated = admit_validated_retained_notify(&payload, &source, |hints| {
-            enqueue_validated_retained_source(&state, source.clone(), hints);
-        });
-        if let Err(error) = validated {
-            return error;
+        // Keep the fresh header identity check, but never perform its blocking
+        // file read on an async runtime worker.
+        let validated = tokio::task::spawn_blocking(move || {
+            admit_validated_retained_notify(&payload, &source, |hints| {
+                enqueue_validated_retained_source(&state, source.clone(), hints);
+            })
+        })
+        .await;
+        match validated {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return error,
+            Err(error) => {
+                log::error!("Retained notify admission failed: {error}");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Retained notify admission failed".into(),
+                );
+            }
         }
         return (StatusCode::ACCEPTED, "queued".to_string());
     }
@@ -2436,6 +2486,45 @@ async fn get_session_facets(
 
 #[cfg(test)]
 mod observed_subagent_tests {
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Legacy Notify Failure Retry]]
+    #[test]
+    fn legacy_notify_failure_keeps_pending_payload_and_newer_generation() {
+        use super::*;
+        let payload: SessionNotifyPayload = serde_json::from_value(serde_json::json!({
+            "session_id": "fixture", "jsonl_path": "/synthetic/source.jsonl"
+        }))
+        .unwrap();
+        let key = session_notify_key(&payload);
+        let mut pending = HashMap::from([(
+            key.clone(),
+            PendingSessionNotify {
+                generation: 1,
+                updated_at: Instant::now(),
+                latest: payload,
+            },
+        )]);
+        assert!(matches!(
+            finish_session_notify(&mut pending, &key, 1, false),
+            SessionNotifyCompletion::Retry
+        ));
+        assert_eq!(pending.len(), 1);
+        pending.get_mut(&key).unwrap().generation = 2;
+        assert!(matches!(
+            finish_session_notify(&mut pending, &key, 1, false),
+            SessionNotifyCompletion::Newer
+        ));
+        assert!(matches!(
+            finish_session_notify(&mut pending, &key, 1, true),
+            SessionNotifyCompletion::Newer
+        ));
+        assert_eq!(pending[&key].generation, 2);
+        assert!(matches!(
+            finish_session_notify(&mut pending, &key, 2, true),
+            SessionNotifyCompletion::Done
+        ));
+        assert!(pending.is_empty());
+    }
+
     use super::*;
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Lifecycle Recovery]]
