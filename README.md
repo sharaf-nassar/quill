@@ -153,7 +153,7 @@ Download the latest release for your platform from the [Releases](../../releases
 executable, installs it to `~/Applications`, and launches it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/quill/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/quill/refs/heads/main/install.sh | sh
 ```
 
 **Manual** — the AppImage is a portable executable, but browsers save downloads
@@ -161,6 +161,7 @@ non-executable, so mark it runnable first (it is the only Linux build, and the
 only format the in-app updater can self-update):
 
 ```bash
+# x86_64; use the _linux_aarch64 AppImage on ARM (e.g. Ubuntu VMs on Apple Silicon)
 chmod +x Quill_*_linux_amd64.AppImage
 ./Quill_*_linux_amd64.AppImage
 ```
@@ -181,7 +182,7 @@ To fully remove Quill and its data:
 sudo dpkg -r quill
 
 # If using AppImage:
-rm -f ~/Applications/Quill_*_linux_amd64.AppImage
+rm -f ~/Applications/Quill.AppImage ~/Applications/Quill_*_linux_*.AppImage
 
 # Remove app data (usage database, auth secret, logs, etc.)
 # macOS:

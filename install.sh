@@ -1,8 +1,8 @@
 #!/bin/sh
-# Quill installer for Linux (x86_64 AppImage).
+# Quill installer for Linux (x86_64 or aarch64 AppImage).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/quill/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/quill/refs/heads/main/install.sh | sh
 #
 # Browsers save downloads non-executable, so a raw AppImage download otherwise
 # needs a manual `chmod +x` before it runs. This script removes that step: it
@@ -25,9 +25,11 @@ err() {
 # --- preconditions -------------------------------------------------------
 [ "$(uname -s)" = "Linux" ] ||
   err "the AppImage is Linux-only (this is $(uname -s)); see the releases page for macOS/Windows."
-arch="$(uname -m)"
-[ "$arch" = "x86_64" ] ||
-  err "only x86_64 Linux is currently built (this is ${arch})."
+case "$(uname -m)" in
+x86_64) arch=amd64 ;;
+aarch64 | arm64) arch=aarch64 ;;
+*) err "only x86_64 and aarch64 Linux are built (this is $(uname -m))." ;;
+esac
 command -v curl >/dev/null 2>&1 || err "curl is required but not installed."
 
 # --- resolve the latest AppImage URL ------------------------------------
@@ -35,11 +37,11 @@ info "Finding the latest Quill release..."
 url="$(
   curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" |
     grep '"browser_download_url"' |
-    grep '_linux_amd64\.AppImage"' |
+    grep "_linux_${arch}\\.AppImage\"" |
     head -n 1 |
     cut -d '"' -f 4
 )"
-[ -n "$url" ] || err "could not find an x86_64 Linux AppImage in the latest release."
+[ -n "$url" ] || err "could not find a ${arch} Linux AppImage in the latest release."
 
 # --- download atomically and install ------------------------------------
 mkdir -p "$DEST_DIR"

@@ -84,11 +84,11 @@ A `create-release` job validates the `v*` tag ref, then runs before all builds t
 
 ### Build Matrix
 
-Four parallel builds (fail-fast disabled), all depending on `create-release` so `tauri-action` finds the existing draft.
+Five parallel builds (fail-fast disabled), all depending on `create-release` so `tauri-action` finds the existing draft.
 
 `tauri-action` runs with `retryAttempts: 3` because its per-build `latest.json` uploads race on the shared release asset (tauri-action#1270); the publish job rebuilds that manifest deterministically regardless (see Release Publishing below).
 
-Platforms: Linux (Ubuntu 22.04, AppImage), macOS Intel (x86_64), macOS ARM (aarch64), Windows (NSIS, runner pinned to `windows-2025`). Each installs Node.js 24 without an LTS-alias manifest lookup, trusts the runner system CA store for Node-based release clients, and installs the pinned Rust toolchain plus platform-specific system dependencies.
+Platforms: Linux x86_64 (Ubuntu 22.04, AppImage), Linux aarch64 (native `ubuntu-22.04-arm` runner, AppImage; the AppImage tooling cannot cross-build and the runner is free only for public repos), macOS Intel (x86_64), macOS ARM (aarch64), Windows (NSIS, runner pinned to `windows-2025`). Each installs Node.js 24 without an LTS-alias manifest lookup, trusts the runner system CA store for Node-based release clients, and installs the pinned Rust toolchain plus platform-specific system dependencies.
 
 Unix free-space probes normalize `statvfs` counters to `u64` before multiplication because Apple exposes the fields with mixed integer widths; this keeps both macOS release targets compilable without changing overflow checks.
 
@@ -112,7 +112,7 @@ After build, submits DMG to Apple notary service (35-minute timeout), staples th
 
 A third job (`publish`) waits for all builds, finds the draft release, and renames assets with platform labels (e.g., `Quill_0.3.1_macOS_amd64.dmg`).
 
-It retries the draft lookup for API eventual consistency, then rebuilds `latest.json` from scratch and publishes the release. Because `tauri-action`'s parallel per-build `latest.json` uploads race on the single shared asset and silently drop platforms (this shipped v0.3.33 with no `linux-x86_64` entry, breaking the updater for Linux), the publish job is the manifest's single writer: after renaming assets it runs `.github/scripts/assemble-latest-json.sh`, which reads each platform's signed `*.sig` asset (distinct names never race) and emits the four base updater keys (`linux-x86_64`, `darwin-aarch64`, `darwin-x86_64`, `windows-x86_64`). The script fails the release if any base platform is missing, turning a silently broken manifest into a hard failure. The macOS build still verifies that `*.app.tar.gz` plus its `.sig` exist before continuing so the `darwin-*` signatures are present to assemble.
+It retries the draft lookup for API eventual consistency, then rebuilds `latest.json` from scratch and publishes the release. Because `tauri-action`'s parallel per-build `latest.json` uploads race on the single shared asset and silently drop platforms (this shipped v0.3.33 with no `linux-x86_64` entry, breaking the updater for Linux), the publish job is the manifest's single writer: after renaming assets it runs `.github/scripts/assemble-latest-json.sh`, which reads each platform's signed `*.sig` asset (distinct names never race) and emits the five base updater keys (`linux-x86_64`, `linux-aarch64`, `darwin-aarch64`, `darwin-x86_64`, `windows-x86_64`). The script fails the release if any base platform is missing, turning a silently broken manifest into a hard failure. The macOS build still verifies that `*.app.tar.gz` plus its `.sig` exist before continuing so the `darwin-*` signatures are present to assemble.
 
 Asset URLs are constructed as `https://github.com/<repo>/releases/download/<tag>/<name>` rather than read from the draft's `browser_download_url`: the API reports draft assets under an ephemeral `untagged-<hash>` path that GitHub invalidates at publish time, which shipped v0.3.34 with dead updater URLs (Install silently no-oped; the manifest was hot-patched in place with corrected URLs).
 

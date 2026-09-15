@@ -28,10 +28,10 @@ assets_json="$(gh api "repos/${REPO}/releases/${RELEASE_ID}/assets" --paginate)"
 
 # The base platform keys the Tauri updater looks up. tauri-plugin-updater's
 # get_urls() uses "{os}-{arch}" verbatim when the target is set (the default),
-# so these four keys are exactly what check() requires. Each maps to the regex
+# so these five keys are exactly what check() requires. Each maps to the regex
 # matching its updater bundle asset (the .sig is keyed off that name + ".sig").
-keys=(linux-x86_64 darwin-aarch64 darwin-x86_64 windows-x86_64)
-pats=('\.AppImage\.tar\.gz$' 'aarch64\.app\.tar\.gz$' 'x64\.app\.tar\.gz$' '\.nsis\.zip$')
+keys=(linux-x86_64 linux-aarch64 darwin-aarch64 darwin-x86_64 windows-x86_64)
+pats=('amd64\.AppImage\.tar\.gz$' 'aarch64\.AppImage\.tar\.gz$' 'aarch64\.app\.tar\.gz$' 'x64\.app\.tar\.gz$' '\.nsis\.zip$')
 
 platforms='{}'
 for i in "${!keys[@]}"; do
