@@ -663,7 +663,7 @@ The hook calls [[src-tauri/src/appimage_integration.rs#get_appimage_integration_
 
 The `install.sh` script (repo root) is a `curl | sh` one-liner that handles the *pre-launch* step the app cannot — browsers save downloads non-executable.
 
-It maps `uname -m` (`x86_64` or `aarch64`) to the matching `*_linux_amd64.AppImage` or `*_linux_aarch64.AppImage`, resolves the latest one from the GitHub releases API, downloads it to `~/Applications/Quill.AppImage`, marks it executable, and launches it; first-run integration then adds the menu entry. Because it lands the AppImage directly at the integration target, [[src-tauri/src/appimage_integration.rs#copy_appimage]] skips the copy when the source already resolves to the destination; other installs use an atomic replacement.
+Before downloading, it installs `fuse3` through apt when neither `fusermount3` nor `fusermount` is on `PATH`: the static AppImage runtime no longer needs `libfuse2`, but still mounts through that helper. It maps `uname -m` (`x86_64` or `aarch64`) to the matching `*_linux_amd64.AppImage` or `*_linux_aarch64.AppImage`, resolves the latest one from the GitHub releases API, downloads it to `~/Applications/Quill.AppImage`, marks it executable, and launches it; first-run integration then adds the menu entry. Because it lands the AppImage directly at the integration target, [[src-tauri/src/appimage_integration.rs#copy_appimage]] skips the copy when the source already resolves to the destination; other installs use an atomic replacement.
 
 ### Updater interaction
 

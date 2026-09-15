@@ -90,6 +90,8 @@ Five parallel builds (fail-fast disabled), all depending on `create-release` so 
 
 Platforms: Linux x86_64 (Ubuntu 22.04, AppImage), Linux aarch64 (native `ubuntu-22.04-arm` runner, AppImage; the AppImage tooling cannot cross-build and the runner is free only for public repos), macOS Intel (x86_64), macOS ARM (aarch64), Windows (NSIS, runner pinned to `windows-2025`). Each installs Node.js 24 without an LTS-alias manifest lookup, trusts the runner system CA store for Node-based release clients, and installs the pinned Rust toolchain plus platform-specific system dependencies.
 
+Linux builds then run `.github/scripts/strip-appimage-libs.sh` on the AppImage. The Tauri bundler's pinned linuxdeploy copies the build host's `libwayland-*`, `libxkbcommon`, `libxcb-{randr,render,shm}`, `libXau`, and `libXdmcp` into `usr/lib`, where AppRun loads them ahead of the system copies; on Mesa 25+ WebKitWebProcess then aborts with `EGL_BAD_PARAMETER` and the transparent window stays blank (tauri-apps/tauri#15976). That linuxdeploy predates `LINUXDEPLOY_EXCLUDED_LIBRARIES` and Tauri has no exclude option, so the script deletes those 10 libraries, repacks the squashfs payload behind the original type-2 runtime (offset read from the ELF section header table), rebuilds the single-file `.AppImage.tar.gz` updater bundle, re-signs both with `tauri signer sign`, and the job re-uploads all four assets with `--clobber` before `publish` assembles `latest.json`.
+
 Unix free-space probes normalize `statvfs` counters to `u64` before multiplication because Apple exposes the fields with mixed integer widths; this keeps both macOS release targets compilable without changing overflow checks.
 
 ### Version Injection

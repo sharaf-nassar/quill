@@ -32,6 +32,17 @@ aarch64 | arm64) arch=aarch64 ;;
 esac
 command -v curl >/dev/null 2>&1 || err "curl is required but not installed."
 
+# The AppImage runtime is static (no libfuse2 needed) but mounts through the
+# system fusermount helper, which the fuse3 package provides.
+as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
+if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+  command -v apt-get >/dev/null 2>&1 ||
+    err "FUSE is required: install your distribution's fuse3 package, then re-run."
+  info "Installing fuse3 (required to run AppImages)..."
+  { as_root apt-get update -qq && as_root apt-get install -y fuse3; } ||
+    err "could not install fuse3; run 'sudo apt-get install fuse3' and re-run."
+fi
+
 # --- resolve the latest AppImage URL ------------------------------------
 info "Finding the latest Quill release..."
 url="$(

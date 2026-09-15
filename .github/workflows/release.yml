@@ -82,7 +82,7 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu-')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils squashfs-tools
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
@@ -178,6 +178,27 @@ jobs:
           # otherwise-good build. The publish job rebuilds the manifest anyway.
           retryAttempts: 3
           args: ${{ matrix.args }}
+
+      # The bundled display stack (libwayland etc.) aborts WebKit with
+      # EGL_BAD_PARAMETER on Mesa 25+ (tauri#15976). Strip it, re-sign, and
+      # replace the AppImage assets tauri-action just uploaded to the draft.
+      - name: Strip bundled display libraries from AppImage
+        if: startsWith(matrix.platform, 'ubuntu-')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          shopt -s nullglob
+          apps=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          if [ "${#apps[@]}" -ne 1 ]; then
+            echo "::error::Expected one AppImage, found ${#apps[@]}"
+            exit 1
+          fi
+          app="${apps[0]}"
+          bash .github/scripts/strip-appimage-libs.sh "$app"
+          gh release upload "${{ github.ref_name }}" "$app" "$app.sig" "$app.tar.gz" "$app.tar.gz.sig" --clobber
 
       - name: Verify Sentry build artifacts
         run: npm run verify:sentry-output
