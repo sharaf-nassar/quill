@@ -633,15 +633,10 @@ fn macos_sbpl_profile(temp_dir: &Path, claude_path: &Path) -> String {
     )
 }
 
-/// Replay the parent command's *explicit* environment deltas onto the
-/// wrapper command. `build_command` only ever calls `env_remove` (the R-6
-/// scrub) and never `env`-sets, so this re-applies exactly the scrub onto
-/// the new outer process while the rest of the inherited environment (PATH,
-/// HOME for node's module resolution, etc.) flows through normally — the
-/// wrapper binaries (`bwrap`/`sandbox-exec`) all pass the parent env to
-/// their child by default, so the scrub must be re-asserted here. The
-/// Landlock arm reuses the inner `Command` directly (no outer wrapper
-/// process), so it does not call `replay_env_scrub`.
+/// Replay explicit environment deltas onto the sandbox wrapper: credential
+/// and AppImage library removals, plus per-call temporary-directory settings.
+/// Wrappers pass this environment to the provider. Landlock reuses the inner
+/// command directly and needs no replay.
 fn replay_env_scrub(src: &std::process::Command, dst: &mut Command) {
     for (k, v) in src.get_envs() {
         match v {
@@ -868,9 +863,8 @@ fn apply_sandbox_bwrap(
         let p = dir.display().to_string();
         bw.arg("--bind").arg(&p).arg(&p);
     }
-    // bwrap inherits and passes the parent env through by default
-    // (no `--clearenv`), so node's PATH/HOME module resolution still
-    // works; re-assert only the R-6 scrub via `replay_env_scrub`.
+    // bwrap passes its environment through, so replay all explicit deltas,
+    // including the AppImage library removal and credential scrub.
     if let Some(cwd) = std_inner.get_current_dir() {
         bw.arg("--chdir").arg(cwd);
     }
@@ -1215,7 +1209,7 @@ fn build_command(
     artifact_dir: Option<&Path>,
     claude_path: &Path,
 ) -> (Command, SandboxKind) {
-    let mut cmd = Command::new(claude_path);
+    let mut cmd = Command::from(crate::config::external_command(claude_path));
 
     // Headless one-shot mode with the documented JSON envelope.
     cmd.arg("-p").arg("--output-format").arg("json");
@@ -1395,7 +1389,7 @@ fn classify_error(
 /// `tokio::process::Command` so it never blocks a runtime worker even
 /// if several streams hit the version-mismatch path concurrently.
 async fn probe_claude_version(claude_path: &Path) -> Option<String> {
-    let output = Command::new(claude_path)
+    let output = Command::from(crate::config::external_command(claude_path))
         .arg("--version")
         .output()
         .await
@@ -1824,6 +1818,22 @@ mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
+
+    // @lat: [[provider-cli-tests#Provider CLI Tests#Sandbox Environment Replay]]
+    #[test]
+    fn sandbox_wrapper_preserves_appimage_library_removal() {
+        let mut inner = std::process::Command::new("claude");
+        inner.env_remove("LD_LIBRARY_PATH");
+        let mut wrapper = Command::new("bwrap");
+        wrapper.env("LD_LIBRARY_PATH", "/tmp/.mount_Quill-test/usr/lib");
+        replay_env_scrub(&inner, &mut wrapper);
+        assert!(
+            wrapper
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| { key == OsStr::new("LD_LIBRARY_PATH") && value.is_none() })
+        );
+    }
 
     fn exit_ok() -> ExitStatus {
         ExitStatus::from_raw(0)

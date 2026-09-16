@@ -1824,7 +1824,7 @@ fn commit_ref_resolves(conn: &Mutex<Connection>, repo_path: Option<&str>, hash: 
     }
 
     if let Some(repo) = repo_path.filter(|p| !p.is_empty() && *p != "global") {
-        let ok = std::process::Command::new("git")
+        let ok = crate::config::external_command("git")
             .args(["cat-file", "-e", &format!("{hash}^{{commit}}")])
             .current_dir(repo)
             .output()

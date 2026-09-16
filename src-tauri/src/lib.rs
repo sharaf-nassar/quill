@@ -1789,11 +1789,11 @@ fn app_data_dir() -> std::path::PathBuf {
 /// directly, the same way `spawn_delayed_relaunch` spawns the relaunch child.
 fn open_path_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    let mut cmd = std::process::Command::new("open");
+    let mut cmd = crate::config::external_command("open");
     #[cfg(target_os = "windows")]
-    let mut cmd = std::process::Command::new("explorer");
+    let mut cmd = crate::config::external_command("explorer");
     #[cfg(all(unix, not(target_os = "macos")))]
-    let mut cmd = std::process::Command::new("xdg-open");
+    let mut cmd = crate::config::external_command("xdg-open");
     cmd.arg(path);
     cmd.spawn()
         .map(|_| ())

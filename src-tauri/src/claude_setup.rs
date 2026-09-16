@@ -8,7 +8,6 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tauri::Manager;
 
 // ── Path helpers ──
@@ -216,7 +215,7 @@ pub(crate) fn detect_claude_home() -> bool {
 fn resolve_node_executable() -> Result<PathBuf, String> {
     let node = crate::config::resolve_command_path("node")
         .ok_or_else(|| "Node.js 18 or newer is required for Claude hooks".to_string())?;
-    let output = Command::new(&node)
+    let output = crate::config::external_command(&node)
         .arg("--version")
         .env("PATH", crate::config::path_for_resolved_command(&node))
         .output()
@@ -248,7 +247,7 @@ fn resolve_runtime_paths() -> Result<ClaudeRuntimePaths, String> {
     let node = resolve_node_executable()?;
     let git = crate::config::resolve_command_path("git")
         .ok_or_else(|| "Git is required for the Claude qbuild guard".to_string())?;
-    let output = Command::new(&git)
+    let output = crate::config::external_command(&git)
         .arg("--version")
         .env("PATH", crate::config::path_for_resolved_command(&git))
         .output()
@@ -1824,7 +1823,7 @@ fn verify_mcp(features: IntegrationFeatures) -> Result<(), String> {
     };
     let uv_path_env = crate::config::path_for_resolved_command(&uv_path);
 
-    let mut uv_check = Command::new(&uv_path);
+    let mut uv_check = crate::config::external_command(&uv_path);
     let uv_check = crate::integrations::clean_mcp_verification_environment(&mut uv_check)
         .arg("--version")
         .env("PATH", &uv_path_env)
@@ -1839,7 +1838,7 @@ fn verify_mcp(features: IntegrationFeatures) -> Result<(), String> {
     let mcp_path = mcp_dir();
     let mcp_path_str = mcp_path.to_string_lossy().to_string();
 
-    let mut verify = Command::new(&uv_path);
+    let mut verify = crate::config::external_command(&uv_path);
     let verify = crate::integrations::clean_mcp_verification_environment(&mut verify)
         .args([
             "run",

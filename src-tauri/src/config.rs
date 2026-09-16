@@ -31,9 +31,19 @@ pub fn http_client() -> &'static reqwest::Client {
     })
 }
 
+/// Host tools must load host libraries, not the AppImage's bundled versions.
+/// Keep Quill's own environment intact, including for updater relaunches.
+pub(crate) fn external_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    if cfg!(target_os = "linux") && std::env::var_os("APPIMAGE").is_some() {
+        command.env_remove("LD_LIBRARY_PATH");
+    }
+    command
+}
+
 pub fn claude_user_agent() -> &'static str {
     CLAUDE_VERSION.get_or_init(|| {
-        std::process::Command::new("claude")
+        external_command("claude")
             .arg("--version")
             .output()
             .ok()
@@ -153,7 +163,7 @@ pub fn detect_provider_cli(command: &str) -> (bool, Vec<String>) {
         return (false, attempts);
     };
 
-    let ok = std::process::Command::new(&cli_path)
+    let ok = external_command(&cli_path)
         .arg("--version")
         .env("PATH", path_for_resolved_command(&cli_path))
         .output()
@@ -428,10 +438,7 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 
 fn capture_login_shell_output(command: &str) -> Option<String> {
     for shell in login_shell_candidates() {
-        let Ok(output) = std::process::Command::new(&shell)
-            .args(["-lc", command])
-            .output()
-        else {
+        let Ok(output) = external_command(&shell).args(["-lc", command]).output() else {
             continue;
         };
         if !output.status.success() {
@@ -507,7 +514,7 @@ fn find_keychain_service() -> Result<String, String> {
     const BASE_SERVICE: &str = "Claude Code-credentials";
 
     // Try exact match first (older Claude Code versions)
-    let output = std::process::Command::new("security")
+    let output = external_command("security")
         .args(["find-generic-password", "-s", BASE_SERVICE, "-w"])
         .output()
         .map_err(|e| format!("Failed to run security command: {e}"))?;
@@ -517,7 +524,7 @@ fn find_keychain_service() -> Result<String, String> {
     }
 
     // Search for hash-suffixed variants (Claude Code v2.1.52+)
-    let output = std::process::Command::new("bash")
+    let output = external_command("bash")
         .args([
             "-c",
             r#"security dump-keychain 2>/dev/null | awk -F'"' '/svce.*<blob>="Claude Code-credentials/{print $4; exit}'"#,
@@ -537,7 +544,7 @@ fn find_keychain_service() -> Result<String, String> {
 fn read_keychain_credentials() -> Result<String, String> {
     let service = find_keychain_service()?;
 
-    let output = std::process::Command::new("security")
+    let output = external_command("security")
         .args(["find-generic-password", "-s", &service, "-w"])
         .output()
         .map_err(|e| format!("Failed to read from Keychain: {e}"))?;
@@ -586,7 +593,7 @@ pub async fn claude_logged_in() -> Result<bool, String> {
     let claude_path =
         resolve_command_path("claude").ok_or_else(|| "claude binary not found".to_string())?;
 
-    let mut command = tokio::process::Command::new(&claude_path);
+    let mut command = tokio::process::Command::from(external_command(&claude_path));
     command
         .args(["auth", "status", "--json"])
         .env("PATH", path_for_resolved_command(&claude_path))
@@ -615,4 +622,57 @@ pub async fn claude_logged_in() -> Result<bool, String> {
     serde_json::from_slice::<ClaudeAuthStatus>(&output.stdout)
         .map(|status| status.logged_in)
         .map_err(|e| format!("Failed to parse claude auth status: {e}"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    // @lat: [[provider-cli-tests#Provider CLI Tests#AppImage Child Environment]]
+    #[test]
+    fn external_commands_do_not_inherit_appimage_libraries() {
+        const CHILD: &str = "QUILL_TEST_APPIMAGE_ENV";
+        const LIBRARIES: &str = "/tmp/.mount_Quill-test/usr/lib:/quill-test/custom/lib";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let expected = if mode == "appimage" {
+                "unset"
+            } else {
+                LIBRARIES
+            };
+            let mut command = external_command("/bin/sh");
+            command.args(["-c", "printf '%s' \"${LD_LIBRARY_PATH-unset}\""]);
+            // The same environment must survive conversion for async OAuth calls.
+            let mut command = tokio::process::Command::from(command);
+            let output = command.as_std_mut().output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+            assert_eq!(std::env::var("LD_LIBRARY_PATH").unwrap(), LIBRARIES);
+            return;
+        }
+
+        // Re-exec only this test so no process-global environment is mutated
+        // while the rest of the Rust tests run on other threads.
+        for mode in ["appimage", "ordinary"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "config::tests::external_commands_do_not_inherit_appimage_libraries",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .env("LD_LIBRARY_PATH", LIBRARIES)
+                .env_remove("APPIMAGE");
+            if mode == "appimage" {
+                command.env("APPIMAGE", "/quill-test/Quill.AppImage");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }

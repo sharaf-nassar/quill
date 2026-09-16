@@ -163,7 +163,7 @@ async fn run_git_command(project_path: &str, args: &[&str]) -> Result<String, St
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
 
     tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("git")
+        let output = crate::config::external_command("git")
             .args(&args)
             .current_dir(&path)
             .output()

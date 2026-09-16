@@ -555,13 +555,11 @@ fn perform_integration(
 /// appears immediately. Missing tools or non-zero exits are ignored (research
 /// R-D): on environments without them the catalog refreshes on its own schedule.
 fn refresh_desktop_caches(applications_dir: &Path, icon_root: &Path) {
-    use std::process::Command;
-
-    let _ = Command::new("update-desktop-database")
+    let _ = crate::config::external_command("update-desktop-database")
         .arg(applications_dir)
         .status();
     // `-q -f -t <theme-root>`: quiet, force, target the hicolor theme root.
-    let _ = Command::new("gtk-update-icon-cache")
+    let _ = crate::config::external_command("gtk-update-icon-cache")
         .arg("-q")
         .arg("-f")
         .arg("-t")

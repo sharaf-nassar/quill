@@ -499,7 +499,7 @@ fn verify_mcp(features: IntegrationFeatures) -> Result<(), String> {
     };
     let uv_path_env = crate::config::path_for_resolved_command(&uv_path);
 
-    let mut uv_check = Command::new(&uv_path);
+    let mut uv_check = crate::config::external_command(&uv_path);
     let uv_check = crate::integrations::clean_mcp_verification_environment(&mut uv_check)
         .arg("--version")
         .env("PATH", &uv_path_env)
@@ -511,7 +511,7 @@ fn verify_mcp(features: IntegrationFeatures) -> Result<(), String> {
 
     let mcp_path = mcp_dir();
     let mcp_path_str = mcp_path.to_string_lossy().to_string();
-    let mut verify = Command::new(&uv_path);
+    let mut verify = crate::config::external_command(&uv_path);
     let verify = crate::integrations::clean_mcp_verification_environment(&mut verify)
         .args([
             "run",
@@ -969,7 +969,7 @@ fn run_app_server_request_at<T: serde::de::DeserializeOwned>(
     params: serde_json::Value,
 ) -> Result<T, String> {
     let codex_env_path = crate::config::path_for_resolved_command(codex_path);
-    let mut command = Command::new(codex_path);
+    let mut command = crate::config::external_command(codex_path);
     command
         .args([
             "app-server",

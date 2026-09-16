@@ -1516,7 +1516,7 @@ impl SessionIndex {
                     .and_then(short)
             })
             .or_else(|| {
-                std::process::Command::new("hostname")
+                crate::config::external_command("hostname")
                     .output()
                     .ok()
                     .filter(|output| output.status.success())

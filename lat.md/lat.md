@@ -23,6 +23,7 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[crash-reporting-tests]] — Rust crash payload privacy and release identity test specs
 - [[codex-lifecycle-tests]] — Codex hook-discovery authentication isolation test specs
 - [[appimage-integration-tests]] — Version-aware AppImage refresh test specs
+- [[provider-cli-tests]]: AppImage host-command environment and sandbox replay test specs
 - [[window-chrome-tests]] — Cross-platform resize policy and macOS configuration test specs
 - [[pi-provider-plumbing-tests]] — Pi provider persistence, breakdown, hook, and root test specs
 - [[pi-integrations-ui-tests]] — Pi setup, consent, provider-count, and Limits omission test specs

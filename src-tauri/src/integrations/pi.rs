@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use tauri::Manager;
 
@@ -132,7 +132,7 @@ fn status_from_detection(
 }
 
 fn read_pi_version(cli_path: &Path) -> Result<String, String> {
-    let output = Command::new(cli_path)
+    let output = crate::config::external_command(cli_path)
         .arg("--version")
         .env("PATH", crate::config::path_for_resolved_command(cli_path))
         .output()
@@ -151,7 +151,7 @@ fn read_pi_version(cli_path: &Path) -> Result<String, String> {
 pub(crate) async fn oauth_bearer_token(provider: &'static str) -> Result<String, String> {
     let cli_path = crate::config::resolve_command_path("pi")
         .ok_or_else(|| "Pi CLI was not found in PATH".to_string())?;
-    let mut command = tokio::process::Command::new(&cli_path);
+    let mut command = tokio::process::Command::from(crate::config::external_command(&cli_path));
     command
         .args([
             "auth",
