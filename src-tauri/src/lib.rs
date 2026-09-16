@@ -355,12 +355,6 @@ const ALWAYS_ON_TOP_KEY: &str = "always_on_top";
 // default rather than a user's decision to transmit.
 const CRASH_REPORTING_OPT_IN_KEY: &str = "crash_reporting.opt_in";
 
-// One-time marker for the widget main window (feature 018). Its only job is to
-// seed the new always-on-top default exactly once: a widget that hides behind
-// the editor is useless, but an existing user who deliberately stored `false`
-// must keep that choice, so the seed only writes when no value exists.
-const WIDGET_UI_MARKER_KEY: &str = "widget_ui_v1";
-
 // One-time marker for the widget's stored window size. The pre-widget main
 // window was a split-pane surface users had grown several hundred pixels wider
 // than the 360px widget, and that geometry is still sitting in
@@ -4081,39 +4075,6 @@ fn read_bool_setting(storage: &Storage, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-/// Seed the widget's fresh-install always-on-top default, once.
-///
-/// The widget main window ships with always-on-top on, but the preference has
-/// existed (defaulting to off) since before the widget did. Writing the new
-/// default unconditionally would silently re-enable it for a user who turned
-/// it off, so the seed runs only while the `widget_ui_v1` marker is absent and
-/// only when no `always_on_top` value is stored at all. Returns the value the
-/// window should start with.
-fn seed_widget_always_on_top(storage: &Storage) -> bool {
-    let stored = storage.get_setting(ALWAYS_ON_TOP_KEY).ok().flatten();
-    let seeded = storage
-        .get_setting(WIDGET_UI_MARKER_KEY)
-        .ok()
-        .flatten()
-        .is_some();
-
-    if !seeded {
-        if stored.is_none()
-            && let Err(error) = storage.set_setting(ALWAYS_ON_TOP_KEY, "true")
-        {
-            log::warn!("Failed to seed widget always-on-top default: {error}");
-        }
-        if let Err(error) = storage.set_setting(WIDGET_UI_MARKER_KEY, "1") {
-            log::warn!("Failed to record widget UI marker: {error}");
-        }
-    }
-
-    match stored {
-        Some(value) => value == "true",
-        None => !seeded,
-    }
-}
-
 /// Pick the geometry flags the widget window restores, resetting size once.
 ///
 /// Position is always restored — where the user parked the widget survives any
@@ -6211,11 +6172,10 @@ fn finish_setup(app: &tauri::AppHandle, storage: &'static Storage) -> tauri::Res
         });
     }
 
-    // Restore the always-on-top preference, seeding the widget's
-    // fresh-install default on the first run of the new UI.
+    // Restore the saved preference; fresh installs default to off.
     let on_top_enabled = STORAGE
         .get()
-        .map(seed_widget_always_on_top)
+        .map(|storage| load_runtime_settings(storage).always_on_top)
         .unwrap_or(false);
 
     if let Some(w) = app.get_webview_window("main") {
