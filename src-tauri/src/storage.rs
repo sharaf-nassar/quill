@@ -16727,6 +16727,7 @@ impl Storage {
                     observed_agents: None,
                     live_linked_sessions: None,
                     observed_only: false,
+                    background_tasks_running: false,
                 })
             })
             .map_err(|e| format!("Query error: {e}"))?;
@@ -35368,6 +35369,7 @@ mod tests {
             ]),
             live_linked_sessions: None,
             observed_only: false,
+            background_tasks_running: false,
         }];
 
         with_pinned_query_now(pinned_now, || {
@@ -35435,6 +35437,7 @@ mod tests {
             }]),
             live_linked_sessions: Some(Vec::new()),
             observed_only: true,
+            background_tasks_running: false,
         }];
 
         with_pinned_query_now(now, || {
@@ -35602,6 +35605,7 @@ mod tests {
             observed_agents: Some(vec![live_agent.clone()]),
             live_linked_sessions: Some(Vec::new()),
             observed_only: true,
+            background_tasks_running: false,
         };
 
         let mut rows = [row()];
@@ -37647,6 +37651,7 @@ mod tests {
             observed_agents: None,
             live_linked_sessions: None,
             observed_only: false,
+            background_tasks_running: false,
         }];
         with_pinned_query_now(pinned_now, || {
             storage
@@ -37742,6 +37747,7 @@ mod tests {
             observed_agents: None,
             live_linked_sessions: None,
             observed_only: false,
+            background_tasks_running: false,
         }];
         storage
             .populate_session_runtime_evidence(&mut rows)
@@ -38841,6 +38847,7 @@ mod tests {
             ]),
             live_linked_sessions: None,
             observed_only: false,
+            background_tasks_running: false,
         };
         let assert_live = |row: &SessionBreakdown| {
             assert_eq!(row.active_runtime_secs, Some(465.0));

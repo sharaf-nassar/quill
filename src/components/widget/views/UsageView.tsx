@@ -268,6 +268,8 @@ interface RowModel {
   live?: boolean;
   /** True only when the live runtime value is known and may use status green. */
   liveActivity?: boolean;
+  /** Idle session with a background task still running: amber dot. */
+  backgroundWork?: boolean;
   name: string;
   chip?: { text: string; tone: string };
   /** Dim secondary count, e.g. `41 sess`. */
@@ -596,6 +598,7 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
     key: `${row.provider}:${row.hostname}:${row.session_id}`,
     live,
     liveActivity,
+    backgroundWork: !live && row.background_tasks_running,
     name,
     nameLabel: `Session ${name} on ${row.hostname}`,
     sessionStats: {
@@ -1172,9 +1175,22 @@ function UsageView({ range, webSurface = false }: UsageViewProps) {
                 <div className="wg-row-main">
                   {row.live !== undefined && (
                     <span
-                      className="wg-row-dot"
-                      data-live={row.live ? "true" : "false"}
-                      aria-hidden="true"
+                      className="wg-row-dot wg-row-datum"
+                      data-live={row.live ? "true" : row.backgroundWork ? "background" : "false"}
+                      data-tooltip={
+                        row.live
+                          ? "Active"
+                          : row.backgroundWork
+                            ? "Inactive, background task running"
+                            : "Inactive"
+                      }
+                      aria-label={
+                        row.live
+                          ? "Active session"
+                          : row.backgroundWork
+                            ? "Inactive session with a background task running"
+                            : "Inactive session"
+                      }
                     />
                   )}
                   {row.sessionStats ? (

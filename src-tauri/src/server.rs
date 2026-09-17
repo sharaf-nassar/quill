@@ -2588,6 +2588,7 @@ mod observed_subagent_tests {
             observed_agents: None,
             live_linked_sessions: None,
             observed_only: false,
+            background_tasks_running: false,
         };
         let lineage_of = |tracker: &crate::live_tracker::LiveTracker| {
             tracker

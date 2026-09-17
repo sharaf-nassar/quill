@@ -6654,6 +6654,7 @@ mod tests {
             observed_agents: None,
             live_linked_sessions: None,
             observed_only: false,
+            background_tasks_running: false,
         };
         let mut rows = vec![row("covered-root"), row("storage-only-root")];
         rows[1].ended_at = Some("2030-01-01T00:00:02Z".to_string());

@@ -216,6 +216,8 @@ A rewritten file is shorter than the offset already consumed, which clears the a
 
 Pi activity advances from `user`, `assistant`, and `toolResult` entries only, so custom extension records, the reporter's own `quill-tracking` entry, and thinking-level and compaction markers written after a turn cannot reopen a finished session.
 
+A pi-background-tasks launch receipt (a `toolResult` whose `details.task.status` is `running`) opens that task id on the session and the `background-task-notification` custom message naming the same id closes it; both are bookkeeping for activity, so `SessionBreakdown.background_tasks_running` is true while an idle session still has such a task open, and a rewritten file clears the set before its replacement is refolded.
+
 ## Pi Corpus Fold Regression
 
 The real headless Pi corpus folds `cliproxyapi/gpt-5.6-luna` with root `21482`, parent `87413`, child `8828`, and recorded activity timestamps.

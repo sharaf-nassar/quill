@@ -2975,6 +2975,16 @@ html[data-view="migration"] #root {
   opacity: 0.4;
 }
 
+.wg-row-dot[data-live="background"] {
+  background: var(--meter-amber);
+}
+
+/* A 6px anchor sits at the row's left edge, so center a tip and it clips. */
+.wg-row-dot::after {
+  left: 0;
+  transform: none;
+}
+
 .wg-row-name {
   flex: 1 1 auto;
   min-width: 0;

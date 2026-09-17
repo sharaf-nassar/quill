@@ -593,6 +593,9 @@ pub struct SessionBreakdown {
     /// True when current-process hook evidence supplied the row before the
     /// first retained token snapshot made its metrics available.
     pub observed_only: bool,
+    /// True while the live fold sees a pi-background-tasks launch with no
+    /// terminal notification yet, so an idle session still has work running.
+    pub background_tasks_running: bool,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]

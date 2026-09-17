@@ -105,6 +105,9 @@ struct LiveSession {
     /// Sub-agents this session has spawned, by the id their transcript is
     /// named for.
     agents: HashMap<String, LiveAgent>,
+    /// pi-background-tasks ids a `bg_run`/`bg_delegate`/fusion launch receipt
+    /// opened and no `background-task-notification` has closed yet.
+    background_tasks: HashSet<String>,
 }
 
 /// One sub-agent inside a [`LiveSession`].
@@ -484,6 +487,7 @@ impl TrackerState {
                     session.last_activity = session.started_at.unwrap_or(DateTime::UNIX_EPOCH);
                     session.folded_tokens = None;
                     session.live_tokens = None;
+                    session.background_tasks.clear();
                     changed = true;
                 }
                 read_appended(path, &mut offset, |line| {
@@ -1474,6 +1478,7 @@ impl LiveTracker {
                 row.runtime_as_of_ms = Some(now.timestamp_millis());
             }
             row.observed_agents = Some(observed_agents);
+            row.background_tasks_running = !session.background_tasks.is_empty();
             row.pi_lineage = projected_lineage
                 .get(&key)
                 .cloned()
@@ -1574,6 +1579,7 @@ impl LiveTracker {
                     live_linked_sessions: (key.provider == IntegrationProvider::Pi.as_str())
                         .then(|| linked_by_parent.get(key).cloned().unwrap_or_default()),
                     observed_only: true,
+                    background_tasks_running: !session.background_tasks.is_empty(),
                 });
             }
         }
@@ -1760,6 +1766,11 @@ fn fold_codex_line(line: &str, session: &mut LiveSession, agent_id: Option<&str>
 /// `session_info`, keyed to the run id its runtime tree assigned. Bookkeeping
 /// entries — including the reporter's `quill-tracking` entry — cannot reopen a
 /// finished session.
+///
+/// A pi-background-tasks launch receipt (`details.task.status == "running"`)
+/// opens a background task and the matching `background-task-notification`
+/// closes it; neither is turn activity, so a session waiting on one reads
+/// idle-with-work rather than live.
 fn fold_pi_line(line: &str, session: &mut LiveSession, run_id: Option<&str>) -> bool {
     let Ok(record) = serde_json::from_str::<PiRecord>(line) else {
         return false;
@@ -1777,6 +1788,14 @@ fn fold_pi_line(line: &str, session: &mut LiveSession, run_id: Option<&str>) -> 
                 && let Some(timestamp) = record.timestamp.as_deref().and_then(utc)
             {
                 changed |= advance(&mut session.last_activity, timestamp);
+            }
+            if let Some(task) = message
+                .details
+                .known()
+                .and_then(|details| details.task.known())
+                && task.status.as_deref() == Some(PI_BACKGROUND_TASK_RUNNING)
+            {
+                changed |= session.background_tasks.insert(task.id);
             }
             if message.role.as_deref() != Some(PI_ASSISTANT_ROLE) {
                 return changed;
@@ -1813,6 +1832,13 @@ fn fold_pi_line(line: &str, session: &mut LiveSession, run_id: Option<&str>) -> 
             {
                 session.structural_agent_role = Some(role);
                 changed = true;
+            }
+        }
+        PI_CUSTOM_MESSAGE_RECORD => {
+            if record.custom_type.as_deref() == Some(PI_BACKGROUND_TASK_NOTIFICATION)
+                && let Some(task) = record.details.known()
+            {
+                changed |= session.background_tasks.remove(&task.id);
             }
         }
         _ => {}
@@ -2082,7 +2108,11 @@ struct CodexHead {
 const PI_MESSAGE_RECORD: &str = "message";
 const PI_MODEL_CHANGE_RECORD: &str = "model_change";
 const PI_SESSION_INFO_RECORD: &str = "session_info";
+const PI_CUSTOM_MESSAGE_RECORD: &str = "custom_message";
 const PI_ASSISTANT_ROLE: &str = "assistant";
+/// pi-background-tasks' terminal notice; its `details` is the task snapshot.
+const PI_BACKGROUND_TASK_NOTIFICATION: &str = "background-task-notification";
+const PI_BACKGROUND_TASK_RUNNING: &str = "running";
 /// The roles Pi gives an entry that carries turn content. Everything else it
 /// writes is bookkeeping appended around a turn rather than inside one.
 const PI_ACTIVITY_ROLES: [&str; 3] = ["user", PI_ASSISTANT_ROLE, "toolResult"];
@@ -2102,6 +2132,35 @@ struct PiRecord {
     model_id: Option<String>,
     /// Pi's own session label, which a nested child keys to its runtime run id.
     name: Option<String>,
+    /// Extension label of a `custom_message`.
+    custom_type: Option<String>,
+    /// A `background-task-notification`'s task snapshot.
+    #[serde(default)]
+    details: Lenient<PiBackgroundTask>,
+}
+
+/// A field whose shape belongs to whichever extension wrote the record: any
+/// other shape reads as absent rather than failing the whole line.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Lenient<T> {
+    Known(T),
+    Other(serde::de::IgnoredAny),
+}
+
+impl<T> Default for Lenient<T> {
+    fn default() -> Self {
+        Self::Other(serde::de::IgnoredAny)
+    }
+}
+
+impl<T> Lenient<T> {
+    fn known(self) -> Option<T> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2111,6 +2170,22 @@ struct PiMessage {
     provider: Option<String>,
     model: Option<String>,
     usage: Option<PiUsage>,
+    /// Tool-result details; only a background-task launch receipt's `task`
+    /// is read out of it.
+    #[serde(default)]
+    details: Lenient<PiToolDetails>,
+}
+
+#[derive(Deserialize)]
+struct PiToolDetails {
+    #[serde(default)]
+    task: Lenient<PiBackgroundTask>,
+}
+
+#[derive(Deserialize)]
+struct PiBackgroundTask {
+    id: String,
+    status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4907,6 +4982,7 @@ mod tests {
             observed_agents: None,
             live_linked_sessions: None,
             observed_only: false,
+            background_tasks_running: false,
         };
         let rows = tracker.overlay(
             vec![stored],
@@ -4963,6 +5039,7 @@ mod tests {
             observed_agents: None,
             live_linked_sessions: None,
             observed_only: false,
+            background_tasks_running: false,
         }
     }
 

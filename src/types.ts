@@ -213,6 +213,8 @@ export interface SessionBreakdown {
   live_linked_sessions: ObservedLinkedSession[] | null;
   /** True until retained token metrics arrive for a current-boot observed root. */
   observed_only: boolean;
+  /** True while a pi-background-tasks launch has no terminal notification yet. */
+  background_tasks_running: boolean;
   /** Provider-recorded session display name; null when never named. */
   session_name: string | null;
   /** Range-scoped failed tool calls; null when no error evidence exists. */

@@ -1949,6 +1949,7 @@ mod tests {
             observed_agents: None,
             live_linked_sessions: None,
             observed_only: false,
+            background_tasks_running: false,
         };
         let raw = format!(
             "API_KEY=sk-ant-api03-LongLivedSecretValue000111\n{}",
