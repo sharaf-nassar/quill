@@ -1107,6 +1107,8 @@ pub(crate) struct IndexedSource {
 pub struct IndexState {
     #[serde(default)]
     pub(crate) sources: HashMap<String, IndexedSource>,
+    #[serde(default)]
+    pub(crate) rejections: HashMap<String, crate::transcript_identity::SourceRejection>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1573,7 +1575,10 @@ impl SessionIndex {
             if std::fs::metadata(&source.canonical_path)
                 .ok()
                 .and_then(|metadata| model_source_fast_fingerprint(&metadata).ok())
-                .is_some_and(|fingerprint| self.source_is_current(source, fingerprint))
+                .is_some_and(|fingerprint| {
+                    self.source_is_current(source, fingerprint)
+                        || self.source_is_rejected(source, fingerprint)
+                })
             {
                 continue;
             }
@@ -1621,6 +1626,19 @@ impl SessionIndex {
                 .flat_map(|root| &root.sources)
                 .map(|source| source.source_key.as_str())
                 .collect::<HashSet<_>>();
+            state.rejections.retain(|key, rejection| {
+                discovered.contains(key.as_str())
+                    || !roots.iter().any(|root| {
+                        matches!(root.outcome, ProviderRootEnumerationOutcome::Complete)
+                            && key
+                                .split_once(':')
+                                .is_some_and(|(provider, _)| provider == root.provider.as_str())
+                            && root
+                                .canonical_root_path
+                                .as_ref()
+                                .is_some_and(|path| rejection.source_path().starts_with(path))
+                    })
+            });
             let vanished = state
                 .sources
                 .iter()
@@ -1693,6 +1711,19 @@ impl SessionIndex {
             })
     }
 
+    fn source_is_rejected(
+        &self,
+        source: &DiscoveredRetainedJsonlSource,
+        fingerprint: ModelSourceFastFingerprint,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .rejections
+            .get(&source.source_key)
+            .is_some_and(|rejection| rejection.is_current(&source.canonical_path, fingerprint))
+    }
+
     pub(crate) fn sync_source(
         &self,
         source: &DiscoveredRetainedJsonlSource,
@@ -1713,6 +1744,9 @@ impl SessionIndex {
                 .and_then(|metadata| {
                     model_source_fast_fingerprint(&metadata).map_err(|error| error.to_string())
                 })?;
+            if self.source_is_rejected(source, fingerprint) {
+                return Ok(0);
+            }
             if self.source_is_current(source, fingerprint)
                 && hints.is_none_or(|hints| {
                     self.state
@@ -1725,9 +1759,38 @@ impl SessionIndex {
             {
                 return Ok(0);
             }
-            let (mut extracted, fingerprint) =
-                read_extracted_session(source.provider, &source.canonical_path)?;
-            self.replace_retained_source(source, fingerprint, &mut extracted, hostname, hints)
+            match read_extracted_session(source.provider, &source.canonical_path) {
+                Ok((mut extracted, fingerprint)) => self.replace_retained_source(
+                    source,
+                    fingerprint,
+                    &mut extracted,
+                    hostname,
+                    hints,
+                ),
+                Err(error) => {
+                    if error.permanent
+                        && let Some(rejection) =
+                            crate::transcript_identity::SourceRejection::capture(
+                                &source.canonical_path,
+                                fingerprint,
+                                &error.message,
+                            )
+                    {
+                        log::warn!(
+                            "Search source rejected; retaining last-good documents: {}",
+                            rejection.message
+                        );
+                        self.state
+                            .lock()
+                            .unwrap()
+                            .rejections
+                            .insert(source.source_key.clone(), rejection);
+                        Ok(0)
+                    } else {
+                        Err(error.message)
+                    }
+                }
+            }
         })
     }
 
@@ -1838,6 +1901,7 @@ impl SessionIndex {
                 .map_err(|rollback| format!("{error}; rollback: {rollback}"))?;
             return Err(error);
         }
+        state.rejections.remove(&source.source_key);
         state.sources.insert(
             source.source_key.clone(),
             IndexedSource {
@@ -2586,7 +2650,7 @@ pub struct HookInvocation {
 
 const TOOL_RESULT_DETAILS_MAX_BYTES: usize = 10_240;
 
-fn truncate(s: &str, max_len: usize) -> String {
+pub(crate) fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
@@ -2601,7 +2665,7 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-fn pi_tool_result_details(value: Option<&serde_json::Value>) -> Option<String> {
+pub(crate) fn pi_tool_result_details(value: Option<&serde_json::Value>) -> Option<String> {
     value
         .and_then(serde_json::Value::as_object)
         .and_then(|details| serde_json::to_string(details).ok())
@@ -3733,24 +3797,68 @@ pub fn extract_messages_from_jsonl(provider: IntegrationProvider, path: &Path) -
     }
 }
 
+#[derive(Debug)]
+struct SourceExtractionError {
+    message: String,
+    permanent: bool,
+}
+impl std::fmt::Display for SourceExtractionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl From<SourceExtractionError> for String {
+    fn from(error: SourceExtractionError) -> Self {
+        error.message
+    }
+}
+impl SourceExtractionError {
+    fn permanent(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: error.to_string(),
+            permanent: true,
+        }
+    }
+    fn read(error: crate::transcript_identity::StableTranscriptReadError) -> Self {
+        let permanent = matches!(
+            error,
+            crate::transcript_identity::StableTranscriptReadError::SourceTooLarge
+                | crate::transcript_identity::StableTranscriptReadError::ResourceLimit(_)
+        );
+        Self {
+            message: error.to_string(),
+            permanent,
+        }
+    }
+    fn pi(error: crate::pi_session::PiSessionParseError) -> Self {
+        match error {
+            crate::pi_session::PiSessionParseError::Stream(error) => Self::read(error),
+            error => Self::permanent(error),
+        }
+    }
+}
+
 /// Bounded stable reads fail explicitly so writers retain last-known-good docs.
 fn read_extracted_session(
     provider: IntegrationProvider,
     path: &Path,
-) -> Result<(ExtractedSession, ModelSourceFastFingerprint), String> {
+) -> Result<(ExtractedSession, ModelSourceFastFingerprint), SourceExtractionError> {
     let path = path.to_path_buf();
     crate::transcript_work::decode(move || {
+        if provider == IntegrationProvider::Pi {
+            let (session, fingerprint, _) = crate::pi_session::read_stable_pi_session(&path)
+                .map_err(SourceExtractionError::pi)?;
+            return Ok((extract_pi_session(&path, session), fingerprint));
+        }
         let (bytes, fingerprint) = crate::transcript_identity::read_stable_transcript(&path)
-            .map_err(|error| error.to_string())?;
-        let contents = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
-        let extracted = if provider == IntegrationProvider::Pi {
-            let session = crate::pi_session::parse_pi_session_jsonl(contents)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "Missing supported Pi session header".to_owned())?;
-            extract_pi_session(&path, session)
-        } else {
-            extract_messages_from_jsonl_contents(provider, &path, contents)
-        };
+            .map_err(SourceExtractionError::read)?;
+        let contents = std::str::from_utf8(&bytes).map_err(SourceExtractionError::permanent)?;
+        let extracted = extract_messages_from_jsonl_contents(provider, &path, contents);
+        if extracted.session_id.is_empty() {
+            return Err(SourceExtractionError::permanent(
+                "provider-native identity is missing",
+            ));
+        }
         Ok((extracted, fingerprint))
     })
 }
@@ -3901,11 +4009,7 @@ pub(crate) fn extract_pi_session(
             else {
                 continue;
             };
-            let output = entry
-                .message
-                .get("content")
-                .map(pi_message_text)
-                .map(|value| truncate(&value, 10_240));
+            let output = entry.tool_output;
             let is_error = Some(
                 entry
                     .message
@@ -3913,7 +4017,7 @@ pub(crate) fn extract_pi_session(
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
             );
-            let details_json = pi_tool_result_details(entry.message.get("details"));
+            let details_json = entry.tool_details;
             let result_image_count = Some(pi_tool_result_image_count(entry.message.get("content")));
             if let Some(tool_entry) = tool_use_map.get(tool_use_id)
                 && let Some(message) = messages.get_mut(tool_entry.message_idx)
@@ -4200,7 +4304,7 @@ fn pi_code_change_lines(tool_name: &str, input: Option<&serde_json::Value>) -> O
     }
 }
 
-fn pi_message_text(content: &serde_json::Value) -> String {
+pub(crate) fn pi_message_text(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(text) => text.clone(),
         serde_json::Value::Array(blocks) => blocks
@@ -7405,17 +7509,18 @@ mod tests {
         let sources_after_first_sweep = index.state.lock().unwrap().sources.clone();
         assert_eq!(
             sources_after_first_sweep.len(),
-            4,
-            "every discovered transcript, including the poisoned one, is fingerprinted"
+            3,
+            "successful checkpoints are separate from rejected sources"
         );
         assert_eq!(
             sources_after_first_sweep
                 .values()
                 .filter(|indexed| indexed.session_id.is_empty())
                 .count(),
-            1,
-            "the unresolvable source is remembered without a session id"
+            0,
+            "an unresolvable source must not claim a successful checkpoint"
         );
+        assert_eq!(index.state.lock().unwrap().rejections.len(), 1);
 
         assert_eq!(
             index.sync_without_emit().expect("second sweep"),
@@ -7430,7 +7535,27 @@ mod tests {
 
         fs::remove_file(codex.join("rollout-healthy-1.jsonl")).expect("remove one transcript");
         assert_eq!(index.sync_without_emit().expect("third sweep"), 0);
-        assert_eq!(index.state.lock().unwrap().sources.len(), 3);
+        assert_eq!(index.state.lock().unwrap().sources.len(), 2);
+        fs::remove_file(codex.join("rollout-poison.jsonl")).unwrap();
+        let mut incomplete = enumerate_retained_jsonl_source_roots();
+        for root in &mut incomplete {
+            if root.provider == IntegrationProvider::Codex {
+                root.outcome = ProviderRootEnumerationOutcome::Failed {
+                    diagnostic: "incomplete fixture".into(),
+                };
+            }
+        }
+        index.sync_inner(&incomplete).unwrap();
+        assert_eq!(
+            index.state.lock().unwrap().rejections.len(),
+            1,
+            "incomplete inventory cannot prune rejection metadata"
+        );
+        index.sync_without_emit().unwrap();
+        assert!(
+            index.state.lock().unwrap().rejections.is_empty(),
+            "complete inventory prunes vanished rejection metadata"
+        );
         index.reader.reload().expect("reload index");
         assert_eq!(
             index

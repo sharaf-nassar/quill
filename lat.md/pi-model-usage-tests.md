@@ -96,9 +96,9 @@ Sessions rows carry the registry session name and the range-scoped failed tool-c
 
 ## Pi Scoped Reingest Marker
 
-Historical Pi analytics backfill must bypass freshness only for Pi roots and clear its marker only after complete Pi success.
+Historical Pi backfill bypasses freshness only for Pi roots and clears its marker after complete inventory and settled attempts, including current-policy content rejections.
 
-`transcript_analytics::tests::pi_scoped_reingest_retries_and_clears_once_after_success` seeds unchanged Claude and Pi sources, removes retained Pi reasoning evidence, and arms only `pi_transcript_analytics_reingest_pending`. It proves Claude keeps its fast-path sentinel while Pi reparses, a failing Pi sibling keeps the marker armed across repeated idempotent retries, repairing that sibling restores the expected evidence, the successful pass deletes the marker exactly once, and the next ordinary pass replaces nothing. Migration 48 separately pins that it arms this Pi marker without setting the global all-provider marker.
+`transcript_analytics::tests::pi_scoped_reingest_retries_and_clears_once_after_success` seeds unchanged Claude and Pi sources, removes retained Pi reasoning evidence, and arms only `pi_transcript_analytics_reingest_pending`. It proves Claude keeps its fast-path sentinel while Pi reparses, a permanently rejected Pi sibling does not pin the marker, repeated passes retain its diagnostic without reparsing, repairing that sibling restores the expected evidence, and the marker is deleted exactly once. Migration 48 separately pins that it arms this Pi marker without setting the global all-provider marker.
 
 ## Pi Backfill Starvation Budget
 

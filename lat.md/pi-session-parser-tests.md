@@ -6,7 +6,9 @@ lat:
 
 These tests pin the shared persisted Pi parser used by search indexing and source snapshots, plus bounded notify header probes.
 
-Production decoding consumes owned JSON records line by line without cloning a whole Pi tree; summary/tracking base metadata deserializes by reference. Both owning file readers enforce the stable 256 MiB raw-input cap; full-input tracking/version validation and original source ordinals remain unchanged.
+Production Pi reads stream physical JSONL records instead of buffering the whole file. Original bytes, including ignored payloads and malformed lines, feed SHA-256; open-handle and path stability are checked before acceptance. Limits are 4 GiB input, 256 MiB per record, 100000 records, and 256 MiB serialized retained evidence. Exceeding a limit rejects the new version without truncating conversation text or replacing last-good rows. These limits bound input and retained representation, not an exact allocator-byte ceiling.
+
+Tool output retains its existing 10 KiB preview, oversized tool details remain absent under the existing rule, and image payloads and thinking bodies are discarded after their type evidence is recorded. Native usage, tools, summaries, ordinals, and complete user/assistant text remain available.
 
 ## V3 Message Entries
 
@@ -39,6 +41,24 @@ Exact `quill-tracking` entries are different: malformed or unsupported tracking 
 Supported `quill-tracking` entries decode through the exact protocol-v2 validator while preserving entry identity and source ordinal.
 
 Native message usage, model-change, tool, skill, lifecycle, receipt, and search evidence remain available from the same parse; tracking rows never become searchable content, and invalid lifecycle tracking produces a typed parse failure. `tool_span`/`thinking_span` entries are routed to the span decoder instead and a malformed span is retained undecoded for the fold's bounded diagnostic.
+
+## Historical Self Resume
+
+Only persisted `session_start` records with reason `resume` and equal previous/current ids have the redundant previous id removed before strict validation.
+
+`pi_session::stream_tests::historical_self_resume_is_repaired_only_on_disk` checks recovery, unchanged live rejection, and rejection of fork self-links and unexpected fields. Source files are never rewritten.
+
+## Streaming Evidence And Hash
+
+Streaming and in-memory parsing produce equal retained evidence and ordinals, while the fingerprint hashes exact original bytes rather than normalized records.
+
+`pi_session::stream_tests::streaming_preserves_evidence_ordinals_and_original_hash` includes malformed and ignored lines and rejects invalid UTF-8.
+
+## Streaming Version Drift
+
+A file changed during streaming is retried before its decoded result can escape; oversized records fail within a bounded read.
+
+`pi_session::stream_tests::streaming_retries_changed_source_and_bounds_records` checks version replacement, original-content hashing, and a sparse oversized record.
 
 ## Ephemeral Sessions
 

@@ -106,7 +106,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 48;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 49;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StartupMigrationPlan {
@@ -635,6 +635,7 @@ pub(crate) struct StoredTranscriptAnalyticsSource {
     pub(crate) last_error: Option<String>,
     pub(crate) suppressed_sha256: Option<String>,
     pub(crate) suppressed_at_ms: Option<i64>,
+    pub(crate) rejection: Option<crate::transcript_identity::SourceRejection>,
 }
 
 pub(crate) struct UnchangedTranscriptAnalyticsSource<'a> {
@@ -769,6 +770,7 @@ pub(crate) struct StoredModelSource {
     pub(crate) source_root_key: String,
     pub(crate) source_path: PathBuf,
     pub(crate) fast_fingerprint: Option<ModelSourceFastFingerprint>,
+    pub(crate) rejection: Option<crate::transcript_identity::SourceRejection>,
     pub(crate) content_sha256: Option<String>,
     pub(crate) processing_status: SourceProcessingStatus,
     pub(crate) last_error: Option<ModelUsageDiagnostic>,
@@ -2014,7 +2016,7 @@ const MODEL_SOURCE_STATE_COLUMNS: &str = "
     first_activity_at_ms, last_activity_at_ms, mtime_ns, size_bytes,
     content_sha256, last_error, suppressed_sha256, suppressed_at_ms,
     seen_generation, processing_status, observation_count,
-    last_attempt_at_ms, last_success_at_ms";
+    last_attempt_at_ms, last_success_at_ms, rejection";
 
 /// Read-path filter selecting active (non-suppressed) model-source ownership.
 /// Deletion keeps each removed fingerprint as durable suppression, so every
@@ -2058,6 +2060,7 @@ struct RawStoredModelSource {
     observation_count: i64,
     last_attempt_at_ms: Option<i64>,
     last_success_at_ms: Option<i64>,
+    rejection: Option<String>,
 }
 
 struct PreparedModelObservation<'a> {
@@ -2333,7 +2336,9 @@ pub(crate) fn classify_model_source_change(
         };
     }
 
-    if existing.content_sha256.as_deref() == Some(content_sha256) {
+    if existing.processing_status == SourceProcessingStatus::Ok
+        && existing.content_sha256.as_deref() == Some(content_sha256)
+    {
         ModelSourceChange::ContentUnchanged
     } else {
         ModelSourceChange::ContentChanged
@@ -2367,6 +2372,7 @@ fn read_raw_model_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawStoredM
         observation_count: row.get(22)?,
         last_attempt_at_ms: row.get(23)?,
         last_success_at_ms: row.get(24)?,
+        rejection: row.get(25)?,
     })
 }
 
@@ -2426,6 +2432,13 @@ fn stored_model_source_from_raw(
         source_root_key: row.source_root_key,
         source_path,
         fast_fingerprint,
+        rejection: row
+            .rejection
+            .map(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|error| format!("Invalid model rejection checkpoint: {error}"))
+            })
+            .transpose()?,
         content_sha256: row.content_sha256,
         processing_status,
         last_error: row
@@ -6216,7 +6229,7 @@ impl Storage {
                         session_name, cwd, hostname, mtime_ns, size_bytes,
                         content_sha256, seen_generation, processing_status, last_attempt_at_ms,
                         last_success_at_ms, last_error, suppressed_sha256,
-                        suppressed_at_ms
+                        suppressed_at_ms, rejection
                  FROM transcript_analytics_sources
                  WHERE provider = ?1 AND source_root_key = ?2
                  ORDER BY source_key",
@@ -6249,6 +6262,18 @@ impl Storage {
                     last_error: row.get(20)?,
                     suppressed_sha256: row.get(21)?,
                     suppressed_at_ms: row.get(22)?,
+                    rejection: row
+                        .get::<_, Option<String>>(23)?
+                        .map(|json| {
+                            serde_json::from_str(&json).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    23,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                        })
+                        .transpose()?,
                 })
             })
             .map_err(|error| format!("Read transcript source root inventory: {error}"))?;
@@ -6429,17 +6454,27 @@ impl Storage {
     ) -> Result<(), String> {
         let bounded_error = source.error.chars().take(1024).collect::<String>();
         let now = chrono::Utc::now().timestamp_millis();
-        let (failed_mtime_ns, failed_size_bytes) = match source.failed_stat {
-            Some((mtime_ns, size_bytes)) => (Some(mtime_ns), Some(size_bytes)),
-            None => (None, None),
-        };
+        let rejection = source
+            .failed_stat
+            .filter(|_| source.fingerprint_failure)
+            .and_then(|(mtime_ns, size_bytes)| {
+                crate::transcript_identity::SourceRejection::capture(
+                    source.source_path,
+                    crate::transcript_identity::ModelSourceFastFingerprint {
+                        mtime_ns,
+                        size_bytes,
+                    },
+                    source.error,
+                )
+            })
+            .map(|rejection| serde_json::to_string(&rejection).expect("rejection serialization"));
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO transcript_analytics_sources (
                  provider, source_key, source_root_key, source_path,
                  seen_generation, processing_status, last_attempt_at_ms,
-                 last_error, mtime_ns, size_bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'failed', ?6, ?7, ?8, ?9)
+                 last_error, rejection
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'failed', ?6, ?7, ?8)
              ON CONFLICT(provider, source_key) DO UPDATE SET
                  source_root_key = excluded.source_root_key,
                  source_path = excluded.source_path,
@@ -6452,8 +6487,7 @@ impl Storage {
                  END,
                  last_attempt_at_ms = excluded.last_attempt_at_ms,
                  last_error = excluded.last_error,
-                 mtime_ns = CASE WHEN ?10 THEN excluded.mtime_ns ELSE NULL END,
-                 size_bytes = CASE WHEN ?10 THEN excluded.size_bytes ELSE NULL END
+                 rejection = excluded.rejection
              WHERE transcript_analytics_sources.seen_generation
                    <= excluded.seen_generation",
             params![
@@ -6464,9 +6498,7 @@ impl Storage {
                 source.generation,
                 now,
                 bounded_error,
-                failed_mtime_ns,
-                failed_size_bytes,
-                source.fingerprint_failure,
+                rejection,
             ],
         )
         .map_err(|error| format!("Record transcript analytics failure: {error}"))?;
@@ -7315,6 +7347,7 @@ impl Storage {
                      source_kind = 'transcript',
                      suppressed_sha256 = NULL,
                      suppressed_at_ms = NULL,
+                     rejection = NULL,
                      last_error = NULL
                  WHERE transcript_analytics_sources.seen_generation
                        <= excluded.seen_generation",
@@ -10708,6 +10741,22 @@ impl Storage {
                 .map_err(|e| format!("Migration 48 commit: {e}"))?;
         }
 
+        if current_version < 49 {
+            let tx = conn
+                .transaction()
+                .map_err(|error| format!("Migration 49 begin: {error}"))?;
+            for table in ["transcript_analytics_sources", "model_observation_sources"] {
+                if !table_has_column(&tx, table, "rejection") {
+                    tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN rejection TEXT;"))
+                        .map_err(|error| format!("Migration 49 rejection column: {error}"))?;
+                }
+            }
+            tx.execute_batch("INSERT INTO schema_version (version) VALUES (49);")
+                .map_err(|error| format!("Migration 49 rejection checkpoints: {error}"))?;
+            tx.commit()
+                .map_err(|error| format!("Migration 49 commit: {error}"))?;
+        }
+
         report_migration_progress(
             progress,
             "finalizing",
@@ -14066,6 +14115,7 @@ impl Storage {
                      mtime_ns = ?5,
                      size_bytes = ?6,
                      last_error = NULL,
+                     rejection = NULL,
                      seen_generation = ?7,
                      processing_status = 'ok',
                      last_attempt_at_ms = ?8
@@ -14510,6 +14560,7 @@ impl Storage {
                 size_bytes = excluded.size_bytes,
                 content_sha256 = excluded.content_sha256,
                 last_error = NULL,
+                rejection = NULL,
                 suppressed_sha256 = NULL,
                 suppressed_at_ms = NULL,
                 seen_generation = excluded.seen_generation,
@@ -14556,13 +14607,16 @@ impl Storage {
 
     /// Mark a source attempt failed while retaining last-known-good rows and
     /// preserving any durable suppression until replacement commits.
-    pub(crate) fn mark_model_source_failure(
+    pub(crate) fn mark_model_source_failure_with_rejection(
         &self,
         source: &NormalizedSource,
         fast: Option<ModelSourceFastFingerprint>,
         diagnostic: &ModelUsageDiagnostic,
         attempted_at_ms: i64,
+        rejection: Option<&crate::transcript_identity::SourceRejection>,
     ) -> Result<(), String> {
+        let rejection = rejection
+            .map(|rejection| serde_json::to_string(rejection).expect("rejection serialization"));
         validate_normalized_model_source(source)?;
         validate_nonnegative_model_source_value(attempted_at_ms, "last_attempt_at_ms")?;
         if let Some(fast) = fast
@@ -14604,8 +14658,7 @@ impl Storage {
              ON CONFLICT(provider, source_key) DO UPDATE SET
                 source_root_key = excluded.source_root_key,
                 source_path = excluded.source_path,
-                mtime_ns = COALESCE(excluded.mtime_ns, model_observation_sources.mtime_ns),
-                size_bytes = COALESCE(excluded.size_bytes, model_observation_sources.size_bytes),
+                rejection = ?21,
                 last_error = excluded.last_error,
                 seen_generation = excluded.seen_generation,
                 processing_status = CASE
@@ -14640,9 +14693,12 @@ impl Storage {
                 diagnostic.as_str(),
                 source.seen_generation,
                 attempted_at_ms,
+                rejection,
             ],
         )
         .map_err(|error| format!("Mark model source processing failure: {error}"))?;
+        tx.execute("UPDATE model_observation_sources SET rejection = ?3 WHERE provider = ?1 AND source_key = ?2", params![source.provider.as_str(), source.source_key, rejection])
+            .map_err(|error| format!("Persist model rejection: {error}"))?;
         // A first failed source can still add unsuppressed retained-session
         // ownership, so conservatively invalidate active pages on every
         // committed failure-state write.
@@ -14650,6 +14706,24 @@ impl Storage {
         tx.commit()
             .map_err(|error| format!("Commit model source processing failure: {error}"))?;
 
+        Ok(())
+    }
+
+    /// Preserve an enumerated source through generation-based pruning without
+    /// rewriting its rejection, last attempt, or last-good evidence.
+    pub(crate) fn mark_model_source_seen(
+        &self,
+        provider: IntegrationProvider,
+        source_key: &str,
+        generation: i64,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE model_observation_sources SET seen_generation = ?3
+             WHERE provider = ?1 AND source_key = ?2 AND seen_generation < ?3",
+            params![provider.as_str(), source_key, generation],
+        )
+        .map_err(|error| format!("Mark enumerated model source seen: {error}"))?;
         Ok(())
     }
 
@@ -23031,7 +23105,9 @@ mod tests {
                  'transcript_analytics_reingest_pending',
                  'pi_transcript_analytics_reingest_pending'
              );
-             DELETE FROM schema_version WHERE version = 48;",
+             ALTER TABLE transcript_analytics_sources DROP COLUMN rejection;
+             ALTER TABLE model_observation_sources DROP COLUMN rejection;
+             DELETE FROM schema_version WHERE version >= 48;",
         )
         .expect("rewind analytics capture migration");
     }
@@ -23443,7 +23519,7 @@ mod tests {
                 |row| row.get::<_, i32>(0),
             )
             .expect("read migrated schema"),
-            48
+            MAX_SUPPORTED_SCHEMA_VERSION
         );
         assert_eq!(
             conn.query_row(
@@ -23969,7 +24045,7 @@ mod tests {
                     |row| row.get::<_, i32>(0),
                 )
                 .expect("read migrated schema"),
-            48
+            MAX_SUPPORTED_SCHEMA_VERSION
         );
         drop(migrated);
         let reopened = Storage::init_at(db.clone(), false).expect("reopen migrated database");
@@ -24049,7 +24125,7 @@ mod tests {
                     |row| row.get::<_, i32>(0),
                 )
                 .expect("read resumed schema"),
-            48
+            MAX_SUPPORTED_SCHEMA_VERSION
         );
         clear_env();
     }
@@ -29214,7 +29290,7 @@ mod tests {
                 |row| row.get::<_, i32>(0),
             )
             .expect("read schema version"),
-            48
+            MAX_SUPPORTED_SCHEMA_VERSION
         );
         for column in [
             "event_uuid",
@@ -33019,13 +33095,19 @@ mod tests {
             let metadata = std::fs::metadata(&self.transcript).expect("stat transcript");
             let stat = crate::transcript_identity::model_source_fast_fingerprint(&metadata)
                 .expect("fingerprint transcript");
+            let rejection = crate::transcript_identity::SourceRejection::capture(
+                &self.transcript,
+                stat,
+                "seeded failure",
+            )
+            .unwrap();
             let conn = self.storage.conn.lock().unwrap();
             conn.execute(
                 "UPDATE transcript_analytics_sources
                  SET processing_status = 'failed', last_error = 'seeded failure',
-                     mtime_ns = ?2, size_bytes = ?3, last_attempt_at_ms = 1
+                     rejection = ?2, last_attempt_at_ms = 1
                  WHERE provider = 'claude' AND source_key = ?1",
-                params![self.source_key, stat.mtime_ns(), stat.size_bytes()],
+                params![self.source_key, serde_json::to_string(&rejection).unwrap()],
             )
             .expect("mark source failed at its current fingerprint");
         }
@@ -33165,7 +33247,7 @@ mod tests {
         assert_eq!(status, "ok", "changed content must be reparsed in full");
         assert_ne!(attempt, Some(1));
 
-        // So is the durable reingest marker, even at an identical fingerprint.
+        // A current-policy rejection is settled even during forced reingest.
         fixture.mark_failed_at_current_fingerprint();
         fixture
             .storage
@@ -33174,8 +33256,8 @@ mod tests {
         fixture.reconcile();
         assert_eq!(
             fixture.registry_state().0,
-            "ok",
-            "a forced reparse must retry a content-deterministic failure"
+            "failed",
+            "a current-policy rejection must not pin forced reingest forever"
         );
         clear_env();
     }

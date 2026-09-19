@@ -16,7 +16,39 @@ One source budget covers decoding through stalled consumption; the fixed decoder
 
 Overlapping source consumers preserve appends and last-good data while unchanged versions skip decoding.
 
-`transcript_analytics::tests::shared_notify_sweep_versions_append_hints_and_failures_preserve_both_consumers` overlaps two real owning calls while a Tantivy writer stalls the first, appends during that work, and checks the appended message survives. Subsequent identical admissions perform zero decodes. New Search hints re-extract Search only, identical hints do nothing, and watcher admission cannot erase hints. An injected SQLite insert failure preserves previous analytics while Search succeeds; analytics retry leaves the successful Search checkpoint unchanged. A sparse source exceeding 256 MiB preserves both last-good consumers.
+`transcript_analytics::tests::shared_notify_sweep_versions_append_hints_and_failures_preserve_both_consumers` overlaps two real owning calls while a Tantivy writer stalls the first, appends during that work, and checks the appended message survives. Subsequent identical admissions perform zero decodes. New Search hints re-extract Search only, identical hints do nothing, and watcher admission cannot erase hints. An injected SQLite insert failure preserves previous analytics while Search succeeds; analytics retry leaves the successful Search checkpoint unchanged. A sparse Pi source exceeding the 4 GiB streaming input budget preserves both last-good consumers and settles as a durable rejection rather than retryable work.
+
+## Durable Rejections
+
+A failed source version is remembered separately from successful Search and analytics checkpoints; identical rejected versions perform no decode or diagnostic rewrite.
+
+`transcript_analytics::tests::rejected_versions_preserve_success_and_rearm_on_change` checks successful rows and fingerprints survive rejection, Search rejection survives reopen, and changed valid content clears both rejections. Checkpoints include canonical path, nanosecond mtime, size, and parser policy; legacy failures require revalidation. Infrastructure failures remain retryable.
+
+## Empty Codex Recovery
+
+An empty rollout is rejected without inventing native identity; unchanged rejection survives restart, and the producer's first valid append rearms both consumers.
+
+`model_usage::tests::empty_codex_rejection_survives_reopen_and_recovers_after_append` checks durable model and Search rejection, no successful empty Search checkpoint, preservation through a new model inventory generation without rewriting attempt diagnostics, and normal replacement after `session_meta` arrives.
+
+## Rejection Policy Invalidation
+
+Negative checkpoints are valid only for their canonical path, source fingerprint, and decoder policy; diagnostics are bounded independently of input size.
+
+`transcript_identity::rejection_tests::changed_source_or_parser_policy_rearms_a_rejection` checks policy upgrades, path changes, changed bytes, the 1024-character diagnostic cap, and refusal to record a raced source.
+
+## Finite Live Retry Budget
+
+Six failed attempts retire one queued revision so a broken dependency cannot keep the immediate drain alive forever; recovery can admit a fresh revision.
+
+`tests::retained_source_retry_budget_yields_to_recovery` exercises the real queue without sleeps and verifies a later admission resets the failure count.
+
+## Large Streamed Pi Source
+
+A 400 MiB synthetic Pi file must preserve complete searchable messages, tool-result previews, and native usage while staying below 2 GiB peak RSS in an isolated process.
+
+Qualification on 2026-09-19 (Linux, default allocator, isolated synthetic data): the 400 MiB tool-output case passed in 31.32 seconds with 164752 KiB peak RSS. The existing 244 MiB text-heavy case passed four growing versions, peaking at 857228 KiB RSS with zero swap and one decode per changed version. These are workload-specific measurements, not a universal RSS guarantee.
+
+`transcript_analytics::tests::large_pi_stream_preserves_search_tools_and_usage_under_memory_budget` is ignored by default. Run alone with `uv run --locked --project claude-integration/mcp cargo test large_pi_stream_preserves_search_tools_and_usage_under_memory_budget -- --ignored --nocapture --test-threads=1` from `src-tauri/`. Twenty 20 MiB tool results exercise raw input beyond the former 256 MiB cap without retaining their discarded tails. This qualifies large tool-output-heavy sources, not unlimited conversation text or arbitrary JSON expansion.
 
 ## Fanout Hint And Failure Ownership
 

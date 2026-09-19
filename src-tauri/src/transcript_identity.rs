@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::Metadata;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -32,6 +32,67 @@ impl ModelSourceFastFingerprint {
 
     pub(crate) const fn size_bytes(self) -> i64 {
         self.size_bytes
+    }
+}
+
+/// A content rejection is distinct from the last successful checkpoint.
+/// Increment the policy when decoding rules change so old failures are retried.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SourceRejection {
+    path: PathBuf,
+    fingerprint: ModelSourceFastFingerprint,
+    policy: u32,
+    pub(crate) message: String,
+}
+
+impl SourceRejection {
+    const POLICY: u32 = 1;
+
+    pub(crate) fn capture(
+        path: &Path,
+        before: ModelSourceFastFingerprint,
+        message: &str,
+    ) -> Option<Self> {
+        let after = model_source_fast_fingerprint(&std::fs::metadata(path).ok()?).ok()?;
+        (before == after).then(|| Self {
+            path: path.to_owned(),
+            fingerprint: before,
+            policy: Self::POLICY,
+            message: message.chars().take(1024).collect(),
+        })
+    }
+
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn is_current(&self, path: &Path, fingerprint: ModelSourceFastFingerprint) -> bool {
+        self.policy == Self::POLICY && self.path == path && self.fingerprint == fingerprint
+    }
+}
+
+#[cfg(test)]
+mod rejection_tests {
+    use super::*;
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Rejection Policy Invalidation]]
+    #[test]
+    fn changed_source_or_parser_policy_rearms_a_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.jsonl");
+        std::fs::write(&path, "bad").unwrap();
+        let before = model_source_fast_fingerprint(&std::fs::metadata(&path).unwrap()).unwrap();
+        let mut rejected = SourceRejection::capture(&path, before, &"x".repeat(2048)).unwrap();
+        assert_eq!(rejected.message.len(), 1024);
+        assert!(rejected.is_current(&path, before));
+        rejected.policy = 0;
+        assert!(!rejected.is_current(&path, before));
+        rejected.policy = SourceRejection::POLICY;
+        assert!(!rejected.is_current(&dir.path().join("different"), before));
+        std::fs::write(&path, "changed bytes").unwrap();
+        let after = model_source_fast_fingerprint(&std::fs::metadata(&path).unwrap()).unwrap();
+        assert!(!rejected.is_current(&path, after));
+        assert!(SourceRejection::capture(&path, before, "stale failure").is_none());
     }
 }
 
@@ -64,6 +125,7 @@ pub(crate) enum StableTranscriptReadError {
     Read(std::io::Error),
     InvalidMetadata,
     SourceTooLarge,
+    ResourceLimit(&'static str),
     UnstableSource,
 }
 
@@ -73,6 +135,7 @@ impl fmt::Display for StableTranscriptReadError {
             Self::Read(error) => write!(formatter, "cannot read retained transcript: {error}"),
             Self::InvalidMetadata => formatter.write_str("retained transcript metadata is invalid"),
             Self::SourceTooLarge => formatter.write_str("retained transcript exceeds 256 MiB"),
+            Self::ResourceLimit(message) => formatter.write_str(message),
             Self::UnstableSource => {
                 formatter.write_str("retained transcript changed during bounded read retries")
             }
@@ -168,6 +231,65 @@ pub(crate) fn read_stable_transcript(
         }
     }
     Err(StableTranscriptReadError::UnstableSource)
+}
+
+/// Stream a bounded source through one decoder while hashing original bytes.
+/// Nothing may commit until both the open handle and path still name this version.
+pub(crate) fn read_stable_stream<T, E>(
+    path: &Path,
+    max_bytes: u64,
+    mut decode: impl FnMut(&mut dyn BufRead) -> Result<T, E>,
+) -> Result<(T, ModelSourceFastFingerprint, String), E>
+where
+    E: From<StableTranscriptReadError>,
+{
+    struct HashedReader<R> {
+        inner: R,
+        hash: Sha256,
+        count: u64,
+    }
+    impl<R: Read> Read for HashedReader<R> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(bytes)?;
+            self.hash.update(&bytes[..count]);
+            self.count += count as u64;
+            Ok(count)
+        }
+    }
+    for _ in 0..STABLE_READ_MAX_ATTEMPTS {
+        let stat = |metadata: std::io::Result<Metadata>| {
+            stable_source_stat(&metadata.map_err(StableTranscriptReadError::Read)?)
+        };
+        let before = stat(std::fs::metadata(path))?;
+        if before.fast.size_bytes() as u64 > max_bytes {
+            return Err(StableTranscriptReadError::ResourceLimit(
+                "Pi transcript exceeds 4 GiB streaming input budget",
+            )
+            .into());
+        }
+        let file = std::fs::File::open(path).map_err(StableTranscriptReadError::Read)?;
+        if stat(file.metadata())? != before {
+            continue;
+        }
+        let mut reader = BufReader::new(HashedReader {
+            inner: file.take(max_bytes + 1),
+            hash: Sha256::new(),
+            count: 0,
+        });
+        let result = decode(&mut reader);
+        let opened_after = stat(reader.get_ref().inner.get_ref().metadata())?;
+        let after = stat(std::fs::metadata(path))?;
+        if before != after || before != opened_after {
+            continue;
+        }
+        let value = result?;
+        let reader = reader.into_inner();
+        if reader.count != after.fast.size_bytes() as u64 {
+            return Err(StableTranscriptReadError::UnstableSource.into());
+        }
+        return Ok((value, after.fast, crate::hex_encode(reader.hash.finalize())));
+    }
+    Err(StableTranscriptReadError::UnstableSource.into())
 }
 
 /// Hash the exact stable bytes consumed by either analytics parser.

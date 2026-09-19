@@ -72,10 +72,12 @@ Filed as two beads:
 The flag mechanism itself was later removed. The Session Search sweep no
 longer reads any `*_reingest_pending` marker: it derives no analytics rows
 (retained reconciliation owns those and carries its own marker), and it
-remembers every attempted source, including one whose identity never
-resolves, under its canonical source key with an empty session id, so the
-failing file is skipped until its bytes change. There is no cache to clear
-and nothing left to loop on.
+originally remembered every attempted source under its canonical source
+key, including unresolved identity with an empty session id. `quill-2ozu`
+replaces that ambiguous successful checkpoint with a separate, versioned
+rejection. Unchanged invalid files stay skipped; their first valid append
+rearms ingestion without inventing identity or losing last-good evidence.
+See `retained-transcript-rejections-and-streaming.md` in this directory.
 
 `quill-w5bu` (P3) separately decides whether the chip may show a role at all;
 it is deliberately blocked on the two above, because the fallback only looks

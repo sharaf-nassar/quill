@@ -2072,6 +2072,7 @@ impl std::error::Error for ModelSourceReconciliationBatchError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StagedSourceAction {
+    RejectedUnchanged,
     FastUnchanged,
     ContentUnchanged,
     SuppressedUnchanged,
@@ -2087,6 +2088,7 @@ struct StagedModelSource {
     fingerprint: Option<ModelSourceFingerprint>,
     parsed: Option<ProviderAdapterParseResult>,
     diagnostic: Option<ModelUsageDiagnostic>,
+    rejection: Option<crate::transcript_identity::SourceRejection>,
 }
 
 impl StagedModelSource {
@@ -2920,6 +2922,7 @@ fn stage_model_source(
         fingerprint: None,
         parsed: None,
         diagnostic: None,
+        rejection: None,
     };
 
     let fast = match source_fast_fingerprint(&staged.discovered) {
@@ -2936,6 +2939,15 @@ fn stage_model_source(
         }
     };
     staged.fast = Some(fast);
+    if staged.existing.as_ref().is_some_and(|existing| {
+        existing
+            .rejection
+            .as_ref()
+            .is_some_and(|rejection| rejection.is_current(&staged.discovered.canonical_path, fast))
+    }) {
+        staged.action = StagedSourceAction::RejectedUnchanged;
+        return staged;
+    }
 
     match classify_model_source_change(staged.existing.as_ref(), fast, None) {
         ModelSourceChange::FastUnchanged => {
@@ -2981,6 +2993,18 @@ fn stage_source_content_inner(staged: &mut StagedModelSource, hostname: &str) {
         ));
         return;
     };
+    if expected_fast.size_bytes() as u64 > crate::transcript_identity::RETAINED_TRANSCRIPT_MAX_BYTES
+    {
+        staged.rejection = crate::transcript_identity::SourceRejection::capture(
+            &staged.discovered.canonical_path,
+            expected_fast,
+            "retained transcript exceeds 256 MiB",
+        );
+        staged.fail(ModelUsageDiagnostic::new(
+            ModelUsageDiagnosticKind::SourceReadFailed,
+        ));
+        return;
+    }
     let contents = match read_stable_source_bytes(&staged.discovered, expected_fast) {
         Ok(contents) => contents,
         Err(error) => {
@@ -3015,7 +3039,14 @@ fn stage_source_content_inner(staged: &mut StagedModelSource, hostname: &str) {
                     staged.action = StagedSourceAction::Replace;
                     staged.parsed = Some(parsed);
                 }
-                Err(diagnostic) => staged.fail(diagnostic),
+                Err(diagnostic) => {
+                    staged.rejection = crate::transcript_identity::SourceRejection::capture(
+                        &staged.discovered.canonical_path,
+                        expected_fast,
+                        diagnostic.as_str(),
+                    );
+                    staged.fail(diagnostic);
+                }
             }
         }
         ModelSourceChange::FastUnchanged | ModelSourceChange::ContentHashRequired => {
@@ -3105,10 +3136,10 @@ fn parse_model_source_inner(
 
     if matches!(
         result.native_identity,
-        ProviderNativeIdentityState::Conflicted
+        ProviderNativeIdentityState::Absent | ProviderNativeIdentityState::Conflicted
     ) {
         log::warn!(
-            "Model source {} contains conflicting provider-native identity metadata",
+            "Model source {} has missing or conflicting provider-native identity metadata",
             discovered.canonical_path.display()
         );
         Err(ModelUsageDiagnostic::new(
@@ -3681,6 +3712,17 @@ fn commit_staged_model_source_inner(
     let mut notify_data_changed = None;
 
     match staged.action {
+        StagedSourceAction::RejectedUnchanged => {
+            storage.mark_model_source_seen(provider, &staged.discovered.source_key, generation)?;
+            result.diagnostic = staged
+                .existing
+                .as_ref()
+                .and_then(|existing| existing.last_error.clone());
+            result.retained_last_good = staged
+                .existing
+                .as_ref()
+                .is_some_and(|existing| existing.last_good.last_success_at_ms.is_some());
+        }
         StagedSourceAction::FastUnchanged => {
             let fast = staged
                 .fast
@@ -3826,11 +3868,12 @@ fn commit_staged_model_source_inner(
                 Some(diagnostic.clone()),
                 attempted_at_ms,
             );
-            storage.mark_model_source_failure(
+            storage.mark_model_source_failure_with_rejection(
                 &normalized,
                 staged.fast,
                 &diagnostic,
                 attempted_at_ms,
+                staged.rejection.as_ref(),
             )?;
             if status_changed {
                 notify_data_changed = Some(false);
@@ -4059,6 +4102,92 @@ mod tests {
                 .observation_count,
             1
         );
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Empty Codex Recovery]]
+    #[test]
+    fn empty_codex_rejection_survives_reopen_and_recovers_after_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let source = DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Codex,
+            source_root_key: "codex:sessions",
+            source_key: "empty-rollout".into(),
+            canonical_path: path.clone(),
+            filesystem_path: path.clone(),
+            layout_hint: RetainedJsonlSourceLayoutHint::CodexTranscript,
+        };
+        let db = dir.path().join("usage.db");
+        let storage = Storage::init_at(db.clone(), false).unwrap();
+        let staged = stage_model_source(source.clone(), None, "host");
+        assert_eq!(staged.action, StagedSourceAction::Fail);
+        assert!(staged.rejection.is_some());
+        commit_staged_model_source(&storage, &staged, 0, ModelSourceCommitMode::Backfill).unwrap();
+        let index =
+            crate::sessions::SessionIndex::open_or_create_for_tests(&dir.path().join("index"))
+                .unwrap();
+        assert_eq!(index.sync_source(&source, "host").unwrap(), 0);
+        assert!(index.state.lock().unwrap().sources.is_empty());
+        assert_eq!(index.state.lock().unwrap().rejections.len(), 1);
+        index.save_state().unwrap();
+        drop(index);
+        drop(storage);
+        let storage = Storage::init_at(db, false).unwrap();
+        let stored = storage
+            .list_model_sources_for_root(source.provider, source.source_root_key)
+            .unwrap()
+            .remove(0);
+        let rejected = stage_model_source(source.clone(), Some(stored.clone()), "host");
+        assert_eq!(rejected.action, StagedSourceAction::RejectedUnchanged);
+        commit_staged_model_source(&storage, &rejected, 1, ModelSourceCommitMode::Backfill)
+            .unwrap();
+        let proof = CompletedModelSourceRoot::from_completed_inventory(
+            &ProviderSourceRoot {
+                provider: source.provider,
+                source_root_key: source.source_root_key,
+                resolved_root_path: dir.path().to_owned(),
+                canonical_root_path: Some(dir.path().to_owned()),
+                outcome: ProviderRootEnumerationOutcome::Complete,
+                sources: vec![source.clone()],
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            storage
+                .prune_model_sources_for_completed_root(&proof)
+                .unwrap()
+                .sources_pruned,
+            0,
+            "unchanged rejection must survive a new inventory generation"
+        );
+        let seen = storage
+            .list_model_sources_for_root(source.provider, source.source_root_key)
+            .unwrap()
+            .remove(0);
+        assert_eq!(seen.last_attempt_at_ms, stored.last_attempt_at_ms);
+        assert_eq!(seen.rejection, stored.rejection);
+        std::fs::write(&path, "{\"type\":\"session_meta\",\"timestamp\":\"2026-08-18T03:00:00Z\",\"payload\":{\"id\":\"recovered\",\"cwd\":\"/fixture\"}}\n{\"type\":\"event_msg\",\"timestamp\":\"2026-08-18T03:00:00Z\",\"payload\":{\"type\":\"agent_message\",\"message\":\"recoveredneedle\"}}\n").unwrap();
+        let staged = stage_model_source(
+            source.clone(),
+            Some(seen),
+            &crate::sessions::SessionIndex::local_hostname(),
+        );
+        assert_eq!(staged.action, StagedSourceAction::Replace);
+        commit_staged_model_source(&storage, &staged, 1, ModelSourceCommitMode::Backfill).unwrap();
+        assert!(
+            storage
+                .list_model_sources_for_root(source.provider, source.source_root_key)
+                .unwrap()[0]
+                .rejection
+                .is_none()
+        );
+        let index =
+            crate::sessions::SessionIndex::open_or_create_for_tests(&dir.path().join("index"))
+                .unwrap();
+        assert_eq!(index.sync_source(&source, "host").unwrap(), 1);
+        assert!(index.state.lock().unwrap().rejections.is_empty());
     }
 
     fn claude_context<'a>(

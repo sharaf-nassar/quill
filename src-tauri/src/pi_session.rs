@@ -40,6 +40,10 @@ pub(crate) struct PiMessageEntry {
     pub(crate) message: Value,
     #[serde(skip)]
     pub(crate) source_ordinal: u64,
+    #[serde(skip)]
+    pub(crate) tool_output: Option<String>,
+    #[serde(skip)]
+    pub(crate) tool_details: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -137,6 +141,8 @@ pub(crate) struct PiSession {
 #[derive(Debug)]
 pub(crate) enum PiSessionParseError {
     UnsupportedVersion(u64),
+    ResourceLimit(&'static str),
+    Stream(crate::transcript_identity::StableTranscriptReadError),
     InvalidTrackingEntry {
         source_ordinal: u64,
         code: PiProtocolV2ErrorCode,
@@ -152,6 +158,8 @@ pub(crate) enum PiSessionParseError {
 impl fmt::Display for PiSessionParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ResourceLimit(message) => formatter.write_str(message),
+            Self::Stream(error) => error.fmt(formatter),
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "pi session version {version} is unsupported")
             }
@@ -176,9 +184,134 @@ impl std::error::Error for PiSessionParseError {
         match self {
             #[cfg(test)]
             Self::Read { source, .. } => Some(source),
-            Self::UnsupportedVersion(_) | Self::InvalidTrackingEntry { .. } => None,
+            Self::Stream(error) => Some(error),
+            Self::ResourceLimit(_)
+            | Self::UnsupportedVersion(_)
+            | Self::InvalidTrackingEntry { .. } => None,
         }
     }
+}
+
+impl From<crate::transcript_identity::StableTranscriptReadError> for PiSessionParseError {
+    fn from(error: crate::transcript_identity::StableTranscriptReadError) -> Self {
+        Self::Stream(error)
+    }
+}
+
+/// Limits apply to one record and retained evidence, not whole-file buffering.
+const MAX_PI_RECORD_BYTES: u64 = crate::transcript_identity::RETAINED_TRANSCRIPT_MAX_BYTES;
+const MAX_PI_RETAINED_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PI_RECORDS: u64 = 100_000;
+
+pub(crate) fn read_stable_pi_session(
+    path: &Path,
+) -> Result<
+    (
+        PiSession,
+        crate::transcript_identity::ModelSourceFastFingerprint,
+        String,
+    ),
+    PiSessionParseError,
+> {
+    crate::transcript_identity::read_stable_stream(path, 4 * 1024 * 1024 * 1024, |reader| {
+        let mut ordinal = 0;
+        let mut failure = None;
+        let mut line = Vec::new();
+        let records = std::iter::from_fn(|| {
+            loop {
+                line.clear();
+                let count = match Read::take(&mut *reader, MAX_PI_RECORD_BYTES + 1)
+                    .read_until(b'\n', &mut line)
+                {
+                    Ok(count) => count,
+                    Err(error) => {
+                        failure = Some(PiSessionParseError::Stream(
+                            crate::transcript_identity::StableTranscriptReadError::Read(error),
+                        ));
+                        return None;
+                    }
+                };
+                if count == 0 {
+                    return None;
+                }
+                if count as u64 > MAX_PI_RECORD_BYTES || ordinal >= MAX_PI_RECORDS {
+                    failure = Some(PiSessionParseError::ResourceLimit(
+                        "Pi transcript exceeds 256 MiB record or 100000 record streaming budget",
+                    ));
+                    return None;
+                }
+                let current = ordinal;
+                ordinal += 1;
+                if std::str::from_utf8(&line).is_err() {
+                    failure = Some(PiSessionParseError::ResourceLimit(
+                        "Pi transcript is not valid UTF-8",
+                    ));
+                    return None;
+                }
+                if let Ok(value) = serde_json::from_slice::<Value>(&line)
+                    && value.is_object()
+                {
+                    return Some((current, value));
+                }
+            }
+        });
+        let parsed = parse_pi_session_records(records);
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        parsed?.ok_or(PiSessionParseError::ResourceLimit(
+            "missing supported Pi session header",
+        ))
+    })
+}
+
+// Keep precisely the evidence consumers use. In particular, tool output/details
+// already have display caps; images and thinking bodies were never indexed.
+fn compact_message(entry: &mut PiMessageEntry) {
+    let Some(message) = entry.message.as_object_mut() else {
+        return;
+    };
+    if message.get("role").and_then(Value::as_str) == Some("toolResult") {
+        entry.tool_output = message
+            .get("content")
+            .map(crate::sessions::pi_message_text)
+            .map(|text| crate::sessions::truncate(&text, 10_240));
+        entry.tool_details = crate::sessions::pi_tool_result_details(message.get("details"));
+        message.remove("details");
+        if let Some(Value::Array(content)) = message.get_mut("content") {
+            content.retain(|block| block.get("type").and_then(Value::as_str) == Some("image"));
+        } else {
+            message.remove("content");
+        }
+    }
+    if let Some(Value::Array(content)) = message.get_mut("content") {
+        for block in content {
+            if let Some(object) = block.as_object_mut()
+                && matches!(
+                    object.get("type").and_then(Value::as_str),
+                    Some("image" | "thinking")
+                )
+            {
+                object.retain(|key, _| key == "type");
+            }
+        }
+    }
+}
+
+fn retained_size(value: &Value) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).expect("JSON value serialization");
+    counter.0
 }
 
 #[cfg(test)]
@@ -251,11 +384,47 @@ pub(crate) fn parse_pi_session_records(
     let mut thinking_level_changes = Vec::new();
     let mut session_infos = Vec::new();
     let mut custom_messages = Vec::new();
+    let mut retained = 0usize;
     for (source_ordinal, value) in records {
+        if matches!(
+            value.get("type").and_then(Value::as_str),
+            Some(
+                "model_change"
+                    | "compaction"
+                    | "branch_summary"
+                    | "thinking_level_change"
+                    | "session_info"
+                    | "custom_message"
+            )
+        ) || (value.get("type").and_then(Value::as_str) == Some("custom")
+            && value.get("customType").and_then(Value::as_str) == Some("quill-tracking"))
+        {
+            retained = retained.saturating_add(retained_size(&value));
+        }
+        if retained > MAX_PI_RETAINED_BYTES {
+            return Err(PiSessionParseError::ResourceLimit(
+                "Pi retained evidence exceeds 256 MiB memory budget",
+            ));
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("message") => {
                 if let Ok(mut entry) = serde_json::from_value::<PiMessageEntry>(value) {
                     entry.source_ordinal = source_ordinal;
+                    compact_message(&mut entry);
+                    retained = retained
+                        .saturating_add(retained_size(&entry.message))
+                        .saturating_add(entry.tool_output.as_ref().map_or(0, String::len))
+                        .saturating_add(entry.tool_details.as_ref().map_or(0, String::len))
+                        .saturating_add(
+                            entry.base.id.len()
+                                + entry.base.timestamp.len()
+                                + entry.base.parent_id.as_ref().map_or(0, String::len),
+                        );
+                    if retained > MAX_PI_RETAINED_BYTES {
+                        return Err(PiSessionParseError::ResourceLimit(
+                            "Pi retained evidence exceeds 256 MiB memory budget",
+                        ));
+                    }
                     if version == 2
                         && entry.message.get("role").and_then(Value::as_str) == Some("hookMessage")
                     {
@@ -326,6 +495,16 @@ pub(crate) fn parse_pi_session_records(
                 object.remove("id");
                 object.remove("parentId");
                 object.remove("timestamp");
+                // Older reporters emitted a self-reference on same-file resume.
+                // Repair only that persisted shape, then run every strict check.
+                if let Some(data) = object.get_mut("data").and_then(Value::as_object_mut)
+                    && data.get("event").and_then(Value::as_str) == Some("session_start")
+                    && data.get("reason").and_then(Value::as_str) == Some("resume")
+                    && data.get("session_id").and_then(Value::as_str).is_some()
+                    && data.get("previous_session_id") == data.get("session_id")
+                {
+                    data.remove("previous_session_id");
+                }
                 let bytes =
                     serde_json::to_vec(&wire).expect("JSON value serialization cannot fail");
                 match base {
@@ -365,6 +544,10 @@ pub(crate) fn parse_pi_session_records(
         custom_messages,
     }))
 }
+
+#[cfg(test)]
+#[path = "pi_session/stream_tests.rs"]
+mod stream_tests;
 
 #[cfg(test)]
 mod tests {

@@ -639,6 +639,12 @@ impl RetainedSourceRunnerState {
                 work.failures = work.failures.saturating_add(1);
                 work.ready_at =
                     std::time::Instant::now() + model_usage_failure_retry_delay(work.failures);
+                if work.failures >= 6 {
+                    work.pending = false;
+                    log::warn!(
+                        "Live source retry budget exhausted; recovery will retry this source"
+                    );
+                }
             }
         }
         inner
@@ -938,6 +944,7 @@ async fn drain_transcript_analytics_live_queue(
                         }
                         Ok(
                             transcript_analytics::TranscriptSourceResult::SuppressedUnchanged
+                            | transcript_analytics::TranscriptSourceResult::Rejected
                             | transcript_analytics::TranscriptSourceResult::StaleGeneration,
                         ) => true,
                         Err(error) => {
@@ -6757,6 +6764,42 @@ mod tests {
         assert!(!queued.model.has_work());
         assert!(queued.transcript.pending);
         assert_eq!(queued.transcript.failures, 1);
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Finite Live Retry Budget]]
+    #[test]
+    fn retained_source_retry_budget_yields_to_recovery() {
+        let state = RetainedSourceRunnerState::new();
+        let source = retained_test_source("finite-retry");
+        state
+            .enqueue_live_source(source.clone(), RetainedLiveDomains::TRANSCRIPT)
+            .unwrap();
+        for _ in 0..6 {
+            for queued in state.inner.lock().unwrap().live_sources.values_mut() {
+                queued.transcript.ready_at = std::time::Instant::now();
+            }
+            let jobs = state.take_ready(RetainedLiveDomain::Transcript, 1);
+            assert_eq!(jobs.len(), 1);
+            state.finish(RetainedLiveDomain::Transcript, &jobs[0], false);
+        }
+        assert!(state.inner.lock().unwrap().live_sources.is_empty());
+        state
+            .enqueue_live_source(source, RetainedLiveDomains::TRANSCRIPT)
+            .unwrap();
+        assert_eq!(state.take_ready(RetainedLiveDomain::Transcript, 1).len(), 1);
+        assert_eq!(
+            state
+                .inner
+                .lock()
+                .unwrap()
+                .live_sources
+                .values()
+                .next()
+                .unwrap()
+                .transcript
+                .failures,
+            0
+        );
     }
 
     // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Live Source Coordinator Test Specs#Newer Notification Wins]]

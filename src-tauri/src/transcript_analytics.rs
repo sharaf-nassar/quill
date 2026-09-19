@@ -508,6 +508,7 @@ pub(crate) struct CompletedTranscriptSourceRoot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TranscriptSourceResult {
+    Rejected,
     Replaced,
     SuppressedUnchanged,
     StaleGeneration,
@@ -570,6 +571,7 @@ struct UnchangedTranscriptSource {
 /// Raw bytes of a source that must be re-parsed, read exactly once.
 struct ChangedTranscriptSourceBytes {
     bytes: Vec<u8>,
+    pi_path: Option<PathBuf>,
     stable_stat: ModelSourceFastFingerprint,
     content_sha256: String,
 }
@@ -637,9 +639,9 @@ fn classify_transcript_source_freshness(
         )));
     }
 
-    let (bytes, stable_stat) =
-        read_stable_transcript(&source.canonical_path).map_err(TranscriptAnalyticsError::from)?;
-    let content_sha256 = model_source_content_sha256(&bytes);
+    let changed = read_changed_transcript_source(source)?;
+    let stable_stat = changed.stable_stat;
+    let content_sha256 = &changed.content_sha256;
     if !force_full_reparse
         && existing.processing_status == "ok"
         && has_last_good_identity
@@ -659,29 +661,34 @@ fn classify_transcript_source_freshness(
                     generation,
                     mtime_ns: stable_stat.mtime_ns(),
                     size_bytes: stable_stat.size_bytes(),
-                    content_sha256: Some(content_sha256),
+                    content_sha256: Some(content_sha256.clone()),
                 },
             },
         )));
     }
 
-    Ok(TranscriptSourceFreshness::Changed(Box::new(
-        ChangedTranscriptSourceBytes {
-            bytes,
-            stable_stat,
-            content_sha256,
-        },
-    )))
+    Ok(TranscriptSourceFreshness::Changed(changed))
 }
 
 fn read_changed_transcript_source(
     source: &DiscoveredRetainedJsonlSource,
 ) -> Result<Box<ChangedTranscriptSourceBytes>, TranscriptAnalyticsError> {
+    if source.provider == IntegrationProvider::Pi {
+        let metadata =
+            std::fs::metadata(&source.canonical_path).map_err(TranscriptAnalyticsError::Read)?;
+        return Ok(Box::new(ChangedTranscriptSourceBytes {
+            bytes: Vec::new(),
+            pi_path: Some(source.canonical_path.clone()),
+            stable_stat: model_source_fast_fingerprint(&metadata)?,
+            content_sha256: String::new(),
+        }));
+    }
     let (bytes, stable_stat) =
         read_stable_transcript(&source.canonical_path).map_err(TranscriptAnalyticsError::from)?;
     let content_sha256 = model_source_content_sha256(&bytes);
     Ok(Box::new(ChangedTranscriptSourceBytes {
         bytes,
+        pi_path: None,
         stable_stat,
         content_sha256,
     }))
@@ -730,7 +737,10 @@ fn failed_with_unchanged_fingerprint(
     else {
         return false;
     };
-    existing.mtime_ns == Some(stat.mtime_ns()) && existing.size_bytes == Some(stat.size_bytes())
+    existing
+        .rejection
+        .as_ref()
+        .is_some_and(|rejection| rejection.is_current(&source.canonical_path, stat))
 }
 
 fn classify_transcript_source_identity(
@@ -750,9 +760,7 @@ fn classify_transcript_source_identity_inner(
     generation: i64,
     force_full_reparse: bool,
 ) -> Result<RootSourceClassification, TranscriptAnalyticsError> {
-    if !force_full_reparse
-        && existing.is_some_and(|stored| failed_with_unchanged_fingerprint(source, stored))
-    {
+    if existing.is_some_and(|stored| failed_with_unchanged_fingerprint(source, stored)) {
         return Ok(RootSourceClassification::UnchangedFailure);
     }
     match classify_transcript_source_freshness(source, existing, generation, force_full_reparse)? {
@@ -768,33 +776,15 @@ fn classify_transcript_source_identity_inner(
         TranscriptSourceFreshness::Changed(changed) => {
             let discovered = source.clone();
             let (native_identity, diagnostics) = crate::transcript_work::decode(move || {
-                let contents = std::str::from_utf8(&changed.bytes)
-                    .map_err(|_| TranscriptAnalyticsError::InvalidUtf8)?;
-                if discovered.provider == IntegrationProvider::Pi {
-                    // Validate all tracking entries, but never retain message payloads
-                    // merely to resolve a Pi header's native identity.
-                    let mut first = true;
-                    let session = crate::pi_session::parse_pi_session_records(
-                        contents.lines().enumerate().filter_map(|(ordinal, line)| {
-                            let value = serde_json::from_str::<Value>(line).ok()?;
-                            value.as_object()?;
-                            let keep = std::mem::replace(&mut first, false)
-                                || matches!(
-                                    value.get("type").and_then(Value::as_str),
-                                    Some("session" | "custom")
-                                );
-                            keep.then_some((ordinal as u64, value))
-                        }),
-                    )
-                    .map_err(|error| TranscriptAnalyticsError::PiSession(error.to_string()))?
-                    .ok_or_else(|| {
-                        TranscriptAnalyticsError::PiSession("missing session header".into())
-                    })?;
+                if let Some(path) = changed.pi_path {
+                    let (session, _, _) = crate::pi_session::read_stable_pi_session(&path)?;
                     Ok((
                         resolve_pi_native_identity(&session)?,
                         TranscriptRecordDiagnostics::default(),
                     ))
                 } else {
+                    let contents = std::str::from_utf8(&changed.bytes)
+                        .map_err(|_| TranscriptAnalyticsError::InvalidUtf8)?;
                     resolve_native_identity(&discovered, &parse_jsonl_records(contents))
                 }
             })?;
@@ -836,20 +826,13 @@ fn record_source_failure(
     source: &DiscoveredRetainedJsonlSource,
     generation: i64,
     error: &str,
-    fingerprint_failure: bool,
+    failed_stat: Option<ModelSourceFastFingerprint>,
 ) -> Result<(), RootReconciliationFault> {
     log::warn!(
         "Retained transcript analytics source failed: provider={} source={} error={error}",
         source.provider.as_str(),
         source.source_key,
     );
-    let failed_stat = fingerprint_failure
-        .then(|| {
-            std::fs::metadata(&source.canonical_path)
-                .ok()
-                .and_then(|metadata| model_source_fast_fingerprint(&metadata).ok())
-        })
-        .flatten();
     storage
         .record_transcript_analytics_source_failure(FailedTranscriptAnalyticsSource {
             provider: source.provider,
@@ -858,7 +841,7 @@ fn record_source_failure(
             source_path: &source.canonical_path,
             generation,
             error,
-            fingerprint_failure,
+            fingerprint_failure: failed_stat.is_some(),
             failed_stat: failed_stat.map(|stat| (stat.mtime_ns(), stat.size_bytes())),
         })
         .map_err(|storage_error| {
@@ -880,7 +863,7 @@ fn record_live_source_failure(
     if let Err(
         RootReconciliationFault::Database(message)
         | RootReconciliationFault::RootUnavailable(message),
-    ) = record_source_failure(storage, source, generation, error, false)
+    ) = record_source_failure(storage, source, generation, error, None)
     {
         log::warn!("Could not persist transcript analytics failure: {message}");
     }
@@ -965,6 +948,7 @@ fn reingest_marker_pending(storage: &Storage, marker: &str) -> bool {
 struct RootReconciliationOutcome {
     replaced_sources: usize,
     failed_sources: usize,
+    rejected_sources: usize,
     skipped_records: usize,
     proof: Option<CompletedTranscriptSourceRoot>,
 }
@@ -996,7 +980,7 @@ fn commit_reconciled_source(
     resolved_root: &str,
     hostname: &str,
     generation: i64,
-) -> Result<CommittedTranscriptSource, String> {
+) -> Result<CommittedTranscriptSource, TranscriptAnalyticsError> {
     commit_reconciled_source_with_search(
         storage,
         discovered,
@@ -1016,15 +1000,14 @@ fn commit_reconciled_source_with_search(
     hostname: &str,
     generation: i64,
     index: Option<crate::sessions::SourceSearch<'_>>,
-) -> Result<CommittedTranscriptSource, String> {
+) -> Result<CommittedTranscriptSource, TranscriptAnalyticsError> {
     crate::transcript_work::with_source(|| {
-        let parsed =
-            parse_transcript_analytics_source(discovered, hostname).map_err(|e| e.to_string())?;
+        let parsed = parse_transcript_analytics_source(discovered, hostname)?;
         // The file can change between inventory and commit. Stamping a root that
         // was resolved from a different identity would silently reparent rows, so
         // drift is a source failure that retains last-known-good data instead.
         if !native_identity_matches(&parsed.native_identity, inventoried) {
-            return Err(TranscriptAnalyticsError::SourceIdentityDrift.to_string());
+            return Err(TranscriptAnalyticsError::SourceIdentityDrift);
         }
         commit_parsed_source(
             storage,
@@ -1035,6 +1018,7 @@ fn commit_reconciled_source_with_search(
             generation,
             index,
         )
+        .map_err(TranscriptAnalyticsError::Commit)
     })
 }
 
@@ -1128,6 +1112,9 @@ fn reconcile_transcript_source_root(
     let mut handled_keys = HashSet::new();
     let mut unchanged_failures = 0usize;
     for source in &root.sources {
+        let attempted_stat = std::fs::metadata(&source.canonical_path)
+            .ok()
+            .and_then(|metadata| model_source_fast_fingerprint(&metadata).ok());
         match classify_transcript_source_identity(
             source,
             persisted_by_key.get(source.source_key.as_str()).copied(),
@@ -1141,24 +1128,28 @@ fn reconcile_transcript_source_root(
             Ok(RootSourceClassification::UnchangedFailure) => {
                 outcome.failed_sources = outcome.failed_sources.saturating_add(1);
                 unchanged_failures = unchanged_failures.saturating_add(1);
+                outcome.rejected_sources += 1;
             }
             Err(error) => {
                 outcome.failed_sources = outcome.failed_sources.saturating_add(1);
-                let fingerprint_failure = matches!(
-                    &error,
-                    TranscriptAnalyticsError::InvalidUtf8
-                        | TranscriptAnalyticsError::InvalidSourceMetadata
-                        | TranscriptAnalyticsError::SourceTooLarge
-                        | TranscriptAnalyticsError::Identity(_)
-                        | TranscriptAnalyticsError::PiSession(_)
-                        | TranscriptAnalyticsError::PiSourceIdentity
-                );
+                let failed_stat = attempted_stat.filter(|stat| {
+                    error.is_permanent()
+                        && crate::transcript_identity::SourceRejection::capture(
+                            &source.canonical_path,
+                            *stat,
+                            &error.to_string(),
+                        )
+                        .is_some()
+                });
+                if failed_stat.is_some() {
+                    outcome.rejected_sources += 1;
+                }
                 record_source_failure(
                     storage,
                     source,
                     generation,
                     &error.to_string(),
-                    fingerprint_failure,
+                    failed_stat,
                 )?;
             }
         }
@@ -1200,7 +1191,7 @@ fn reconcile_transcript_source_root(
                 &identity.discovered,
                 generation,
                 "unchanged transcript has no last-good native identity",
-                false,
+                None,
             )?;
             continue;
         };
@@ -1213,7 +1204,7 @@ fn reconcile_transcript_source_root(
                     &identity.discovered,
                     generation,
                     &error.to_string(),
-                    false,
+                    None,
                 )?;
                 continue;
             }
@@ -1221,6 +1212,9 @@ fn reconcile_transcript_source_root(
         if !identity.changed && identity.previous_root.as_deref() == Some(resolved_root.as_str()) {
             continue;
         }
+        let attempted_stat = std::fs::metadata(&identity.discovered.canonical_path)
+            .ok()
+            .and_then(|metadata| model_source_fast_fingerprint(&metadata).ok());
         match commit_reconciled_source_with_search(
             storage,
             &identity.discovered,
@@ -1244,7 +1238,26 @@ fn reconcile_transcript_source_root(
             }
             Err(error) => {
                 outcome.failed_sources = outcome.failed_sources.saturating_add(1);
-                record_source_failure(storage, &identity.discovered, generation, &error, false)?;
+                let message = error.to_string();
+                let failed_stat = attempted_stat.filter(|stat| {
+                    error.is_permanent()
+                        && crate::transcript_identity::SourceRejection::capture(
+                            &identity.discovered.canonical_path,
+                            *stat,
+                            &message,
+                        )
+                        .is_some()
+                });
+                if failed_stat.is_some() {
+                    outcome.rejected_sources += 1;
+                }
+                record_source_failure(
+                    storage,
+                    &identity.discovered,
+                    generation,
+                    &message,
+                    failed_stat,
+                )?;
             }
         }
     }
@@ -1332,6 +1345,13 @@ fn reconcile_live_transcript_source_with_search(
     let existing = persisted
         .iter()
         .find(|stored| stored.source_key == source.source_key);
+    if existing.is_some_and(|stored| failed_with_unchanged_fingerprint(source, stored)) {
+        return Ok(TranscriptSourceResult::Rejected);
+    }
+    let attempted_stat = std::fs::metadata(&source.canonical_path)
+        .ok()
+        .and_then(|metadata| model_source_fast_fingerprint(&metadata).ok());
+    let permanent = std::cell::Cell::new(false);
     let immediate = crate::transcript_work::with_source(
         || -> Result<Option<TranscriptSourceResult>, String> {
             let freshness = classify_transcript_source_freshness(
@@ -1340,7 +1360,10 @@ fn reconcile_live_transcript_source_with_search(
                 generation,
                 reingest_marker_pending(storage, TRANSCRIPT_ANALYTICS_REINGEST_MARKER),
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                permanent.set(error.is_permanent());
+                error.to_string()
+            })?;
             let changed = match freshness {
                 TranscriptSourceFreshness::Unchanged(unchanged) => {
                     if !storage.refresh_unchanged_transcript_analytics_source(
@@ -1358,10 +1381,14 @@ fn reconcile_live_transcript_source_with_search(
                 source,
                 hostname,
                 changed.bytes,
+                changed.pi_path,
                 changed.stable_stat,
                 changed.content_sha256,
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                permanent.set(error.is_permanent());
+                error.to_string()
+            })?;
             let mut metadata = vec![parsed.native_identity.clone()];
             metadata.extend(
                 persisted
@@ -1394,10 +1421,32 @@ fn reconcile_live_transcript_source_with_search(
             commit_parsed_source(storage, source, parsed, &root, hostname, generation, index)
                 .map(|committed| Some(committed.result))
         },
-    )
-    .inspect_err(|error| {
-        record_live_source_failure(storage, source, generation, error);
-    })?;
+    );
+    let immediate = match immediate {
+        Ok(result) => result,
+        Err(error) => {
+            let failed_stat = attempted_stat.filter(|stat| {
+                permanent.get()
+                    && crate::transcript_identity::SourceRejection::capture(
+                        &source.canonical_path,
+                        *stat,
+                        &error,
+                    )
+                    .is_some()
+            });
+            if failed_stat.is_some() {
+                record_source_failure(storage, source, generation, &error, failed_stat).map_err(
+                    |fault| match fault {
+                        RootReconciliationFault::Database(message)
+                        | RootReconciliationFault::RootUnavailable(message) => message,
+                    },
+                )?;
+                return Ok(TranscriptSourceResult::Rejected);
+            }
+            record_live_source_failure(storage, source, generation, &error);
+            return Err(error);
+        }
+    };
     if let Some(result) = immediate {
         return Ok(result);
     }
@@ -1497,9 +1546,9 @@ fn reconcile_live_transcript_source_with_search(
                             storage,
                             &identity.discovered,
                             generation,
-                            &error,
+                            &error.to_string(),
                         );
-                        return Err(error);
+                        return Err(error.to_string());
                     }
                 }
             }
@@ -1667,7 +1716,7 @@ fn reconcile_transcript_analytics_roots(
         summary.skipped_records = summary
             .skipped_records
             .saturating_add(outcome.skipped_records);
-        if outcome.failed_sources > 0 {
+        if outcome.failed_sources > outcome.rejected_sources {
             record_summary_failure(
                 &mut summary,
                 format!(
@@ -1683,7 +1732,7 @@ fn reconcile_transcript_analytics_roots(
         match prune_completed_transcript_root(storage, &proof) {
             Ok(pruned) => {
                 summary.pruned_sources = summary.pruned_sources.saturating_add(pruned);
-                if outcome.failed_sources == 0 {
+                if outcome.failed_sources == outcome.rejected_sources {
                     successful_roots = successful_roots.saturating_add(1);
                     if root.provider == IntegrationProvider::Pi {
                         successful_pi_roots = successful_pi_roots.saturating_add(1);
@@ -1741,6 +1790,7 @@ fn reconcile_transcript_analytics_roots(
 #[derive(Debug)]
 pub(crate) enum TranscriptAnalyticsError {
     Read(std::io::Error),
+    Commit(String),
     InvalidUtf8,
     InvalidSourceMetadata,
     SourceTooLarge,
@@ -1757,6 +1807,7 @@ impl fmt::Display for TranscriptAnalyticsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Read(error) => write!(formatter, "cannot read retained transcript: {error}"),
+            Self::Commit(message) => formatter.write_str(message),
             Self::InvalidUtf8 => formatter.write_str("retained transcript is not valid UTF-8"),
             Self::InvalidSourceMetadata => {
                 formatter.write_str("retained transcript metadata is invalid")
@@ -1783,6 +1834,19 @@ impl fmt::Display for TranscriptAnalyticsError {
     }
 }
 
+impl TranscriptAnalyticsError {
+    fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidUtf8
+                | Self::SourceTooLarge
+                | Self::Identity(_)
+                | Self::PiSession(_)
+                | Self::PiSourceIdentity
+        )
+    }
+}
+
 impl std::error::Error for TranscriptAnalyticsError {}
 
 impl From<StableTranscriptReadError> for TranscriptAnalyticsError {
@@ -1791,7 +1855,17 @@ impl From<StableTranscriptReadError> for TranscriptAnalyticsError {
             StableTranscriptReadError::Read(error) => Self::Read(error),
             StableTranscriptReadError::InvalidMetadata => Self::InvalidSourceMetadata,
             StableTranscriptReadError::SourceTooLarge => Self::SourceTooLarge,
+            StableTranscriptReadError::ResourceLimit(message) => Self::PiSession(message.into()),
             StableTranscriptReadError::UnstableSource => Self::UnstableSource,
+        }
+    }
+}
+
+impl From<crate::pi_session::PiSessionParseError> for TranscriptAnalyticsError {
+    fn from(error: crate::pi_session::PiSessionParseError) -> Self {
+        match error {
+            crate::pi_session::PiSessionParseError::Stream(error) => error.into(),
+            error => Self::PiSession(error.to_string()),
         }
     }
 }
@@ -2518,26 +2592,39 @@ pub(crate) fn parse_transcript_analytics_source(
     source: &DiscoveredRetainedJsonlSource,
     hostname: &str,
 ) -> Result<ParsedTranscriptAnalyticsSource, TranscriptAnalyticsError> {
-    let (bytes, stable_stat) =
-        read_stable_transcript(&source.canonical_path).map_err(TranscriptAnalyticsError::from)?;
-    let content_sha256 = model_source_content_sha256(&bytes);
-    parse_transcript_analytics_source_bytes(source, hostname, bytes, stable_stat, content_sha256)
+    let changed = read_changed_transcript_source(source)?;
+    parse_transcript_analytics_source_bytes(
+        source,
+        hostname,
+        changed.bytes,
+        changed.pi_path,
+        changed.stable_stat,
+        changed.content_sha256,
+    )
 }
 
 fn parse_transcript_analytics_source_bytes(
     source: &DiscoveredRetainedJsonlSource,
     hostname: &str,
     bytes: Vec<u8>,
+    pi_path: Option<PathBuf>,
     stable_stat: ModelSourceFastFingerprint,
     content_sha256: String,
 ) -> Result<ParsedTranscriptAnalyticsSource, TranscriptAnalyticsError> {
     let source = source.clone();
     let hostname = hostname.to_owned();
     crate::transcript_work::decode(move || {
+        let (pi_session, stable_stat, content_sha256) = if let Some(path) = pi_path {
+            let (session, stat, hash) = crate::pi_session::read_stable_pi_session(&path)?;
+            (Some(session), stat, hash)
+        } else {
+            (None, stable_stat, content_sha256)
+        };
         parse_transcript_analytics_source_bytes_inner(
             &source,
             &hostname,
             bytes,
+            pi_session,
             stable_stat,
             content_sha256,
         )
@@ -2548,6 +2635,7 @@ fn parse_transcript_analytics_source_bytes_inner(
     source: &DiscoveredRetainedJsonlSource,
     hostname: &str,
     bytes: Vec<u8>,
+    pi_session: Option<crate::pi_session::PiSession>,
     stable_stat: ModelSourceFastFingerprint,
     content_sha256: String,
 ) -> Result<ParsedTranscriptAnalyticsSource, TranscriptAnalyticsError> {
@@ -2556,16 +2644,7 @@ fn parse_transcript_analytics_source_bytes_inner(
 
     let source_key = source.source_key.clone();
     let (native_identity, diagnostics, extracted, setting_events, session_name, pi_evidence) =
-        if source.provider == IntegrationProvider::Pi {
-            let session = crate::pi_session::parse_pi_session_records(
-                contents.lines().enumerate().filter_map(|(ordinal, line)| {
-                    let value = serde_json::from_str::<Value>(line).ok()?;
-                    value.as_object()?;
-                    Some((ordinal as u64, value))
-                }),
-            )
-            .map_err(|error| TranscriptAnalyticsError::PiSession(error.to_string()))?
-            .ok_or_else(|| TranscriptAnalyticsError::PiSession("missing session header".into()))?;
+        if let Some(session) = pi_session {
             drop(bytes);
             let native_identity = resolve_pi_native_identity(&session)?;
             let mut diagnostics = TranscriptRecordDiagnostics::default();
@@ -3179,12 +3258,15 @@ mod tests {
             .write(true)
             .open(&source.canonical_path)
             .unwrap()
-            .set_len(RETAINED_TRANSCRIPT_MAX_BYTES + 1)
+            .set_len(4 * 1024 * 1024 * 1024 + 1)
             .unwrap();
         let (analytics, search) =
             reconcile_retained_source(&storage, &source, TEST_HOSTNAME, Some(&index));
-        assert!(analytics.is_err());
-        assert!(search.is_err());
+        assert_eq!(analytics.unwrap(), TranscriptSourceResult::Rejected);
+        assert!(
+            search.is_ok(),
+            "resource rejection is terminal for this version"
+        );
         assert_eq!(
             index.state.lock().unwrap().sources,
             successful_search,
@@ -3197,6 +3279,161 @@ mod tests {
                 .unwrap(),
             3
         );
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Durable Rejections]]
+    #[test]
+    #[serial]
+    fn rejected_versions_preserve_success_and_rearm_on_change() {
+        use crate::sessions::SessionIndex;
+        use crate::transcript_work::DECODE_COUNT;
+        let dir = TempDir::new().unwrap();
+        let source = pi_usage_evidence_source(dir.path());
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        storage
+            .delete_setting(TRANSCRIPT_ANALYTICS_REINGEST_MARKER)
+            .unwrap();
+        let index = SessionIndex::open_or_create_for_tests(&dir.path().join("index")).unwrap();
+        let run = || reconcile_retained_source(&storage, &source, TEST_HOSTNAME, Some(&index));
+        let initial = run();
+        assert_eq!(initial.0.unwrap(), TranscriptSourceResult::Replaced);
+        initial.1.unwrap();
+        let successful_search = index.state.lock().unwrap().sources.clone();
+        let stored = || {
+            storage
+                .list_transcript_analytics_sources_for_root(source.provider, source.source_root_key)
+                .unwrap()
+                .remove(0)
+        };
+        let success = stored();
+        std::fs::write(&source.canonical_path, [0xff]).unwrap();
+        let rejected = run();
+        assert_eq!(rejected.0.unwrap(), TranscriptSourceResult::Rejected);
+        rejected.1.unwrap();
+        let failure = stored();
+        assert_eq!(failure.content_sha256, success.content_sha256);
+        assert_eq!(failure.mtime_ns, success.mtime_ns);
+        assert_eq!(failure.size_bytes, success.size_bytes);
+        assert!(failure.rejection.is_some());
+        let decodes = DECODE_COUNT.get();
+        assert_eq!(run().0.unwrap(), TranscriptSourceResult::Rejected);
+        assert_eq!(DECODE_COUNT.get(), decodes);
+        assert_eq!(
+            stored(),
+            failure,
+            "unchanged failure performs no diagnostic rewrite"
+        );
+        assert_eq!(index.state.lock().unwrap().sources, successful_search);
+        assert_eq!(index.state.lock().unwrap().rejections.len(), 1);
+        index.save_state().unwrap();
+        drop(index);
+        let index = SessionIndex::open_or_create_for_tests(&dir.path().join("index")).unwrap();
+        assert_eq!(index.sync_source(&source, TEST_HOSTNAME).unwrap(), 0);
+        std::fs::write(&source.canonical_path, PI_USAGE_EVIDENCE).unwrap();
+        set_mtime_ns(&source.canonical_path, FIXED_MTIME_NS + 1);
+        assert_eq!(
+            reconcile_retained_source(&storage, &source, TEST_HOSTNAME, Some(&index))
+                .0
+                .unwrap(),
+            TranscriptSourceResult::Replaced
+        );
+        assert!(stored().rejection.is_none());
+        assert!(index.state.lock().unwrap().rejections.is_empty());
+    }
+
+    // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Large Streamed Pi Source]]
+    #[test]
+    #[ignore = "400 MiB streaming qualification; run alone"]
+    fn large_pi_stream_preserves_search_tools_and_usage_under_memory_budget() {
+        use std::io::Write;
+        let dir = TempDir::new().unwrap();
+        let source = pi_usage_evidence_source(dir.path());
+        let baseline = parse_transcript_analytics_source(&source, TEST_HOSTNAME).unwrap();
+        let baseline_messages = baseline.extracted.messages.len();
+        let baseline_usage = baseline.snapshot.pi_evidence.as_ref().unwrap().usage.len();
+        drop(baseline);
+        let mut file = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&source.canonical_path)
+                .unwrap(),
+        );
+        let block = "x".repeat(1024 * 1024);
+        for n in 0..20 {
+            writeln!(file, "{}", json!({"type":"message","id":format!("large-user-{n}"),"parentId":null,"timestamp":"2026-08-18T03:00:00Z","message":{"role":"user","content":format!("large-stream-needle {n}")}})).unwrap();
+            writeln!(file, "{}", json!({"type":"message","id":format!("large-assistant-{n}"),"parentId":null,"timestamp":"2026-08-18T03:00:01Z","message":{"role":"assistant","provider":"openai","model":"gpt-5","content":[{"type":"toolCall","id":format!("large-call-{n}"),"name":"bash","arguments":{"command":"true"}}],"usage":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0}}})).unwrap();
+            write!(file, "{{\"type\":\"message\",\"id\":\"large-result-{n}\",\"parentId\":null,\"timestamp\":\"2026-08-18T03:00:02Z\",\"message\":{{\"role\":\"toolResult\",\"toolCallId\":\"large-call-{n}\",\"content\":[{{\"type\":\"text\",\"text\":\"").unwrap();
+            for _ in 0..20 {
+                file.write_all(block.as_bytes()).unwrap();
+            }
+            writeln!(file, "\"}}]}}}}").unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+        assert!(
+            std::fs::metadata(&source.canonical_path).unwrap().len()
+                > RETAINED_TRANSCRIPT_MAX_BYTES
+        );
+        let started = std::time::Instant::now();
+        let parsed = parse_transcript_analytics_source(&source, TEST_HOSTNAME).unwrap();
+        assert_eq!(parsed.extracted.messages.len(), baseline_messages + 40);
+        assert_eq!(
+            parsed.snapshot.pi_evidence.as_ref().unwrap().usage.len(),
+            baseline_usage + 20
+        );
+        for message in parsed
+            .extracted
+            .messages
+            .iter()
+            .filter(|message| message.uuid.starts_with("large-assistant"))
+        {
+            assert_eq!(message.tool_actions.len(), 1);
+            assert_eq!(
+                message.tool_actions[0].full_output.as_ref().unwrap(),
+                &crate::sessions::truncate(&"x".repeat(10_241), 10_240)
+            );
+        }
+        drop(parsed);
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let index =
+            crate::sessions::SessionIndex::open_or_create_for_tests(&dir.path().join("index"))
+                .unwrap();
+        let (analytics, search) =
+            reconcile_retained_source(&storage, &source, TEST_HOSTNAME, Some(&index));
+        assert_eq!(analytics.unwrap(), TranscriptSourceResult::Replaced);
+        search.unwrap();
+        index.reader.reload().unwrap();
+        assert_eq!(
+            index
+                .search(
+                    "large-stream-needle",
+                    &Default::default(),
+                    "relevance",
+                    0,
+                    50
+                )
+                .unwrap()
+                .total_hits,
+            20
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let hwm: u64 = status
+                .lines()
+                .find(|line| line.starts_with("VmHWM:"))
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse()
+                .unwrap();
+            eprintln!(
+                "400 MiB streaming: elapsed={:?}, peak_rss_kib={hwm}",
+                started.elapsed()
+            );
+            assert!(hwm < 2 * 1024 * 1024, "streaming must stay below 2 GiB RSS");
+        }
     }
 
     fn pi_usage_evidence_source(dir: &Path) -> DiscoveredRetainedJsonlSource {
@@ -4255,6 +4492,7 @@ mod tests {
             last_attempt_at_ms: None,
             last_success_at_ms: None,
             last_error: None,
+            rejection: None,
             suppressed_sha256: None,
             suppressed_at_ms: None,
         }
@@ -4914,7 +5152,7 @@ mod tests {
                 &source,
                 generation,
                 &drift_error.to_string(),
-                false,
+                None,
             )
             .is_ok(),
             "record Pi source failure",
@@ -5189,13 +5427,14 @@ mod tests {
             .find(|row| row.source_key == broken.source_key)
             .expect("broken source is registered");
         assert_eq!(failed.processing_status, "failed");
-        assert_eq!(
-            (failed.mtime_ns, failed.size_bytes),
-            (
-                Some(stat_of(&broken.canonical_path).0),
-                Some(stat_of(&broken.canonical_path).1)
+        assert_eq!((failed.mtime_ns, failed.size_bytes), (None, None));
+        assert!(
+            failed.rejection.as_ref().unwrap().is_current(
+                &broken.canonical_path,
+                model_source_fast_fingerprint(&std::fs::metadata(&broken.canonical_path).unwrap())
+                    .unwrap(),
             ),
-            "a content-deterministic Pi failure records its fingerprint"
+            "a rejected fingerprint must not masquerade as a successful one"
         );
         assert!(
             stored
@@ -5694,12 +5933,15 @@ mod tests {
         let failed = run_transcript_analytics_reconciliation(&storage, TEST_HOSTNAME, &retry_roots)
             .expect("run failed Pi backfill");
         assert_eq!(failed.failed_sources, 1);
-        assert!(!failed.completed_all_roots);
+        assert!(
+            failed.completed_all_roots,
+            "current-policy rejection settles the attempted source"
+        );
         assert_eq!(
             storage
                 .get_setting(PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER)
                 .expect("read retained marker"),
-            Some("1".to_owned())
+            None
         );
         assert_eq!(
             reader
@@ -5743,8 +5985,8 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM marker_delete_audit", [], |row| {
                     row.get::<_, i64>(0)
                 })
-                .expect("count premature marker clears"),
-            0
+                .expect("count settled marker clears"),
+            1
         );
 
         let retried =
@@ -5768,7 +6010,7 @@ mod tests {
                     row.get::<_, i64>(0)
                 })
                 .expect("count retry marker clears"),
-            0
+            1
         );
 
         std::fs::write(
@@ -5996,10 +6238,10 @@ mod tests {
             Ok(_) => panic!("drifted identity must not be stamped with the stale root"),
             Err(error) => error,
         };
-        assert_eq!(
+        assert!(matches!(
             error,
-            TranscriptAnalyticsError::SourceIdentityDrift.to_string()
-        );
+            TranscriptAnalyticsError::SourceIdentityDrift
+        ));
 
         // `cwd` is descriptive origin, so a moved checkout still commits.
         let relocated = NativeChainIdentity {
