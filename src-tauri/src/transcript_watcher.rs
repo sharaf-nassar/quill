@@ -16,6 +16,7 @@ const QUIET_DEBOUNCE: Duration = Duration::from_millis(250);
 const MAX_DEBOUNCE: Duration = Duration::from_secs(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(120);
 const MAX_PENDING_PATHS: usize = 4_096;
+const MAX_MODEL_RECOVERY_SOURCES: usize = 128;
 // Bound repeated whole-root work while self-generated or external bursts converge.
 const RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -291,27 +292,28 @@ pub(crate) fn start(app: tauri::AppHandle) {
         // does not re-admit the sources the startup inventory already covers.
         let mut watermark = std::time::SystemTime::now();
         run_retained_scan_worker(scan_receiver, scan_recovery, |recovery| {
-            // Capture the pass start before enumerating so a source modified
-            // during the walk is admitted by this pass or the next, never lost.
-            let pass_start = std::time::SystemTime::now();
-            let roots = crate::sessions::enumerate_retained_jsonl_source_roots();
             if recovery {
-                admit_changed_sources(&scan_app, watermark, &roots);
+                // Capture the pass start before waiting for the inventory lock.
+                // This can over-admit an edit made while waiting, but cannot
+                // lose one from the next pass.
+                let pass_start = std::time::SystemTime::now();
+                reconcile_all(&scan_app, watermark);
                 watermark = pass_start;
-                reconcile_all(&scan_app, &roots);
+            } else {
+                let roots = crate::sessions::enumerate_retained_jsonl_source_roots();
+                sync_search_index(&scan_app, &roots);
             }
-            sync_search_index(&scan_app, &roots);
         });
     });
     std::thread::spawn(move || {
         // Cold start: fold live evidence first. Historical reconciliation then
         // runs on the retained worker, never inline on this watcher thread.
         schedule_retained_after_live_fold(&scans, || sweep_live_tracker(&app));
-        if let Err(error) = run(app, scans) {
-            log::warn!(
-                "Transcript watcher unavailable; 120-second recovery scan remains active: {error}"
-            );
-        }
+        run_watcher_with_retry(
+            || run(app.clone(), &scans),
+            || schedule_retained_after_live_fold(&scans, || sweep_live_tracker(&app)),
+            RETRY_INTERVAL,
+        );
     });
 }
 
@@ -346,7 +348,27 @@ fn reset_changed_root_watches(
     }
 }
 
-fn run(app: tauri::AppHandle, scans: RetainedScanScheduler) -> Result<(), String> {
+fn run_watcher_with_retry(
+    mut run_once: impl FnMut() -> Result<(), String>,
+    mut recover: impl FnMut(),
+    retry_interval: Duration,
+) {
+    loop {
+        match run_once() {
+            Ok(()) => return,
+            Err(error) => {
+                log::warn!(
+                    "Transcript watcher unavailable; recovery scan requested and watcher retrying in {} seconds: {error}",
+                    retry_interval.as_secs(),
+                );
+                recover();
+                std::thread::sleep(retry_interval);
+            }
+        }
+    }
+}
+
+fn run(app: tauri::AppHandle, scans: &RetainedScanScheduler) -> Result<(), String> {
     let (tx, rx) = mpsc::sync_channel(MAX_PENDING_PATHS);
     let overflow = Arc::new(AtomicBool::new(false));
     let callback_overflow = Arc::clone(&overflow);
@@ -408,13 +430,13 @@ fn run(app: tauri::AppHandle, scans: RetainedScanScheduler) -> Result<(), String
             // Unconditional: notify semantics differ per platform, so this tick
             // is the backstop for events that never arrived. Retained recovery
             // is requested only after this live fold and stays worker-isolated.
-            schedule_retained_after_live_fold(&scans, || sweep_live_tracker(&app));
+            schedule_retained_after_live_fold(scans, || sweep_live_tracker(&app));
         }
         let timeout = pending
             .timeout(now)
             .min(retry_at.saturating_duration_since(now));
         if timeout.is_zero() {
-            admit_pending(&app, &scans, pending.take());
+            admit_pending(&app, scans, pending.take());
             continue;
         }
         match rx.recv_timeout(timeout) {
@@ -430,7 +452,7 @@ fn run(app: tauri::AppHandle, scans: RetainedScanScheduler) -> Result<(), String
                     },
                 );
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => admit_pending(&app, &scans, pending.take()),
+            Err(mpsc::RecvTimeoutError::Timeout) => admit_pending(&app, scans, pending.take()),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("filesystem watcher channel disconnected".to_string());
             }
@@ -545,15 +567,113 @@ fn admit_changed_sources(
     log::info!("Transcript watcher admitted {count} changed retained sources");
 }
 
-fn reconcile_all(app: &tauri::AppHandle, roots: &[crate::sessions::ProviderSourceRoot]) {
+fn model_recovery_sources(
+    storage: &crate::storage::Storage,
+    roots: &[crate::sessions::ProviderSourceRoot],
+    limit: usize,
+) -> Result<Vec<crate::sessions::DiscoveredRetainedJsonlSource>, String> {
+    let mut candidates = Vec::new();
+    for root in roots.iter().filter(|root| {
+        matches!(
+            root.provider,
+            IntegrationProvider::Claude | IntegrationProvider::Codex
+        )
+    }) {
+        let persisted = storage.list_model_sources_for_root(root.provider, root.source_root_key)?;
+        let persisted = persisted
+            .into_iter()
+            .map(|source| (source.source_key.clone(), source))
+            .collect::<HashMap<_, _>>();
+        for source in &root.sources {
+            let stored = persisted.get(&source.source_key);
+            let current_fast = || {
+                std::fs::metadata(&source.canonical_path)
+                    .ok()
+                    .and_then(|metadata| {
+                        crate::transcript_identity::model_source_fast_fingerprint(&metadata).ok()
+                    })
+            };
+            let retryable = stored.is_none_or(|stored| {
+                if stored.rejection.as_ref().is_some_and(|rejection| {
+                    current_fast()
+                        .is_some_and(|fast| rejection.is_current(&source.canonical_path, fast))
+                }) {
+                    return false;
+                }
+                match stored.processing_status {
+                    crate::model_usage::SourceProcessingStatus::Pending
+                    | crate::model_usage::SourceProcessingStatus::Stale
+                    | crate::model_usage::SourceProcessingStatus::Failed => true,
+                    crate::model_usage::SourceProcessingStatus::Ok
+                    | crate::model_usage::SourceProcessingStatus::Suppressed => {
+                        current_fast() != stored.fast_fingerprint
+                    }
+                }
+            });
+            if retryable {
+                candidates.push((
+                    stored.is_some(),
+                    stored.and_then(|stored| stored.last_attempt_at_ms),
+                    source.clone(),
+                ));
+            }
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.provider.as_str().cmp(right.2.provider.as_str()))
+            .then_with(|| left.2.source_key.cmp(&right.2.source_key))
+    });
+    Ok(candidates
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, source)| source)
+        .collect())
+}
+
+fn admit_model_recovery_sources(
+    app: &tauri::AppHandle,
+    storage: &crate::storage::Storage,
+    roots: &[crate::sessions::ProviderSourceRoot],
+) {
+    match model_recovery_sources(storage, roots, MAX_MODEL_RECOVERY_SOURCES) {
+        Ok(sources) => {
+            let count = sources.len();
+            for source in sources {
+                if let Err(error) = crate::enqueue_model_usage_live_source(app, source) {
+                    log::warn!("Transcript watcher failed to rearm model source: {error}");
+                }
+            }
+            if count > 0 {
+                log::info!("Transcript watcher rearmed {count} durable model sources");
+            }
+        }
+        Err(error) => log::warn!("Transcript watcher model recovery inventory failed: {error}"),
+    }
+}
+
+fn reconcile_all(app: &tauri::AppHandle, watermark: std::time::SystemTime) {
     let result = crate::get_storage().and_then(|storage| {
         let index = app.try_state::<crate::sessions::SessionIndexState>();
-        crate::transcript_analytics::run_transcript_analytics_reconciliation_with_search(
+        let mut inventory = None;
+        let result = crate::transcript_analytics::run_locked_transcript_analytics_recovery(
             storage,
             &crate::sessions::SessionIndex::local_hostname(),
-            roots,
             index.as_ref().map(|index| index.0.as_ref()),
-        )
+            |roots| {
+                admit_changed_sources(app, watermark, roots);
+                admit_model_recovery_sources(app, storage, roots);
+                inventory = Some(roots.to_vec());
+            },
+        );
+        // Search's changed-source path enters live transcript reconciliation,
+        // so run it only after the inventory-to-prune permit is released.
+        if let Some(roots) = inventory {
+            sync_search_index(app, &roots);
+        }
+        result
     });
     match result {
         Ok(summary) if summary.replaced_sources > 0 || summary.pruned_sources > 0 => {
@@ -1041,6 +1161,126 @@ mod tests {
         );
         let future = std::time::SystemTime::now() + Duration::from_secs(3600);
         assert!(changed_sources_since(future, &roots).is_empty());
+    }
+
+    // @lat: [[pipeline-recovery-tests#Pipeline Recovery Test Specs#Durable Model Recovery]]
+    #[test]
+    fn durable_model_recovery_ignores_mtime_and_skips_versioned_rejections() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(&path, "{}\n").expect("write source");
+        let source = crate::sessions::DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "claude:projects",
+            source_key: "recovery-source".to_owned(),
+            filesystem_path: path.clone(),
+            canonical_path: std::fs::canonicalize(&path).expect("canonical source"),
+            layout_hint: crate::sessions::RetainedJsonlSourceLayoutHint::ClaudeParent {
+                default_project: "/fixture".to_owned(),
+            },
+        };
+        let roots = [crate::sessions::ProviderSourceRoot {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "claude:projects",
+            resolved_root_path: temp.path().to_path_buf(),
+            canonical_root_path: Some(std::fs::canonicalize(temp.path()).expect("canonical root")),
+            outcome: crate::sessions::ProviderRootEnumerationOutcome::Complete,
+            sources: vec![source.clone()],
+        }];
+        let storage = crate::storage::Storage::init_at(temp.path().join("usage.db"), false)
+            .expect("initialize storage");
+
+        assert_eq!(
+            model_recovery_sources(&storage, &roots, 1).unwrap(),
+            vec![source.clone()]
+        );
+        let conn = rusqlite::Connection::open(storage.database_path()).expect("open database");
+        conn.execute(
+            "INSERT INTO model_observation_sources (
+                 provider, source_key, source_root_key, source_path, is_sidechain,
+                 seen_generation, processing_status, observation_count, last_attempt_at_ms
+             ) VALUES ('claude', ?1, ?2, ?3, 0, 0, 'failed', 0, 7)",
+            rusqlite::params![
+                source.source_key,
+                source.source_root_key,
+                source.canonical_path.to_string_lossy()
+            ],
+        )
+        .expect("insert retryable failure");
+        assert_eq!(
+            model_recovery_sources(&storage, &roots, 1).unwrap(),
+            vec![source.clone()]
+        );
+
+        let metadata = std::fs::metadata(&source.canonical_path).expect("source metadata");
+        let fast = crate::transcript_identity::model_source_fast_fingerprint(&metadata)
+            .expect("source fingerprint");
+        conn.execute(
+            "UPDATE model_observation_sources
+             SET processing_status = 'ok', mtime_ns = ?1, size_bytes = ?2,
+                 content_sha256 = 'last-good', rejection = NULL
+             WHERE provider = 'claude' AND source_key = ?3",
+            rusqlite::params![
+                fast.mtime_ns().saturating_add(1),
+                fast.size_bytes(),
+                source.source_key
+            ],
+        )
+        .expect("record clock-regressed last-good source");
+        assert_eq!(
+            model_recovery_sources(&storage, &roots, 1).unwrap(),
+            vec![source.clone()],
+            "a backwards mtime must still rearm changed model work"
+        );
+
+        let rejection = crate::transcript_identity::SourceRejection::capture(
+            &source.canonical_path,
+            fast,
+            "permanent rejection",
+        )
+        .expect("stable rejection");
+        conn.execute(
+            "UPDATE model_observation_sources
+             SET processing_status = 'failed', mtime_ns = ?1, size_bytes = ?2, rejection = ?3
+             WHERE provider = 'claude' AND source_key = ?4",
+            rusqlite::params![
+                fast.mtime_ns(),
+                fast.size_bytes(),
+                serde_json::to_string(&rejection).unwrap(),
+                source.source_key
+            ],
+        )
+        .expect("settle rejection");
+        assert!(
+            model_recovery_sources(&storage, &roots, 1)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&source.canonical_path, "changed\n").expect("change rejected source");
+        assert_eq!(
+            model_recovery_sources(&storage, &roots, 1).unwrap(),
+            vec![source],
+            "changed rejected bytes must rearm recovery"
+        );
+    }
+
+    // @lat: [[pipeline-recovery-tests#Pipeline Recovery Test Specs#Watcher Initialization Recovery]]
+    #[test]
+    fn watcher_initialization_failure_requests_recovery_before_retry() {
+        let attempts = std::cell::Cell::new(0usize);
+        let recoveries = std::cell::Cell::new(0usize);
+        run_watcher_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                (attempts.get() > 1)
+                    .then_some(())
+                    .ok_or_else(|| "unavailable".to_owned())
+            },
+            || recoveries.set(recoveries.get() + 1),
+            Duration::ZERO,
+        );
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(recoveries.get(), 1);
     }
 
     // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Transcript Watcher Test Specs#Provider Paths And Burst Coalescing]]

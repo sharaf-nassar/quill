@@ -8,6 +8,7 @@ import { ParentSessionLink } from "./ResultCard";
 interface DetailPanelProps {
 	hit: SearchHit;
 	context: SessionContext | null;
+	contextError?: string | null;
 	locStats: SessionCodeStats | null;
 	/** Retention watermark, or null when nothing has been pruned (feature 014). */
 	retentionCutoff: string | null;
@@ -17,6 +18,7 @@ interface DetailPanelProps {
 function DetailPanel({
 	hit,
 	context,
+	contextError,
 	locStats,
 	retentionCutoff,
 	onNavigateSession,
@@ -87,6 +89,7 @@ function DetailPanel({
 
 			{context ? (
 				<div className="sessions-detail-context">
+					{context.truncated && <p role="status">Context truncated to the response limit.</p>}
 					{context.messages.map((msg) => (
 						<div
 							key={msg.message_id}
@@ -94,6 +97,7 @@ function DetailPanel({
 						>
 							<div className="sessions-context-msg-header">
 								<span className="sessions-context-role">{msg.role}</span>
+								{msg.truncated && <span>Truncated</span>}
 								{msg.tools_used && (
 									<span className="sessions-context-tools">
 										{msg.tools_used.split(" ").filter(Boolean).map((tool) => (
@@ -114,6 +118,8 @@ function DetailPanel({
 						</div>
 					))}
 				</div>
+			) : contextError ? (
+				<div className="sessions-detail-loading" role="alert">Context unavailable: {contextError}</div>
 			) : (
 				<div className="sessions-detail-loading">Loading context...</div>
 			)}

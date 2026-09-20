@@ -36,7 +36,7 @@ Pi notify rejects a transcript outside the configured Pi session root and never 
 
 The filesystem watcher registers the configured Pi root with Claude and Codex, preserves provider identity through debounced changed-source admission, and uses whole-root recovery for remove, rename, overflow, late-root, and periodic rescan signals.
 
-Each recovery pass also admits the sources whose mtime advanced since the previous pass, from the inventory it already enumerated, and a watermark ahead of every file admits nothing.
+Each recovery pass also admits sources whose mtime advanced since the previous pass, plus bounded durable model obligations independent of that watermark. An ahead-of-time watermark cannot hide never-seen or unchanged transiently failed sources. See [[pipeline-recovery-tests]].
 
 ## Startup Search Recovery
 
@@ -70,13 +70,15 @@ Pi search hits retain provider, project, and host metadata, while provider facet
 
 An absolute project filter matches exact indexed cwd identity, so projects with the same final directory name do not leak into each other's results.
 
-## Search Schema Rebuild
+## Search Schema Migration
 
-Opening an index from schema version 7 removes its old contents and records version 8 so stored metadata, cwd filtering, and the `custom_type` field are available after reindexing.
+Opening an older index preserves existing documents through a staged schema-10 migration.
+
+Unknown ownership remains explicitly unattributed; schema-marker mismatch cannot delete history. Recoverable directory promotion and exact cwd preservation are covered by [[pipeline-search-tests]].
 
 ## Provider Safe Cleanup
 
-Reindex cleanup deletes Pi documents only, even when another provider uses the same session id.
+Reindex cleanup deletes only the canonical Pi source owner, even when another physical file or pushed host uses the same provider and session id.
 
 ## Demo Root Isolation
 

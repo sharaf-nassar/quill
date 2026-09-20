@@ -20,6 +20,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -33,6 +35,7 @@ const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_INDEX_BYTES: usize = 5 * 1024 * 1024;
 const MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 512 * 1024;
+const MAX_INLINE_OUTPUT_BYTES: usize = 16 * 1024;
 const CHUNK_TARGET_BYTES: usize = 8192;
 const CHUNK_OVERLAP_LINES: usize = 4;
 
@@ -71,11 +74,16 @@ pub(crate) async fn spawn_context_server(
     if !config.enabled {
         return Ok(None);
     }
-    if let Some(parent) = config.db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("Create context directory: {error}"))?;
-    }
-    open_store(&config.db_path)?;
+    let store_path = config.db_path.clone();
+    run_blocking(move || {
+        if let Some(parent) = store_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("Create context directory: {error}"))?;
+        }
+        open_store(&store_path)?;
+        Ok(())
+    })
+    .await?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, config.port))
         .await
         .map_err(|error| format!("Bind context HTTP server: {error}"))?;
@@ -93,6 +101,16 @@ pub(crate) async fn spawn_context_server(
         }
     });
     Ok(Some(ContextServerHandle { addr, task }))
+}
+
+async fn run_blocking<T, F>(operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| format!("Context blocking task failed: {error}"))?
 }
 
 fn context_router(state: Arc<ContextState>) -> Router {
@@ -672,11 +690,43 @@ fn map_source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRow> {
     ))
 }
 
+fn stats_for_connection(conn: &Connection, path: &Path) -> Result<Value, String> {
+    Ok(
+        json!({"db_path":path.to_string_lossy(),"fts_available":has_fts(conn),"sources":conn.query_row("SELECT COUNT(*) FROM sources",[],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?,"chunks":conn.query_row("SELECT COUNT(*) FROM chunks",[],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?,"executions":conn.query_row("SELECT COUNT(*) FROM executions",[],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?,"fetch_cache_entries":conn.query_row("SELECT COUNT(*) FROM fetch_cache",[],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?,"indexed_bytes":conn.query_row("SELECT COALESCE(SUM(content_bytes),0) FROM sources",[],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?}),
+    )
+}
+
 fn stats_store(path: &Path) -> Result<Value, String> {
     let conn = open_store(path)?;
-    Ok(
-        json!({"db_path":path.to_string_lossy(),"fts_available":has_fts(&conn),"sources":conn.query_row("SELECT COUNT(*) FROM sources",[],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?,"chunks":conn.query_row("SELECT COUNT(*) FROM chunks",[],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?,"executions":conn.query_row("SELECT COUNT(*) FROM executions",[],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?,"fetch_cache_entries":conn.query_row("SELECT COUNT(*) FROM fetch_cache",[],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?,"indexed_bytes":conn.query_row("SELECT COALESCE(SUM(content_bytes),0) FROM sources",[],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?}),
-    )
+    stats_for_connection(&conn, path)
+}
+
+fn purge_store(path: &Path, source_id: Option<i64>) -> Result<Value, String> {
+    let mut conn = open_store(path)?;
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    if let Some(id) = source_id {
+        tx.execute("DELETE FROM fetch_cache WHERE source_id=?1", [id])
+            .map_err(|error| error.to_string())?;
+        delete_sources(&tx, &[id])?;
+        tx.commit().map_err(|error| error.to_string())?;
+        return Ok(json!({"purged":true,"scope":format!("source:{id}")}));
+    }
+
+    let prior = stats_for_connection(&tx, path)?;
+    tx.execute("DELETE FROM fetch_cache", [])
+        .map_err(|error| error.to_string())?;
+    tx.execute("DELETE FROM executions", [])
+        .map_err(|error| error.to_string())?;
+    if has_fts(&tx) {
+        tx.execute("DELETE FROM chunks_fts", [])
+            .map_err(|error| error.to_string())?;
+    }
+    tx.execute("DELETE FROM chunks", [])
+        .map_err(|error| error.to_string())?;
+    tx.execute("DELETE FROM sources", [])
+        .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(json!({"purged":true,"scope":"all","previous_counts":prior,"removed_files":[]}))
 }
 
 #[derive(Deserialize)]
@@ -768,6 +818,43 @@ fn yes() -> bool {
     true
 }
 
+fn decode_bounded_utf8(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(error) if error.error_len().is_none() => {
+            String::from_utf8_lossy(&bytes[..error.valid_up_to()]).into_owned()
+        }
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+fn read_index_file(
+    file: &str,
+    cwd: Option<&str>,
+    roots: &[PathBuf],
+    limit: usize,
+) -> Result<(String, String, bool), String> {
+    let cwd = resolve_cwd(cwd, roots)?;
+    let path = resolve_file(file, &cwd)?;
+    let mut file = File::open(&path).map_err(|error| error.to_string())?;
+    let metadata_bytes = file
+        .metadata()
+        .map(|metadata| usize::try_from(metadata.len()).unwrap_or(usize::MAX))
+        .unwrap_or(0);
+    let mut bytes = Vec::with_capacity(limit.saturating_add(1));
+    file.by_ref()
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let truncated = bytes.len() > limit || metadata_bytes > limit;
+    bytes.truncate(limit);
+    Ok((
+        decode_bounded_utf8(&bytes),
+        path.to_string_lossy().into_owned(),
+        truncated,
+    ))
+}
+
 async fn index_handler(
     State(state): State<Arc<ContextState>>,
     headers: HeaderMap,
@@ -780,56 +867,52 @@ async fn index_handler(
         return bad_request("provide exactly one of content or file_path");
     }
     let limit = req.max_bytes.clamp(1024, MAX_INDEX_BYTES);
-    let (mut text, kind, file_path, label, input_bytes) = if let Some(content) = req.content {
-        let bytes = content.as_bytes();
-        let kept = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]).into_owned();
+    let (mut text, kind, file_path, label, truncated) = if let Some(content) = req.content {
+        let mut end = content.len().min(limit);
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        let kept = content[..end].to_owned();
+        let truncated = content.len() > end;
         let label = req
             .source
             .unwrap_or_else(|| format!("content:{}", &sha256(&kept)[..12]));
-        (kept, "content", None, label, bytes.len())
+        (kept, "content", None, label, truncated)
     } else {
         let file = req.file_path.unwrap();
-        let cwd = match resolve_cwd(req.cwd.as_deref(), &state.allowed_roots) {
-            Ok(p) => p,
-            Err(e) => return bad_request(e),
-        };
-        let path = match resolve_file(&file, &cwd) {
-            Ok(p) => p,
-            Err(e) => return bad_request(e),
-        };
-        let bytes = match std::fs::read(&path) {
-            Ok(v) => v,
-            Err(e) => return bad_request(e),
-        };
-        let kept = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]).into_owned();
-        let label = req
-            .source
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        (
-            kept,
-            "file",
-            Some(path.to_string_lossy().into_owned()),
-            label,
-            bytes.len(),
-        )
+        let cwd = req.cwd;
+        let roots = state.allowed_roots.clone();
+        let (kept, path, truncated) =
+            match run_blocking(move || read_index_file(&file, cwd.as_deref(), &roots, limit)).await
+            {
+                Ok(value) => value,
+                Err(error) => return bad_request(error),
+            };
+        let label = req.source.unwrap_or_else(|| path.clone());
+        (kept, "file", Some(path), label, truncated)
     };
-    let truncated = input_bytes > limit;
     if truncated {
         text.push_str("\n\n[truncated at Quill indexing cap]")
     }
-    match insert_source(
-        &state.db_path,
-        NewSource {
-            label: &label,
-            kind,
-            origin: "quill_index_context",
-            file_path: file_path.as_deref(),
-            url: None,
-            content: &text,
-            content_type: &req.content_type,
-            metadata: json!({"truncated":truncated}),
-        },
-    ) {
+    let db_path = state.db_path.clone();
+    let content_type = req.content_type;
+    match run_blocking(move || {
+        insert_source(
+            &db_path,
+            NewSource {
+                label: &label,
+                kind,
+                origin: "quill_index_context",
+                file_path: file_path.as_deref(),
+                url: None,
+                content: &text,
+                content_type: &content_type,
+                metadata: json!({"truncated":truncated}),
+            },
+        )
+    })
+    .await
+    {
         Ok(indexed) => bounded_json(
             StatusCode::OK,
             json!({"indexed":indexed,"truncated":truncated}),
@@ -845,7 +928,10 @@ async fn search_handler(
     if !authorized(&headers, &state.secret) {
         return unauthorized();
     }
-    match search_store(&state.db_path, &req.query, req.limit, req.source.as_deref()) {
+    let db_path = state.db_path.clone();
+    match run_blocking(move || search_store(&db_path, &req.query, req.limit, req.source.as_deref()))
+        .await
+    {
         Ok(v) => bounded_json(StatusCode::OK, v),
         Err(e) => internal(e),
     }
@@ -858,7 +944,8 @@ async fn source_handler(
     if !authorized(&headers, &state.secret) {
         return unauthorized();
     }
-    match source_store(&state.db_path, &req) {
+    let db_path = state.db_path.clone();
+    match run_blocking(move || source_store(&db_path, &req)).await {
         Ok(v) => bounded_json(StatusCode::OK, v),
         Err(e) => internal(e),
     }
@@ -871,7 +958,8 @@ async fn stats_handler(
     if !authorized(&headers, &state.secret) {
         return unauthorized();
     }
-    match stats_store(&state.db_path) {
+    let db_path = state.db_path.clone();
+    match run_blocking(move || stats_store(&db_path)).await {
         Ok(v) => bounded_json(StatusCode::OK, v),
         Err(e) => internal(e),
     }
@@ -890,37 +978,17 @@ async fn purge_handler(
             json!({"purged":false,"message":"Pass confirm=true to purge context data."}),
         );
     }
-    let conn = match open_store(&state.db_path) {
-        Ok(c) => c,
-        Err(e) => return internal(e),
-    };
-    if let Some(reference) = req.source_ref {
+    let source_id = if let Some(reference) = req.source_ref {
         let Some(id) = parse_ref(Some(&reference), "source") else {
             return bad_request("invalid source_ref");
         };
-        if let Err(e) = delete_sources(&conn, &[id]) {
-            return internal(e);
-        }
-        let _ = conn.execute("DELETE FROM fetch_cache WHERE source_id=?1", [id]);
-        return bounded_json(
-            StatusCode::OK,
-            json!({"purged":true,"scope":format!("source:{id}")}),
-        );
-    }
-    let prior = stats_store(&state.db_path).unwrap_or(json!({}));
-    let result = (|| -> Result<(), String> {
-        if has_fts(&conn) {
-            conn.execute("DELETE FROM chunks_fts", [])
-                .map_err(|e| e.to_string())?;
-        }
-        conn.execute_batch("DELETE FROM fetch_cache;DELETE FROM executions;DELETE FROM chunks;DELETE FROM sources;").map_err(|e|e.to_string())?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => bounded_json(
-            StatusCode::OK,
-            json!({"purged":true,"scope":"all","previous_counts":prior,"removed_files":[]}),
-        ),
+        Some(id)
+    } else {
+        None
+    };
+    let db_path = state.db_path.clone();
+    match run_blocking(move || purge_store(&db_path, source_id)).await {
+        Ok(value) => bounded_json(StatusCode::OK, value),
         Err(e) => internal(e),
     }
 }
@@ -934,14 +1002,16 @@ async fn fetch_handler(
         return unauthorized();
     }
     let max = req.max_bytes.clamp(1024, MAX_FETCH_BYTES);
-    if !req.force
-        && let Ok(conn) = open_store(&state.db_path)
-        && let Ok(Some((id, label, chunks, fetched_at))) = conn
-            .query_row(
+    if !req.force {
+        let db_path = state.db_path.clone();
+        let url = req.url.clone();
+        let cached = run_blocking(move || {
+            let conn = open_store(&db_path)?;
+            conn.query_row(
                 "SELECT s.id,s.label,s.chunk_count,f.fetched_at
                  FROM fetch_cache f JOIN sources s ON s.id=f.source_id
                  WHERE f.url=?1 AND julianday('now')-julianday(f.fetched_at)<1.0",
-                [&req.url],
+                [&url],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -952,44 +1022,86 @@ async fn fetch_handler(
                 },
             )
             .optional()
-    {
-        return bounded_json(
-            StatusCode::OK,
-            json!({"cached":true,"source_ref":format!("source:{id}"),"label":label,"chunk_count":chunks,"fetched_at":fetched_at}),
-        );
+            .map_err(|error| error.to_string())
+        })
+        .await;
+        match cached {
+            Ok(Some((id, label, chunks, fetched_at))) => {
+                return bounded_json(
+                    StatusCode::OK,
+                    json!({"cached":true,"source_ref":format!("source:{id}"),"label":label,"chunk_count":chunks,"fetched_at":fetched_at}),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => return internal(error),
+        }
     }
     let fetched = match crate::fetcher::fetch_context_url(&req.url, max).await {
         Ok(v) => v,
         Err(e) => return bad_request(e),
     };
+    index_fetched_context(state, req, fetched).await
+}
+
+async fn index_fetched_context(
+    state: Arc<ContextState>,
+    req: FetchRequest,
+    fetched: crate::fetcher::ContextFetch,
+) -> Response<Body> {
     let label = req.source.unwrap_or_else(|| req.url.clone());
     let mut text = String::from_utf8_lossy(&fetched.body).into_owned();
     if fetched.truncated {
         text.push_str("\n\n[truncated at Quill fetch cap]")
     }
-    let indexed = match insert_source(
-        &state.db_path,
-        NewSource {
-            label: &label,
-            kind: "fetch",
-            origin: "quill_fetch_and_index",
-            file_path: None,
-            url: Some(&req.url),
-            content: &text,
-            content_type: "text",
-            metadata: json!({"truncated":fetched.truncated,"status_code":fetched.status,"content_type":fetched.content_type,"final_url":fetched.final_url}),
-        },
-    ) {
+    let response_preview = preview(&text, 3000);
+    let db_path = state.db_path.clone();
+    let index_label = label.clone();
+    let index_url = req.url.clone();
+    let index_text = text;
+    let index_metadata = json!({"truncated":fetched.truncated,"status_code":fetched.status,"content_type":fetched.content_type,"final_url":fetched.final_url});
+    let indexed = match run_blocking(move || {
+        insert_source(
+            &db_path,
+            NewSource {
+                label: &index_label,
+                kind: "fetch",
+                origin: "quill_fetch_and_index",
+                file_path: None,
+                url: Some(&index_url),
+                content: &index_text,
+                content_type: "text",
+                metadata: index_metadata,
+            },
+        )
+    })
+    .await
+    {
         Ok(v) => v,
         Err(e) => return internal(e),
     };
-    if let Ok(conn) = open_store(&state.db_path) {
-        let _=conn.execute("INSERT INTO fetch_cache(url,source_id,label,content_type,status_code,etag,last_modified,fetched_at,content_hash)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)ON CONFLICT(url)DO UPDATE SET source_id=excluded.source_id,label=excluded.label,content_type=excluded.content_type,status_code=excluded.status_code,etag=excluded.etag,last_modified=excluded.last_modified,fetched_at=excluded.fetched_at,content_hash=excluded.content_hash",params![req.url,indexed["source_id"].as_i64(),label,fetched.content_type,fetched.status,fetched.etag,fetched.last_modified,now(),indexed["content_hash"].as_str()]);
+    let db_path = state.db_path.clone();
+    let cache_url = req.url;
+    let cache_label = label;
+    let cache_content_type = fetched.content_type;
+    let cache_status = fetched.status;
+    let cache_etag = fetched.etag;
+    let cache_last_modified = fetched.last_modified;
+    let source_id = indexed["source_id"].as_i64();
+    let content_hash = indexed["content_hash"].as_str().map(str::to_owned);
+    let cache_result = run_blocking(move || {
+        let conn = open_store(&db_path)?;
+        conn.execute("INSERT INTO fetch_cache(url,source_id,label,content_type,status_code,etag,last_modified,fetched_at,content_hash)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)ON CONFLICT(url)DO UPDATE SET source_id=excluded.source_id,label=excluded.label,content_type=excluded.content_type,status_code=excluded.status_code,etag=excluded.etag,last_modified=excluded.last_modified,fetched_at=excluded.fetched_at,content_hash=excluded.content_hash",params![cache_url,source_id,cache_label,cache_content_type,cache_status,cache_etag,cache_last_modified,now(),content_hash])
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    let mut response = json!({"cached":false,"indexed":indexed,"preview":response_preview});
+    if let Err(error) = cache_result {
+        response["cacheError"] = json!(format!(
+            "Fetch cache persistence failed; indexed content remains available: {error}"
+        ));
     }
-    bounded_json(
-        StatusCode::OK,
-        json!({"cached":false,"indexed":indexed,"preview":preview(&text,3000)}),
-    )
+    bounded_json(StatusCode::OK, response)
 }
 
 fn resolve_cwd(cwd: Option<&str>, roots: &[PathBuf]) -> Result<PathBuf, String> {
@@ -1044,29 +1156,83 @@ fn validate_command(command: &str) -> Result<(), String> {
     }
     Ok(())
 }
+struct OutputCapture {
+    text: String,
+    total_bytes: usize,
+    truncated: bool,
+    deadline_elapsed: bool,
+}
+
 async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     limit: usize,
-) -> Result<(String, usize, bool), String> {
-    let mut kept = Vec::new();
-    let mut total = 0;
+    deadline: tokio::time::Instant,
+) -> Result<OutputCapture, String> {
+    let mut kept = Vec::with_capacity(limit.min(8192));
+    let mut total = 0usize;
+    let mut deadline_elapsed = false;
     let mut buffer = [0u8; 8192];
     loop {
-        let count = reader.read(&mut buffer).await.map_err(|e| e.to_string())?;
+        let count = match tokio::time::timeout_at(deadline, reader.read(&mut buffer)).await {
+            Ok(result) => result.map_err(|error| error.to_string())?,
+            Err(_) => {
+                deadline_elapsed = true;
+                break;
+            }
+        };
         if count == 0 {
             break;
         }
-        total += count;
+        total = total.saturating_add(count);
         if kept.len() < limit {
             kept.extend_from_slice(&buffer[..count.min(limit - kept.len())]);
         }
     }
-    Ok((
-        String::from_utf8_lossy(&kept).into_owned(),
-        total,
-        total > kept.len(),
-    ))
+    Ok(OutputCapture {
+        text: String::from_utf8_lossy(&kept).into_owned(),
+        total_bytes: total,
+        truncated: total > kept.len() || deadline_elapsed,
+        deadline_elapsed,
+    })
 }
+
+#[cfg(unix)]
+struct ProcessGroupGuard(Option<i32>);
+
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    fn kill(&self) {
+        if let Some(pid) = self.0 {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+fn inline_output(text: &str, limit: usize) -> (String, bool) {
+    if text.len() <= limit {
+        return (text.to_owned(), false);
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true)
+}
+
 async fn execute_handler(
     State(state): State<Arc<ContextState>>,
     headers: HeaderMap,
@@ -1084,9 +1250,11 @@ async fn execute_handler(
     if let Err(e) = validate_command(&req.command) {
         return bad_request(e);
     }
-    let cwd = match resolve_cwd(req.cwd.as_deref(), &state.allowed_roots) {
-        Ok(p) => p,
-        Err(e) => return bad_request(e),
+    let requested_cwd = req.cwd.clone();
+    let roots = state.allowed_roots.clone();
+    let cwd = match run_blocking(move || resolve_cwd(requested_cwd.as_deref(), &roots)).await {
+        Ok(path) => path,
+        Err(error) => return bad_request(error),
     };
     let cap = req.max_output_bytes.clamp(1024, MAX_OUTPUT_BYTES);
     let started = Instant::now();
@@ -1117,71 +1285,128 @@ async fn execute_handler(
         Ok(c) => c,
         Err(e) => return bad_request(e),
     };
-    let stdout = tokio::spawn(read_bounded(child.stdout.take().unwrap(), cap));
-    let stderr = tokio::spawn(read_bounded(child.stderr.take().unwrap(), cap));
-    let (status, timed_out) = match tokio::time::timeout(
-        Duration::from_millis(req.timeout_ms.clamp(100, 120_000)),
-        child.wait(),
-    )
-    .await
-    {
-        Ok(Ok(s)) => (Some(s), false),
-        Ok(Err(e)) => return internal(e),
+    let timeout = Duration::from_millis(req.timeout_ms.clamp(100, 120_000));
+    let deadline = tokio::time::Instant::now() + timeout;
+    #[cfg(unix)]
+    let mut process_group = ProcessGroupGuard(child.id().map(|id| id as i32));
+    let stdout = tokio::spawn(read_bounded(child.stdout.take().unwrap(), cap, deadline));
+    let stderr = tokio::spawn(read_bounded(child.stderr.take().unwrap(), cap, deadline));
+    let (status, process_timed_out) = match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(status)) => (Some(status), false),
+        Ok(Err(error)) => return internal(error),
         Err(_) => {
             #[cfg(unix)]
-            if let Some(id) = child.id() {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(id as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
+            process_group.kill();
             let _ = child.kill().await;
             (child.wait().await.ok(), true)
         }
     };
-    let (stdout_text, stdout_bytes, stdout_truncated) = match stdout.await {
-        Ok(Ok(v)) => v,
-        _ => return internal("stdout reader failed"),
+    let stdout_capture = match stdout.await {
+        Ok(Ok(capture)) => capture,
+        Ok(Err(error)) => return internal(error),
+        Err(error) => return internal(format!("stdout reader failed: {error}")),
     };
-    let (stderr_text, stderr_bytes, stderr_truncated) = match stderr.await {
-        Ok(Ok(v)) => v,
-        _ => return internal("stderr reader failed"),
+    let stderr_capture = match stderr.await {
+        Ok(Ok(capture)) => capture,
+        Ok(Err(error)) => return internal(error),
+        Err(error) => return internal(format!("stderr reader failed: {error}")),
     };
+    let drain_timed_out = stdout_capture.deadline_elapsed || stderr_capture.deadline_elapsed;
+    if drain_timed_out {
+        #[cfg(unix)]
+        process_group.kill();
+        // Windows has no process-group primitive here. kill_on_drop covers the direct
+        // child on cancellation, while inherited descendant pipes stop at the deadline.
+        if status.is_none() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+    #[cfg(unix)]
+    process_group.disarm();
+
+    let timed_out = process_timed_out || drain_timed_out;
+    let exit_code = status.and_then(|status| status.code());
     let duration = started.elapsed().as_millis() as i64;
+    let needs_index = req.index_output
+        && (stdout_capture.truncated
+            || stderr_capture.truncated
+            || stdout_capture.text.len() + stderr_capture.text.len() > 12 * 1024);
+    let (command_text, command_truncated) = inline_output(&req.command, MAX_INLINE_OUTPUT_BYTES);
     let mut output_source = None;
-    if req.index_output
-        && (stdout_truncated
-            || stderr_truncated
-            || stdout_text.len() + stderr_text.len() > 12 * 1024)
-    {
-        let text = format!(
+    let mut output_source_error = None;
+    if needs_index {
+        let source_text = format!(
             "$ {}\ncwd: {}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
-            req.command,
+            command_text,
             cwd.display(),
-            stdout_text,
-            stderr_text
+            stdout_capture.text,
+            stderr_capture.text
         );
-        output_source = insert_source(
-            &state.db_path,
-            NewSource {
-                label: &format!("execute:{}", &sha256(&(req.command.clone() + &now()))[..12]),
-                kind: "execution",
-                origin: "quill_execute",
-                file_path: None,
-                url: None,
-                content: &text,
-                content_type: "text",
-                metadata: json!({"cwd":cwd}),
-            },
-        )
-        .ok();
+        let source_label = format!(
+            "execute:{}",
+            &sha256(&format!("{}{}", req.command, now()))[..12]
+        );
+        let db_path = state.db_path.clone();
+        let source_cwd = cwd.clone();
+        match run_blocking(move || {
+            insert_source(
+                &db_path,
+                NewSource {
+                    label: &source_label,
+                    kind: "execution",
+                    origin: "quill_execute",
+                    file_path: None,
+                    url: None,
+                    content: &source_text,
+                    content_type: "text",
+                    metadata: json!({"cwd":source_cwd}),
+                },
+            )
+        })
+        .await
+        {
+            Ok(source) => output_source = Some(source),
+            Err(error) => {
+                log::error!("Context execution output indexing failed: {error}");
+                output_source_error =
+                    Some("output indexing failed; the command completed and was not retried");
+            }
+        }
     }
-    if let Ok(conn) = open_store(&state.db_path) {
-        let _=conn.execute("INSERT INTO executions(command,cwd,exit_code,timed_out,duration_ms,stdout_bytes,stderr_bytes,stdout_truncated,stderr_truncated,output_source_id,created_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![req.command,cwd.to_string_lossy(),status.and_then(|s|s.code()),timed_out as i64,duration,stdout_bytes as i64,stderr_bytes as i64,stdout_truncated as i64,stderr_truncated as i64,output_source.as_ref().and_then(|v|v["source_id"].as_i64()),now()]);
-    }
+
+    let output_source_id = output_source
+        .as_ref()
+        .and_then(|value| value["source_id"].as_i64());
+    let db_path = state.db_path.clone();
+    let record_command = req.command.clone();
+    let record_cwd = cwd.to_string_lossy().into_owned();
+    let stdout_bytes = stdout_capture.total_bytes;
+    let stderr_bytes = stderr_capture.total_bytes;
+    let stdout_capture_truncated = stdout_capture.truncated;
+    let stderr_capture_truncated = stderr_capture.truncated;
+    let recording_error = match run_blocking(move || {
+        let conn = open_store(&db_path)?;
+        conn.execute("INSERT INTO executions(command,cwd,exit_code,timed_out,duration_ms,stdout_bytes,stderr_bytes,stdout_truncated,stderr_truncated,output_source_id,created_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![record_command,record_cwd,exit_code,timed_out as i64,duration,stdout_bytes as i64,stderr_bytes as i64,stdout_capture_truncated as i64,stderr_capture_truncated as i64,output_source_id,now()])
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    {
+        Ok(()) => None,
+        Err(error) => {
+            log::error!("Context execution record persistence failed: {error}");
+            Some("execution record persistence failed; the command completed and was not retried")
+        }
+    };
+
+    let (stdout_text, stdout_preview_truncated) =
+        inline_output(&stdout_capture.text, MAX_INLINE_OUTPUT_BYTES / 2);
+    let (stderr_text, stderr_preview_truncated) =
+        inline_output(&stderr_capture.text, MAX_INLINE_OUTPUT_BYTES / 2);
     bounded_json(
         StatusCode::OK,
-        json!({"command":req.command,"cwd":cwd,"exitCode":status.and_then(|s|s.code()),"timedOut":timed_out,"durationMs":duration,"stdout":stdout_text,"stderr":stderr_text,"stdoutBytes":stdout_bytes,"stderrBytes":stderr_bytes,"stdoutTruncated":stdout_truncated,"stderrTruncated":stderr_truncated,"outputSource":output_source}),
+        json!({"command":command_text,"commandTruncated":command_truncated,"cwd":cwd,"exitCode":exit_code,"timedOut":timed_out,"durationMs":duration,"stdout":stdout_text,"stderr":stderr_text,"stdoutBytes":stdout_bytes,"stderrBytes":stderr_bytes,"stdoutTruncated":stdout_capture_truncated || stdout_preview_truncated,"stderrTruncated":stderr_capture_truncated || stderr_preview_truncated,"outputSource":output_source,"outputSourceError":output_source_error,"recordingError":recording_error}),
     )
 }
 
@@ -1295,7 +1520,92 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), reqwest::StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["stdout"].as_str().unwrap().len() < 200000);
+        assert_eq!(body["stdoutBytes"], 200000);
+        assert_eq!(body["stdoutTruncated"], true);
+        let source_ref = body["outputSource"]["source_ref"].as_str().unwrap();
+        let source: Value = post(
+            &handle,
+            "/api/v1/context/source",
+            json!({"sourceRef": source_ref}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(source["source_ref"], source_ref);
+        assert!(source["chunks"].as_array().unwrap().len() > 1);
+        let chunk_ref = source["chunks"][0]["chunk_ref"].as_str().unwrap();
+        let chunk: Value = post(
+            &handle,
+            "/api/v1/context/source",
+            json!({"chunkRef": chunk_ref, "includeContent": true}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(chunk["chunk_ref"], chunk_ref);
+        assert!(
+            chunk["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("STDOUT")
+        );
+
+        let response = post(
+            &handle,
+            "/api/v1/context/execute",
+            json!({
+                "command": "head -c 200000 /dev/zero",
+                "cwd": temp.path().join("work"),
+                "maxOutputBytes": 200000,
+                "indexOutput": false
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["outputSource"].is_null());
+        assert!(body["stdout"].as_str().unwrap().len() <= MAX_INLINE_OUTPUT_BYTES / 2);
+        assert_eq!(body["stdoutBytes"], 200000);
+        assert_eq!(body["stdoutTruncated"], true);
+    }
+
+    // @lat: [[pipeline-context-rust-tests#Bounded file indexing]]
+    #[tokio::test]
+    async fn file_index_reads_and_indexes_only_the_requested_cap() {
+        let (temp, handle) = api(true, Arc::new(AtomicBool::new(false))).await;
+        let handle = handle.unwrap();
+        let work = temp.path().join("work");
+        let path = work.join("large.txt");
+        let mut content = vec![b'x'; MAX_INDEX_BYTES + 1];
+        content[1023] = 0xf0;
+        std::fs::write(&path, content).unwrap();
+
+        let (sample, _, truncated) = read_index_file(
+            path.to_str().unwrap(),
+            Some(work.to_str().unwrap()),
+            std::slice::from_ref(&work),
+            1024,
+        )
+        .unwrap();
+        assert_eq!(sample.len(), 1023);
+        assert!(!sample.contains('\u{fffd}'));
+        assert!(truncated);
+
+        let response = post(
+            &handle,
+            "/api/v1/context/index",
+            json!({"filePath": path, "cwd": work, "maxBytes": 1024}),
+        )
+        .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["truncated"], true);
+        assert!(body["indexed"]["content_bytes"].as_u64().unwrap() < 1200);
     }
 
     // @lat: [[context-http-api-tests#Execute permission scope and cap]]
@@ -1337,6 +1647,283 @@ mod tests {
         assert_eq!(body["stdoutBytes"], 4096);
         assert_eq!(body["stdout"].as_str().unwrap().len(), 1024);
         assert_eq!(body["stdoutTruncated"], true);
+    }
+
+    // @lat: [[pipeline-context-rust-tests#One execution deadline]]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_deadline_covers_descendant_pipes_and_keeps_partial_output() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let (temp, handle) = api(true, flag).await;
+        let handle = handle.unwrap();
+        let started = Instant::now();
+        let response = post(
+            &handle,
+            "/api/v1/context/execute",
+            json!({
+                "command": "printf partial; (sleep 5) &",
+                "cwd": temp.path().join("work"),
+                "timeoutMs": 200
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["timedOut"], true);
+        assert_eq!(body["stdout"], "partial");
+    }
+
+    // @lat: [[pipeline-context-rust-tests#Indexed-output persistence failure]]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_reports_index_failure_without_inviting_command_retry() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let (temp, handle) = api(true, flag).await;
+        let handle = handle.unwrap();
+        let conn = open_store(&temp.path().join("context.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_execution_source BEFORE INSERT ON sources
+             WHEN NEW.kind='execution'
+             BEGIN SELECT RAISE(ABORT, 'forced index failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let response = post(
+            &handle,
+            "/api/v1/context/execute",
+            json!({
+                "command": "head -c 20000 /dev/zero | tr '\\0' x",
+                "cwd": temp.path().join("work")
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["exitCode"], 0);
+        assert_eq!(body["timedOut"], false);
+        assert!(body["outputSource"].is_null());
+        assert!(
+            body["outputSourceError"]
+                .as_str()
+                .unwrap()
+                .contains("not retried")
+        );
+        assert!(body["stdout"].as_str().unwrap().len() <= MAX_INLINE_OUTPUT_BYTES / 2);
+    }
+
+    // @lat: [[pipeline-context-rust-tests#Fetch-cache persistence failure]]
+    #[tokio::test]
+    async fn fetch_cache_failure_preserves_indexed_source_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("context.db");
+        let conn = open_store(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_fetch_cache BEFORE INSERT ON fetch_cache
+             BEGIN SELECT RAISE(ABORT, 'forced cache failure'); END;",
+        )
+        .unwrap();
+        let state = Arc::new(ContextState {
+            db_path,
+            secret: "test".into(),
+            allowed_roots: vec![],
+            execute_enabled: Arc::new(|| false),
+        });
+        let request: FetchRequest = serde_json::from_value(json!({
+            "url": "https://example.com/cache-fixture",
+        }))
+        .unwrap();
+        let response = index_fetched_context(
+            state,
+            request,
+            crate::fetcher::ContextFetch {
+                body: b"preserve indexed content".to_vec(),
+                truncated: false,
+                final_url: "https://example.com/cache-fixture".into(),
+                content_type: "text/plain".into(),
+                status: 200,
+                etag: None,
+                last_modified: None,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_HTTP_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            body["cacheError"]
+                .as_str()
+                .unwrap()
+                .contains("forced cache failure")
+        );
+        let source_id = body["indexed"]["source_id"].as_i64().unwrap();
+        assert_eq!(body["indexed"]["source_ref"], format!("source:{source_id}"));
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM chunks WHERE source_id=?1",
+                [source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "preserve indexed content");
+        let cached: i64 = conn
+            .query_row("SELECT COUNT(*) FROM fetch_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached, 0);
+    }
+
+    // @lat: [[pipeline-context-rust-tests#Transactional purge]]
+    #[tokio::test]
+    async fn source_purge_deletes_cache_first_and_rolls_back_together() {
+        let (temp, handle) = api(true, Arc::new(AtomicBool::new(false))).await;
+        let handle = handle.unwrap();
+        let indexed: Value = post(
+            &handle,
+            "/api/v1/context/index",
+            json!({"content": "keep me", "source": "purge-fixture"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let id = indexed["indexed"]["source_id"].as_i64().unwrap();
+        let conn = open_store(&temp.path().join("context.db")).unwrap();
+        conn.execute(
+            "INSERT INTO fetch_cache(url,source_id,label,fetched_at) VALUES('https://example.com',?1,'fixture',?2)",
+            params![id, now()],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER cache_must_go_before_source BEFORE DELETE ON sources
+             WHEN EXISTS(SELECT 1 FROM fetch_cache WHERE source_id=OLD.id)
+             BEGIN SELECT RAISE(ABORT, 'cache reference remains'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let response = post(
+            &handle,
+            "/api/v1/context/purge",
+            json!({"confirm": true, "sourceRef": format!("source:{id}")}),
+        )
+        .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let conn = open_store(&temp.path().join("context.db")).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM fetch_cache", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        conn.execute_batch(
+            "DROP TRIGGER cache_must_go_before_source;
+             INSERT INTO sources(label,kind,content_bytes,chunk_count,created_at,updated_at)
+             VALUES('rollback','content',0,0,'now','now');
+             INSERT INTO fetch_cache(url,source_id,label,fetched_at)
+             VALUES('https://rollback.example',last_insert_rowid(),'rollback','now');
+             CREATE TRIGGER reject_source_delete BEFORE DELETE ON sources
+             BEGIN SELECT RAISE(ABORT, 'forced rollback'); END;",
+        )
+        .unwrap();
+        let rollback_id = conn
+            .query_row("SELECT id FROM sources WHERE label='rollback'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        drop(conn);
+
+        let response = post(
+            &handle,
+            "/api/v1/context/purge",
+            json!({"confirm": true, "sourceRef": format!("source:{rollback_id}")}),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let conn = open_store(&temp.path().join("context.db")).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM fetch_cache WHERE source_id=?1",
+                [rollback_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    // @lat: [[pipeline-context-rust-tests#Transactional purge]]
+    #[tokio::test]
+    async fn full_purge_rolls_back_all_tables_on_failure() {
+        let (temp, handle) = api(true, Arc::new(AtomicBool::new(false))).await;
+        let handle = handle.unwrap();
+        post(
+            &handle,
+            "/api/v1/context/index",
+            json!({"content": "keep me", "source": "full-purge-fixture"}),
+        )
+        .await;
+        let conn = open_store(&temp.path().join("context.db")).unwrap();
+        let source_id = conn
+            .query_row(
+                "SELECT id FROM sources WHERE label='full-purge-fixture'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO fetch_cache(url,source_id,label,fetched_at) VALUES('https://full.example',?1,'fixture','now')",
+            [source_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO executions(command,cwd,timed_out,duration_ms,output_source_id,created_at) VALUES('true','/',0,1,?1,'now')",
+            [source_id],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_full_source_delete BEFORE DELETE ON sources
+             BEGIN SELECT RAISE(ABORT, 'forced rollback'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let response = post(&handle, "/api/v1/context/purge", json!({"confirm": true})).await;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let conn = open_store(&temp.path().join("context.db")).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM sources", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM fetch_cache", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM executions", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     // @lat: [[context-http-api-tests#Shared-store Python parity]]

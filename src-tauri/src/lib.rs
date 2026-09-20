@@ -730,13 +730,14 @@ pub(crate) enum RetainedLiveQueueAdmission {
     Coalesced,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ModelUsageLiveReconciliationProgress {
     processed_sources: usize,
     skipped_sources: usize,
     failed_sources: usize,
     observations_written: i64,
     data_changed: bool,
+    retry_by_source: HashMap<RetainedLiveSourceKey, bool>,
 }
 
 impl ModelUsageLiveReconciliationProgress {
@@ -750,6 +751,19 @@ impl ModelUsageLiveReconciliationProgress {
             .observations_written
             .saturating_add(batch.observations_written());
         self.data_changed |= batch.data_changed;
+        for source in &batch.sources {
+            self.retry_by_source.insert(
+                RetainedLiveSourceKey {
+                    provider: source.provider.as_str(),
+                    source_key: source.source_key.clone(),
+                },
+                source.should_retry(),
+            );
+        }
+    }
+
+    fn succeeded(&self, job: &RetainedDomainJob) -> bool {
+        self.retry_by_source.get(&job.key) == Some(&false)
     }
 }
 
@@ -1028,12 +1042,14 @@ async fn drain_model_usage_live_queue(
         }
 
         let queued = jobs.iter().map(|job| job.source.clone()).collect();
-        match reconcile_queued_model_usage_sources(app_handle.clone(), queued, permit).await {
-            Ok(_) => {
-                for job in &jobs {
-                    state_ref.finish(RetainedLiveDomain::Model, job, true);
-                }
-            }
+        let progress = match reconcile_queued_model_usage_sources(
+            app_handle.clone(),
+            queued,
+            permit,
+        )
+        .await
+        {
+            Ok(progress) => progress,
             Err(failure) => {
                 log::error!(
                     "Live model source reconciliation failed: {}; committed before failure: processed={}, skipped={}, failed={}, observations={}, data_changed={}",
@@ -1044,10 +1060,11 @@ async fn drain_model_usage_live_queue(
                     failure.committed.observations_written,
                     failure.committed.data_changed,
                 );
-                for job in &jobs {
-                    state_ref.finish(RetainedLiveDomain::Model, job, false);
-                }
+                failure.committed
             }
+        };
+        for job in &jobs {
+            state_ref.finish(RetainedLiveDomain::Model, job, progress.succeeded(job));
         }
         tokio::task::yield_now().await;
     }
@@ -6802,6 +6819,29 @@ mod tests {
         );
     }
 
+    // @lat: [[pipeline-recovery-tests#Pipeline Recovery Test Specs#Durable Model Recovery]]
+    #[test]
+    fn exhausted_model_retry_rearms_without_a_source_append() {
+        let state = RetainedSourceRunnerState::new();
+        let source = retained_test_source("exhausted-model");
+        state
+            .enqueue_live_source(source.clone(), RetainedLiveDomains::MODEL)
+            .unwrap();
+        for _ in 0..6 {
+            for queued in state.inner.lock().unwrap().live_sources.values_mut() {
+                queued.model.ready_at = std::time::Instant::now();
+            }
+            let jobs = state.take_ready(RetainedLiveDomain::Model, 1);
+            state.finish(RetainedLiveDomain::Model, &jobs[0], false);
+        }
+        assert!(state.inner.lock().unwrap().live_sources.is_empty());
+
+        state
+            .enqueue_live_source(source, RetainedLiveDomains::MODEL)
+            .unwrap();
+        assert_eq!(state.take_ready(RetainedLiveDomain::Model, 1).len(), 1);
+    }
+
     // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Live Source Coordinator Test Specs#Newer Notification Wins]]
     #[test]
     fn retained_source_coordinator_rearms_both_domains_for_a_newer_notification() {
@@ -6873,6 +6913,63 @@ mod tests {
         assert!(failing.transcript.pending);
         assert!(!healthy.transcript.has_work());
         assert!(healthy.model.pending);
+    }
+
+    // @lat: [[pipeline-recovery-tests#Pipeline Recovery Test Specs#Per-Source Model Outcomes]]
+    #[test]
+    fn model_batch_outcomes_settle_healthy_and_permanent_siblings_only() {
+        let state = RetainedSourceRunnerState::new();
+        for key in ["transient", "healthy", "permanent"] {
+            state
+                .enqueue_live_source(retained_test_source(key), RetainedLiveDomains::MODEL)
+                .unwrap();
+        }
+        let jobs = state.take_ready(RetainedLiveDomain::Model, 3);
+        let mut progress = ModelUsageLiveReconciliationProgress::default();
+        progress.record(&model_usage::ModelSourceReconciliationBatchResult {
+            sources: vec![
+                model_usage::ModelSourceReconciliationResult {
+                    provider: integrations::IntegrationProvider::Claude,
+                    source_key: "transient".into(),
+                    disposition: model_usage::ModelSourceReconciliationDisposition::Failed,
+                    observations_written: 0,
+                    data_changed: false,
+                    diagnostic: None,
+                    retained_last_good: false,
+                    retryable: true,
+                },
+                model_usage::ModelSourceReconciliationResult {
+                    provider: integrations::IntegrationProvider::Claude,
+                    source_key: "healthy".into(),
+                    disposition: model_usage::ModelSourceReconciliationDisposition::Processed,
+                    observations_written: 1,
+                    data_changed: true,
+                    diagnostic: None,
+                    retained_last_good: false,
+                    retryable: false,
+                },
+                model_usage::ModelSourceReconciliationResult {
+                    provider: integrations::IntegrationProvider::Claude,
+                    source_key: "permanent".into(),
+                    disposition: model_usage::ModelSourceReconciliationDisposition::Failed,
+                    observations_written: 0,
+                    data_changed: false,
+                    diagnostic: None,
+                    retained_last_good: true,
+                    retryable: false,
+                },
+            ],
+            data_changed: true,
+        });
+        for job in &jobs {
+            state.finish(RetainedLiveDomain::Model, job, progress.succeeded(job));
+        }
+
+        let inner = state.inner.lock().unwrap();
+        assert_eq!(inner.live_sources.len(), 1);
+        let remaining = inner.live_sources.values().next().unwrap();
+        assert_eq!(remaining.source.source_key, "transient");
+        assert_eq!(remaining.model.failures, 1);
     }
 
     // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Live Source Coordinator Test Specs#Model Backfill Isolation]]

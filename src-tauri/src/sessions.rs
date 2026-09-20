@@ -1039,6 +1039,9 @@ fn append_hex_bytes(output: &mut String, bytes: &[u8]) {
 
 #[derive(Clone)]
 pub struct SessionSchema {
+    pub source_key: Field,
+    pub source_state: Field,
+    pub document_kind: Field,
     pub provider: Field,
     pub message_id: Field,
     pub session_id: Field,
@@ -1100,9 +1103,9 @@ pub(crate) struct IndexedSource {
 ///
 /// Keyed by canonical retained source key, the same identity analytics and
 /// the live coordinator use, so a provider is recoverable from the key prefix
-/// and a moved or re-mounted root does not orphan every entry. The index
-/// directory is rebuilt whenever `SCHEMA_VERSION` moves, so this shape never
-/// needs to read an older layout.
+/// and a moved or re-mounted root does not orphan every entry. Committed
+/// source metadata is authoritative; this sidecar only accelerates
+/// rejection checks and is retained for compatibility.
 #[derive(Serialize, Deserialize, Default)]
 pub struct IndexState {
     #[serde(default)]
@@ -1125,7 +1128,7 @@ pub struct SessionIndex {
 }
 
 impl SessionIndex {
-    const SCHEMA_VERSION: u32 = 9;
+    const SCHEMA_VERSION: u32 = 10;
     const PRODUCTION_WRITER_HEAP_BYTES: usize = 50_000_000;
     #[cfg(test)]
     const TEST_WRITER_HEAP_BYTES: usize = 15_000_000;
@@ -1146,25 +1149,26 @@ impl SessionIndex {
         index_dir: &Path,
         writer_heap_bytes: usize,
     ) -> Result<Self, String> {
+        Self::recover_migration(index_dir)?;
         std::fs::create_dir_all(index_dir)
             .map_err(|e| format!("Failed to create index dir: {e}"))?;
 
-        // Check schema version — rebuild index if schema changed
+        // Migrate stored history; a schema marker is never authority to erase it.
         let version_path = index_dir.join("schema_version.txt");
         let stored_version: u32 = std::fs::read_to_string(&version_path)
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(1);
 
-        if stored_version < Self::SCHEMA_VERSION {
-            log::info!(
-                "Schema version mismatch ({stored_version} < {}), rebuilding index",
-                Self::SCHEMA_VERSION
-            );
-            // Remove entire index directory and recreate it (handles files + subdirectories)
-            let _ = std::fs::remove_dir_all(index_dir);
-            std::fs::create_dir_all(index_dir)
-                .map_err(|e| format!("Failed to recreate index dir: {e}"))?;
+        if index_dir.join("meta.json").exists()
+            && stored_version < Self::SCHEMA_VERSION
+            && Index::open_in_dir(index_dir)
+                .map_err(|e| e.to_string())?
+                .schema()
+                .get_field("source_key")
+                .is_err()
+        {
+            Self::migrate_legacy(index_dir, writer_heap_bytes)?;
         }
 
         let (schema, fields) = Self::build_schema();
@@ -1189,14 +1193,16 @@ impl SessionIndex {
 
         let _ = std::fs::write(&version_path, Self::SCHEMA_VERSION.to_string());
 
-        Ok(Self {
+        let result = Self {
             index,
             fields,
             writer: Arc::new(Mutex::new(writer)),
             reader,
             index_dir: index_dir.to_path_buf(),
             state: Mutex::new(state),
-        })
+        };
+        result.recover_committed_sources()?;
+        Ok(result)
     }
 
     /// Build the Tantivy schema.
@@ -1234,9 +1240,15 @@ impl SessionIndex {
             .set_precision(DateTimePrecision::Seconds);
         let timestamp = builder.add_date_field("timestamp", date_opts);
 
+        let source_key = builder.add_text_field("source_key", STRING | STORED);
+        let source_state = builder.add_text_field("source_state", STORED);
+        let document_kind = builder.add_text_field("document_kind", STRING);
         let schema = builder.build();
 
         let fields = SessionSchema {
+            source_key,
+            source_state,
+            document_kind,
             provider,
             message_id,
             session_id,
@@ -1434,36 +1446,15 @@ impl SessionIndex {
         project_facet: &str,
         host_facet: &str,
     ) -> Result<(), String> {
-        let doc = self.build_index_document(provider, msg, project_facet, host_facet);
+        let mut doc = self.build_index_document(provider, msg, project_facet, host_facet);
+        doc.add_text(
+            self.fields.source_key,
+            Self::remote_source_key(provider, host_facet, &msg.session_id),
+        );
         writer
             .add_document(doc)
             .map_err(|e| format!("Add document: {e}"))?;
         Ok(())
-    }
-
-    fn delete_session_docs_with_writer(
-        &self,
-        writer: &IndexWriter,
-        provider: IntegrationProvider,
-        session_id: &str,
-    ) -> Result<(), String> {
-        let provider_term = Term::from_field_text(self.fields.provider, provider.as_str());
-        let session_term = Term::from_field_text(self.fields.session_id, session_id);
-        let delete_query = BooleanQuery::new(vec![
-            (
-                Occur::Must,
-                Box::new(TermQuery::new(provider_term, IndexRecordOption::Basic)),
-            ),
-            (
-                Occur::Must,
-                Box::new(TermQuery::new(session_term, IndexRecordOption::Basic)),
-            ),
-        ]);
-
-        writer
-            .delete_query(Box::new(delete_query))
-            .map(|_| ())
-            .map_err(|e| format!("Delete session docs: {e}"))
     }
 
     pub(crate) fn replace_session_docs_batch(
@@ -1475,7 +1466,10 @@ impl SessionIndex {
         messages: &[ExtractedMessage],
     ) -> Result<usize, String> {
         let mut writer = self.writer.lock().unwrap();
-        self.delete_session_docs_with_writer(&writer, provider, session_id)?;
+        self.delete_source_docs(
+            &writer,
+            &Self::remote_source_key(provider, host_facet, session_id),
+        );
         for msg in messages {
             self.add_message_to_writer(&writer, provider, msg, project_facet, host_facet)?;
         }
@@ -1647,7 +1641,8 @@ impl SessionIndex {
                         .iter()
                         .find(|root| {
                             matches!(root.outcome, ProviderRootEnumerationOutcome::Complete)
-                                && key.starts_with(root.source_root_key)
+                                && key.split_once(':').is_some_and(|(provider, _)| provider == root.provider.as_str())
+                                && indexed.canonical_path.as_ref().is_some_and(|path| path.starts_with(root.canonical_root_path.as_ref().unwrap_or(&root.resolved_root_path)))
                                 && !discovered.contains(key.as_str())
                                 // A live commit may postdate this inventory. Only
                                 // proven absence can prune its new checkpoint.
@@ -1665,8 +1660,8 @@ impl SessionIndex {
             if !vanished.is_empty() {
                 let mut writer = self.writer.lock().unwrap();
                 let result = (|| {
-                    for (_, provider, session_id) in &vanished {
-                        self.delete_session_docs_with_writer(&writer, *provider, session_id)?;
+                    for (key, _, _) in &vanished {
+                        self.delete_source_docs(&writer, key);
                     }
                     writer
                         .commit()
@@ -1814,24 +1809,13 @@ impl SessionIndex {
             return Err("Search source changed before replacement".into());
         }
         let mut state = self.state.lock().unwrap();
-        if extracted.session_id.is_empty() {
-            if state
+        if extracted.session_id.is_empty()
+            && state
                 .sources
                 .get(&source.source_key)
                 .is_some_and(|previous| !previous.session_id.is_empty())
-            {
-                return Err("Search source lost its native identity".into());
-            }
-            state.sources.insert(
-                source.source_key.clone(),
-                IndexedSource {
-                    fingerprint,
-                    session_id: String::new(),
-                    hints: hints.cloned(),
-                    canonical_path: Some(source.canonical_path.clone()),
-                },
-            );
-            return Ok(0);
+        {
+            return Err("Search source lost its native identity".into());
         }
         let hints = hints.cloned().or_else(|| {
             state
@@ -1875,21 +1859,27 @@ impl SessionIndex {
             .or(extracted.project_name.as_deref())
             .filter(|name| !name.is_empty())
             .unwrap_or("unknown");
+        let checkpoint = IndexedSource {
+            fingerprint,
+            session_id: extracted.session_id.clone(),
+            hints: hints.clone(),
+            canonical_path: Some(source.canonical_path.clone()),
+        };
+        let checkpoint_doc = self.checkpoint_document(&source.source_key, &checkpoint)?;
         let mut writer = self.writer.lock().unwrap();
         let result = (|| {
-            if let Some(previous) = state.sources.get(&source.source_key)
-                && previous.session_id != extracted.session_id
-            {
-                self.delete_session_docs_with_writer(
-                    &writer,
-                    source.provider,
-                    &previous.session_id,
-                )?;
-            }
-            self.delete_session_docs_with_writer(&writer, source.provider, &extracted.session_id)?;
+            self.delete_source_docs(&writer, &source.source_key);
             for message in &extracted.messages {
-                self.add_message_to_writer(&writer, source.provider, message, project, hostname)?;
+                let mut doc =
+                    self.build_index_document(source.provider, message, project, hostname);
+                doc.add_text(self.fields.source_key, &source.source_key);
+                writer
+                    .add_document(doc)
+                    .map_err(|e| format!("Add document: {e}"))?;
             }
+            writer
+                .add_document(checkpoint_doc)
+                .map_err(|e| format!("Add checkpoint: {e}"))?;
             writer
                 .commit()
                 .map_err(|error| format!("Commit index: {error}"))?;
@@ -1927,6 +1917,7 @@ impl SessionIndex {
         page_size: usize,
     ) -> Result<SearchResults, String> {
         let start = std::time::Instant::now();
+        let (limit, offset) = search_page_bounds(page, page_size)?;
         let searcher = self.searcher();
         let f = &self.fields;
 
@@ -1969,7 +1960,7 @@ impl SessionIndex {
 
         // Combine with filter clauses via BooleanQuery
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
-            vec![(Occur::Must, text_query)];
+            vec![(Occur::Must, text_query), ownership::exclude_checkpoints(f)];
         let non_pi = BooleanQuery::new(vec![
             (Occur::Must, Box::new(tantivy::query::AllQuery)),
             (
@@ -2079,42 +2070,50 @@ impl SessionIndex {
 
         // Date range filter
         if filters.date_from.is_some() || filters.date_to.is_some() {
-            let parse_date = |s: &str| -> Option<DateTime> {
-                // Try RFC3339 first, then plain date
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map(|dt| DateTime::from_timestamp_secs(dt.timestamp()))
-                    .ok()
-                    .or_else(|| {
-                        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                            .map(|d| {
-                                DateTime::from_timestamp_secs(
-                                    d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(),
-                                )
-                            })
-                            .ok()
-                    })
-            };
-
-            let lower = match &filters.date_from {
-                Some(from_str) => {
-                    let dt = parse_date(from_str).unwrap_or(DateTime::MIN);
-                    Bound::Included(Term::from_field_date(f.timestamp, dt))
+            let parse_bound = |value: &str, upper: bool| -> Result<Bound<Term>, String> {
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+                    return Ok(Bound::Included(Term::from_field_date(
+                        f.timestamp,
+                        DateTime::from_timestamp_secs(dt.timestamp()),
+                    )));
                 }
-                None => Bound::Unbounded,
-            };
-            let upper = match &filters.date_to {
-                Some(to_str) => {
-                    let dt = parse_date(to_str).unwrap_or(DateTime::MAX);
-                    Bound::Included(Term::from_field_date(f.timestamp, dt))
+                let mut date =
+                    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+                        "Invalid search date: expected YYYY-MM-DD or RFC3339".to_string()
+                    })?;
+                if upper {
+                    date = date
+                        .succ_opt()
+                        .ok_or("Invalid search date: next day overflows")?;
                 }
-                None => Bound::Unbounded,
+                let term = Term::from_field_date(
+                    f.timestamp,
+                    DateTime::from_timestamp_secs(
+                        date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(),
+                    ),
+                );
+                Ok(if upper {
+                    Bound::Excluded(term)
+                } else {
+                    Bound::Included(term)
+                })
             };
+            let lower = filters
+                .date_from
+                .as_deref()
+                .map(|v| parse_bound(v, false))
+                .transpose()?
+                .unwrap_or(Bound::Unbounded);
+            let upper = filters
+                .date_to
+                .as_deref()
+                .map(|v| parse_bound(v, true))
+                .transpose()?
+                .unwrap_or(Bound::Unbounded);
             clauses.push((Occur::Must, Box::new(RangeQuery::new(lower, upper))));
         }
 
         let combined = BooleanQuery::new(clauses);
-        let limit = page_size.min(100);
-        let offset = page * page_size;
 
         let (doc_addresses, total_count): (Vec<(f32, tantivy::DocAddress)>, usize) =
             if sort_by == "recency" {
@@ -2192,6 +2191,10 @@ impl SessionIndex {
                 provider: get_text(f.provider)
                     .parse()
                     .unwrap_or(IntegrationProvider::Claude),
+                source_key: doc
+                    .get_first(f.source_key)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
                 message_id: get_text(f.message_id),
                 session_id: get_text(f.session_id),
                 parent_session_id: doc
@@ -2301,10 +2304,48 @@ impl SessionIndex {
         message_id: &str,
         window: usize,
     ) -> Result<SessionContext, String> {
+        self.get_context_for_source(provider, session_id, message_id, window, None)
+    }
+
+    pub fn get_context_for_source(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+        message_id: &str,
+        window: usize,
+        source_key: Option<&str>,
+    ) -> Result<SessionContext, String> {
+        if session_id.len() > 1024 || message_id.len() > 1024 {
+            return Err("Context identity exceeds 1024 bytes".into());
+        }
         crate::transcript_work::with_source(|| {
-            let path = find_session_path(provider, session_id)?
-                .ok_or_else(|| format!("JSONL file not found for session {session_id}"))?;
+            let path = {
+                let state = self.state.lock().unwrap();
+                let mut candidates = state.sources.iter().filter(|(key, source)| {
+                    source.session_id == session_id
+                        && key
+                            .split_once(':')
+                            .is_some_and(|(p, _)| p == provider.as_str())
+                        && source_key.is_none_or(|wanted| wanted == String::as_str(key))
+                });
+                let first = candidates
+                    .next()
+                    .and_then(|(_, source)| source.canonical_path.clone());
+                if candidates.next().is_some() {
+                    return Err("Ambiguous session context: supply source_key".into());
+                }
+                first
+            };
+            let path = match (path, source_key) {
+                (Some(path), _) => path,
+                (None, Some(_)) => return Err("Requested source has no retained transcript".into()),
+                (None, None) => find_session_path(provider, session_id)?
+                    .ok_or_else(|| format!("JSONL file not found for session {session_id}"))?,
+            };
             let (extracted, _) = read_extracted_session(provider, &path)?;
+            if extracted.session_id != session_id {
+                return Err("Context source identity changed".into());
+            }
             let project_name = extracted.project_name.unwrap_or_default();
             let messages = extracted.messages;
 
@@ -2312,8 +2353,10 @@ impl SessionIndex {
             let target_idx = messages
                 .iter()
                 .position(|m| m.uuid == message_id)
-                .unwrap_or(0);
+                .ok_or("Requested context message not found")?;
 
+            let requested_window = window;
+            let window = window.min(20);
             let start = target_idx.saturating_sub(window);
             let end = target_idx
                 .saturating_add(window)
@@ -2333,6 +2376,7 @@ impl SessionIndex {
                         .join("\n");
 
                     ContextMessage {
+                        truncated: false,
                         message_id: m.uuid.clone(),
                         role: m.role.clone(),
                         content: m.content.clone(),
@@ -2344,15 +2388,17 @@ impl SessionIndex {
                 })
                 .collect();
 
-            // Transfer the explicitly requested wire response, not the raw
-            // transcript/other rows. Response byte limits remain an API concern.
-            Ok(SessionContext {
+            // Bound the wire response centrally for both IPC and HTTP consumers.
+            let mut context = SessionContext {
+                truncated: requested_window > window,
                 provider,
                 session_id: session_id.to_string(),
                 project: project_name,
                 session_name: None,
                 messages: context_messages,
-            })
+            };
+            context.bound_response();
+            Ok(context)
         })
     }
 }
@@ -2363,6 +2409,7 @@ impl SessionIndex {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct SearchHit {
+    pub source_key: Option<String>,
     pub provider: IntegrationProvider,
     pub message_id: String,
     pub session_id: String,
@@ -2401,6 +2448,7 @@ impl SearchResults {
         for hit in &self.hits {
             hits.push(serde_json::json!({
                 "provider": hit.provider,
+                "source_key": hit.source_key,
                 "message_id": truncate(&hit.message_id, 512),
                 "session_id": truncate(&hit.session_id, 512),
                 "parent_session_id": hit
@@ -2471,6 +2519,7 @@ pub struct SearchFacets {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct ContextMessage {
+    pub truncated: bool,
     pub message_id: String,
     pub role: String,
     pub content: String,
@@ -2482,6 +2531,7 @@ pub struct ContextMessage {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct SessionContext {
+    pub truncated: bool,
     pub provider: IntegrationProvider,
     pub session_id: String,
     pub project: String,
@@ -5339,6 +5389,7 @@ pub(crate) fn attach_context_session_name(
     context.session_name = storage
         .transcript_session_names(&[(context.provider, context.session_id.clone())])
         .remove(&(context.provider, context.session_id.clone()));
+    context.bound_response();
 }
 
 #[tauri::command]
@@ -5365,12 +5416,19 @@ pub async fn get_session_context(
     session_id: String,
     around_message_id: String,
     window: Option<u32>,
+    source_key: Option<String>,
     state: tauri::State<'_, SessionIndexState>,
 ) -> Result<SessionContext, String> {
     let idx = state.0.clone();
     let w = window.unwrap_or(5) as usize;
     crate::run_blocking(move || {
-        let mut context = idx.get_context(provider, &session_id, &around_message_id, w)?;
+        let mut context = idx.get_context_for_source(
+            provider,
+            &session_id,
+            &around_message_id,
+            w,
+            source_key.as_deref(),
+        )?;
         attach_context_session_name(crate::STORAGE.get(), &mut context);
         Ok(context)
     })
@@ -5891,15 +5949,16 @@ mod tests {
         let path = dir.path().join("pi.jsonl");
         let body = |id: &str| {
             format!(
-                "{}\n",
-                serde_json::json!({"type":"session","version":3,"id":id,"cwd":"/work/test","timestamp":"2026-08-14T08:00:00Z"})
+                "{}\n{}\n",
+                serde_json::json!({"type":"session","version":3,"id":id,"cwd":"/work/test","timestamp":"2026-08-14T08:00:00Z"}),
+                serde_json::json!({"type":"message","id":"entry","timestamp":"2026-08-14T08:00:01Z","message":{"role":"user","content":"pi-oldneedle"}})
             )
         };
         fs::write(&path, body("old-native")).unwrap();
         let source = DiscoveredRetainedJsonlSource {
             provider: IntegrationProvider::Pi,
             source_root_key: PI_SOURCE_ROOT_KEY,
-            source_key: "pi:sessions:old-native".into(),
+            source_key: crate::storage::pi_source_key("host", "old-native").unwrap(),
             canonical_path: path.clone(),
             filesystem_path: path.clone(),
             layout_hint: RetainedJsonlSourceLayoutHint::PiTranscript,
@@ -5924,11 +5983,27 @@ mod tests {
                 .contains_key(&source.source_key),
             "an existing matching source survives an older inventory"
         );
+        index.reader.reload().unwrap();
+        assert_eq!(
+            index
+                .search("pi-oldneedle", &Default::default(), "relevance", 0, 10)
+                .unwrap()
+                .total_hits,
+            1
+        );
         fs::write(path, body("new-native")).unwrap();
         index.sync_inner(&[root]).unwrap();
         assert!(
             index.state.lock().unwrap().sources.is_empty(),
             "a new valid header proves the old native source was replaced even though its path remains"
+        );
+        index.reader.reload().unwrap();
+        assert_eq!(
+            index
+                .search("pi-oldneedle", &Default::default(), "relevance", 0, 10)
+                .unwrap()
+                .total_hits,
+            0
         );
     }
 
@@ -7141,6 +7216,7 @@ mod tests {
     #[test]
     fn compact_search_results_omit_content_and_obey_byte_budget() {
         let hit = SearchHit {
+            source_key: None,
             provider: IntegrationProvider::Pi,
             message_id: "message".to_string(),
             session_id: "session".to_string(),
@@ -7227,10 +7303,10 @@ mod tests {
         assert_eq!(result.hits[0].message_id, "message-a");
     }
 
-    // @lat: [[session-search-tests#Session Search Test Specs#Schema Rebuild Measurement]]
+    // @lat: [[session-search-tests#Session Search Test Specs#Schema Migration Measurement]]
     #[test]
-    #[ignore = "reproducible index rebuild wall-time measurement"]
-    fn measure_session_index_schema_rebuild_on_pinned_corpus() {
+    #[ignore = "reproducible index migration wall-time measurement"]
+    fn measure_session_index_schema_migration_on_pinned_corpus() {
         const MANIFEST: &str = "pi-analytics-migration-v1\nsessions=80\nentries=30700\nassistant_messages=12685\ntool_results=16670\n";
         const MANIFEST_SHA256: &str =
             "0489da2b94fe813d785f8b5bc4ed2f871b3f0732cde6aab5334c55788f9f673e";
@@ -7239,7 +7315,7 @@ mod tests {
         // messages plus the non-assistant, non-tool-result remainder.
         const DOCUMENTS: usize = 30_700 - 16_670;
         // `custom_message` entries observed in the same window; they carry the
-        // schema-8 `custom_type` field this rebuild exists for.
+        // `custom_type` field that migration must preserve.
         const INJECTED_CONTEXT: usize = 655;
         const PER_SESSION: usize = DOCUMENTS.div_ceil(SESSIONS);
 
@@ -7279,32 +7355,35 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        // One writer and one commit for the whole sweep, exactly as
-        // `startup_scan` reindexes after a schema bump.
-        let index_corpus = |index: &SessionIndex| {
-            let writer = index.writer.lock().unwrap();
+        // Seed the real v9 schema, not just an old version marker on a v10 index.
+        {
+            let builder_dir = TempDir::new().expect("document builder tempdir");
+            let builder = SessionIndex::open_or_create_for_tests(builder_dir.path())
+                .expect("document builder");
+            let mut schema_json = serde_json::to_value(builder.index.schema()).unwrap();
+            schema_json.as_array_mut().unwrap().retain(|field| {
+                !matches!(
+                    field["name"].as_str(),
+                    Some("source_key" | "source_state" | "document_kind")
+                )
+            });
+            let old_schema: Schema = serde_json::from_value(schema_json).unwrap();
+            let old = Index::create_in_dir(temp.path(), old_schema).expect("seed v9 index");
+            let mut writer = old
+                .writer::<TantivyDocument>(SessionIndex::TEST_WRITER_HEAP_BYTES)
+                .unwrap();
             for message in &corpus {
-                index
-                    .add_message_to_writer(
-                        &writer,
+                writer
+                    .add_document(builder.build_index_document(
                         IntegrationProvider::Pi,
                         message,
                         "quill",
                         "host",
-                    )
-                    .expect("index corpus document");
+                    ))
+                    .unwrap();
             }
-            drop(writer);
-            index
-                .writer
-                .lock()
-                .unwrap()
-                .commit()
-                .expect("commit corpus");
-        };
-        {
-            let index = SessionIndex::open_or_create_for_tests(temp.path()).expect("seed index");
-            index_corpus(&index);
+            writer.commit().expect("commit corpus");
+            writer.wait_merging_threads().expect("finish seed merges");
         }
         let bytes_before = fs::read_dir(temp.path())
             .expect("read seeded index")
@@ -7319,8 +7398,7 @@ mod tests {
         .expect("pin pre-upgrade schema version");
 
         let started = std::time::Instant::now();
-        let rebuilt = SessionIndex::open_or_create_for_tests(temp.path()).expect("rebuild index");
-        index_corpus(&rebuilt);
+        let rebuilt = SessionIndex::open_or_create_for_tests(temp.path()).expect("migrate index");
         rebuilt.reader.reload().expect("reload rebuilt index");
         let wall_time = started.elapsed();
 
@@ -7338,14 +7416,15 @@ mod tests {
             INJECTED_CONTEXT as u64
         );
         eprintln!(
-            "index-rebuild-measurement manifest_sha256={MANIFEST_SHA256} sessions={SESSIONS} documents={DOCUMENTS} injected_context={INJECTED_CONTEXT} bytes_before={bytes_before} wall_time_ms={}",
+            "index-migration-measurement manifest_sha256={MANIFEST_SHA256} sessions={SESSIONS} documents={DOCUMENTS} injected_context={INJECTED_CONTEXT} bytes_before={bytes_before} wall_time_ms={}",
             wall_time.as_millis()
         );
     }
 
-    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Search Schema Rebuild]]
+    // @lat: [[pipeline-search-tests#Pipeline Search Tests#Preservation First Migration]]
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Search Schema Migration]]
     #[test]
-    fn search_schema_change_rebuilds_existing_index() {
+    fn search_schema_marker_does_not_erase_unknown_files() {
         let temp = TempDir::new().expect("tempdir");
         fs::write(
             temp.path().join("schema_version.txt"),
@@ -7361,7 +7440,7 @@ mod tests {
             fs::read_to_string(temp.path().join("schema_version.txt")).expect("read version"),
             SessionIndex::SCHEMA_VERSION.to_string()
         );
-        assert!(!obsolete.exists(), "old schema contents must be removed");
+        assert!(obsolete.exists(), "unknown files must not be erased");
     }
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Provider Safe Cleanup]]
@@ -7582,3 +7661,78 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pipeline_tests;
+
+mod ownership;
+
+/// Limit Tantivy's per-segment top-k heaps, not just the returned page.
+pub(crate) fn search_page_bounds(page: usize, page_size: usize) -> Result<(usize, usize), String> {
+    if page_size == 0 {
+        return Err("Invalid search page_size: must be nonzero".into());
+    }
+    let limit = page_size.min(100);
+    let offset = page
+        .checked_mul(limit)
+        .filter(|offset| *offset <= 10_000 - limit)
+        .ok_or("Invalid search page: maximum result window is 10000")?;
+    Ok((limit, offset))
+}
+
+pub const CONTEXT_MAX_BYTES: usize = 64 * 1024;
+
+impl SessionContext {
+    fn bound_response(&mut self) {
+        fn cap(value: &mut String, bytes: usize) -> bool {
+            if value.len() <= bytes {
+                return false;
+            }
+            *value = truncate(value, bytes);
+            true
+        }
+        self.truncated |= cap(&mut self.project, 512);
+        if let Some(name) = &mut self.session_name {
+            self.truncated |= cap(name, 512);
+        }
+        for message in &mut self.messages {
+            message.truncated |= cap(&mut message.content, 16 * 1024);
+            message.truncated |= cap(&mut message.tool_summary, 8 * 1024);
+            message.truncated |= cap(&mut message.tools_used, 1024);
+            message.truncated |= cap(&mut message.role, 128);
+            message.truncated |= cap(&mut message.timestamp, 128);
+            // Neighbor identities are display-only; the requested identity is validated.
+            if !message.is_match {
+                message.truncated |= cap(&mut message.message_id, 1024);
+            }
+            self.truncated |= message.truncated;
+        }
+        // ponytail: at most 41 bounded messages; serialize to measure JSON escaping exactly.
+        while serde_json::to_vec(self)
+            .expect("context is JSON serializable")
+            .len()
+            > CONTEXT_MAX_BYTES
+        {
+            self.truncated = true;
+            if self.messages.len() > 1 {
+                let target = self.messages.iter().position(|m| m.is_match).unwrap_or(0);
+                let last = self.messages.len() - 1;
+                self.messages
+                    .remove(if target >= last - target { 0 } else { last });
+            } else if let Some(message) = self.messages.first_mut() {
+                message.truncated = true;
+                let content_limit = message.content.len() / 2;
+                let tool_limit = message.tool_summary.len() / 2;
+                cap(&mut message.content, content_limit);
+                cap(&mut message.tool_summary, tool_limit);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_context_tests;
+#[cfg(test)]
+mod pipeline_migration_tests;

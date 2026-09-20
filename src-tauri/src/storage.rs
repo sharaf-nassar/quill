@@ -24260,6 +24260,7 @@ mod tests {
         }
 
         let hit = |provider: IntegrationProvider, session_id: &str| crate::sessions::SearchHit {
+            source_key: None,
             provider,
             message_id: format!("{session_id}-message"),
             session_id: session_id.to_owned(),
@@ -24308,6 +24309,7 @@ mod tests {
         );
 
         let mut context = crate::sessions::SessionContext {
+            truncated: false,
             provider: IntegrationProvider::Pi,
             session_id: "named-session".to_owned(),
             project: "quill".to_owned(),

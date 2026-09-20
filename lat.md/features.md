@@ -24,7 +24,7 @@ A provider with no live buckets still gets a row stating why: `SETUP` in amber w
 
 CPA pool rows derive mean account pressure from routing-usable account snapshots and are never persisted as independent facts.
 
-[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means CPA's documented `active` or compatible `ready` status without disabled or unavailable flags; every account remains in the total denominator. Each window is normally the arithmetic mean of healthy accounts returning that window, so missing buckets are excluded rather than read as zero. When no account is routing-usable, quota-readable snapshots provide a fallback mean so the provider row retains quota data.
+[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means CPA's documented `active` or compatible `ready` status without disabled or unavailable flags and without any returned account-wide window at or above 100%; every account remains in the total denominator. Each window is normally the arithmetic mean of healthy accounts returning that window, so missing buckets are excluded rather than read as zero. When no account is healthy, quota-readable, non-exhausted snapshots provide a fallback mean. Account-wide exhaustion excludes all pool percentages and resets, even when CPA still reports the account as active. Claude's account-wide windows are `five_hour` and `seven_day`; model- or surface-scoped windows do not block the whole account. Codex's returned rate-limit windows are account-wide.
 
 The widget renders each aggregate as that provider's sole top-level row while the pool exists: fixed provider identity, inline healthy/total count, mean window cells, and reset readouts for visible canonical windows. Each reset uses only its matching aggregate window's earliest contributing timestamp; missing timestamps show a dash and elapsed timestamps show neutral `now`. A semantic disclosure reveals at most six account rows plus a remainder count.
 
@@ -36,17 +36,29 @@ CPA v7 reports usable credentials as `active`; Quill also accepts the compatible
 
 #### Usable account mean
 
-Each normalized window averages returned utilization across active or ready, non-disabled, available accounts that contain it; routing-unusable accounts cannot influence quota math.
+Each normalized window averages returned utilization across active or ready, non-disabled, available, non-exhausted accounts that contain it; unusable accounts cannot influence the healthy pool mean.
 
 Its reset is the earliest parseable contributing reset because that is when the displayed mean can first change.
 
 #### Health denominator with unusable exclusions
 
-Every account counts toward total, but while any account is active or ready, only active or ready, non-disabled, available accounts count as healthy or contribute buckets. A cooling sibling therefore cannot dilute active utilization.
+Every account counts toward total. Only active or ready, non-disabled, available accounts without exhausted windows count as healthy. While any healthy account exists, cooling siblings cannot contribute buckets or dilute active utilization.
 
 #### All-cooling fallback
 
-When every account is routing-unusable, all quota-readable snapshots with returned windows contribute to the provider mean while the healthy count remains zero.
+When no account is healthy, quota-readable snapshots without exhausted windows contribute to the provider mean while the healthy count remains zero. Disabled, unavailable, or exhausted snapshots remain excluded.
+
+#### Exhausted account exclusion
+
+An account-wide window at or above 100% excludes that account from every pool window and reset, regardless of lifecycle status. Claude and Codex both preserve the remaining account's 21% weekly total rather than averaging it with 100%.
+
+#### Scoped Claude limits retain account totals
+
+Exhausted Claude model or surface quotas do not remove the account from pool means. With Fable at 100% on both accounts, 2%/5% short usage and 53%/79% weekly usage still aggregate to 3.5%, 66%, and 100% Fable, with resets retained.
+
+#### Entirely exhausted pool
+
+When every account has an exhausted account-wide window, the pool retains its total account count with zero healthy accounts and no numeric aggregate buckets. Individual account rows still expose utilization and reset times.
 
 #### Missing account buckets stay gaps
 
@@ -80,7 +92,7 @@ A configured CPA connection yields no native polling candidates; without CPA, ev
 
 Quota scheduling depends on credential readability, not CPA routing health.
 
-The poll mapper canonicalizes `active` and compatible `ready` to the frontend's ready state, but schedules every non-disabled, available Claude or Codex account when its provider smoke gate is open. Successful buckets render and enter pool pressure even when CPA reports a routing `error`.
+The poll mapper canonicalizes `active` and compatible `ready` to the frontend's ready state, but schedules every non-disabled, available Claude or Codex account when its provider smoke gate is open. Successful buckets render even when CPA reports a routing `error`; non-exhausted snapshots enter fallback pool pressure only when no healthy account exists.
 
 #### Smoke verdict gate
 

@@ -45,15 +45,31 @@ fn compute_provider_pool(
         return None;
     }
 
-    let healthy = provider_accounts
+    let quota_accounts = provider_accounts
+        .iter()
+        .copied()
+        .filter(|account| {
+            account.is_quota_readable()
+                && !account.buckets.iter().flatten().any(|bucket| {
+                    bucket.utilization >= 100.0
+                        && (provider == IntegrationProvider::Codex
+                            || matches!(
+                                account_window_key(bucket, &account.health.auth_index).as_str(),
+                                "five_hour" | "seven_day"
+                            ))
+                })
+        })
+        .collect::<Vec<_>>();
+    let healthy = quota_accounts
         .iter()
         .filter(|account| account.is_healthy())
         .count();
     let use_readable_fallback = healthy == 0;
     let mut means = BTreeMap::<String, (UsageBucket, f64, usize)>::new();
-    for account in provider_accounts.iter().copied().filter(|account| {
-        account.is_healthy() || use_readable_fallback && account.is_quota_readable()
-    }) {
+    for account in quota_accounts
+        .into_iter()
+        .filter(|account| account.is_healthy() || use_readable_fallback)
+    {
         let Some(buckets) = account.buckets.as_ref() else {
             continue;
         };
@@ -270,7 +286,7 @@ mod tests {
                 false,
                 false,
                 false,
-                Some(vec![bucket("a", "5h", 40.0)]),
+                Some(vec![bucket("a", "five_hour", 40.0)]),
             ),
             account(
                 "b",
@@ -278,13 +294,13 @@ mod tests {
                 false,
                 false,
                 false,
-                Some(vec![bucket("b", "5h", 100.0)]),
+                Some(vec![bucket("b", "five_hour", 100.0)]),
             ),
         ];
 
         let pool = &compute_cpa_pools(&accounts)[0];
         assert_eq!((pool.healthy, pool.total), (0, 2));
-        assert_eq!(pool.buckets[0].utilization, 70.0);
+        assert_eq!(pool.buckets[0].utilization, 40.0);
     }
 
     #[test]
@@ -296,7 +312,7 @@ mod tests {
                 false,
                 false,
                 false,
-                Some(vec![bucket("a", "5h", 40.0)]),
+                Some(vec![bucket("a", "five_hour", 40.0)]),
             ),
             account(
                 "b",
@@ -304,7 +320,7 @@ mod tests {
                 false,
                 false,
                 false,
-                Some(vec![bucket("b", "5h", 100.0)]),
+                Some(vec![bucket("b", "five_hour", 100.0)]),
             ),
         ];
 
@@ -312,8 +328,146 @@ mod tests {
         assert_eq!((pool.healthy, pool.total), (0, 2));
         assert_eq!(
             pool.buckets.first().map(|bucket| bucket.utilization),
-            Some(70.0)
+            Some(40.0)
         );
+    }
+
+    // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Exhausted account exclusion]]
+    #[test]
+    fn excludes_exhausted_accounts_from_every_window_and_reset() {
+        for provider in [IntegrationProvider::Claude, IntegrationProvider::Codex] {
+            let (short_window, weekly_window) = if provider == IntegrationProvider::Claude {
+                ("five_hour", "seven_day")
+            } else {
+                ("codex_300m", "codex_10080m")
+            };
+            for status in ["active", "ready", "cooling", "error"] {
+                let mut accounts = [
+                    account(
+                        "usable",
+                        status,
+                        false,
+                        false,
+                        false,
+                        Some(vec![
+                            bucket("usable", short_window, 13.0),
+                            bucket("usable", weekly_window, 21.0),
+                        ]),
+                    ),
+                    account(
+                        "maxed",
+                        status,
+                        false,
+                        false,
+                        false,
+                        Some(vec![
+                            bucket("maxed", short_window, 0.0),
+                            bucket("maxed", weekly_window, 100.0),
+                        ]),
+                    ),
+                    account("unavailable", status, false, true, false, None),
+                ];
+                for account in &mut accounts {
+                    account.health.provider = provider.as_str().to_string();
+                    for bucket in account.buckets.iter_mut().flatten() {
+                        bucket.provider = provider;
+                        bucket.resets_at = Some(
+                            if account.health.auth_index == "usable" {
+                                "2026-09-10T00:00:00Z"
+                            } else {
+                                "2026-09-01T00:00:00Z"
+                            }
+                            .to_string(),
+                        );
+                    }
+                }
+                let pool = &compute_cpa_pools(&accounts)[0];
+                assert_eq!(pool.total, 3);
+                assert_eq!(pool.healthy, usize::from(is_usable_account_status(status)));
+                assert_eq!(pool.buckets.len(), 2);
+                for bucket in &pool.buckets {
+                    assert_eq!(
+                        bucket.utilization,
+                        if bucket.key.ends_with(short_window) {
+                            13.0
+                        } else {
+                            21.0
+                        }
+                    );
+                    assert_eq!(bucket.resets_at.as_deref(), Some("2026-09-10T00:00:00Z"));
+                }
+            }
+        }
+    }
+
+    // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Scoped Claude limits retain account totals]]
+    #[test]
+    fn scoped_claude_exhaustion_preserves_general_totals() {
+        for scoped_window in [
+            "weekly_scoped_fable",
+            "weekly_scoped_opus",
+            "seven_day_sonnet",
+            "seven_day_opus",
+            "seven_day_cowork",
+            "seven_day_oauth_apps",
+        ] {
+            for status in ["ready", "cooling", "error"] {
+                let accounts = [("a", 2.0, 53.0), ("b", 5.0, 79.0)].map(|(id, short, weekly)| {
+                    account(
+                        id,
+                        status,
+                        false,
+                        false,
+                        false,
+                        Some(vec![
+                            bucket(id, "five_hour", short),
+                            bucket(id, "seven_day", weekly),
+                            bucket(id, scoped_window, 100.0),
+                        ]),
+                    )
+                });
+                let pool = &compute_cpa_pools(&accounts)[0];
+                assert_eq!(
+                    (pool.healthy, pool.total),
+                    (if status == "ready" { 2 } else { 0 }, 2)
+                );
+                assert_eq!(pool.buckets.len(), 3);
+                for (window, expected) in [
+                    ("five_hour", 3.5),
+                    ("seven_day", 66.0),
+                    (scoped_window, 100.0),
+                ] {
+                    let bucket = pool
+                        .buckets
+                        .iter()
+                        .find(|bucket| bucket.key == format!("cpa/pool/{window}"))
+                        .unwrap();
+                    assert_eq!(bucket.utilization, expected);
+                    assert_eq!(bucket.resets_at.as_deref(), Some("reset-a"));
+                }
+            }
+        }
+    }
+
+    // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Entirely exhausted pool]]
+    #[test]
+    fn entirely_exhausted_pool_has_no_numeric_buckets() {
+        for status in ["ready", "cooling", "error"] {
+            let accounts = [account(
+                "maxed",
+                status,
+                false,
+                false,
+                false,
+                Some(vec![
+                    bucket("maxed", "five_hour", 0.0),
+                    bucket("maxed", "seven_day", 100.0),
+                ]),
+            )];
+            let pool = &compute_cpa_pools(&accounts)[0];
+            assert_eq!((pool.healthy, pool.total), (0, 1));
+            assert!(pool.buckets.is_empty());
+        }
     }
 
     // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Usable lifecycle compatibility]]

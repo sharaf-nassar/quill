@@ -43,3 +43,8 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[web-ui-server-tests]] — Browser command default-deny, request gate, and listener lifecycle test specs
 
 - [[transcript-memory-tests]]: Bounded source materialization, shared consumer retries, cache lifetime, and synthetic memory regressions
+- [[pipeline-hardening]]: Source ownership, recovery, transaction boundaries, retrieval limits, and upstream research
+- [[pipeline-search-tests]]: Source-owned search, migration recovery, date ranges, pagination, context limits, and UI error tests
+- [[pipeline-recovery-tests]]: Serialized inventory, independent retries, durable recovery, and watcher fallback tests
+- [[pipeline-context-rust-tests]]: Bounded indexing, execution deadlines and responses, and transactional purge tests
+- [[pipeline-context-python-tests]]: DNS-pinned fetching, shared-connection isolation, replacement rollback, and purge tests

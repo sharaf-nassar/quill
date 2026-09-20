@@ -51,6 +51,7 @@ function SessionsWindowView() {
 	const [sortBy, setSortBy] = useState<SortMode>("relevance");
 	const [selectedHit, setSelectedHit] = useState<SearchHit | null>(null);
 	const [context, setContext] = useState<Record<string, SessionContext>>({});
+	const [contextErrors, setContextErrors] = useState<Record<string, string | null>>({});
 	const [syncingIndex, setSyncingIndex] = useState(true);
 	const [syncError, setSyncError] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
@@ -59,8 +60,8 @@ function SessionsWindowView() {
 	const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const searchRequestRef = useRef(0);
 	const hitKey = useCallback(
-		(hit: Pick<SearchHit, "provider" | "message_id">) =>
-			`${hit.provider}:${hit.message_id}`,
+		(hit: Pick<SearchHit, "provider" | "message_id" | "source_key" | "session_id" | "host">) =>
+			JSON.stringify([hit.provider, hit.source_key, hit.host, hit.session_id, hit.message_id]),
 		[],
 	);
 
@@ -204,17 +205,19 @@ function SessionsWindowView() {
 		async (hit: SearchHit) => {
 			setSelectedHit(hit);
 			const key = hitKey(hit);
+			setContextErrors((previous) => ({ ...previous, [key]: null }));
 			if (!context[key]) {
 				try {
 					const ctx = await invoke<SessionContext>("get_session_context", {
 						provider: hit.provider,
 						sessionId: hit.session_id,
 						aroundMessageId: hit.message_id,
+						sourceKey: hit.source_key ?? null,
 						window: 5,
 					});
 					setContext((prev) => ({ ...prev, [key]: ctx }));
-				} catch {
-					/* no-op */
+				} catch (error) {
+					setContextErrors((previous) => ({ ...previous, [key]: String(error) }));
 				}
 			}
 		},
@@ -315,6 +318,7 @@ function SessionsWindowView() {
 						<DetailPanel
 							hit={selectedHit}
 							context={context[hitKey(selectedHit)] ?? null}
+							contextError={contextErrors[hitKey(selectedHit)] ?? null}
 							locStats={
 								locStatsMap[sessionRefKey({
 									provider: selectedHit.provider,

@@ -1100,12 +1100,40 @@ fn reconcile_transcript_source_root(
         .iter()
         .map(|source| (source.source_key.as_str(), source))
         .collect::<HashMap<_, _>>();
-    let discovered_keys = root
+    let mut discovered_keys = root
         .sources
         .iter()
         .map(|source| source.source_key.clone())
         .collect::<HashSet<_>>();
     let enumeration_complete = matches!(root.outcome, ProviderRootEnumerationOutcome::Complete);
+    if enumeration_complete {
+        // Explicit-inventory callers can have waited for this root permit after
+        // walking the filesystem. Revalidate only persisted rows absent from
+        // that snapshot: a completed live commit must survive, while a valid
+        // different native identity at the old path may prune the old owner.
+        for stored in &persisted {
+            if discovered_keys.contains(&stored.source_key) {
+                continue;
+            }
+            let preserve = match crate::sessions::validate_retained_notify_source(
+                stored.provider,
+                &stored.source_path,
+            ) {
+                Ok(Some(current)) => current.source_key == stored.source_key,
+                Ok(None) => false,
+                Err(_) => {
+                    stored.source_path.exists()
+                        && root
+                            .canonical_root_path
+                            .as_ref()
+                            .is_some_and(|path| stored.source_path.starts_with(path))
+                }
+            };
+            if preserve {
+                discovered_keys.insert(stored.source_key.clone());
+            }
+        }
+    }
 
     let mut outcome = RootReconciliationOutcome::default();
     let mut identities = Vec::with_capacity(root.sources.len());
@@ -1644,13 +1672,67 @@ pub(crate) fn run_transcript_analytics_reconciliation(
     run_transcript_analytics_reconciliation_with_search(storage, hostname, roots, None)
 }
 
+#[allow(dead_code)] // Retained for explicit-inventory callers and synthetic qualifications.
 pub(crate) fn run_transcript_analytics_reconciliation_with_search(
     storage: &Storage,
     hostname: &str,
     roots: &[ProviderSourceRoot],
     index: Option<&crate::sessions::SessionIndex>,
 ) -> Result<TranscriptAnalyticsReconciliationSummary, String> {
-    let result = reconcile_transcript_analytics_roots(storage, hostname, roots, index);
+    let permit = acquire_all_transcript_reconciliation_roots()?;
+    finish_transcript_analytics_reconciliation(
+        reconcile_transcript_analytics_roots(storage, hostname, roots, index, &permit),
+        index,
+    )
+}
+
+/// Discover a recovery inventory only after owning every root permit, then
+/// retain that ownership through graph resolution and absence pruning.
+/// SQLite transactions serialize database writes, not the filesystem walk
+/// that proves absence, so the inventory must live inside this permit scope.
+pub(crate) fn run_locked_transcript_analytics_recovery(
+    storage: &Storage,
+    hostname: &str,
+    index: Option<&crate::sessions::SessionIndex>,
+    inspect_inventory: impl FnOnce(&[ProviderSourceRoot]),
+) -> Result<TranscriptAnalyticsReconciliationSummary, String> {
+    run_locked_transcript_analytics_recovery_with_inventory(
+        storage,
+        hostname,
+        index,
+        crate::sessions::enumerate_retained_jsonl_source_roots,
+        inspect_inventory,
+    )
+}
+
+fn run_locked_transcript_analytics_recovery_with_inventory(
+    storage: &Storage,
+    hostname: &str,
+    index: Option<&crate::sessions::SessionIndex>,
+    enumerate: impl FnOnce() -> Vec<ProviderSourceRoot>,
+    inspect_inventory: impl FnOnce(&[ProviderSourceRoot]),
+) -> Result<TranscriptAnalyticsReconciliationSummary, String> {
+    let permit = acquire_all_transcript_reconciliation_roots()?;
+    let roots = enumerate();
+    inspect_inventory(&roots);
+    finish_transcript_analytics_reconciliation(
+        reconcile_transcript_analytics_roots(storage, hostname, &roots, index, &permit),
+        index,
+    )
+}
+
+fn acquire_all_transcript_reconciliation_roots() -> Result<TranscriptReconciliationPermit, String> {
+    acquire_transcript_reconciliation(
+        retained_jsonl_source_root_identities()
+            .into_iter()
+            .map(|(provider, source_root_key)| (provider, source_root_key.to_owned())),
+    )
+}
+
+fn finish_transcript_analytics_reconciliation(
+    result: Result<TranscriptAnalyticsReconciliationSummary, String>,
+    index: Option<&crate::sessions::SessionIndex>,
+) -> Result<TranscriptAnalyticsReconciliationSummary, String> {
     // Earlier source commits remain valid even if a later root fails.
     if let Some(index) = index
         && let Err(error) = index.save_state()
@@ -1668,12 +1750,8 @@ fn reconcile_transcript_analytics_roots(
     hostname: &str,
     roots: &[ProviderSourceRoot],
     index: Option<&crate::sessions::SessionIndex>,
+    _permit: &TranscriptReconciliationPermit,
 ) -> Result<TranscriptAnalyticsReconciliationSummary, String> {
-    let _permit = acquire_transcript_reconciliation(
-        retained_jsonl_source_root_identities()
-            .into_iter()
-            .map(|(provider, source_root_key)| (provider, source_root_key.to_owned())),
-    )?;
     let reingest = TranscriptAnalyticsReingestState::read(storage);
     let mut summary = TranscriptAnalyticsReconciliationSummary::default();
     let mut successful_roots = 0usize;
@@ -2962,6 +3040,141 @@ mod tests {
         std::fs::write(&path, jsonl_body(lines)).expect("write transcript");
         set_mtime_ns(&path, FIXED_MTIME_NS);
         discovered_source(provider, path, layout_hint)
+    }
+
+    // @lat: [[pipeline-recovery-tests#Pipeline Recovery Test Specs#Inventory-To-Prune Serialization]]
+    #[test]
+    fn live_commit_after_locked_inventory_cannot_be_pruned_by_that_inventory() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        storage
+            .delete_setting(TRANSCRIPT_ANALYTICS_REINGEST_MARKER)
+            .unwrap();
+        let empty_root = ProviderSourceRoot {
+            provider: IntegrationProvider::Claude,
+            source_root_key: source_root_key(IntegrationProvider::Claude),
+            resolved_root_path: dir.path().to_path_buf(),
+            canonical_root_path: Some(dir.path().to_path_buf()),
+            outcome: ProviderRootEnumerationOutcome::Complete,
+            sources: Vec::new(),
+        };
+        let (source_tx, source_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (live_tx, live_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let storage_ref = &storage;
+            let transcript_dir = dir.path().to_path_buf();
+            let full = scope.spawn(move || {
+                run_locked_transcript_analytics_recovery_with_inventory(
+                    storage_ref,
+                    TEST_HOSTNAME,
+                    None,
+                    || vec![empty_root],
+                    |_| {
+                        let source = write_jsonl_source(
+                            &transcript_dir,
+                            "live.jsonl",
+                            IntegrationProvider::Claude,
+                            claude_parent_hint(),
+                            &[json!({
+                                "type":"assistant",
+                                "sessionId":"live-session",
+                                "uuid":"message-1",
+                                "timestamp":TEST_TIMESTAMP,
+                                "cwd":"/fixture",
+                                "message":{"role":"assistant","model":"claude-test","usage":{"input_tokens":1}}
+                            })
+                            .to_string()],
+                        );
+                        source_tx.send(source).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                )
+                .unwrap();
+            });
+            let source = source_rx.recv().unwrap();
+            let live = scope.spawn(move || {
+                let result = reconcile_live_transcript_source(storage_ref, &source, TEST_HOSTNAME);
+                live_tx.send(result).unwrap();
+            });
+            assert!(matches!(
+                live_rx.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            release_tx.send(()).unwrap();
+            full.join().unwrap();
+            assert_eq!(
+                live_rx.recv().unwrap(),
+                Ok(TranscriptSourceResult::Replaced)
+            );
+            live.join().unwrap();
+            assert_eq!(
+                storage
+                    .list_transcript_analytics_sources_for_root(
+                        IntegrationProvider::Claude,
+                        source_root_key(IntegrationProvider::Claude),
+                    )
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
+    }
+
+    // @lat: [[pipeline-recovery-tests#Pipeline Recovery Test Specs#Inventory-To-Prune Serialization]]
+    #[test]
+    fn stale_explicit_inventory_revalidates_a_completed_live_commit() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        storage
+            .delete_setting(TRANSCRIPT_ANALYTICS_REINGEST_MARKER)
+            .unwrap();
+        let stale_root = ProviderSourceRoot {
+            provider: IntegrationProvider::Claude,
+            source_root_key: source_root_key(IntegrationProvider::Claude),
+            resolved_root_path: dir.path().to_path_buf(),
+            canonical_root_path: Some(dir.path().to_path_buf()),
+            outcome: ProviderRootEnumerationOutcome::Complete,
+            sources: Vec::new(),
+        };
+        let source = write_jsonl_source(
+            dir.path(),
+            "live-before-lock.jsonl",
+            IntegrationProvider::Claude,
+            claude_parent_hint(),
+            &[json!({
+                "type":"assistant",
+                "sessionId":"live-before-lock",
+                "uuid":"message-1",
+                "timestamp":TEST_TIMESTAMP,
+                "cwd":"/fixture",
+                "message":{"role":"assistant","model":"claude-test","usage":{"input_tokens":1}}
+            })
+            .to_string()],
+        );
+        assert_eq!(
+            reconcile_live_transcript_source(&storage, &source, TEST_HOSTNAME),
+            Ok(TranscriptSourceResult::Replaced)
+        );
+
+        let summary = run_transcript_analytics_reconciliation(
+            &storage,
+            TEST_HOSTNAME,
+            std::slice::from_ref(&stale_root),
+        )
+        .unwrap();
+        assert_eq!(summary.pruned_sources, 0);
+        assert_eq!(
+            storage
+                .list_transcript_analytics_sources_for_root(
+                    IntegrationProvider::Claude,
+                    source_root_key(IntegrationProvider::Claude),
+                )
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Fanout Hint And Failure Ownership]]

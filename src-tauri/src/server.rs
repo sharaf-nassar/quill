@@ -2306,12 +2306,24 @@ async fn get_session_search(
     };
 
     let query = params.get("q").cloned().unwrap_or_default();
-    let page: usize = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let page_size: usize = params
-        .get("page_size")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10)
-        .min(100);
+    let parse_number = |name: &str, default: usize| -> Result<usize, String> {
+        params.get(name).map_or(Ok(default), |value| {
+            value.parse().map_err(|_| format!("Invalid {name}"))
+        })
+    };
+    let (page, page_size) = match parse_number("page", 0).and_then(|page| {
+        let size = parse_number("page_size", 10)?;
+        sessions::search_page_bounds(page, size)?;
+        Ok((page, size))
+    }) {
+        Ok(bounds) => bounds,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            );
+        }
+    };
 
     let provider = match params.get("provider") {
         Some(value) => match value.parse::<IntegrationProvider>() {
@@ -2359,6 +2371,10 @@ async fn get_session_search(
             };
             (StatusCode::OK, Json(body))
         }
+        Err(e) if e.starts_with("Invalid search") => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ),
         Err(e) => {
             log::error!("Session search error: {e}");
             (
@@ -2430,11 +2446,20 @@ async fn get_session_context_api(
     };
 
     let result = tokio::task::block_in_place(|| {
-        idx.get_context(provider, &session_id, &message_id, window)
-            .map(|mut context| {
-                sessions::attach_context_session_name(Some(state.storage), &mut context);
-                context
-            })
+        match params.get("source_key") {
+            Some(source_key) => idx.get_context_for_source(
+                provider,
+                &session_id,
+                &message_id,
+                window,
+                Some(source_key),
+            ),
+            None => idx.get_context(provider, &session_id, &message_id, window),
+        }
+        .map(|mut context| {
+            sessions::attach_context_session_name(Some(state.storage), &mut context);
+            context
+        })
     });
 
     match result {

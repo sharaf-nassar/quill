@@ -42,11 +42,11 @@ Search hits and session context carry a nullable `session_name` joined from the 
 
 Lookups are deduplicated per response and chunked, so a page costs a bounded number of indexed reads and a batch wider than one chunk keeps its tail. `storage::tests::session_name_enrichment_uses_one_bounded_registry_lookup` pins per-provider resolution, absent names staying NULL, and the chunk boundary.
 
-## Schema Rebuild Measurement
+## Schema Migration Measurement
 
-The schema-8 rebuild cost is measured on the pinned audit-window corpus rather than asserted.
+Schema-10 preservation-first migration cost is measured on a synthetic v9-shaped index using the pinned audit-window manifest, not asserted as a timing gate.
 
-`sessions::tests::measure_session_index_schema_rebuild_on_pinned_corpus` is an ignored measurement that reindexes 14,030 documents — including 655 injected-context documents — through one writer and one commit, and reports wall time. Recorded evidence lives in `specs/030-pi-analytics-migration-measurement.md`.
+`sessions::tests::measure_session_index_schema_migration_on_pinned_corpus` seeds 14,030 documents, including 655 injected-context documents, migrates them through the production staging path, and reports wall time. Current evidence and migration limits live in [[pipeline-search-tests]]. Historical schema-8 rebuild evidence remains in `specs/030-pi-analytics-migration-measurement.md`.
 
 ## Registry Backed Context Lookup
 

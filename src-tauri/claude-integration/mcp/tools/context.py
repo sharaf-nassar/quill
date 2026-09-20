@@ -600,106 +600,107 @@ def _insert_source(
     content_hash = _sha256_text(content)
 
     with _db_lock:
-        rows = conn.execute("SELECT id FROM sources WHERE label = ?", [label]).fetchall()
-        _delete_sources(conn, [int(row["id"]) for row in rows])
+        with conn:
+            rows = conn.execute("SELECT id FROM sources WHERE label = ?", [label]).fetchall()
+            _delete_sources(conn, [int(row["id"]) for row in rows])
 
-        cur = conn.execute(
-            """
-            INSERT INTO sources (
-                label, kind, origin, file_path, url, content_hash, content_bytes,
-                chunk_count, created_at, updated_at, metadata_json
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                label,
-                kind,
-                origin,
-                file_path,
-                url,
-                content_hash,
-                content_bytes,
-                len(chunks),
-                now,
-                now,
-                json.dumps(metadata or {}, sort_keys=True),
-            ],
-        )
-        source_id = int(cur.lastrowid)
-        for chunk in chunks:
-            chunk_cur = conn.execute(
+            cur = conn.execute(
                 """
-                INSERT INTO chunks (
-                    source_id, chunk_index, title, content, content_type,
-                    start_line, end_line, byte_length, created_at
+                INSERT INTO sources (
+                    label, kind, origin, file_path, url, content_hash, content_bytes,
+                    chunk_count, created_at, updated_at, metadata_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    source_id,
-                    chunk["chunk_index"],
-                    chunk["title"],
-                    chunk["content"],
-                    chunk["content_type"],
-                    chunk["start_line"],
-                    chunk["end_line"],
-                    chunk["byte_length"],
+                    label,
+                    kind,
+                    origin,
+                    file_path,
+                    url,
+                    content_hash,
+                    content_bytes,
+                    len(chunks),
                     now,
+                    now,
+                    json.dumps(metadata or {}, sort_keys=True),
                 ],
             )
-            chunk_id = int(chunk_cur.lastrowid)
-            if _has_fts(conn):
-                conn.execute(
+            source_id = int(cur.lastrowid)
+            for chunk in chunks:
+                chunk_cur = conn.execute(
                     """
-                    INSERT INTO chunks_fts(rowid, title, content, source_id, content_type)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO chunks (
+                        source_id, chunk_index, title, content, content_type,
+                        start_line, end_line, byte_length, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
-                        chunk_id,
+                        source_id,
+                        chunk["chunk_index"],
                         chunk["title"],
                         chunk["content"],
-                        source_id,
                         chunk["content_type"],
+                        chunk["start_line"],
+                        chunk["end_line"],
+                        chunk["byte_length"],
+                        now,
                     ],
                 )
-        conn.commit()
+                chunk_id = int(chunk_cur.lastrowid)
+                if _has_fts(conn):
+                    conn.execute(
+                        """
+                        INSERT INTO chunks_fts(rowid, title, content, source_id, content_type)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        [
+                            chunk_id,
+                            chunk["title"],
+                            chunk["content"],
+                            source_id,
+                            chunk["content_type"],
+                        ],
+                    )
 
-    return {
-        "source_id": source_id,
-        "source_ref": _source_ref(source_id),
-        "label": label,
-        "kind": kind,
-        "content_bytes": content_bytes,
-        "chunk_count": len(chunks),
-        "content_hash": content_hash,
-        "chunks": _chunk_inventory(source_id, limit=5),
-    }
+        return {
+            "source_id": source_id,
+            "source_ref": _source_ref(source_id),
+            "label": label,
+            "kind": kind,
+            "content_bytes": content_bytes,
+            "chunk_count": len(chunks),
+            "content_hash": content_hash,
+            "chunks": _chunk_inventory(source_id, limit=5),
+        }
 
 
 def _chunk_inventory(source_id: int, limit: int = 20) -> list[dict]:
     conn = _context_db()
-    rows = conn.execute(
-        """
-        SELECT id, chunk_index, title, content, content_type, byte_length, start_line, end_line
-        FROM chunks
-        WHERE source_id = ?
-        ORDER BY chunk_index
-        LIMIT ?
-        """,
-        [source_id, limit],
-    ).fetchall()
-    return [
-        {
-            "chunk_ref": _chunk_ref(int(row["id"])),
-            "index": row["chunk_index"],
-            "title": row["title"],
-            "content_type": row["content_type"],
-            "bytes": row["byte_length"],
-            "lines": [row["start_line"], row["end_line"]],
-            "preview": _preview(row["content"], 400)["text"],
-        }
-        for row in rows
-    ]
+    with _db_lock:
+        rows = conn.execute(
+            """
+            SELECT id, chunk_index, title, content, content_type, byte_length, start_line, end_line
+            FROM chunks
+            WHERE source_id = ?
+            ORDER BY chunk_index
+            LIMIT ?
+            """,
+            [source_id, limit],
+        ).fetchall()
+        return [
+            {
+                "chunk_ref": _chunk_ref(int(row["id"])),
+                "index": row["chunk_index"],
+                "title": row["title"],
+                "content_type": row["content_type"],
+                "bytes": row["byte_length"],
+                "lines": [row["start_line"], row["end_line"]],
+                "preview": _preview(row["content"], 400)["text"],
+            }
+            for row in rows
+        ]
 
 
 def _tokens(query: str) -> list[str]:
@@ -747,6 +748,11 @@ def _snippet(content: str, query: str, limit: int = 700) -> str:
 
 
 def _search_context(query: str, limit: int, source: str | None = None) -> dict:
+    with _db_lock:
+        return _search_context_locked(query, limit, source)
+
+
+def _search_context_locked(query: str, limit: int, source: str | None = None) -> dict:
     conn = _context_db()
     effective_limit = max(1, min(limit, 20))
     fts_used = False
@@ -1022,7 +1028,7 @@ def _execution_output(result: dict) -> str:
 
 def _record_execution(result: dict, source_id: int | None) -> int:
     conn = _context_db()
-    with _db_lock:
+    with _db_lock, conn:
         cur = conn.execute(
             """
             INSERT INTO executions (
@@ -1045,7 +1051,6 @@ def _record_execution(result: dict, source_id: int | None) -> int:
                 _now(),
             ],
         )
-        conn.commit()
         return int(cur.lastrowid)
 
 
@@ -1193,29 +1198,37 @@ def _normalize_fetched_content(content: str, content_type: str) -> tuple[str, st
     return content, "text"
 
 
-def _validate_public_http_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError("only http and https URLs are supported")
-    if not parsed.hostname:
-        raise ValueError("URL must include a hostname")
+def _validate_public_http_url(
+    url: str,
+) -> tuple[httpx.URL, ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    try:
+        logical_url = httpx.URL(url)
+    except httpx.InvalidURL as err:
+        raise ValueError(f"invalid URL: {url}") from err
 
-    host = parsed.hostname.strip().lower()
+    if logical_url.scheme not in {"http", "https"}:
+        raise ValueError("only http and https URLs are supported")
+    if not logical_url.host:
+        raise ValueError("URL must include a hostname")
+    parsed = urlparse(url)
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URL credentials are not supported")
+
+    host = logical_url.host.strip().lower()
     if host == "localhost" or host.endswith(".localhost"):
         raise ValueError("refusing to fetch localhost URLs")
 
+    port = logical_url.port or (443 if logical_url.scheme == "https" else 80)
     try:
-        addresses = {ipaddress.ip_address(host)}
+        addresses = [ipaddress.ip_address(host)]
     except ValueError:
         try:
-            infos = socket.getaddrinfo(
-                host,
-                parsed.port or (443 if parsed.scheme == "https" else 80),
-                type=socket.SOCK_STREAM,
-            )
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         except socket.gaierror as err:
             raise ValueError(f"could not resolve URL hostname: {host}") from err
-        addresses = {ipaddress.ip_address(info[4][0]) for info in infos}
+        addresses = list(
+            dict.fromkeys(ipaddress.ip_address(info[4][0]) for info in infos)
+        )
 
     if not addresses:
         raise ValueError(f"could not resolve URL hostname: {host}")
@@ -1226,39 +1239,55 @@ def _validate_public_http_url(url: str) -> None:
             "refusing to fetch non-public URL address(es): " + ", ".join(blocked[:3])
         )
 
+    return logical_url, addresses[0]
+
 
 async def _fetch_public_url(url: str, max_bytes: int) -> dict:
-    headers = {"User-Agent": "Quill-MCP/0.1"}
     current_url = url
     redirect_count = 0
 
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False, headers=headers) as client:
-        while True:
-            _validate_public_http_url(current_url)
-            chunks: list[bytes] = []
-            total = 0
+    while True:
+        logical_url, address = _validate_public_http_url(current_url)
+        pinned_url = logical_url.copy_with(host=str(address))
+        request_headers = {
+            "Host": logical_url.netloc.decode("ascii"),
+            "User-Agent": "Quill-MCP/0.1",
+        }
+        extensions = {"sni_hostname": logical_url.raw_host.decode("ascii")}
+        chunks: list[bytes] = []
+        total = 0
 
-            async with client.stream("GET", current_url) as resp:
+        # A client per hop prevents a connection authenticated for one hostname
+        # from being reused after a cross-host redirect to the same numeric IP.
+        async with httpx.AsyncClient(
+            timeout=30.0, follow_redirects=False, trust_env=False
+        ) as client:
+            request = client.build_request(
+                "GET", pinned_url, headers=request_headers, extensions=extensions
+            )
+            resp = await client.send(request, stream=True)
+            try:
                 if 300 <= resp.status_code < 400 and resp.headers.get("location"):
                     redirect_count += 1
                     if redirect_count > 5:
                         raise ValueError("too many redirects while fetching URL")
-                    current_url = urljoin(str(resp.url), resp.headers["location"])
+                    current_url = urljoin(current_url, resp.headers["location"])
                     continue
 
                 resp.raise_for_status()
                 content_type = resp.headers.get("content-type", "text/plain")
+                kept = 0
                 async for chunk in resp.aiter_bytes():
                     total += len(chunk)
-                    kept = sum(len(part) for part in chunks)
                     if kept < max_bytes:
-                        remaining = max_bytes - kept
-                        chunks.append(chunk[:remaining])
+                        part = chunk[: max_bytes - kept]
+                        chunks.append(part)
+                        kept += len(part)
                     if total > max_bytes:
                         break
 
                 return {
-                    "final_url": str(resp.url),
+                    "final_url": str(logical_url),
                     "raw": b"".join(chunks),
                     "total": total,
                     "content_type": content_type,
@@ -1267,6 +1296,8 @@ async def _fetch_public_url(url: str, max_bytes: int) -> dict:
                     "last_modified": resp.headers.get("last-modified"),
                     "encoding": resp.encoding or "utf-8",
                 }
+            finally:
+                await resp.aclose()
 
 
 def _purge_marker_files() -> list[str]:
@@ -1421,15 +1452,16 @@ def quill_get_context_source(
     conn = _context_db()
     chunk_id = _parse_ref(chunk_ref, "chunk")
     if chunk_id is not None:
-        row = conn.execute(
-            """
-            SELECT c.*, s.label, s.kind
-            FROM chunks c
-            JOIN sources s ON s.id = c.source_id
-            WHERE c.id = ?
-            """,
-            [chunk_id],
-        ).fetchone()
+        with _db_lock:
+            row = conn.execute(
+                """
+                SELECT c.*, s.label, s.kind
+                FROM chunks c
+                JOIN sources s ON s.id = c.source_id
+                WHERE c.id = ?
+                """,
+                [chunk_id],
+            ).fetchone()
         if row is None:
             return {"error": f"chunk not found: {chunk_ref}"}
         content_preview = _preview(row["content"], 16 * 1024 if include_content else 1200)
@@ -1469,16 +1501,18 @@ def quill_get_context_source(
         where += " AND label LIKE ? ESCAPE '\\'"
         params.append(f"%{_like_escape(source)}%")
 
-    row = conn.execute(
-        f"""
-        SELECT *
-        FROM sources
-        WHERE {where}
-        ORDER BY updated_at DESC
-        LIMIT 1
-        """,
-        params,
-    ).fetchone()
+    with _db_lock:
+        row = conn.execute(
+            f"""
+            SELECT *
+            FROM sources
+            WHERE {where}
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        chunks = _chunk_inventory(int(row["id"]), limit=limit) if row else None
     if row is None:
         return {"error": "source not found"}
 
@@ -1492,7 +1526,7 @@ def quill_get_context_source(
         "content_bytes": row["content_bytes"],
         "chunk_count": row["chunk_count"],
         "updated_at": row["updated_at"],
-        "chunks": _chunk_inventory(int(row["id"]), limit=limit),
+        "chunks": chunks,
     }
     return _attach_context_savings(
         response,
@@ -1715,12 +1749,20 @@ async def quill_fetch_and_index(
     conn = _context_db()
     label = source or url
     if not force:
-        row = conn.execute("SELECT * FROM fetch_cache WHERE url = ?", [url]).fetchone()
-        fetched_at = _parse_time(row["fetched_at"]) if row else None
-        if row and fetched_at and datetime.now(timezone.utc) - fetched_at < FETCH_TTL:
+        with _db_lock:
+            row = conn.execute("SELECT * FROM fetch_cache WHERE url = ?", [url]).fetchone()
+            fetched_at = _parse_time(row["fetched_at"]) if row else None
             source_row = None
-            if row["source_id"] is not None:
-                source_row = conn.execute("SELECT * FROM sources WHERE id = ?", [row["source_id"]]).fetchone()
+            if (
+                row
+                and fetched_at
+                and datetime.now(timezone.utc) - fetched_at < FETCH_TTL
+                and row["source_id"] is not None
+            ):
+                source_row = conn.execute(
+                    "SELECT * FROM sources WHERE id = ?", [row["source_id"]]
+                ).fetchone()
+        if row and fetched_at and datetime.now(timezone.utc) - fetched_at < FETCH_TTL:
             if source_row is not None:
                 response = {
                     "cached": True,
@@ -1769,7 +1811,7 @@ async def quill_fetch_and_index(
             "final_url": fetched["final_url"],
         },
     )
-    with _db_lock:
+    with _db_lock, conn:
         conn.execute(
             """
             INSERT INTO fetch_cache (
@@ -1799,7 +1841,6 @@ async def quill_fetch_and_index(
                 indexed["content_hash"],
             ],
         )
-        conn.commit()
 
     response = {
         "cached": False,
@@ -1843,20 +1884,23 @@ def quill_context_stats() -> dict:
 
 def _context_stats() -> dict:
     conn = _context_db()
-    source_count = conn.execute("SELECT COUNT(*) AS c FROM sources").fetchone()["c"]
-    chunk_count = conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
-    execution_count = conn.execute("SELECT COUNT(*) AS c FROM executions").fetchone()["c"]
-    cache_count = conn.execute("SELECT COUNT(*) AS c FROM fetch_cache").fetchone()["c"]
-    bytes_row = conn.execute("SELECT COALESCE(SUM(content_bytes), 0) AS b FROM sources").fetchone()
-    return {
-        "db_path": str(CONTEXT_DB),
-        "fts_available": _has_fts(conn),
-        "sources": source_count,
-        "chunks": chunk_count,
-        "executions": execution_count,
-        "fetch_cache_entries": cache_count,
-        "indexed_bytes": bytes_row["b"],
-    }
+    with _db_lock:
+        source_count = conn.execute("SELECT COUNT(*) AS c FROM sources").fetchone()["c"]
+        chunk_count = conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
+        execution_count = conn.execute("SELECT COUNT(*) AS c FROM executions").fetchone()["c"]
+        cache_count = conn.execute("SELECT COUNT(*) AS c FROM fetch_cache").fetchone()["c"]
+        bytes_row = conn.execute(
+            "SELECT COALESCE(SUM(content_bytes), 0) AS b FROM sources"
+        ).fetchone()
+        return {
+            "db_path": str(CONTEXT_DB),
+            "fts_available": _has_fts(conn),
+            "sources": source_count,
+            "chunks": chunk_count,
+            "executions": execution_count,
+            "fetch_cache_entries": cache_count,
+            "indexed_bytes": bytes_row["b"],
+        }
 
 
 @mcp.tool(annotations=DESTRUCTIVE_ANNOTATIONS)
@@ -1876,22 +1920,22 @@ def quill_purge_context(
             source_id = _parse_ref(source_ref, "source")
             if source_id is None:
                 return {"purged": False, "error": f"invalid source_ref: {source_ref}"}
-            _delete_sources(conn, [source_id])
-            conn.execute("DELETE FROM fetch_cache WHERE source_id = ?", [source_id])
-            conn.commit()
+            with conn:
+                conn.execute("DELETE FROM fetch_cache WHERE source_id = ?", [source_id])
+                _delete_sources(conn, [source_id])
             return {"purged": True, "scope": _source_ref(source_id)}
 
         counts = _context_stats()
-        if _has_fts(conn):
-            conn.execute("DELETE FROM chunks_fts")
-        for table in (
-            "fetch_cache",
-            "executions",
-            "chunks",
-            "sources",
-        ):
-            conn.execute(f"DELETE FROM {table}")
-        conn.commit()
+        with conn:
+            if _has_fts(conn):
+                conn.execute("DELETE FROM chunks_fts")
+            for table in (
+                "fetch_cache",
+                "executions",
+                "chunks",
+                "sources",
+            ):
+                conn.execute(f"DELETE FROM {table}")
     removed_files = _purge_marker_files()
     return {
         "purged": True,

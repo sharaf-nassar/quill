@@ -2009,7 +2009,16 @@ pub(crate) struct ModelSourceReconciliationResult {
     pub(crate) observations_written: i64,
     pub(crate) data_changed: bool,
     pub(crate) diagnostic: Option<ModelUsageDiagnostic>,
-    retained_last_good: bool,
+    pub(crate) retained_last_good: bool,
+    /// Transient source failures retry; a versioned content rejection settles
+    /// until its path, fingerprint, or parser policy changes.
+    pub(crate) retryable: bool,
+}
+
+impl ModelSourceReconciliationResult {
+    pub(crate) const fn should_retry(&self) -> bool {
+        self.retryable
+    }
 }
 
 /// Aggregate source results from one provider-root inventory snapshot.
@@ -3691,6 +3700,7 @@ fn commit_staged_model_source_inner(
                 data_changed: false,
                 diagnostic: None,
                 retained_last_good: false,
+                retryable: false,
             },
             notify: None,
         });
@@ -3708,6 +3718,7 @@ fn commit_staged_model_source_inner(
         data_changed: false,
         diagnostic: None,
         retained_last_good: false,
+        retryable: false,
     };
     let mut notify_data_changed = None;
 
@@ -3880,6 +3891,7 @@ fn commit_staged_model_source_inner(
             }
             result.disposition = ModelSourceReconciliationDisposition::Failed;
             result.diagnostic = Some(diagnostic);
+            result.retryable = staged.rejection.is_none();
             result.retained_last_good = staged.existing.as_ref().is_some_and(|existing| {
                 existing.processing_status != SourceProcessingStatus::Suppressed
                     && existing.suppressed_sha256.is_none()
@@ -4104,6 +4116,32 @@ mod tests {
         );
     }
 
+    // @lat: [[pipeline-recovery-tests#Pipeline Recovery Test Specs#Per-Source Model Outcomes]]
+    #[test]
+    fn transient_model_read_failure_remains_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.jsonl");
+        let source = DiscoveredRetainedJsonlSource {
+            provider: IntegrationProvider::Codex,
+            source_root_key: "codex:sessions",
+            source_key: "transient-read".into(),
+            canonical_path: path.clone(),
+            filesystem_path: path,
+            layout_hint: RetainedJsonlSourceLayoutHint::CodexTranscript,
+        };
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let staged = stage_model_source(source, None, "host");
+        assert_eq!(staged.action, StagedSourceAction::Fail);
+        assert!(staged.rejection.is_none());
+        let committed =
+            commit_staged_model_source(&storage, &staged, 0, ModelSourceCommitMode::Live).unwrap();
+        assert_eq!(
+            committed.result.disposition,
+            ModelSourceReconciliationDisposition::Failed
+        );
+        assert!(committed.result.should_retry());
+    }
+
     // @lat: [[transcript-memory-tests#Transcript Memory Test Specs#Empty Codex Recovery]]
     #[test]
     fn empty_codex_rejection_survives_reopen_and_recovers_after_append() {
@@ -4123,7 +4161,10 @@ mod tests {
         let staged = stage_model_source(source.clone(), None, "host");
         assert_eq!(staged.action, StagedSourceAction::Fail);
         assert!(staged.rejection.is_some());
-        commit_staged_model_source(&storage, &staged, 0, ModelSourceCommitMode::Backfill).unwrap();
+        let rejected_result =
+            commit_staged_model_source(&storage, &staged, 0, ModelSourceCommitMode::Backfill)
+                .unwrap();
+        assert!(!rejected_result.result.should_retry());
         let index =
             crate::sessions::SessionIndex::open_or_create_for_tests(&dir.path().join("index"))
                 .unwrap();
@@ -4140,8 +4181,10 @@ mod tests {
             .remove(0);
         let rejected = stage_model_source(source.clone(), Some(stored.clone()), "host");
         assert_eq!(rejected.action, StagedSourceAction::RejectedUnchanged);
-        commit_staged_model_source(&storage, &rejected, 1, ModelSourceCommitMode::Backfill)
-            .unwrap();
+        let unchanged_rejection =
+            commit_staged_model_source(&storage, &rejected, 1, ModelSourceCommitMode::Backfill)
+                .unwrap();
+        assert!(!unchanged_rejection.result.should_retry());
         let proof = CompletedModelSourceRoot::from_completed_inventory(
             &ProviderSourceRoot {
                 provider: source.provider,

@@ -647,6 +647,7 @@ export interface SearchFilters {
 }
 
 export interface SearchHit {
+  source_key?: string | null;
   provider: IntegrationProvider;
 	message_id: string;
 	session_id: string;
@@ -686,6 +687,7 @@ export interface SearchFacets {
 }
 
 export interface ContextMessage {
+  truncated?: boolean;
 	message_id: string;
 	role: string;
 	content: string;
@@ -696,6 +698,7 @@ export interface ContextMessage {
 }
 
 export interface SessionContext {
+  truncated?: boolean;
   provider: IntegrationProvider;
   messages: ContextMessage[];
   session_id: string;
