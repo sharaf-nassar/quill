@@ -1,5 +1,17 @@
 # Spec: cpa-oauth-limits
 
+## Implementation update (2026-09-21)
+
+The initial proposal and research below are historical. Current behavior is
+specified in `lat.md/features.md` (CPA Pool Aggregation, CPA Poll Scheduling,
+and CPA Connection Lifecycle), `lat.md/data-flow.md`, and `lat.md/cpa-tests.md`.
+The CPA 7.3.9 audit replaced permanent smoke gates with per-account retries,
+serialized transactional lifecycle changes, coherent timestamped caches,
+management-auth suppression, passive observations with active fallback, and
+scope-preserving Codex limits. Pool pressure is a per-window arithmetic mean,
+not the original proposed maximum. Native usage is suppressed while CPA is
+configured, including cold-cache and tray reads.
+
 ## Problem Statement
 
 Quill's LIMITS band shows one row per natively-integrated provider (Claude, Codex, MiniMax), each backed by a single credential that Quill reads directly (Anthropic OAuth usage API, Codex app-server, MiniMax API key). A growing class of power users no longer holds one account per provider: they run a local **CLI Proxy API** (CPA — the open-source Go project `router-for-me/CLIProxyAPI`) that pools *multiple* OAuth accounts per provider (Claude Code, Codex/ChatGPT, Gemini CLI, Antigravity, Grok Build, Kimi, Qwen, iFlow, …) behind OpenAI/Claude/Gemini-compatible endpoints, with round-robin or fill-first routing and per-credential quota/cooldown state.
@@ -151,7 +163,7 @@ All confirmed against https://help.router-for.me/management/api and https://help
 
 Retrieved 2026-08-01. Sources: CLIProxyAPI server source (`internal/api/server_management.go`, `internal/api/handlers/management/api_tools.go`), Cli-Proxy-API-Management-Center panel source (`src/services/api/apiCall.ts`, `src/features/quota/providers/*`), AllenReder/CLIProxyAPI-Quota-Inspector, and a live probe of the user's local instance (CPA v7.2.113 on port 8317).
 
-- **STANDARDIZED QUOTA MECHANISM (verified 3 ways):** `POST /v0/management/api-call`, body `{authIndex, method, url, header{...}, data}`, response `{status_code, header, body}` (body = raw upstream string). `$TOKEN$` in any header value is replaced server-side with the credential's access token (refreshed if expired). 60s fixed timeout. No per-provider quota endpoints exist on the server.
+- **STANDARDIZED QUOTA MECHANISM (verified 3 ways):** `POST /v0/management/api-call`, body `{authIndex, method, url, header{...}, data}`, response `{status_code, header, body}` (body = raw upstream string). `$TOKEN$` in any header value is replaced server-side with the credential's stored access token. This does not refresh expired Claude or Codex OAuth tokens; credential recovery remains with CPA. 60s fixed timeout. No per-provider quota endpoints exist on the server.
 - **NO SIDE EFFECTS:** the api-call handler builds its own `http.Client`; it does NOT touch success/failed counters, cooldown/quota state, or routing (sole exception: Antigravity token refresh persists rotated tokens — benign).
 - **Claude quota via api-call:** `GET https://api.anthropic.com/api/oauth/usage`, headers `Authorization: Bearer $TOKEN$`, `anthropic-beta: oauth-2025-04-20`, `Content-Type: application/json`. Windows keyed `five_hour`, `seven_day`, `seven_day_oauth_apps`, `seven_day_opus`, `seven_day_sonnet`, `seven_day_cowork`, `iguana_necktie` — each `{utilization, resets_at}`; plus `limits[]`, `extra_usage`. `GET /api/oauth/profile` gives `organization.rate_limit_tier` and account plan flags (dedup/tier enabler, deferred).
 - **Codex quota via api-call (VERIFIED — plain HTTPS works with a CPA-held OAuth token):** `GET https://chatgpt.com/backend-api/wham/usage`, headers `Authorization: Bearer $TOKEN$`, `Chatgpt-Account-Id: <from auth file>`, Codex CLI User-Agent. Response: `plan_type`, `rate_limit{primary_window,secondary_window}` each `{used_percent, limit_window_seconds, reset_after_seconds, reset_at}`, `additional_rate_limits[]`, `rate_limit_reset_credits`.

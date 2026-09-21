@@ -33,6 +33,7 @@ const CPA_ERROR_CODES = new Set<CpaConnectErrorCode>([
   "hashed_key",
   "unreachable",
   "unauthorized",
+  "forbidden",
   "unsupported_version",
   "unexpected_response",
   "storage",
@@ -47,6 +48,8 @@ const CPA_ERROR_MESSAGES: Record<CpaConnectErrorCode, string> = {
     "CPA is unreachable at this URL. Start CPA and verify the port, then retry.",
   unauthorized:
     "CPA rejected the management key. Paste the plaintext management key and retry.",
+  forbidden:
+    "CPA denied management access. Check CPA for an IP lockout, wait for any ban to expire, then reconnect.",
   unsupported_version:
     "This CPA build does not expose required account fields. Update CPA and retry.",
   unexpected_response:
@@ -169,9 +172,7 @@ function CpaConnectionSettings() {
       if (result.connection.baseUrl) setBaseUrl(result.connection.baseUrl);
       setFeedback({
         tone: "info",
-        message: [result.smoke.claude.message, result.smoke.codex.message].join(
-          " ",
-        ),
+        message: "CPA connected. Account quotas are checked independently; see Limits for freshness and retry status.",
       });
     } catch (error) {
       const normalized = normalizeCpaError(error);
@@ -213,7 +214,7 @@ function CpaConnectionSettings() {
       <p className="cpa-settings-description">
         Read pooled Claude and Codex OAuth limits from one local CPA instance.
         Quill sends the management key only to this loopback endpoint; CPA then
-        calls provider quota APIs for smoke checks and polling.
+        calls provider quota APIs when fresh observations do not cover the limits.
       </p>
 
       <form

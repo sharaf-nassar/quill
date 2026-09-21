@@ -53,6 +53,20 @@ export interface ProviderCredits {
   balance: string | null;
 }
 
+export interface CpaQuotaHealth {
+  state: "unknown" | "live" | "cached" | "paused";
+  observed_at: string | null;
+  retry_at: string | null;
+  message: string | null;
+  credits: {
+    balance: string | null;
+    has_credits: boolean | null;
+    unlimited: boolean | null;
+    reset_available: number | null;
+  } | null;
+  models: { model: string; available: boolean; available_at: string | null }[];
+}
+
 export interface CpaAccountHealth {
   provider: string;
   auth_index: string;
@@ -62,6 +76,7 @@ export interface CpaAccountHealth {
   disabled: boolean;
   unavailable: boolean;
   runtime_only: boolean;
+  quota?: CpaQuotaHealth;
 }
 
 export interface CpaPoolAggregate {
@@ -347,19 +362,8 @@ export interface CpaConnectionStatus {
   configured: boolean;
 }
 
-export type CpaSmokeState = "available" | "unavailable" | "not_present";
-
-export interface CpaSmokeVerdict {
-  state: CpaSmokeState;
-  message: string;
-}
-
 export interface CpaConnectResult {
   connection: CpaConnectionStatus;
-  smoke: {
-    claude: CpaSmokeVerdict;
-    codex: CpaSmokeVerdict;
-  };
 }
 
 export type CpaConnectErrorCode =
@@ -367,6 +371,7 @@ export type CpaConnectErrorCode =
   | "hashed_key"
   | "unreachable"
   | "unauthorized"
+  | "forbidden"
   | "unsupported_version"
   | "unexpected_response"
   | "storage";

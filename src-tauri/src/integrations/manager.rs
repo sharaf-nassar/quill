@@ -255,13 +255,7 @@ pub(crate) fn set_cpa_connection(
 pub(crate) fn clear_cpa_connection() -> Result<(), CpaConnectError> {
     let _mutation_guard = integration_mutation_guard().map_err(|_| CpaConnectError::storage())?;
     let storage = Storage::init().map_err(|_| CpaConnectError::storage())?;
-    cpa::delete_connection(&storage)?;
-    storage
-        .delete_settings_with_prefix("usage.cpa.")
-        .map_err(|_| CpaConnectError::storage())?;
-    storage
-        .delete_cpa_usage_snapshots()
-        .map_err(|_| CpaConnectError::storage())
+    cpa::delete_connection(&storage)
 }
 
 pub(crate) fn get_cpa_connection_status() -> Result<CpaConnectionStatus, CpaConnectError> {

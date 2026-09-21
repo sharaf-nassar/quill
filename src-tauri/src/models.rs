@@ -441,7 +441,42 @@ pub struct ProviderCredits {
     pub balance: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CpaQuotaState {
+    #[default]
+    Unknown,
+    Live,
+    Cached,
+    Paused,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpaCredits {
+    pub balance: Option<String>,
+    pub has_credits: Option<bool>,
+    pub unlimited: Option<bool>,
+    pub reset_available: Option<u64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CpaModelAvailability {
+    pub model: String,
+    pub available: bool,
+    pub available_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpaQuotaHealth {
+    pub state: CpaQuotaState,
+    pub observed_at: Option<String>,
+    pub retry_at: Option<String>,
+    pub message: Option<String>,
+    pub credits: Option<CpaCredits>,
+    pub models: Vec<CpaModelAvailability>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CpaAccountHealth {
     pub provider: String,
     pub auth_index: String,
@@ -451,6 +486,8 @@ pub struct CpaAccountHealth {
     pub disabled: bool,
     pub unavailable: bool,
     pub runtime_only: bool,
+    #[serde(default)]
+    pub quota: CpaQuotaHealth,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -461,7 +498,7 @@ pub struct CpaPoolAggregate {
     pub buckets: Vec<UsageBucket>,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, Default)]
 pub struct UsageData {
     pub buckets: Vec<UsageBucket>,
     pub provider_errors: Vec<UsageProviderError>,

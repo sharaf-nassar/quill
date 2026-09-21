@@ -1,3 +1,5 @@
+pub(crate) mod cpa;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(any(unix, windows))]
 use std::ffi::OsString;
@@ -15036,15 +15038,14 @@ impl Storage {
                         snapshot.account_label
                  FROM usage_snapshots snapshot
                  INNER JOIN (
-                     SELECT provider, account_id, bucket_key,
+                     SELECT provider, account_id,
                             MAX(timestamp) AS latest_timestamp
                      FROM usage_snapshots
                      WHERE source = 'cpa'
-                     GROUP BY provider, account_id, bucket_key
+                     GROUP BY provider, account_id
                  ) latest
                    ON latest.provider = snapshot.provider
                   AND latest.account_id IS snapshot.account_id
-                  AND latest.bucket_key = snapshot.bucket_key
                   AND latest.latest_timestamp = snapshot.timestamp
                  WHERE snapshot.source = 'cpa'
                  ORDER BY snapshot.provider, snapshot.account_label,

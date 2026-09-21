@@ -17,6 +17,7 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[widget-usage-tests]] — Usage graph dimension preference and token-preservation test specs
 - [[widget-readout-tests]] — Readout activity-figure denominator test specs
 - [[widget-limits-tests]] — Collapsed CPA provider-state cue test specs
+- [[cpa-tests]]: CPA lifecycle, passive observations, retry safety, scoped quota, and widget regressions
 - [[indicator-tests]] — CPA pool precedence and direct-fallback indicator test specs
 - [[view-reader-tests]] — Slow-reader contention and concurrent-ingest test specs
 - [[rollup-concurrency-tests]] — Backfill, quiesce, live-ingest, and WAL-bound test specs

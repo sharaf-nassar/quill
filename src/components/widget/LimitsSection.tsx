@@ -102,8 +102,8 @@ function syncStateForSource(
     .map((error) => error.kind);
   if (kinds.includes("network")) return "offline";
   if (kinds.includes("stale")) return "cached";
-  if (kinds.includes("paused")) return "paused";
-  return "live";
+  if (kinds.includes("paused") || kinds.includes("auth")) return "paused";
+  return kinds.length > 0 ? "cached" : "live";
 }
 
 function syncStateFor(
@@ -204,7 +204,7 @@ function cpaWindowKey(
     ? parts.slice(2).join("/")
     : bucket.key;
   if (provider === "codex") {
-    const duration = key.match(/(?:^|_)(\d+)m$/)?.[1];
+    const duration = key.match(/^codex_(?:(?:primary|secondary)_)?(\d+)m$/)?.[1];
     if (duration) return `codex_${duration}m`;
   }
   return key;
@@ -281,7 +281,7 @@ function cpaWindowDefinitions(
     definitions.set(key, {
       key,
       fullLabel: bucket.label,
-      shortLabel: shortBucketLabel(bucket.label, provider),
+      shortLabel: key.startsWith("codex_scope_") ? bucket.label : shortBucketLabel(bucket.label, provider),
       sortOrder: bucket.sort_order ?? 0,
     });
   }
@@ -305,7 +305,7 @@ function cpaCells(
   );
   return definitions.map((definition) => {
     const bucket = byWindow.get(definition.key);
-    if (bucket) return numericCell(provider, bucket, nowMs, definition.key);
+    if (bucket) return { ...numericCell(provider, bucket, nowMs, definition.key), shortLabel: definition.shortLabel };
     return {
       ...definition,
       percent: null,
@@ -493,7 +493,9 @@ function cpaRows(data: UsageData | null, nowMs: number): CpaLimitsRow[] {
       pool?.buckets ?? [],
       providerBuckets,
     );
-    const cells = cpaCells(provider, definitions, pool?.buckets ?? [], nowMs);
+    const cells = cpaCells(provider, definitions, pool?.buckets ?? [], nowMs).map((cell) =>
+      providerError ? { ...cell, severity: "stale" as const } : cell,
+    );
     const hasInventory = pool !== undefined || providerAccounts.length > 0;
     const health = providerAccounts.filter(
       (account) => accountState(account) === "ready",
@@ -524,7 +526,9 @@ function cpaRows(data: UsageData | null, nowMs: number): CpaLimitsRow[] {
               account.auth_index,
             statusMessage: account.status_message?.trim() || null,
             state: accountState(account),
-            cells: cpaCells(provider, definitions, accountBuckets, nowMs),
+            cells: cpaCells(provider, definitions, accountBuckets, nowMs).map((cell) =>
+              account.quota?.state !== "live" ? { ...cell, severity: "stale" as const } : cell,
+            ),
           };
         }),
       },

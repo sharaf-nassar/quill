@@ -1,13 +1,9 @@
-use crate::cpa::aggregate::is_usable_account_status;
-use crate::cpa::client::{CpaAuthFile, CpaClient, CpaError, validate_loopback_url};
-use crate::cpa::quota::{fetch_claude_usage, fetch_codex_usage};
+use crate::cpa::client::{CpaClient, CpaError, validate_loopback_url};
 use crate::storage::Storage;
 use serde::Serialize;
 
 pub(crate) const BASE_URL_SETTING: &str = "integration.cpa.base_url";
 pub(crate) const MANAGEMENT_KEY_SETTING: &str = "integration.cpa.management_key";
-pub(crate) const CLAUDE_SMOKE_SETTING: &str = "usage.cpa.window_smoke.claude";
-pub(crate) const CODEX_SMOKE_SETTING: &str = "usage.cpa.window_smoke.codex";
 
 #[derive(Clone)]
 pub(crate) struct CpaConnection {
@@ -22,62 +18,10 @@ pub struct CpaConnectionStatus {
     pub configured: bool,
 }
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CpaSmokeState {
-    Available,
-    Unavailable,
-    NotPresent,
-}
-
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct CpaSmokeVerdict {
-    pub state: CpaSmokeState,
-    pub message: String,
-}
-
-impl CpaSmokeVerdict {
-    fn available(provider: &str) -> Self {
-        Self {
-            state: CpaSmokeState::Available,
-            message: format!("{provider} quota path verified."),
-        }
-    }
-
-    fn unavailable(provider: &str) -> Self {
-        Self {
-            state: CpaSmokeState::Unavailable,
-            message: format!(
-                "{provider} quota path could not be verified; accounts will show health only."
-            ),
-        }
-    }
-
-    fn not_present(provider: &str) -> Self {
-        Self {
-            state: CpaSmokeState::NotPresent,
-            message: format!("No {provider} accounts found; window polling stays off."),
-        }
-    }
-
-    fn enables_window_polling(&self) -> bool {
-        self.state == CpaSmokeState::Available
-    }
-}
-
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct CpaSmokeResults {
-    pub claude: CpaSmokeVerdict,
-    pub codex: CpaSmokeVerdict,
-}
-
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CpaConnectResult {
     pub connection: CpaConnectionStatus,
-    pub smoke: CpaSmokeResults,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +31,7 @@ pub enum CpaConnectErrorCode {
     HashedKey,
     Unreachable,
     Unauthorized,
+    Forbidden,
     UnsupportedVersion,
     UnexpectedResponse,
     Storage,
@@ -113,6 +58,9 @@ impl CpaConnectError {
             }
             CpaConnectErrorCode::Unauthorized => {
                 "CPA rejected the management key. Paste the plaintext management key and retry."
+            }
+            CpaConnectErrorCode::Forbidden => {
+                "CPA denied management access, possibly because of an IP lockout. Check CPA, wait for any ban to expire, then reconnect."
             }
             CpaConnectErrorCode::UnsupportedVersion => {
                 "This CPA build does not expose required account fields. Update CPA and retry."
@@ -142,10 +90,11 @@ impl From<CpaError> for CpaConnectError {
             CpaError::HashedKey => CpaConnectErrorCode::HashedKey,
             CpaError::Unreachable => CpaConnectErrorCode::Unreachable,
             CpaError::Unauthorized => CpaConnectErrorCode::Unauthorized,
+            CpaError::Forbidden => CpaConnectErrorCode::Forbidden,
             CpaError::UnsupportedVersion => CpaConnectErrorCode::UnsupportedVersion,
-            CpaError::InvalidResponse | CpaError::AccountCall { .. } => {
-                CpaConnectErrorCode::UnexpectedResponse
-            }
+            CpaError::InvalidResponse
+            | CpaError::AccountCall { .. }
+            | CpaError::ManagementCall { .. } => CpaConnectErrorCode::UnexpectedResponse,
         };
         Self::new(code)
     }
@@ -164,12 +113,7 @@ pub(crate) async fn validate_connection(
     let parsed_url = validate_loopback_url(base_url).map_err(CpaConnectError::from)?;
     let normalized_url = parsed_url.as_str().trim_end_matches('/').to_string();
     let client = CpaClient::new(&normalized_url, management_key).map_err(CpaConnectError::from)?;
-    let auth_files = client.auth_files().await.map_err(CpaConnectError::from)?;
-
-    let (claude, codex) = tokio::join!(
-        smoke_claude(&client, &auth_files),
-        smoke_codex(&client, &auth_files)
-    );
+    client.auth_files().await.map_err(CpaConnectError::from)?;
     Ok(ValidatedCpaConnection {
         connection: CpaConnection {
             base_url: normalized_url.clone(),
@@ -180,49 +124,8 @@ pub(crate) async fn validate_connection(
                 base_url: Some(normalized_url),
                 configured: true,
             },
-            smoke: CpaSmokeResults { claude, codex },
         },
     })
-}
-
-async fn smoke_claude(client: &CpaClient, auth_files: &[CpaAuthFile]) -> CpaSmokeVerdict {
-    let Some(account) = first_provider_account(auth_files, "claude") else {
-        return CpaSmokeVerdict::not_present("Claude");
-    };
-    match fetch_claude_usage(client, &account.auth_index).await {
-        Ok(_) => CpaSmokeVerdict::available("Claude"),
-        Err(_) => CpaSmokeVerdict::unavailable("Claude"),
-    }
-}
-
-async fn smoke_codex(client: &CpaClient, auth_files: &[CpaAuthFile]) -> CpaSmokeVerdict {
-    let Some(account) = first_provider_account(auth_files, "codex") else {
-        return CpaSmokeVerdict::not_present("Codex");
-    };
-    let Some(account_id) = account.chatgpt_account_id.as_deref() else {
-        return CpaSmokeVerdict::unavailable("Codex");
-    };
-    match fetch_codex_usage(client, &account.auth_index, account_id).await {
-        Ok(_) => CpaSmokeVerdict::available("Codex"),
-        Err(_) => CpaSmokeVerdict::unavailable("Codex"),
-    }
-}
-
-fn first_provider_account<'a>(
-    auth_files: &'a [CpaAuthFile],
-    provider: &str,
-) -> Option<&'a CpaAuthFile> {
-    auth_files
-        .iter()
-        .filter(|account| account.provider.eq_ignore_ascii_case(provider))
-        .find(|account| {
-            is_usable_account_status(&account.status) && !account.disabled && !account.unavailable
-        })
-        .or_else(|| {
-            auth_files
-                .iter()
-                .find(|account| account.provider.eq_ignore_ascii_case(provider))
-        })
 }
 
 pub(crate) fn save_connection(
@@ -230,29 +133,9 @@ pub(crate) fn save_connection(
     validated: ValidatedCpaConnection,
 ) -> Result<CpaConnectResult, CpaConnectError> {
     storage
-        .set_setting(BASE_URL_SETTING, &validated.connection.base_url)
-        .map_err(|_| CpaConnectError::storage())?;
-    storage
-        .set_setting(MANAGEMENT_KEY_SETTING, &validated.connection.management_key)
-        .map_err(|_| CpaConnectError::storage())?;
-    storage
-        .set_setting(
-            CLAUDE_SMOKE_SETTING,
-            if validated.result.smoke.claude.enables_window_polling() {
-                "true"
-            } else {
-                "false"
-            },
-        )
-        .map_err(|_| CpaConnectError::storage())?;
-    storage
-        .set_setting(
-            CODEX_SMOKE_SETTING,
-            if validated.result.smoke.codex.enables_window_polling() {
-                "true"
-            } else {
-                "false"
-            },
+        .save_cpa_connection(
+            &validated.connection.base_url,
+            &validated.connection.management_key,
         )
         .map_err(|_| CpaConnectError::storage())?;
     Ok(validated.result)
@@ -290,69 +173,13 @@ pub(crate) fn connection_status(storage: &Storage) -> Result<CpaConnectionStatus
 
 pub(crate) fn delete_connection(storage: &Storage) -> Result<(), CpaConnectError> {
     storage
-        .delete_setting(BASE_URL_SETTING)
-        .map_err(|_| CpaConnectError::storage())?;
-    storage
-        .delete_setting(MANAGEMENT_KEY_SETTING)
-        .map_err(|_| CpaConnectError::storage())?;
-    Ok(())
+        .clear_cpa_connection()
+        .map_err(|_| CpaConnectError::storage())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // @lat: [[features#Features#Settings Window#CPA Connection Lifecycle#Ready account smoke selection]]
-    #[test]
-    fn chooses_ready_account_before_degraded_account() {
-        let account = |auth_index: &str, status: &str, disabled: bool| CpaAuthFile {
-            auth_index: auth_index.to_string(),
-            provider: "claude".to_string(),
-            name: None,
-            email: None,
-            label: None,
-            account: None,
-            status: status.to_string(),
-            status_message: None,
-            disabled,
-            unavailable: false,
-            runtime_only: false,
-            chatgpt_account_id: None,
-        };
-        let accounts = [
-            account("disabled", "ready", true),
-            account("ready", "ready", false),
-        ];
-
-        assert_eq!(
-            first_provider_account(&accounts, "claude").map(|item| item.auth_index.as_str()),
-            Some("ready")
-        );
-    }
-
-    #[test]
-    fn chooses_active_account_before_degraded_account() {
-        let account = |auth_index: &str, status: &str| CpaAuthFile {
-            auth_index: auth_index.to_string(),
-            provider: "claude".to_string(),
-            name: None,
-            email: None,
-            label: None,
-            account: None,
-            status: status.to_string(),
-            status_message: None,
-            disabled: false,
-            unavailable: false,
-            runtime_only: false,
-            chatgpt_account_id: None,
-        };
-        let accounts = [account("degraded", "degraded"), account("active", "active")];
-
-        assert_eq!(
-            first_provider_account(&accounts, "claude").map(|item| item.auth_index.as_str()),
-            Some("active")
-        );
-    }
 
     // @lat: [[features#Features#Settings Window#CPA Connection Lifecycle#Typed safe connect failures]]
     #[test]

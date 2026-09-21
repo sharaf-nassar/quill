@@ -24,7 +24,7 @@ A provider with no live buckets still gets a row stating why: `SETUP` in amber w
 
 CPA pool rows derive mean account pressure from routing-usable account snapshots and are never persisted as independent facts.
 
-[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means CPA's documented `active` or compatible `ready` status without disabled or unavailable flags and without any returned account-wide window at or above 100%; every account remains in the total denominator. Each window is normally the arithmetic mean of healthy accounts returning that window, so missing buckets are excluded rather than read as zero. When no account is healthy, quota-readable, non-exhausted snapshots provide a fallback mean. Account-wide exhaustion excludes all pool percentages and resets, even when CPA still reports the account as active. Claude's account-wide windows are `five_hour` and `seven_day`; model- or surface-scoped windows do not block the whole account. Codex's returned rate-limit windows are account-wide.
+[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means CPA's documented `active` or compatible `ready` status without disabled or unavailable flags and without any returned account-wide window at or above 100%; every account remains in the total denominator. Each window is normally the arithmetic mean of healthy accounts returning that window, so missing buckets are excluded rather than read as zero. When no account is healthy, quota-readable, non-exhausted snapshots provide a fallback mean. Account-wide exhaustion excludes all pool percentages and resets, even when CPA still reports the account as active. Claude's account-wide windows are `five_hour` and `seven_day`; model- or surface-scoped windows do not block the whole account. Only Codex default `codex_<minutes>m` windows are account-wide. Code-review and additional metered-feature windows keep independent scoped identities, including when their durations match.
 
 The widget renders each aggregate as that provider's sole top-level row while the pool exists: fixed provider identity, inline healthy/total count, mean window cells, and reset readouts for visible canonical windows. Each reset uses only its matching aggregate window's earliest contributing timestamp; missing timestamps show a dash and elapsed timestamps show neutral `now`. A semantic disclosure reveals at most six account rows plus a remainder count.
 
@@ -78,9 +78,11 @@ Runtime-only accounts participate in health counts and aggregate math exactly li
 
 ### CPA Poll Scheduling
 
-CPA window polling is smoke-gated, capped, staggered, and exclusive of native provider usage polling while configured.
+CPA window polling is connection-scoped, capped, staggered, and exclusive of native usage in live and cached views.
 
-[[src-tauri/src/cpa/poll.rs#poll_account_snapshots]] maps the complete auth-file inventory before scheduling windows. Only persisted `true` provider smoke verdicts permit calls; the first 16 non-disabled, available accounts by `auth_index` launch 250ms apart with at most three requests active.
+[[src-tauri/src/cpa/poll.rs#poll_account_snapshots]] maps the complete inventory before scheduling. Up to 16 eligible accounts, oldest attempt first, launch 250ms apart with at most three active requests. Per-account failures preserve original observations with typed degraded state and retry deadlines. Management 401/403 stops automatic and forced retries until explicit reconnect, including across restarts.
+
+Fresh recognized passive headers update only matching windows at their upstream observation time. Missing, future, or 180-second-old timestamps cannot replace active reads. All known windows must be fresh to skip an active call, and an authoritative full read is required at least every 15 minutes. Unknown scoped signal namespaces retain active fallback. Full success replaces the complete window set; failures never resurrect historical windows. Malformed optional Codex scopes retain valid default observations but mark the read partial and cached, preserving the prior scoped set until a complete read. Management HTTP failures stop the batch and apply source-wide backoff; upstream failures remain account-local. See [[cpa-tests#CPA Regression Tests]].
 
 Each configured CPA phase logs `cpa_phase_ms` so its real-pool duration can be checked against the 3-minute cadence. Disconnecting CPA restores the enabled native provider polling path.
 
@@ -92,19 +94,19 @@ A configured CPA connection yields no native polling candidates; without CPA, ev
 
 Quota scheduling depends on credential readability, not CPA routing health.
 
-The poll mapper canonicalizes `active` and compatible `ready` to the frontend's ready state, but schedules every non-disabled, available Claude or Codex account when its provider smoke gate is open. Successful buckets render even when CPA reports a routing `error`; non-exhausted snapshots enter fallback pool pressure only when no healthy account exists.
+The poll mapper canonicalizes `active` and compatible `ready` to the frontend's ready state, but schedules every non-disabled, available Claude or Codex account when its account backoff and credential cooldown permit. Successful buckets render even when CPA reports a routing `error`; non-exhausted snapshots enter fallback pool pressure only when no healthy account exists.
 
-#### Smoke verdict gate
+#### Recoverable account capabilities
 
-An absent or false provider smoke verdict produces health-only accounts and schedules no window calls.
+No persistent provider-wide smoke gate exists. Newly added or repaired accounts participate in regular polling without reconnecting; one failed account never disables healthy siblings.
 
 #### Bounded staggered fan-out
 
 A 12-account stub transport verifies the scheduler stays below three concurrent calls and completes within its launch budget.
 
-#### Deterministic account cap
+#### Fair account cap
 
-Pools larger than 16 accounts schedule only the first 16 deterministic `auth_index` entries per cycle.
+Pools larger than 16 accounts prioritize never-attempted and oldest-attempted accounts, with deterministic identity tie-breaking.
 
 #### Unconfigured source null impact
 
@@ -585,7 +587,9 @@ The Integrations tab can update a stored MiniMax API key without disabling and r
 
 CPA is an opt-in cross-provider usage source configured from the Integrations tab without becoming a provider status row.
 
-The form defaults to `http://127.0.0.1:8317`, accepts only HTTP(S) loopback URLs, and sends the management key across Tauri only for an explicit connect attempt. [[src-tauri/src/integrations/cpa.rs#validate_connection]] checks `/v0/management/auth-files`, reports typed invalid-URL, hashed-key, unreachable, unauthorized, unsupported-version, and unexpected-response failures, then runs one Claude and Codex quota smoke check when each provider is present. A valid management connection persists `integration.cpa.base_url`, `integration.cpa.management_key`, and boolean `usage.cpa.window_smoke.{claude,codex}` gates; a failed provider smoke check keeps the connection but leaves that provider in health-only mode.
+The form defaults to `http://127.0.0.1:8317`, accepts only HTTP(S) loopback URLs, and sends the management key across Tauri only for explicit connect. [[src-tauri/src/integrations/cpa.rs#validate_connection]] validates `/v0/management/auth-files` with distinct URL, hash, network, unauthorized, forbidden, unsupported-version, and malformed-response failures. Connection validation no longer issues provider smoke calls or persists capability gates.
+
+The dedicated reused HTTP client disables proxies and redirects, retains 5-second connect and 15-second request limits, and bounds response bodies to 4 MiB. Management failures stay distinct from upstream account status and Retry-After metadata. Optional observation fields are bounded and sanitized.
 
 #### Exact plaintext key bytes
 
@@ -595,17 +599,13 @@ Nonblank management keys retain every byte from Settings through validation, HTT
 
 An exact bcrypt hash shape is rejected before any CPA request with safe recovery copy because CPA replaces configured plaintext with a one-way hash that cannot authenticate as the original key.
 
-[[src-tauri/src/lib.rs#get_cpa_connection_status]] returns only the saved URL and configured state, never the management key. [[src-tauri/src/lib.rs#clear_cpa_connection]] runs the guarded manager purge, deletes both connection settings, every `usage.cpa.*` runtime row, raw CPA snapshots and `usage_hourly` keys under `cpa/%`, then clears the usage cache and advances its epoch so an older in-flight refresh cannot restore disconnected rows. Direct provider snapshots remain intact.
+[[src-tauri/src/lib.rs#get_cpa_connection_status]] returns only URL and configured state, never the key. Connect and [[src-tauri/src/lib.rs#clear_cpa_connection]] hold the shared usage-refresh lock before storage mutations through cache invalidation. URL/key updates and cleanup use one SQLite transaction. Disconnect removes connection settings, all `usage.cpa.*` runtime rows, raw CPA snapshots, and `cpa/%` hourly aggregates without touching direct history. Endpoint replacement purges old CPA history; same-endpoint reconnect preserves analytics but resets runtime/auth suppression.
 
 While CPA is configured, LIMITS uses CPA exclusively and suppresses direct provider usage polling. Disconnecting CPA restores polling for every enabled native provider.
 
-#### Ready account smoke selection
-
-Connection smoke checks prefer a ready, available account over a degraded account for each supported provider.
-
 #### Typed safe connect failures
 
-Invalid URL, unreachable, unauthorized, unsupported-version, and unexpected-response failures keep distinct user-safe codes and messages without credential names.
+Invalid URL, unreachable, unauthorized, forbidden, unsupported-version, and unexpected-response failures keep distinct safe codes without credential names. Forbidden recovery advises checking CPA's IP lockout before reconnecting.
 
 ## Crash Reporting
 

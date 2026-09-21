@@ -1,13 +1,26 @@
-use crate::config::http_client;
-use reqwest::{StatusCode, Url};
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::{Client, ClientBuilder, Response, StatusCode, Url, redirect};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 const AUTH_FILES_PATH: &str = "v0/management/auth-files";
 const API_CALL_PATH: &str = "v0/management/api-call";
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RETRY_AFTER_SECS: u64 = 365 * 24 * 60 * 60;
+const MAX_INVENTORY_SIGNALS: usize = 64;
+const MAX_MODEL_QUOTAS: usize = 128;
+const MAX_COOLDOWNS: usize = 128;
+const MAX_SIGNAL_NAME_BYTES: usize = 128;
+const MAX_SIGNAL_VALUE_BYTES: usize = 512;
+const MAX_INVENTORY_STRING_BYTES: usize = 256;
+
+static CPA_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CpaError {
@@ -15,11 +28,17 @@ pub(crate) enum CpaError {
     HashedKey,
     Unreachable,
     Unauthorized,
+    Forbidden,
+    ManagementCall {
+        status_code: u16,
+        retry_after_secs: Option<u64>,
+    },
     UnsupportedVersion,
     InvalidResponse,
     AccountCall {
         auth_index: String,
         status_code: Option<u16>,
+        retry_after_secs: Option<u64>,
     },
 }
 
@@ -31,6 +50,13 @@ impl fmt::Display for CpaError {
                 .write_str("CPA's persisted bcrypt hash cannot be used as the management key."),
             Self::Unreachable => formatter.write_str("CPA management API is unreachable."),
             Self::Unauthorized => formatter.write_str("CPA management key was rejected."),
+            Self::Forbidden => formatter.write_str("CPA management access was forbidden."),
+            Self::ManagementCall { status_code, .. } => {
+                write!(
+                    formatter,
+                    "CPA management call failed (HTTP {status_code})."
+                )
+            }
             Self::UnsupportedVersion => {
                 formatter.write_str("CPA version does not expose the required account fields.")
             }
@@ -48,6 +74,20 @@ impl fmt::Display for CpaError {
 
 impl Error for CpaError {}
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct CpaQuotaObservation {
+    pub observed_at: Option<String>,
+    pub signals: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct CpaCooldown {
+    pub scope: String,
+    pub model_key: Option<String>,
+    pub reason: Option<String>,
+    pub retry_at: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CpaAuthFile {
     pub auth_index: String,
@@ -62,6 +102,10 @@ pub(crate) struct CpaAuthFile {
     pub unavailable: bool,
     pub runtime_only: bool,
     pub chatgpt_account_id: Option<String>,
+    pub quota: Option<CpaQuotaObservation>,
+    pub model_quotas: BTreeMap<String, CpaQuotaObservation>,
+    pub cooldowns: Vec<CpaCooldown>,
+    pub next_retry_after: Option<String>,
 }
 
 #[derive(Clone)]
@@ -94,6 +138,22 @@ pub(super) struct ApiCallResponse {
     pub status_code: u16,
     pub header: Map<String, Value>,
     pub body: String,
+}
+
+fn configure_cpa_client(builder: ClientBuilder) -> ClientBuilder {
+    builder
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .no_proxy()
+        .redirect(redirect::Policy::none())
+}
+
+fn cpa_http_client() -> &'static Client {
+    CPA_HTTP_CLIENT.get_or_init(|| {
+        configure_cpa_client(Client::builder())
+            .build()
+            .expect("failed to build CPA reqwest client")
+    })
 }
 
 pub(crate) fn validate_loopback_url(base_url: &str) -> Result<Url, CpaError> {
@@ -140,24 +200,18 @@ impl CpaClient {
             .base_url
             .join(AUTH_FILES_PATH)
             .map_err(|_| CpaError::InvalidUrl)?;
-        let response = http_client()
+        let response = cpa_http_client()
             .get(endpoint)
             .bearer_auth(&self.management_key)
             .send()
             .await
             .map_err(|_| CpaError::Unreachable)?;
 
-        if response.status() == StatusCode::UNAUTHORIZED {
-            return Err(CpaError::Unauthorized);
-        }
         if !response.status().is_success() {
-            return Err(CpaError::InvalidResponse);
+            return Err(management_error(response.status(), response.headers()));
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|_| CpaError::InvalidResponse)?;
+        let body = read_bounded_body(response).await?;
         parse_auth_files(&body)
     }
 
@@ -171,6 +225,7 @@ impl CpaClient {
             return Err(CpaError::AccountCall {
                 auth_index: "unknown".to_string(),
                 status_code: None,
+                retry_after_secs: None,
             });
         }
 
@@ -184,7 +239,7 @@ impl CpaClient {
             url: upstream_url,
             header: headers,
         };
-        let response = http_client()
+        let response = cpa_http_client()
             .post(endpoint)
             .bearer_auth(&self.management_key)
             .json(&payload)
@@ -192,26 +247,98 @@ impl CpaClient {
             .await
             .map_err(|_| CpaError::Unreachable)?;
 
-        if response.status() == StatusCode::UNAUTHORIZED {
-            return Err(CpaError::Unauthorized);
-        }
         if !response.status().is_success() {
-            return Err(CpaError::InvalidResponse);
+            return Err(management_error(response.status(), response.headers()));
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|_| CpaError::InvalidResponse)?;
+        let body = read_bounded_body(response).await?;
         let envelope = parse_api_call_response(&body)?;
         if !(200..300).contains(&envelope.status_code) {
             return Err(CpaError::AccountCall {
                 auth_index: auth_index.to_owned(),
                 status_code: Some(envelope.status_code),
+                retry_after_secs: retry_after_from_envelope(&envelope.header),
             });
         }
         Ok(envelope)
     }
+}
+
+fn management_error(status: StatusCode, headers: &HeaderMap) -> CpaError {
+    match status {
+        StatusCode::UNAUTHORIZED => CpaError::Unauthorized,
+        StatusCode::FORBIDDEN => CpaError::Forbidden,
+        _ => CpaError::ManagementCall {
+            status_code: status.as_u16(),
+            retry_after_secs: retry_after_from_headers(headers),
+        },
+    }
+}
+
+async fn read_bounded_body(mut response: Response) -> Result<String, CpaError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(CpaError::InvalidResponse);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| CpaError::InvalidResponse)?
+    {
+        let remaining = MAX_RESPONSE_BYTES.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            return Err(CpaError::InvalidResponse);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| CpaError::InvalidResponse)
+}
+
+fn retry_after_from_headers(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_retry_after(value, Utc::now()))
+}
+
+fn retry_after_from_envelope(headers: &Map<String, Value>) -> Option<u64> {
+    let value = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))?
+        .1;
+    match value {
+        Value::String(value) => parse_retry_after(value, Utc::now()),
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .find_map(|value| parse_retry_after(value, Utc::now())),
+        _ => None,
+    }
+}
+
+fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return None;
+    }
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(
+            value
+                .parse::<u64>()
+                .unwrap_or(u64::MAX)
+                .min(MAX_RETRY_AFTER_SECS),
+        );
+    }
+
+    let retry_at = DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&Utc);
+    Some(retry_at.signed_duration_since(now).num_seconds().max(0) as u64)
+        .map(|seconds| seconds.min(MAX_RETRY_AFTER_SECS))
 }
 
 fn looks_like_bcrypt_hash(value: &str) -> bool {
@@ -278,7 +405,91 @@ fn parse_auth_file(value: &Value) -> Result<CpaAuthFile, CpaError> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         chatgpt_account_id: find_chatgpt_account_id(object),
+        quota: object.get("quota").and_then(parse_quota_observation),
+        model_quotas: parse_model_quotas(object.get("model_quotas")),
+        cooldowns: parse_cooldowns(object.get("cooldowns")),
+        next_retry_after: object
+            .get("next_retry_after")
+            .and_then(parse_inventory_timestamp),
     })
+}
+
+fn parse_quota_observation(value: &Value) -> Option<CpaQuotaObservation> {
+    let object = value.as_object()?;
+    let signals = object
+        .get("signals")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, value)| {
+            let name = sanitize_inventory_string(name, MAX_SIGNAL_NAME_BYTES)?;
+            let value = sanitize_inventory_string(value.as_str()?, MAX_SIGNAL_VALUE_BYTES)?;
+            Some((name, value))
+        })
+        .take(MAX_INVENTORY_SIGNALS)
+        .collect();
+    Some(CpaQuotaObservation {
+        observed_at: object
+            .get("observed_at")
+            .and_then(parse_inventory_timestamp),
+        signals,
+    })
+}
+
+fn parse_model_quotas(value: Option<&Value>) -> BTreeMap<String, CpaQuotaObservation> {
+    value
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(model_key, value)| {
+            Some((
+                sanitize_inventory_string(model_key, MAX_INVENTORY_STRING_BYTES)?,
+                parse_quota_observation(value)?,
+            ))
+        })
+        .take(MAX_MODEL_QUOTAS)
+        .collect()
+}
+
+fn parse_cooldowns(value: Option<&Value>) -> Vec<CpaCooldown> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            let object = value.as_object()?;
+            Some(CpaCooldown {
+                scope: sanitize_inventory_string(
+                    object.get("scope")?.as_str()?,
+                    MAX_INVENTORY_STRING_BYTES,
+                )?,
+                model_key: object
+                    .get("model_key")
+                    .and_then(Value::as_str)
+                    .and_then(|value| sanitize_inventory_string(value, MAX_INVENTORY_STRING_BYTES)),
+                reason: object
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .and_then(|value| sanitize_inventory_string(value, MAX_INVENTORY_STRING_BYTES)),
+                retry_at: object.get("retry_at").and_then(parse_inventory_timestamp),
+            })
+        })
+        .take(MAX_COOLDOWNS)
+        .collect()
+}
+
+fn parse_inventory_timestamp(value: &Value) -> Option<String> {
+    let value = sanitize_inventory_string(value.as_str()?, MAX_INVENTORY_STRING_BYTES)?;
+    DateTime::parse_from_rfc3339(&value).ok()?;
+    Some(value)
+}
+
+fn sanitize_inventory_string(value: &str, max_bytes: usize) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= max_bytes
+        && !value.chars().any(|character| character.is_control()))
+    .then(|| value.to_owned())
 }
 
 fn parse_api_call_response(body: &str) -> Result<ApiCallResponse, CpaError> {
@@ -363,6 +574,41 @@ fn find_account_id_in_claims(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::Proxy;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn serve_once(response: Vec<u8>) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request should connect");
+            let mut request = vec![0; 16 * 1024];
+            let length = socket
+                .read(&mut request)
+                .await
+                .expect("request should read");
+            request.truncate(length);
+            socket
+                .write_all(&response)
+                .await
+                .expect("response should write");
+            request
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn response(status: &str, headers: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
 
     // @lat: [[features#Features#Live Usage View#CPA Management Client Test Specs#Auth inventory fields]]
     #[test]
@@ -516,6 +762,9 @@ mod tests {
             .expect("nonblank key should be accepted exactly");
 
         assert_eq!(client.management_key, "  exact key  ");
+        let debug = format!("{client:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("exact key"));
     }
 
     // @lat: [[features#Settings Window#CPA Connection Lifecycle#One-way hash rejection]]
@@ -564,8 +813,208 @@ mod tests {
         let account_error = CpaError::AccountCall {
             auth_index: "private@example.com".to_string(),
             status_code: Some(429),
+            retry_after_secs: Some(60),
         }
         .to_string();
         assert!(!account_error.contains("private@example.com"));
+    }
+
+    #[test]
+    fn parses_and_saturates_retry_after_seconds_and_dates() {
+        let now = DateTime::parse_from_rfc3339("2026-09-21T12:00:00Z")
+            .expect("fixed time should parse")
+            .with_timezone(&Utc);
+        assert_eq!(parse_retry_after("120", now), Some(120));
+        assert_eq!(
+            parse_retry_after("999999999999999999999999999", now),
+            Some(MAX_RETRY_AFTER_SECS)
+        );
+        assert_eq!(
+            parse_retry_after("Mon, 21 Sep 2026 12:02:00 GMT", now),
+            Some(120)
+        );
+        assert_eq!(
+            parse_retry_after("Mon, 21 Sep 2020 12:02:00 GMT", now),
+            Some(0)
+        );
+        assert_eq!(parse_retry_after("not a date", now), None);
+    }
+
+    #[test]
+    fn parses_optional_inventory_and_drops_malformed_optional_values() {
+        let files = parse_auth_files(
+            r#"{"files":[{
+                "auth_index":1,"provider":"claude","status":"ready","unavailable":false,
+                "quota":{"observed_at":"2026-09-21T12:00:00Z","signals":{"Retry-After":"120","bad":"line\nbreak"}},
+                "model_quotas":{"claude-opus":{"signals":{"x-limit":"0.5"}},"bad\nmodel":{"signals":{}}},
+                "cooldowns":[{"scope":"model","model_key":"claude-opus","reason":"quota","retry_at":"2026-09-21T12:02:00Z"},{"scope":"bad\nscope"}],
+                "next_retry_after":"not-a-time","unknown":{"response_body":"secret"}
+            }]}"#,
+        )
+        .expect("optional field problems must not reject baseline inventory");
+        let file = &files[0];
+        let quota = file
+            .quota
+            .as_ref()
+            .expect("valid quota object should parse");
+        assert_eq!(quota.observed_at.as_deref(), Some("2026-09-21T12:00:00Z"));
+        assert_eq!(
+            quota.signals.get("Retry-After").map(String::as_str),
+            Some("120")
+        );
+        assert!(!quota.signals.contains_key("bad"));
+        assert!(file.model_quotas.contains_key("claude-opus"));
+        assert!(!file.model_quotas.contains_key("bad\nmodel"));
+        assert_eq!(file.cooldowns.len(), 1);
+        assert_eq!(file.cooldowns[0].reason.as_deref(), Some("quota"));
+        assert_eq!(file.next_retry_after, None);
+    }
+
+    #[tokio::test]
+    async fn does_not_follow_management_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request should connect");
+            request_count.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /redirected\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("redirect should write");
+            if let Ok(Ok((_socket, _))) =
+                tokio::time::timeout(Duration::from_millis(300), listener.accept()).await
+            {
+                request_count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let client =
+            CpaClient::new(&format!("http://{address}"), "key").expect("client should build");
+        assert_eq!(
+            client.auth_files().await,
+            Err(CpaError::ManagementCall {
+                status_code: 302,
+                retry_after_secs: None,
+            })
+        );
+        server.await.expect("server should finish");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dedicated_client_clears_explicit_proxy_configuration() {
+        let (target_url, target) = serve_once(response("200 OK", "", "direct")).await;
+        let (proxy_url, proxy) = serve_once(response("200 OK", "", "proxy")).await;
+        let client = configure_cpa_client(
+            Client::builder().proxy(Proxy::all(&proxy_url).expect("proxy URL should parse")),
+        )
+        .build()
+        .expect("client should build");
+
+        let body = client
+            .get(&target_url)
+            .send()
+            .await
+            .expect("direct request should succeed")
+            .text()
+            .await
+            .expect("body should read");
+        assert_eq!(body, "direct");
+        target.await.expect("target server should finish");
+        let mut proxy = proxy;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut proxy)
+                .await
+                .is_err(),
+            "proxy listener must not receive the request"
+        );
+        proxy.abort();
+    }
+
+    #[tokio::test]
+    async fn preserves_management_and_upstream_status_and_retry_after() {
+        let (management_url, management) = serve_once(response(
+            "503 Service Unavailable",
+            "Retry-After: 75\r\n",
+            "private management detail",
+        ))
+        .await;
+        let client = CpaClient::new(&management_url, "key").expect("client should build");
+        assert_eq!(
+            client.auth_files().await,
+            Err(CpaError::ManagementCall {
+                status_code: 503,
+                retry_after_secs: Some(75),
+            })
+        );
+        management.await.expect("management server should finish");
+
+        let envelope = r#"{"status_code":429,"header":{"Retry-After":["120"]},"body":"private upstream detail"}"#;
+        let (upstream_url, upstream) = serve_once(response("200 OK", "", envelope)).await;
+        let client = CpaClient::new(&upstream_url, "key").expect("client should build");
+        assert_eq!(
+            client
+                .api_call("account-1", "https://example.com/fixed", &BTreeMap::new())
+                .await,
+            Err(CpaError::AccountCall {
+                auth_index: "account-1".to_string(),
+                status_code: Some(429),
+                retry_after_secs: Some(120),
+            })
+        );
+        upstream.await.expect("upstream server should finish");
+    }
+
+    #[test]
+    fn distinguishes_forbidden_management_status() {
+        assert_eq!(
+            management_error(StatusCode::FORBIDDEN, &HeaderMap::new()),
+            CpaError::Forbidden
+        );
+        assert_eq!(
+            management_error(StatusCode::UNAUTHORIZED, &HeaderMap::new()),
+            CpaError::Unauthorized
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_chunked_management_response_over_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request should connect");
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .expect("headers should write");
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..=MAX_RESPONSE_BYTES / chunk.len() {
+                if socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .is_err()
+                    || socket.write_all(&chunk).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client =
+            CpaClient::new(&format!("http://{address}"), "key").expect("client should build");
+        assert_eq!(client.auth_files().await, Err(CpaError::InvalidResponse));
+        server.await.expect("server should finish");
     }
 }

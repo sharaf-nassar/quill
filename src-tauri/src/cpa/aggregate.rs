@@ -3,7 +3,7 @@ use crate::models::{CpaAccountHealth, CpaPoolAggregate, UsageBucket, UsageSource
 use chrono::DateTime;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CpaAccountSnapshot {
     pub health: CpaAccountHealth,
     pub buckets: Option<Vec<UsageBucket>>,
@@ -52,11 +52,10 @@ fn compute_provider_pool(
             account.is_quota_readable()
                 && !account.buckets.iter().flatten().any(|bucket| {
                     bucket.utilization >= 100.0
-                        && (provider == IntegrationProvider::Codex
-                            || matches!(
-                                account_window_key(bucket, &account.health.auth_index).as_str(),
-                                "five_hour" | "seven_day"
-                            ))
+                        && is_account_window(
+                            provider,
+                            &account_window_key(bucket, &account.health.auth_index),
+                        )
                 })
         })
         .collect::<Vec<_>>();
@@ -122,6 +121,7 @@ fn account_window_key(bucket: &UsageBucket, auth_index: &str) -> String {
         .unwrap_or(&bucket.key)
         .to_string();
     if bucket.provider == IntegrationProvider::Codex
+        && (key.starts_with("codex_primary_") || key.starts_with("codex_secondary_"))
         && let Some(minutes) = key
             .rsplit('_')
             .next()
@@ -131,6 +131,17 @@ fn account_window_key(bucket: &UsageBucket, auth_index: &str) -> String {
         return format!("codex_{minutes}m");
     }
     key
+}
+
+pub(crate) fn is_account_window(provider: IntegrationProvider, key: &str) -> bool {
+    match provider {
+        IntegrationProvider::Claude => matches!(key, "five_hour" | "seven_day"),
+        IntegrationProvider::Codex => key
+            .strip_prefix("codex_")
+            .and_then(|tail| tail.strip_suffix('m'))
+            .is_some_and(|minutes| minutes.parse::<u32>().is_ok()),
+        _ => false,
+    }
 }
 
 fn earliest_reset(current: Option<&str>, candidate: Option<&str>) -> Option<String> {
@@ -173,6 +184,7 @@ mod tests {
                 disabled,
                 unavailable,
                 runtime_only,
+                quota: Default::default(),
             },
             buckets,
         }
@@ -190,6 +202,38 @@ mod tests {
             account_id: Some(auth_index.to_string()),
             account_label: Some(auth_index.to_string()),
         }
+    }
+
+    // @lat: [[cpa-tests#CPA Regression Tests#Scoped Codex quota and credits]]
+    #[test]
+    fn cpa_scoped_codex_exhaustion_never_excludes_the_account_pool() {
+        let make_bucket = |key, value| {
+            let mut bucket = bucket("a", key, value);
+            bucket.provider = IntegrationProvider::Codex;
+            bucket
+        };
+        let mut snapshot = account(
+            "a",
+            "ready",
+            false,
+            false,
+            false,
+            Some(vec![
+                make_bucket("codex_300m", 25.0),
+                make_bucket("codex_scope_61_300m", 100.0),
+                make_bucket("codex_scope_62_300m", 50.0),
+            ]),
+        );
+        snapshot.health.provider = "codex".into();
+        let pools = compute_cpa_pools(&[snapshot]);
+        assert_eq!(pools[0].healthy, 1);
+        assert_eq!(pools[0].buckets.len(), 3);
+        assert!(
+            pools[0]
+                .buckets
+                .iter()
+                .any(|bucket| bucket.key == "cpa/pool/codex_300m" && bucket.utilization == 25.0)
+        );
     }
 
     // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Usable account mean]]

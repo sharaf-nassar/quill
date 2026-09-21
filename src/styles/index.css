@@ -1788,7 +1788,7 @@ html[data-view="migration"] #root {
   font-size: 9px;
   font-weight: 700;
   line-height: 1;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
 }
 
 .wg-cpa-account-state[data-state="disabled"] {
