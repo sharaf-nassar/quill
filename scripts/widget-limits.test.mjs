@@ -45,7 +45,10 @@ test("CPA failure and scoped identities remain distinct and visible", () => {
   }, Date.now());
   assert.equal(rows[0].cells.length, 2);
   assert.equal(rows[0].accounts[0].cells.length, 2);
-  assert.ok(rows[0].accounts[0].cells.every((cell) => cell.severity === "stale"));
+  assert.deepEqual(
+    [rows[0].cells, rows[0].accounts[0].cells].map((cells) => cells.map((cell) => cell.severity)),
+    [["nominal", "critical"], ["nominal", "critical"]],
+  );
   assert.ok(rows[0].cells.some((cell) => cell.shortLabel === "Spark · 5 hours"));
   const markup = renderToStaticMarkup(createElement(CpaRow, { row: rows[0], expanded: true, controlsId: "quota-test", onToggle() {} }));
   for (const text of ["Observed", "Quota cached", "Retry after", "Credits: 12.5", "Reset credits: 0", "gpt-example cooling", "Showing cached quotas."]) assert.ok(!markup.includes(text), text);

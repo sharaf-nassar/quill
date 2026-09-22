@@ -34,7 +34,7 @@ No deliberately invalid credential is sent to a live CPA service.
 
 ## Truthful widget quota state
 
-CPA rows omit diagnostic paragraphs about observation times, quota state, retries, credits, and model cooldowns. Cached or paused numbers stay neutral; auth/server failures never label sync as live.
+CPA rows omit diagnostic paragraphs about observation times, quota state, retries, credits, and model cooldowns. Cached account and pool values retain utilization colors; auth/server failures never label sync as live.
 
 Equal-duration scoped windows remain independently labeled. Percentages, account status labels, and per-window reset timers remain visible.
 

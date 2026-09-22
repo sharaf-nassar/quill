@@ -5251,6 +5251,76 @@ async fn set_cpa_connection(
 }
 
 #[tauri::command]
+async fn set_cpa_account_enabled(
+    provider: integrations::IntegrationProvider,
+    auth_index: String,
+    enabled: bool,
+    app: tauri::AppHandle,
+) -> Result<UsageData, String> {
+    let _refresh_guard = usage_refresh_lock().lock().await;
+    let connection = load_cpa_connection()?.ok_or("Connect CPA before changing accounts.")?;
+    let storage = get_storage()?;
+    let statuses = run_blocking(move || integrations::load_statuses(storage))?;
+    let status_key = provider_status_key(&statuses, Some(&connection));
+    let mut health =
+        match cpa::poll::set_account_enabled(storage, &connection, provider, &auth_index, enabled)
+            .await
+        {
+            Ok(health) => health,
+            Err(error) => {
+                // Confirmation can fail after a remote write. Keep the displayed
+                // observations, but discard the cache so later reads can reconcile.
+                invalidate_usage_cache();
+                return Err(error);
+            }
+        };
+    let mut usage =
+        current_usage_cache(&status_key).unwrap_or_else(|| load_cached_usage_data(&statuses));
+    if let Some(account) = usage.cpa_accounts.iter_mut().find(|account| {
+        account.provider == health.provider && account.auth_index == health.auth_index
+    }) {
+        // Routing confirmation is not a quota read, in either direction.
+        health.quota = account.quota.clone();
+        *account = health;
+    } else {
+        usage.cpa_accounts.push(health);
+    }
+    let snapshots = usage
+        .cpa_accounts
+        .iter()
+        .map(|health| cpa::aggregate::CpaAccountSnapshot {
+            health: health.clone(),
+            buckets: Some(
+                usage
+                    .buckets
+                    .iter()
+                    .filter(|bucket| {
+                        bucket.source == UsageSource::Cpa
+                            && bucket.provider.as_str() == health.provider
+                            && bucket.account_id.as_deref() == Some(health.auth_index.as_str())
+                    })
+                    .cloned()
+                    .collect(),
+            ),
+        })
+        .collect::<Vec<_>>();
+    usage.cpa_pools = cpa::aggregate::compute_cpa_pools(&snapshots);
+    {
+        let mut cache = usage_cache().lock().unwrap();
+        if let Some(entry) = cache
+            .as_mut()
+            .filter(|entry| entry.provider_status_key == status_key)
+        {
+            // Keep refreshed_at unchanged so toggles cannot postpone polling.
+            entry.usage = usage.clone();
+        }
+    }
+    let indicator_state = build_indicator_state(&statuses, &usage)?;
+    let _ = app.emit(indicator::INDICATOR_UPDATED_EVENT, indicator_state);
+    Ok(usage)
+}
+
+#[tauri::command]
 async fn clear_cpa_connection(
     app: tauri::AppHandle,
 ) -> Result<(), integrations::cpa::CpaConnectError> {
@@ -6412,6 +6482,7 @@ pub fn run() {
             set_brevity_enabled,
             set_minimax_api_key,
             set_cpa_connection,
+            set_cpa_account_enabled,
             clear_cpa_connection,
             get_cpa_connection_status,
             get_runtime_settings,

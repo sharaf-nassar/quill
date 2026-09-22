@@ -215,6 +215,40 @@ impl CpaClient {
         parse_auth_files(&body)
     }
 
+    pub(crate) async fn set_account_disabled(
+        &self,
+        name: &str,
+        auth_index: &str,
+        disabled: bool,
+    ) -> Result<(), CpaError> {
+        let endpoint = self
+            .base_url
+            .join("v0/management/auth-files/status")
+            .map_err(|_| CpaError::InvalidUrl)?;
+        let response = cpa_http_client()
+            .patch(endpoint)
+            .bearer_auth(&self.management_key)
+            .json(&serde_json::json!({
+                "name": name,
+                "auth_index": auth_index,
+                "disabled": disabled,
+            }))
+            .send()
+            .await
+            .map_err(|_| CpaError::Unreachable)?;
+        if !response.status().is_success() {
+            return Err(management_error(response.status(), response.headers()));
+        }
+        let body = read_bounded_body(response).await?;
+        let payload: Value = serde_json::from_str(&body).map_err(|_| CpaError::InvalidResponse)?;
+        if payload.get("status").and_then(Value::as_str) != Some("ok")
+            || payload.get("disabled").and_then(Value::as_bool) != Some(disabled)
+        {
+            return Err(CpaError::InvalidResponse);
+        }
+        Ok(())
+    }
+
     pub(super) async fn api_call(
         &self,
         auth_index: &str,

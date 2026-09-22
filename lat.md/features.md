@@ -583,6 +583,16 @@ The Integrations tab can update a stored MiniMax API key without disabling and r
 
 [[src-tauri/src/lib.rs#set_minimax_api_key]] delegates to [[src-tauri/src/integrations/manager.rs#set_minimax_api_key]] which trims the key, persists it via [[src-tauri/src/integrations/minimax.rs#save_api_key]], refreshes provider statuses, and emits `integrations-updated`. The frontend renders an inline `Save` / `Cancel` form; the dialog-based first-enable flow stays unchanged.
 
+### CPA Account Controls
+
+Desktop power-icon controls enable or disable individual CPA accounts for routing, not local visibility. Browser monitoring remains read-only.
+
+The [[lat.md/frontend#Frontend#Components#Widget Limits Band]] places a small borderless power icon to the left of each account name, with unavailable status beneath the name. Appearance, keyboard access, and pending feedback follow the widget's documented control contract.
+
+[[src-tauri/src/lib.rs#set_cpa_account_enabled]] accepts a Claude or Codex provider, auth index, and requested enabled state. The shared usage-refresh lock serializes changes against polling, reconnect, disconnect, and other toggles. A fresh inventory resolves the actual filename; no display label or caller-supplied path identifies the mutation. [[src-tauri/src/cpa/client.rs#CpaClient#set_account_disabled]] uses `PATCH /v0/management/auth-files/status` with `name`, `auth_index`, and `disabled`, reusing the loopback-only, no-proxy, no-redirect, bounded client.
+
+[[src-tauri/src/cpa/poll.rs#set_account_enabled]] confirms the change with another inventory read before persisting account health. Existing quota observations, timestamps, history, cooldowns, and sibling states survive unchanged. A routing change does not turn live quota into cached quota, promote cached or failed quota to live, or create a new observation. The command patches only the confirmed account health in the endpoint-matched usage snapshot, retains its displayed quota metadata and source errors, and recomputes pool membership from the existing buckets. The cache entry keeps its original refresh timestamp so repeated toggles cannot postpone polling. Only a cold cache uses the persisted cached fallback. The command returns the updated snapshot directly to the widget and emits the updated indicator state, not a quota-refresh event; the widget's last-sync clock does not restart. Cache provenance affects the sync status, never utilization colors: unchanged values keep their severity until reset expiry. Failures retain displayed last-known state and invalidate the in-memory cache for later reconciliation; confirmation failures explicitly ask the user to refresh before retrying. No new browser command is permitted.
+
 ### CPA Connection Lifecycle
 
 CPA is an opt-in cross-provider usage source configured from the Integrations tab without becoming a provider status row.

@@ -376,6 +376,78 @@ pub(crate) fn cached(
     Ok(result(&load_state(storage, connection)?, true))
 }
 
+// Caller holds the shared usage-refresh lock across the remote change and cache write.
+// @lat: [[features#Settings Window#CPA Account Controls]]
+pub(crate) async fn set_account_enabled(
+    storage: &Storage,
+    connection: &CpaConnection,
+    provider: IntegrationProvider,
+    auth_index: &str,
+    enabled: bool,
+) -> Result<CpaAccountHealth, String> {
+    if !matches!(
+        provider,
+        IntegrationProvider::Claude | IntegrationProvider::Codex
+    ) || auth_index.is_empty()
+        || auth_index.len() > 256
+        || auth_index.chars().any(char::is_control)
+    {
+        return Err("Invalid CPA account selection.".into());
+    }
+    let mut state = load_state(storage, connection)?;
+    let client = CpaClient::new(&connection.base_url, &connection.management_key)
+        .map_err(|error| error.to_string())?;
+    let files = client
+        .auth_files()
+        .await
+        .map_err(|error| error.to_string())?;
+    let matches_account = |file: &&CpaAuthFile| {
+        file.provider.eq_ignore_ascii_case(provider.as_str()) && file.auth_index == auth_index
+    };
+    let file = files
+        .iter()
+        .find(matches_account)
+        .ok_or("CPA account no longer exists. Refresh Limits.")?;
+    let name = file
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .ok_or("CPA did not provide an account filename. Update CPA and refresh Limits.")?;
+    if file.disabled == enabled {
+        client
+            .set_account_disabled(name, auth_index, !enabled)
+            .await
+            .map_err(|error| {
+                format!("{error} Refresh Limits to confirm the account state before retrying.")
+            })?;
+    }
+    let files = client.auth_files().await.map_err(|error| {
+        format!("CPA account change was accepted, but confirmation failed: {error} Refresh Limits.")
+    })?;
+    let file = files
+        .iter()
+        .find(matches_account)
+        .ok_or("CPA account disappeared after the change. Refresh Limits.")?;
+    let account = state
+        .accounts
+        .entry(account_key(file))
+        .or_insert_with(|| AccountState::new(file));
+    let quota = std::mem::take(&mut account.snapshot.health.quota);
+    account.snapshot.health = auth_file_snapshot(file).health;
+    account.snapshot.health.quota = quota;
+    let health = account.snapshot.health.clone();
+    let encoded =
+        serde_json::to_string(&state).map_err(|_| "Encode CPA state failed.".to_string())?;
+    storage.store_cpa_state(&encoded, &[])?;
+    if file.disabled == enabled {
+        return Err(
+            "CPA did not retain the requested account state. Refresh Limits before retrying."
+                .into(),
+        );
+    }
+    Ok(health)
+}
+
 pub(crate) async fn refresh(
     storage: &Storage,
     connection: &CpaConnection,

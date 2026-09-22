@@ -446,6 +446,17 @@ overlap another control's hit area.
 - These are labeled button groups, not tablists; the accessible state and the
   visual state are the same attribute.
 
+### Account Switches
+
+CPA account routing uses a single borderless 10px power icon to the left of
+the account name, centered vertically in the existing indentation gutter.
+No track, background fill, or visible On/Off text. Enabled uses
+the neutral text token; disabled uses faint. Hover brightens the icon and the
+tooltip names the action. The transparent desktop button keeps a 24×24px hit
+area, accessible switch state, and the global focus ring. Pending changes dim
+the icon and expose a Saving tooltip without changing state before confirmation.
+Unavailable status sits on its own line below the name. No animation.
+
 ### The View Switcher
 - A **listbox**, because the control has a value: `aria-haspopup="listbox"`
   with `aria-expanded` on the trigger, exactly one `aria-selected` option,
@@ -484,8 +495,10 @@ transitions width at 0.3s ease — meter ballistics, calm rather than twitchy.
 The track is a real `role="progressbar"` with `aria-valuenow/min/max` and the
 untruncated window label as its accessible name. A bucket whose reset has
 already elapsed is `stale`: neutral slate, no severity, because a utilization
-measured against a bygone window is not a live threshold. An optional CPA reset
-sits centered on a dedicated footer beneath that same track. Its 10px tabular
+measured against a bygone window is not a live threshold. Cached observations
+keep their utilization colors until reset expiry; cache provenance and failed
+polls belong in the sync readout, not in the numeric severity. An optional CPA
+reset sits centered on a dedicated footer beneath that same track. Its 10px tabular
 countdown uses the brighter secondary label tone so it stays legible without
 competing with the utilization plane above.
 

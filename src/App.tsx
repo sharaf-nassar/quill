@@ -326,6 +326,14 @@ function App({ integrations }: AppProps) {
                 hasUsageSource={hasUsageSource}
                 lastSyncAt={lastSyncAt}
                 onRefresh={handleUsageRefresh}
+                onSetAccountEnabled={async (provider, authIndex, enabled) => {
+                  const data = await invoke<UsageData>("set_cpa_account_enabled", {
+                    provider,
+                    authIndex,
+                    enabled,
+                  });
+                  setUsageData(data);
+                }}
               />
               <div className="wg-rule" />
               <ViewRegion />

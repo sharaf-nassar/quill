@@ -75,6 +75,8 @@ interface CpaAccountRow {
   label: string;
   statusMessage: string | null;
   state: AccountState;
+  disabled: boolean;
+  unavailable: boolean;
   cells: LimitCell[];
 }
 
@@ -493,9 +495,7 @@ function cpaRows(data: UsageData | null, nowMs: number): CpaLimitsRow[] {
       pool?.buckets ?? [],
       providerBuckets,
     );
-    const cells = cpaCells(provider, definitions, pool?.buckets ?? [], nowMs).map((cell) =>
-      providerError ? { ...cell, severity: "stale" as const } : cell,
-    );
+    const cells = cpaCells(provider, definitions, pool?.buckets ?? [], nowMs);
     const hasInventory = pool !== undefined || providerAccounts.length > 0;
     const health = providerAccounts.filter(
       (account) => accountState(account) === "ready",
@@ -526,9 +526,9 @@ function cpaRows(data: UsageData | null, nowMs: number): CpaLimitsRow[] {
               account.auth_index,
             statusMessage: account.status_message?.trim() || null,
             state: accountState(account),
-            cells: cpaCells(provider, definitions, accountBuckets, nowMs).map((cell) =>
-              account.quota?.state !== "live" ? { ...cell, severity: "stale" as const } : cell,
-            ),
+            disabled: account.disabled,
+            unavailable: account.unavailable,
+            cells: cpaCells(provider, definitions, accountBuckets, nowMs),
           };
         }),
       },
@@ -692,16 +692,105 @@ function AccountHealth({ state }: { state: AccountState }) {
   );
 }
 
+type SetAccountEnabled = (
+  provider: CpaProvider,
+  authIndex: string,
+  enabled: boolean,
+) => Promise<void>;
+
+function CpaAccount({
+  account,
+  provider,
+  onSetAccountEnabled,
+}: {
+  account: CpaAccountRow;
+  provider: CpaProvider;
+  onSetAccountEnabled?: SetAccountEnabled;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const errorId = useId();
+  const changeEnabled = async () => {
+    if (busy || !onSetAccountEnabled) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await onSetAccountEnabled(provider, account.id, account.disabled);
+    } catch (error) {
+      setError(typeof error === "string" ? error : "Could not change CPA account. Refresh Limits and retry.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      className="wg-cpa-account-row"
+      data-state={account.state}
+      title={account.statusMessage ?? undefined}
+    >
+      <span className="wg-cpa-account-identity">
+        {onSetAccountEnabled && (
+          <button
+            type="button"
+            role="switch"
+            className="wg-cpa-account-toggle"
+            aria-label={`Enable ${providerLabel(provider)} account ${account.label}`}
+            aria-checked={!account.disabled}
+            aria-busy={busy}
+            aria-describedby={error ? errorId : undefined}
+            disabled={busy}
+            title={busy ? "Saving account state…" : `${account.disabled ? "Enable" : "Disable"} this account in CPA`}
+            onClick={() => void changeEnabled()}
+          >
+            <svg
+              width="10"
+              height="10"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              aria-hidden="true"
+            >
+              <path d="M18.4 5.6a9 9 0 1 1-12.8 0M12 2v10" />
+            </svg>
+          </button>
+        )}
+        <span className="wg-cpa-account-name" title={account.label}>
+          {account.label}
+        </span>
+        <AccountHealth state={
+          account.unavailable ? "unavailable"
+            : onSetAccountEnabled && account.disabled ? "ready" : account.state
+        } />
+        {error && (
+          <span id={errorId} className="wg-cpa-account-error" role="alert">
+            {error}
+          </span>
+        )}
+      </span>
+      <WindowCells
+        cells={account.cells}
+        ownerLabel={`${providerLabel(provider)} account ${account.label}`}
+        resetReadouts={cpaResetReadouts(account.cells)}
+      />
+    </div>
+  );
+}
+
 function CpaRow({
   row,
   expanded,
   controlsId,
   onToggle,
+  onSetAccountEnabled,
 }: {
   row: CpaLimitsRow;
   expanded: boolean;
   controlsId: string;
   onToggle: () => void;
+  onSetAccountEnabled?: SetAccountEnabled;
 }) {
   const name = providerLabel(row.provider);
   const visibleAccounts = row.accounts.slice(0, MAX_VISIBLE_ACCOUNTS);
@@ -784,24 +873,12 @@ function CpaRow({
           hidden={!expanded}
         >
           {visibleAccounts.map((account) => (
-            <div
-              className="wg-cpa-account-row"
-              data-state={account.state}
-              title={account.statusMessage ?? undefined}
+            <CpaAccount
               key={account.id}
-            >
-              <span className="wg-cpa-account-identity">
-                <span className="wg-cpa-account-name" title={account.label}>
-                  {account.label}
-                </span>
-                <AccountHealth state={account.state} />
-              </span>
-              <WindowCells
-                cells={account.cells}
-                ownerLabel={`${name} account ${account.label}`}
-                resetReadouts={cpaResetReadouts(account.cells)}
-              />
-            </div>
+              account={account}
+              provider={row.provider}
+              onSetAccountEnabled={onSetAccountEnabled}
+            />
           ))}
           {hiddenCount > 0 && (
             <div className="wg-cpa-more">…and {hiddenCount} more</div>
@@ -819,6 +896,7 @@ interface LimitsSectionProps {
   hasUsageSource: boolean;
   lastSyncAt: number | null;
   onRefresh: () => Promise<void>;
+  onSetAccountEnabled?: SetAccountEnabled;
   webSurface?: boolean;
 }
 
@@ -830,6 +908,7 @@ function LimitsSection({
   hasUsageSource,
   lastSyncAt,
   onRefresh,
+  onSetAccountEnabled,
   webSurface = false,
 }: LimitsSectionProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -932,6 +1011,7 @@ function LimitsSection({
             row={cpaRow}
             expanded={expanded.has(cpaRow.provider)}
             controlsId={`${disclosurePrefix}-${cpaRow.provider}-accounts`}
+            onSetAccountEnabled={webSurface ? undefined : onSetAccountEnabled}
             onToggle={() =>
               setExpanded((current) => {
                 const next = new Set(current);
