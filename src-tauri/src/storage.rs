@@ -13744,7 +13744,7 @@ impl Storage {
         session_id: &str,
         range: ModelRange,
     ) -> Result<SessionModelHistoryResponse, SessionModelHistoryQueryError> {
-        let range_end_ms = Utc::now().timestamp_millis();
+        let range_end_ms = query_now().timestamp_millis();
         let range_start_ms = range_end_ms
             .checked_sub(model_range_duration(range).num_milliseconds())
             .ok_or_else(|| {

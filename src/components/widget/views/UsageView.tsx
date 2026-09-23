@@ -508,13 +508,17 @@ function SessionIdentity({ row }: { row: RowModel }) {
   );
 }
 
-function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
-  const name = projectName(row.project) ?? row.session_id.slice(0, 8);
+function isLiveSession(row: SessionBreakdown, nowMs: number): boolean {
   const recovering =
     row.provider === "pi" &&
     row.pi_lineage?.kind === "unresolved" &&
     row.pi_lineage.reason === "recovering";
-  const live = !recovering && isSessionLive(row.last_active, row.ended_at, nowMs);
+  return !recovering && isSessionLive(row.last_active, row.ended_at, nowMs);
+}
+
+function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
+  const name = projectName(row.project) ?? row.session_id.slice(0, 8);
+  const live = isLiveSession(row, nowMs);
   const liveActivity = live && row.current_turn_runtime_active;
   const metrics = resolveSessionMetrics(
     formatTokenCount(row.total_tokens),
@@ -808,16 +812,18 @@ function UsageView({ range, webSurface = false }: UsageViewProps) {
     [mode, breakdown.data, nowMs],
   );
 
-  const liveCount = useMemo(
-    () =>
-      mode === "sessions"
-        ? breakdown.data.filter((row) => {
-            if (!("session_id" in row)) return false;
-            return isSessionLive(row.last_active, row.ended_at, nowMs);
-          }).length
-        : 0,
-    [mode, breakdown.data, nowMs],
-  );
+  const sessionCounts = useMemo(() => {
+    let live = 0;
+    let idle = 0;
+    if (mode === "sessions") {
+      for (const row of breakdown.data) {
+        if (!("session_id" in row)) continue;
+        if (isLiveSession(row, nowMs)) live += 1;
+        else if (row.background_tasks_running) idle += 1;
+      }
+    }
+    return { live, idle };
+  }, [mode, breakdown.data, nowMs]);
 
   const stats = activityStats.data;
   // Denominator-aware: a range whose providers record no tool outcomes reads
@@ -1121,8 +1127,25 @@ function UsageView({ range, webSurface = false }: UsageViewProps) {
               </button>
             ))}
           </div>
-          {mode === "sessions" && liveCount > 0 && (
-            <span className="wg-breakdown-count wg-num">{liveCount} LIVE</span>
+          {mode === "sessions" && (sessionCounts.idle > 0 || sessionCounts.live > 0) && (
+            <span className="wg-breakdown-counts wg-num">
+              {[
+                { count: sessionCounts.idle, status: "background", label: "Idle sessions with background work running" },
+                { count: sessionCounts.live, status: "true", label: "Active sessions" },
+              ].filter(({ count }) => count > 0).map(({ count, status, label }) => (
+                <span
+                  className="wg-breakdown-count"
+                  data-live={status}
+                  key={status}
+                  role="img"
+                  aria-label={`${label}: ${count}`}
+                  title={`${label}: ${count}`}
+                >
+                  <span className="wg-row-dot" data-live={status} aria-hidden="true" />
+                  {count}
+                </span>
+              ))}
+            </span>
           )}
           {mode === "hooks" && (
             <button

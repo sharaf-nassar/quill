@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type {
   CpaAccountHealth,
   CpaPoolAggregate,
@@ -91,6 +91,8 @@ interface ResetRequest {
   accountId: string | null;
   owner: string;
   reset: LimitReset;
+  /** Uses this identity holds, so the dialog can say "1 of N". */
+  total: number;
 }
 
 type RequestReset = (request: ResetRequest) => void;
@@ -401,23 +403,67 @@ function liveResets(resets: LimitReset[], nowMs: number): LimitReset[] {
   return resets.filter((reset) => (msUntil(reset.expires_at, nowMs) ?? 1) > 0);
 }
 
-function resetExpiry(expiresAt: string | null) {
-  const ms = expiresAt ? Date.parse(expiresAt) : Number.NaN;
-  if (Number.isNaN(ms)) return null;
+function expiryMs(reset: LimitReset): number | null {
+  const ms = reset.expires_at ? Date.parse(reset.expires_at) : Number.NaN;
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function formatExpiry(ms: number) {
   const date = new Date(ms);
   return {
-    short: date.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
+    day: date.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
+    time: date.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    }),
     full: date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }),
   };
 }
 
+/** One line of an identity's reset list. */
+interface ResetGroup {
+  /** The reset a Use on this line spends. */
+  reset: LimitReset;
+  /** Uses left across every reset folded into the line. */
+  count: number;
+  expiresMs: number | null;
+}
+
+/**
+ * Soonest expiry first, undated last. Resets that match on label, expiry, and
+ * usability fold into one line, so same-day Codex credits (one entry each)
+ * read as a count instead of repeated identical lines.
+ */
+function resetGroups(resets: LimitReset[]): ResetGroup[] {
+  const groups = new Map<string, ResetGroup>();
+  for (const reset of resets) {
+    const key = JSON.stringify([reset.label, reset.expires_at, reset.usable_now]);
+    const group = groups.get(key);
+    if (group) group.count += reset.count;
+    else groups.set(key, { reset, count: reset.count, expiresMs: expiryMs(reset) });
+  }
+  return [...groups.values()].sort(
+    (left, right) =>
+      (left.expiresMs ?? Infinity) - (right.expiresMs ?? Infinity) || 0,
+  );
+}
+
+function resetDialogTitle({ provider, total }: ResetRequest): string {
+  const name = providerLabel(provider);
+  return total > 1 ? `Use 1 of ${total} ${name} resets?` : `Use ${name} reset?`;
+}
+
 function resetDescription({ provider, accountId, owner, reset }: ResetRequest): string {
   const target = accountId === null ? `your ${owner}` : `${owner}'s`;
+  const ms = expiryMs(reset);
+  const expiry = ms === null ? "no expiry" : `expires ${formatExpiry(ms).full}`;
   const cost =
     provider === "codex"
       ? "It is spent only if a limit actually resets."
       : "This can't be undone.";
-  return `${reset.label ?? "Limit reset"}. Refills ${target} limits now. ${cost}`;
+  return `${reset.label ?? "Limit reset"}, ${expiry}. Refills ${target} limits now. ${cost}`;
 }
 
 function accessibleCountdown(remainingMs: number): string {
@@ -711,65 +757,141 @@ function ResetGlyph() {
 }
 
 /**
- * Banked limit resets under an identity: one line per reset with its expiry
- * date. Usable resets are buttons when the surface can spend them.
+ * An identity's banked limit resets in the empty space under its name: total
+ * uses and the earliest expiry. Clicking them floats a list of every reset,
+ * each usable one with its own Use, and every spend passes through the
+ * confirmation dialog. Without `onUse` (the browser monitor) the list is
+ * read-only.
  */
-function LimitResets({
+// @lat: [[frontend#Frontend#Components#Widget Limits Band#Reset Summary]]
+function ResetSummary({
   resets = [],
   ownerLabel,
   onUse,
 }: {
-  resets: LimitReset[];
+  resets?: LimitReset[];
   ownerLabel: string;
-  onUse?: (reset: LimitReset) => void;
+  onUse?: (reset: LimitReset, total: number) => void;
 }) {
-  if (resets.length === 0) return null;
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
+  const listId = useId();
+
+  // The list floats over the meters, so interaction anywhere else closes it.
+  useEffect(() => {
+    if (!open) return;
+    listRef.current?.scrollIntoView({ block: "nearest" });
+    const dismiss = (event: Event) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setOpen(false);
+      triggerRef.current?.focus();
+    };
+    document.addEventListener("mousedown", dismiss);
+    document.addEventListener("focusin", dismiss);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("mousedown", dismiss);
+      document.removeEventListener("focusin", dismiss);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [open]);
+
+  const groups = resetGroups(resets);
+  if (groups.length === 0) return null;
+
+  const total = groups.reduce((sum, group) => sum + group.count, 0);
+  const first = groups[0];
+  const noun = total === 1 ? "reset" : "resets";
+  const firstExpiry = first.expiresMs === null ? null : formatExpiry(first.expiresMs);
+  const sentence =
+    firstExpiry === null
+      ? `${total} ${noun}, no expiry`
+      : groups.every((group) => group.expiresMs === first.expiresMs)
+        ? `${total} ${noun} ${total === 1 ? "expires" : "expire"} ${firstExpiry.full}`
+        : `${total} ${noun}, first expires ${firstExpiry.full}`;
+
   return (
-    <span className="wg-limit-resets">
-      {resets.map((reset) => {
-        const expiry = resetExpiry(reset.expires_at);
-        const description = `${reset.label ?? "Limit reset"}${
-          reset.count > 1 ? `, ${reset.count} left` : ""
-        }, ${expiry ? `expires ${expiry.full}` : "no expiry"}`;
-        // Both variants carry the full description as their accessible name.
-        const content = (
-          <>
-            <ResetGlyph />
-            <span className="wg-limit-reset-text" aria-hidden="true">
-              {expiry?.short ?? "No expiry"}
-              {reset.count > 1 && ` ×${reset.count}`}
-            </span>
-          </>
-        );
-        if (onUse && reset.usable_now) {
-          return (
-            <button
-              type="button"
-              key={reset.id}
-              className="wg-limit-reset"
-              aria-label={`Use ${ownerLabel} reset. ${description}`}
-              title={`${description}. Click to use.`}
-              onClick={() => onUse(reset)}
-            >
-              {content}
-            </button>
-          );
-        }
-        const note = onUse ? ". Not usable yet" : "";
-        return (
-          <span
-            key={reset.id}
-            className="wg-limit-reset"
-            data-usable={onUse ? "false" : undefined}
-            role="group"
-            aria-label={`${ownerLabel} reset. ${description}${note}`}
-            title={`${description}${note}`}
-          >
-            {content}
-          </span>
-        );
-      })}
-    </span>
+    <div className="wg-resets" ref={rootRef}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="wg-resets-line"
+        aria-expanded={open}
+        aria-controls={open ? listId : undefined}
+        aria-label={`${ownerLabel} resets: ${sentence}`}
+        title={sentence}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <ResetGlyph />
+        <span className="wg-resets-figures">
+          <span className="wg-resets-count">{total}</span>
+          {firstExpiry && (
+            <>
+              <span className="wg-resets-sep"> · </span>
+              {firstExpiry.day}
+            </>
+          )}
+        </span>
+      </button>
+      {open && (
+        <ul
+          ref={listRef}
+          className="wg-resets-pop"
+          id={listId}
+          aria-label={`${ownerLabel} resets`}
+        >
+          {groups.map((group) => {
+            const label = group.reset.label ?? "Limit reset";
+            const expiry =
+              group.expiresMs === null ? null : formatExpiry(group.expiresMs);
+            const detail = `${label}${
+              group.count > 1 ? `, ${group.count} uses` : ""
+            }, ${expiry ? `expires ${expiry.full}` : "no expiry"}`;
+            return (
+              <li key={group.reset.id} className="wg-resets-item" title={detail}>
+                <span className="wg-resets-item-label">
+                  <span className="wg-resets-item-name">{label}</span>
+                  {group.count > 1 && (
+                    <span className="wg-resets-item-count">×{group.count}</span>
+                  )}
+                </span>
+                <span className="wg-resets-item-expiry">
+                  {expiry?.time ?? "No expiry"}
+                </span>
+                {onUse &&
+                  (group.reset.usable_now ? (
+                    <button
+                      type="button"
+                      className="wg-resets-key wg-resets-item-act"
+                      aria-label={`Use ${ownerLabel} reset: ${detail}`}
+                      onClick={() => {
+                        setOpen(false);
+                        onUse(group.reset, total);
+                      }}
+                    >
+                      Use
+                    </button>
+                  ) : (
+                    // Claude spends only its next grant, even when a queued
+                    // one expires first.
+                    <span
+                      className="wg-resets-item-wait wg-resets-item-act"
+                      title="Not usable yet"
+                    >
+                      Not yet
+                    </span>
+                  ))}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -790,17 +912,18 @@ function DirectRow({
       />
       <span className="wg-limits-identity">
         <span className="wg-limits-name">{name.toUpperCase()}</span>
-        <LimitResets
+        <ResetSummary
           resets={row.resets}
           ownerLabel={name}
           onUse={
             onRequestReset &&
-            ((reset) =>
+            ((reset, total) =>
               onRequestReset({
                 provider: row.provider,
                 accountId: null,
                 owner: name,
                 reset,
+                total,
               }))
           }
         />
@@ -916,17 +1039,18 @@ function CpaAccount({
         <span className="wg-cpa-account-name" title={account.label}>
           {account.label}
         </span>
-        <LimitResets
+        <ResetSummary
           resets={account.resets}
           ownerLabel={`${providerLabel(provider)} account ${account.label}`}
           onUse={
             onRequestReset &&
-            ((reset) =>
+            ((reset, total) =>
               onRequestReset({
                 provider,
                 accountId: account.id,
                 owner: account.label,
                 reset,
+                total,
               }))
           }
         />
@@ -1248,11 +1372,7 @@ function LimitsSection({
       )}
       <ConfirmDialog
         open={resetRequest !== null}
-        title={
-          resetRequest
-            ? `Use ${providerLabel(resetRequest.provider)} reset?`
-            : ""
-        }
+        title={resetRequest ? resetDialogTitle(resetRequest) : ""}
         description={resetRequest ? resetDescription(resetRequest) : ""}
         confirmLabel="Use reset"
         busy={resetBusy}

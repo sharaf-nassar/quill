@@ -56,7 +56,7 @@ Compaction and branch-summary usage becomes stable summary observations without 
 
 Summary spend enters every token aggregate while turn counters remain assistant-only.
 
-`transcript_analytics::tests::pi_summary_usage_reconciles_without_turn_inflation` replaces the same pinned source twice and proves five observations reconcile to three turns plus two summaries. Raw observations, model hourly rows, token snapshots, provider token stats, model overview totals, and session history all report 2,032 tokens. Only assistant rows enter token, model, or segment turn counters; the model-less compaction remains 1,300 unattributed tokens.
+`transcript_analytics::tests::pi_summary_usage_reconciles_without_turn_inflation` replaces the same pinned source twice and proves five observations reconcile to three turns plus two summaries. Raw observations, model hourly rows, token snapshots, provider token stats, model overview totals, and session history all report 2,032 tokens. The three range reads run under a query clock pinned one hour after the fixed 2026-08-24 fixture, so the rows never age out of the 30-day window. Only assistant rows enter token, model, or segment turn counters; the model-less compaction remains 1,300 unattributed tokens.
 
 ## Pi Thinking Events And Setting Timeline
 

@@ -3912,32 +3912,39 @@ mod tests {
         );
         drop(conn);
 
-        let stats = storage
-            .get_token_stats(
+        // The fixture is dated 2026-08-24, so range reads use a pinned clock
+        // instead of letting the rows age out of the 30-day windows.
+        let pinned_now: chrono::DateTime<chrono::Utc> =
+            "2026-08-24T06:00:00Z".parse().expect("pinned query clock");
+        let stats = crate::storage::with_pinned_query_now(pinned_now, || {
+            storage.get_token_stats(
                 "30d",
                 Some(IntegrationProvider::Pi),
                 None,
                 Some("pi-usage-evidence"),
                 None,
             )
-            .expect("read Pi provider token totals");
+        })
+        .expect("read Pi provider token totals");
         assert_eq!(stats.total_tokens, 2032);
         assert_eq!(stats.turn_count, 3);
 
-        let overview = storage
-            .get_model_usage_overview(crate::models::ModelRange::ThirtyDays, Some("pi"))
-            .expect("read Pi model overview");
+        let overview = crate::storage::with_pinned_query_now(pinned_now, || {
+            storage.get_model_usage_overview(crate::models::ModelRange::ThirtyDays, Some("pi"))
+        })
+        .expect("read Pi model overview");
         assert_eq!(overview.totals.total_tokens, 2032);
         assert_eq!(overview.totals.turns, 3);
         assert_eq!(overview.totals.attributed_tokens, 732);
 
-        let history = storage
-            .get_session_model_history(
+        let history = crate::storage::with_pinned_query_now(pinned_now, || {
+            storage.get_session_model_history(
                 "pi",
                 "pi-usage-evidence",
                 crate::models::ModelRange::ThirtyDays,
             )
-            .expect("read Pi session model history");
+        })
+        .expect("read Pi session model history");
         let segment_turns = history
             .chains
             .iter()

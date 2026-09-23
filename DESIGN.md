@@ -458,16 +458,22 @@ area, accessible switch state, and the global focus ring. Pending changes dim
 the icon and expose a Saving tooltip without changing state before confirmation.
 CPA's unavailable flag gets no label. No animation.
 
-### Reset Lines
+### Reset Summary
 
-Banked limit resets fill the identity space under an account or provider
-name: one line per reset, a 9px reset glyph plus the 10px tabular month-day
-expiry, no box or chip. A spendable reset is a borderless button in the
-neutral text tone that brightens on hover and takes the global focus ring; a
-reset that is not usable yet is faint and inert, and the read-only browser
-keeps every reset as label-tone text. Resets carry no severity or identity
-hue. Spending one always passes through the confirmation modal because it
-cannot be undone.
+Banked limit resets take one line in the empty identity space under an
+account or provider name, never adding a row: a 9px reset glyph with 10px
+tabular figures (`4 · Oct 1`, the count at Text Hi, the earliest expiry in
+label tone). In an account row the line sits level with the countdown row
+beside it. The line is itself the control, a borderless key whose hover fill
+bleeds past the text; clicking it opens a popover on Menu Raised listing
+every reset, one 24px line each (identical resets fold into a `×N` count),
+with a label-tone date and time and a Use key or a faint `Not yet`. Open, the
+line turns into the popover's tab (Menu Raised and a hairline, open at the
+bottom) and the list hangs flush from it, square at the shared corner, so
+the two read as one shape anchored where you clicked. Resets
+carry no severity or identity hue. Every spend passes through the
+confirmation modal because it cannot be undone; the read-only browser keeps
+the line and popover but no Use keys.
 
 ### The View Switcher
 - A **listbox**, because the control has a value: `aria-haspopup="listbox"`
