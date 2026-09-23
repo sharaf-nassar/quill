@@ -63,7 +63,7 @@ Neither Manage nor release-notes had any affordance at all before this, because 
 
 ## Module Map
 
-The `tauri::generate_handler!` list in [[src-tauri/src/lib.rs]] contains 93 registered Tauri commands.
+The `tauri::generate_handler!` list in [[src-tauri/src/lib.rs]] contains 99 registered Tauri commands.
 
 It starts background tasks on launch. The Web UI controller is managed during setup, but its storage read and listener startup run asynchronously so window creation never waits on a bind.
 
@@ -90,7 +90,7 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 | Models | [[src-tauri/src/models.rs]] | All shared data structures and serde types |
 | CC inference client | [[src-tauri/src/cc_client.rs]] | Subprocess-based Claude Code invocation for all LLM inference (replaces the prior direct rig-core/Anthropic path) |
 | Git analysis | [[src-tauri/src/git_analysis.rs]] | Commit pattern extraction and hotspot analysis |
-| Fetcher | [[src-tauri/src/fetcher.rs]] | Claude API usage bucket fetching |
+| Fetcher | [[src-tauri/src/fetcher.rs]] | Direct provider usage buckets, banked limit resets, and reset claims |
 | Auth | [[src-tauri/src/auth.rs]] | Bearer token generation and storage |
 | Config | [[src-tauri/src/config.rs]] | Credential reading and HTTP client setup |
 | Claude setup | [[src-tauri/src/claude_setup.rs]] | Legacy/local Claude deployment helpers retained outside startup |

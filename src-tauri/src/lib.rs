@@ -2692,6 +2692,7 @@ fn build_usage_data_with_cpa(
         cpa_accounts,
         cpa_pools,
         error,
+        ..Default::default()
     }
 }
 
@@ -2747,12 +2748,8 @@ fn load_cached_usage_data(statuses: &[ProviderStatus]) -> UsageData {
     let enabled_providers = native_usage_providers(statuses, cpa_configured);
     if enabled_providers.is_empty() && !cpa_configured {
         return UsageData {
-            buckets: Vec::new(),
-            provider_errors: Vec::new(),
-            provider_credits: Vec::new(),
-            cpa_accounts: Vec::new(),
-            cpa_pools: Vec::new(),
             error: Some("No providers are enabled.".to_string()),
+            ..Default::default()
         };
     }
 
@@ -2847,12 +2844,8 @@ async fn refresh_usage_cache(
 
         if enabled_providers.is_empty() && cpa_connection.is_none() {
             let usage = UsageData {
-                buckets: Vec::new(),
-                provider_errors: Vec::new(),
-                provider_credits: Vec::new(),
-                cpa_accounts: Vec::new(),
-                cpa_pools: Vec::new(),
                 error: Some("No providers are enabled.".to_string()),
+                ..Default::default()
             };
 
             if USAGE_CACHE_EPOCH.load(AtomicOrdering::SeqCst) != refresh_epoch {
@@ -2873,6 +2866,18 @@ async fn refresh_usage_cache(
         let mut provider_errors = Vec::new();
         let mut provider_credits = Vec::new();
         let mut cpa_snapshots = Vec::new();
+        let mut provider_resets = Vec::new();
+        let mut live_reset_providers = Vec::new();
+        // Direct resets live only in the process cache: a provider served from
+        // cached buckets this cycle keeps the resets it last reported.
+        // ponytail: lost on restart until the next live read; persist if that gap matters.
+        let previous_resets = usage_cache()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|entry| entry.usage.provider_resets.clone())
+            .unwrap_or_default();
+        let native_providers = enabled_providers.clone();
 
         for provider in enabled_providers {
             match provider {
@@ -2906,7 +2911,9 @@ async fn refresh_usage_cache(
                     write_usage_setting_timestamp(CLAUDE_USAGE_LAST_ATTEMPT_KEY, now);
 
                     match fetcher::fetch_claude_usage(pi_oauth_fallback).await {
-                        Ok(mut buckets) => {
+                        Ok((mut buckets, resets)) => {
+                            provider_resets.extend(resets);
+                            live_reset_providers.push(provider);
                             clear_provider_cooldowns(CLAUDE_COOLDOWN_KEYS);
                             // A successful fetch proves the user is logged in;
                             // drop any stale auth-status verdict so a fresh
@@ -2979,11 +2986,15 @@ async fn refresh_usage_cache(
                 }
                 integrations::IntegrationProvider::Codex => {
                     match fetcher::fetch_codex_usage(pi_oauth_fallback).await {
-                        Ok((mut buckets, credits)) => {
-                            display_buckets.extend(buckets.clone());
-                            live_buckets.append(&mut buckets);
-                            if let Some(credits) = credits {
+                        Ok(mut usage) => {
+                            display_buckets.extend(usage.buckets.clone());
+                            live_buckets.append(&mut usage.buckets);
+                            if let Some(credits) = usage.credits {
                                 provider_credits.push(credits);
+                            }
+                            if let Some(resets) = usage.resets {
+                                provider_resets.extend(resets);
+                                live_reset_providers.push(provider);
                             }
                         }
                         Err(message) => {
@@ -3078,6 +3089,11 @@ async fn refresh_usage_cache(
             }
         }
 
+        provider_resets.extend(previous_resets.into_iter().filter(|reset| {
+            native_providers.contains(&reset.provider)
+                && !live_reset_providers.contains(&reset.provider)
+        }));
+
         // A configured CPA connection is the exclusive live usage source;
         // native provider polling resumes after CPA is disconnected.
         if let Some(connection) = cpa_connection {
@@ -3130,17 +3146,15 @@ async fn refresh_usage_cache(
             .map(|snapshot| snapshot.health.clone())
             .collect();
         let cpa_pools = cpa::aggregate::compute_cpa_pools(&cpa_snapshots);
-        let usage = store_usage_cache(
-            build_usage_data_with_cpa(
-                display_buckets,
-                provider_errors,
-                provider_credits,
-                cpa_accounts,
-                cpa_pools,
-            ),
-            &status_key,
-            &statuses,
+        let mut usage = build_usage_data_with_cpa(
+            display_buckets,
+            provider_errors,
+            provider_credits,
+            cpa_accounts,
+            cpa_pools,
         );
+        usage.provider_resets = provider_resets;
+        let usage = store_usage_cache(usage, &status_key, &statuses);
 
         if let Some(app) = app {
             emit_usage_updates(app, &statuses, &usage)?;
@@ -5320,6 +5334,139 @@ async fn set_cpa_account_enabled(
     Ok(usage)
 }
 
+// Idempotency keys of reset claims whose outcome is unknown. Retrying the same
+// reset reuses its key, so the provider dedupes a claim that already landed.
+static UNSETTLED_RESET_CLAIMS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn new_request_id() -> String {
+    let mut bytes: [u8; 16] = rand::random();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = hex_encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+/// Spend one banked limit reset, then force a usage refresh so the refilled
+/// windows and remaining resets replace the displayed snapshot. `account_id`
+/// selects a CPA account; `None` spends a direct-source reset.
+// @lat: [[features#Features#Live Usage View#Limit Resets]]
+#[tauri::command]
+async fn use_limit_reset(
+    provider: integrations::IntegrationProvider,
+    account_id: Option<String>,
+    reset_id: String,
+    app: tauri::AppHandle,
+) -> Result<UsageData, String> {
+    let valid_reset = match provider {
+        integrations::IntegrationProvider::Claude => fetcher::is_claude_grant_id(&reset_id),
+        integrations::IntegrationProvider::Codex => fetcher::is_codex_credit_id(&reset_id),
+        _ => false,
+    };
+    let valid_account = account_id
+        .as_deref()
+        .is_none_or(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control));
+    if !valid_reset || !valid_account {
+        return Err("Invalid limit reset selection.".into());
+    }
+    let claim = {
+        // Serializes claims with polling and with each other.
+        let _refresh_guard = usage_refresh_lock().lock().await;
+        let key = format!(
+            "{}/{}/{reset_id}",
+            provider.as_str(),
+            account_id.as_deref().unwrap_or("direct")
+        );
+        let claims = UNSETTLED_RESET_CLAIMS.get_or_init(Default::default);
+        let request_id = claims
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(new_request_id)
+            .clone();
+        let connection = match account_id {
+            Some(_) => {
+                Some(load_cpa_connection()?.ok_or("Connect CPA before using account resets.")?)
+            }
+            None => None,
+        };
+        let claim = match (&account_id, &connection) {
+            (Some(auth_index), Some(connection)) => {
+                cpa::quota::claim_reset(connection, provider, auth_index, &reset_id, &request_id)
+                    .await
+            }
+            _ if provider == integrations::IntegrationProvider::Claude => {
+                let storage = get_storage()?;
+                let pi_enabled = run_blocking(move || integrations::load_statuses(storage))?
+                    .iter()
+                    .any(|status| {
+                        status.provider == integrations::IntegrationProvider::Pi && status.enabled
+                    });
+                fetcher::claim_claude_reset(pi_enabled, &reset_id, &request_id).await
+            }
+            _ => {
+                let (credit_id, request_id) = (reset_id.clone(), request_id.clone());
+                tokio::task::spawn_blocking(move || {
+                    fetcher::claim_codex_reset(&credit_id, &request_id)
+                })
+                .await
+                .map_err(|error| format!("Codex reset task failed: {error}"))?
+            }
+        };
+        if !matches!(claim, fetcher::ResetClaim::Unconfirmed(_)) {
+            claims.lock().unwrap().remove(&key);
+        }
+        // The forced refresh below can skip this source (cooldown, fallback,
+        // unavailable CPA account), so mirror the spend into every held copy.
+        if let Some(entry) = usage_cache().lock().unwrap().as_mut() {
+            let usage = &mut entry.usage;
+            match &account_id {
+                Some(auth_index) => usage
+                    .cpa_accounts
+                    .iter_mut()
+                    .filter(|account| {
+                        account.provider == provider.as_str() && account.auth_index == *auth_index
+                    })
+                    .for_each(|account| claim.apply(&mut account.quota.resets, &reset_id)),
+                None => claim.apply(&mut usage.provider_resets, &reset_id),
+            }
+        }
+        if let (Some(auth_index), Some(connection)) = (&account_id, &connection)
+            && let Err(error) = cpa::poll::update_account_resets(
+                get_storage()?,
+                connection,
+                provider,
+                auth_index,
+                |resets| claim.apply(resets, &reset_id),
+            )
+        {
+            log::warn!("Failed to record the spent CPA reset: {error}");
+        }
+        claim
+    };
+    let usage = refresh_usage_cache(Some(&app), true).await;
+    match claim {
+        // A spent reset must close the confirmation even if the refresh fails,
+        // or a second click could spend another use of the same grant.
+        fetcher::ResetClaim::Reset => match usage {
+            Ok(usage) => Ok(usage),
+            Err(error) => {
+                log::warn!("Usage refresh after a spent reset failed: {error}");
+                get_cached_usage_data().await
+            }
+        },
+        fetcher::ResetClaim::Gone(message)
+        | fetcher::ResetClaim::Declined(message)
+        | fetcher::ResetClaim::Unconfirmed(message) => Err(message.to_string()),
+    }
+}
+
 #[tauri::command]
 async fn clear_cpa_connection(
     app: tauri::AppHandle,
@@ -6483,6 +6630,7 @@ pub fn run() {
             set_minimax_api_key,
             set_cpa_connection,
             set_cpa_account_enabled,
+            use_limit_reset,
             clear_cpa_connection,
             get_cpa_connection_status,
             get_runtime_settings,
@@ -6619,14 +6767,7 @@ mod tests {
     #[serial_test::serial]
     fn forced_usage_refresh_bypasses_recent_process_cache() {
         let key = "manual-refresh-test";
-        let usage = UsageData {
-            buckets: Vec::new(),
-            provider_errors: Vec::new(),
-            provider_credits: Vec::new(),
-            cpa_accounts: Vec::new(),
-            cpa_pools: Vec::new(),
-            error: None,
-        };
+        let usage = UsageData::default();
         store_usage_cache(usage, key, &[]);
 
         assert!(current_recent_usage_cache(key, false).is_some());

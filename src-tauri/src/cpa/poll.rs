@@ -3,8 +3,8 @@ use super::client::{CpaAuthFile, CpaClient, CpaError};
 use super::quota::{QuotaReading, account_call_error, fetch_claude_usage, fetch_codex_usage};
 use crate::integrations::{IntegrationProvider, cpa::CpaConnection};
 use crate::models::{
-    CpaAccountHealth, CpaModelAvailability, CpaQuotaState, ProviderErrorKind, UsageBucket,
-    UsageProviderError, UsageSource,
+    CpaAccountHealth, CpaModelAvailability, CpaQuotaState, LimitReset, ProviderErrorKind,
+    UsageBucket, UsageProviderError, UsageSource,
 };
 use crate::storage::{Storage, cpa::STATE_SETTING};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -146,6 +146,9 @@ impl AccountState {
         }
         if reading.credits.is_some() {
             self.snapshot.health.quota.credits = reading.credits;
+        }
+        if let Some(resets) = reading.resets {
+            self.snapshot.health.quota.resets = resets;
         }
     }
 
@@ -448,6 +451,29 @@ pub(crate) async fn set_account_enabled(
     Ok(health)
 }
 
+/// Mirror a spent reset into the stored account, so an account that polling
+/// skips (unavailable or cooling) cannot keep offering it. Caller holds the
+/// shared usage-refresh lock.
+pub(crate) fn update_account_resets(
+    storage: &Storage,
+    connection: &CpaConnection,
+    provider: IntegrationProvider,
+    auth_index: &str,
+    update: impl FnOnce(&mut Vec<LimitReset>),
+) -> Result<(), String> {
+    let mut state = load_state(storage, connection)?;
+    let Some(account) = state
+        .accounts
+        .get_mut(&format!("{}/{auth_index}", provider.as_str()))
+    else {
+        return Ok(());
+    };
+    update(&mut account.snapshot.health.quota.resets);
+    let encoded =
+        serde_json::to_string(&state).map_err(|_| "Encode CPA state failed.".to_string())?;
+    storage.store_cpa_state(&encoded, &[])
+}
+
 pub(crate) async fn refresh(
     storage: &Storage,
     connection: &CpaConnection,
@@ -594,12 +620,7 @@ async fn poll_account_snapshots(
                 let client = client.clone();
                 async move {
                     let reading = match call.file.provider.to_ascii_lowercase().as_str() {
-                        "claude" => fetch_claude_usage(&client, &call.file.auth_index)
-                            .await
-                            .map(|buckets| QuotaReading {
-                                buckets,
-                                ..Default::default()
-                            }),
+                        "claude" => fetch_claude_usage(&client, &call.file.auth_index).await,
                         "codex" => match call.file.chatgpt_account_id.as_deref() {
                             Some(id) => fetch_codex_usage(&client, &call.file.auth_index, id).await,
                             None => Err(account_call_error(&call.file.auth_index)),

@@ -223,6 +223,10 @@ const usageData: UsageData = {
     },
   ],
   provider_credits: [{ provider: "codex", balance: "$4.20" }],
+  provider_resets: [
+    { provider: "claude", id: "launch-reset", label: "One usage-limit reset", expires_at: isoIn(30 * D), count: 1, usable_now: true },
+    { provider: "codex", id: "RateLimitResetCredit_demo", label: "Full reset", expires_at: isoIn(12 * D), count: 1, usable_now: true },
+  ],
   cpa_accounts: [],
   cpa_pools: [],
   error: null,
@@ -2653,8 +2657,9 @@ const fixtures: Record<string, FixtureHandler> = {
   run_retention_maintenance: (args) => runRetentionMaintenanceFixture(args),
   // live usage
   fetch_usage_data: () => marketingScreenshotMode()
-    ? { ...usageData, provider_errors: [] }
+    ? { ...usageData, provider_errors: [], provider_resets: [] }
     : usageData,
+  use_limit_reset: () => ({ ...usageData, provider_resets: [] }),
   // tokens
   get_token_history: (args) => tokenHistory(rangeArg(args)),
   get_token_stats: () => tokenStats,

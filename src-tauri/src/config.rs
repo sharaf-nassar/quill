@@ -41,23 +41,32 @@ pub(crate) fn external_command(program: impl AsRef<std::ffi::OsStr>) -> std::pro
     command
 }
 
+/// Oldest Claude CLI version verified to receive banked limit resets; the usage
+/// API refuses 2.1.250 and older with `cli_version`.
+// ponytail: the floor ages; bump it when reset grants report `cli_version` again.
+const CLAUDE_CLI_VERSION_FLOOR: (u32, u32, u32) = (2, 1, 280);
+
+/// Claude Code's own API user agent. The usage API returns banked limit resets
+/// only to this CLI surface, and only for supported versions, so a missing or
+/// older local CLI (a CPA-only machine) still presents the verified floor.
 pub fn claude_user_agent() -> &'static str {
     CLAUDE_VERSION.get_or_init(|| {
-        external_command("claude")
+        let local = external_command("claude")
             .arg("--version")
             .output()
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| {
-                let ver = s.split_whitespace().next()?.to_string();
-                if ver.contains('.') {
-                    Some(format!("claude-code/{ver}"))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "claude-code/0.0.0".into())
+            .and_then(|s| parse_cli_version(s.split_whitespace().next()?));
+        let (major, minor, patch) = local.map_or(CLAUDE_CLI_VERSION_FLOOR, |version| {
+            version.max(CLAUDE_CLI_VERSION_FLOOR)
+        });
+        format!("claude-cli/{major}.{minor}.{patch} (external, cli)")
     })
+}
+
+fn parse_cli_version(text: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = text.split('.').map(|part| part.parse().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
 }
 
 /// Resolve the user's login-shell PATH so spawned processes (e.g. `claude`)

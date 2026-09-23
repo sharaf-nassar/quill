@@ -101,6 +101,7 @@ function App({ integrations }: AppProps) {
         buckets: [],
         provider_errors: [],
         provider_credits: [],
+        provider_resets: [],
         cpa_accounts: [],
         cpa_pools: [],
         error: String(e),
@@ -331,6 +332,16 @@ function App({ integrations }: AppProps) {
                     provider,
                     authIndex,
                     enabled,
+                  });
+                  setUsageData(data);
+                }}
+                onUseReset={async (provider, accountId, resetId) => {
+                  // The command's refresh emits `usage-updated`, which restarts
+                  // the sync clock only when that refresh actually succeeded.
+                  const data = await invoke<UsageData>("use_limit_reset", {
+                    provider,
+                    accountId,
+                    resetId,
                   });
                   setUsageData(data);
                 }}

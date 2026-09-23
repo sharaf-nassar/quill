@@ -129,8 +129,10 @@ impl fmt::Debug for CpaClient {
 struct ApiCallRequest<'a> {
     auth_index: &'a str,
     method: &'static str,
-    url: &'static str,
+    url: &'a str,
     header: &'a BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -249,11 +251,13 @@ impl CpaClient {
         Ok(())
     }
 
+    /// Upstream request with CPA's `$TOKEN$` substitution. A body makes it a POST.
     pub(super) async fn api_call(
         &self,
         auth_index: &str,
-        upstream_url: &'static str,
+        upstream_url: &str,
         headers: &BTreeMap<String, String>,
+        body: Option<&str>,
     ) -> Result<ApiCallResponse, CpaError> {
         if auth_index.trim().is_empty() {
             return Err(CpaError::AccountCall {
@@ -269,9 +273,10 @@ impl CpaClient {
             .map_err(|_| CpaError::InvalidUrl)?;
         let payload = ApiCallRequest {
             auth_index,
-            method: "GET",
+            method: if body.is_some() { "POST" } else { "GET" },
             url: upstream_url,
             header: headers,
+            data: body,
         };
         let response = cpa_http_client()
             .post(endpoint)
@@ -715,6 +720,7 @@ mod tests {
             method: "GET",
             url: "https://api.anthropic.com/api/oauth/usage",
             header: &headers,
+            data: None,
         })
         .expect("request should serialize");
         assert_eq!(request["authIndex"], "12");
@@ -996,7 +1002,12 @@ mod tests {
         let client = CpaClient::new(&upstream_url, "key").expect("client should build");
         assert_eq!(
             client
-                .api_call("account-1", "https://example.com/fixed", &BTreeMap::new())
+                .api_call(
+                    "account-1",
+                    "https://example.com/fixed",
+                    &BTreeMap::new(),
+                    None
+                )
                 .await,
             Err(CpaError::AccountCall {
                 auth_index: "account-1".to_string(),

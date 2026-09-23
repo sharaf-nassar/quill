@@ -361,7 +361,7 @@ Quill resolves the Codex CLI before running provider checks or `codex app-server
 
 [[src-tauri/src/integrations/codex.rs#run_app_server_request]] is the single one-shot `codex app-server` path. Hook registration and usage polling differ in feature, identity, `CODEX_HOME`, provider isolation, and deadline.
 
-Hook discovery selects the built-in `ollama` provider through a process-only config override. This prevents `hooks/list` from refreshing unrelated model-provider auth without changing the user's `model_provider`, `model_providers`, bearer token, base URL, or auth settings. Usage polling applies no provider override because `account/rateLimits/read` needs the configured OpenAI account.
+Hook discovery selects the built-in `ollama` provider through a process-only config override. This prevents `hooks/list` from refreshing unrelated model-provider auth without changing the user's `model_provider`, `model_providers`, bearer token, base URL, or auth settings. Usage polling applies no provider override because `account/rateLimits/read` needs the configured OpenAI account; spending a banked reset through `account/rateLimitResetCredit/consume` follows the same rule and deadline.
 
 Each call spawns the CLI, sends `initialize`, `initialized`, and one request at id 2, then reads stdout until that id answers or the caller's deadline expires. Hook work uses ten seconds because it runs at startup holding the process-wide mutation guard; usage polling uses thirty because the child round-trips to the ChatGPT backend.
 
@@ -430,6 +430,8 @@ Host commands use [[src-tauri/src/config.rs#external_command]]. On Linux with `A
 ## Shared Outbound HTTP Client
 
 [[src-tauri/src/config.rs#http_client]] is the single `reqwest::Client` instance shared by every outbound HTTP call the app makes: live usage polling against the Anthropic OAuth, ChatGPT WHAM, and MiniMax coding-plan APIs in [[src-tauri/src/fetcher.rs]], and GitHub release lookups in [[src-tauri/src/releases.rs]].
+
+Direct Claude limit-reset claims in [[src-tauri/src/fetcher.rs#claim_claude_reset]] use the same client for their profile read and claim, so a dead network fails them on the same deadlines.
 
 The client is built with `connect_timeout(5s)` and `timeout(15s)`. Without these explicit timeouts `reqwest::Client::new()` has no upper bound on connect time and can block the `tokio` runtime indefinitely on a dead network or captive portal (see seanmonstar/reqwest#1256). The 5-second connect timeout is also the signal the poller uses to enter offline cooldown — see [[features#Features#Live Usage View]] and [[src-tauri/src/lib.rs#compute_network_backoff]].
 

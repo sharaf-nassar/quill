@@ -3,6 +3,7 @@ import type {
   CpaAccountHealth,
   CpaPoolAggregate,
   IntegrationProvider,
+  LimitReset,
   ProviderStatus,
   UsageBucket,
   UsageData,
@@ -10,6 +11,7 @@ import type {
   UsageSource,
 } from "../../types";
 import { providerLabel } from "../../utils/providers";
+import ConfirmDialog from "../ConfirmDialog";
 
 /**
  * LIMITS — one authoritative row per provider.
@@ -68,6 +70,7 @@ interface LimitsRow {
   resetText: string | null;
   resetSeverity: Severity;
   detail: string | null;
+  resets: LimitReset[];
 }
 
 interface CpaAccountRow {
@@ -78,7 +81,24 @@ interface CpaAccountRow {
   disabled: boolean;
   unavailable: boolean;
   cells: LimitCell[];
+  resets: LimitReset[];
 }
+
+/** A reset the operator picked; spending it waits for confirmation. */
+interface ResetRequest {
+  provider: IntegrationProvider;
+  /** CPA auth index, or null for the direct login. */
+  accountId: string | null;
+  owner: string;
+  reset: LimitReset;
+}
+
+type RequestReset = (request: ResetRequest) => void;
+type UseReset = (
+  provider: IntegrationProvider,
+  accountId: string | null,
+  resetId: string,
+) => Promise<void>;
 
 interface CpaLimitsRow extends LimitsRow {
   provider: CpaProvider;
@@ -376,6 +396,30 @@ function cpaAggregateResetReadouts(cells: LimitCell[]): CpaResetReadout[] {
   );
 }
 
+/** Resets past their expiry are gone upstream; a missing expiry never lapses. */
+function liveResets(resets: LimitReset[], nowMs: number): LimitReset[] {
+  return resets.filter((reset) => (msUntil(reset.expires_at, nowMs) ?? 1) > 0);
+}
+
+function resetExpiry(expiresAt: string | null) {
+  const ms = expiresAt ? Date.parse(expiresAt) : Number.NaN;
+  if (Number.isNaN(ms)) return null;
+  const date = new Date(ms);
+  return {
+    short: date.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
+    full: date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }),
+  };
+}
+
+function resetDescription({ provider, accountId, owner, reset }: ResetRequest): string {
+  const target = accountId === null ? `your ${owner}` : `${owner}'s`;
+  const cost =
+    provider === "codex"
+      ? "It is spent only if a limit actually resets."
+      : "This can't be undone.";
+  return `${reset.label ?? "Limit reset"}. Refills ${target} limits now. ${cost}`;
+}
+
 function accessibleCountdown(remainingMs: number): string {
   const totalMinutes = Math.max(0, Math.floor(remainingMs / 60_000));
   const days = Math.floor(totalMinutes / 1_440);
@@ -433,6 +477,12 @@ function directRows(
         cells,
         ...rowTiming(cells),
         detail: providerError?.message ?? status.lastError ?? null,
+        resets: liveResets(
+          (data?.provider_resets ?? []).filter(
+            (reset) => reset.provider === status.provider,
+          ),
+          nowMs,
+        ),
       };
     });
 }
@@ -512,6 +562,7 @@ function cpaRows(data: UsageData | null, nowMs: number): CpaLimitsRow[] {
         cells: hasInventory ? cells : [],
         ...rowTiming(hasInventory ? cells : []),
         detail: providerError?.message ?? null,
+        resets: [],
         healthy: pool?.healthy ?? (hasInventory ? health : null),
         total: pool?.total ?? (hasInventory ? providerAccounts.length : null),
         accounts: providerAccounts.map((account) => {
@@ -529,6 +580,7 @@ function cpaRows(data: UsageData | null, nowMs: number): CpaLimitsRow[] {
             disabled: account.disabled,
             unavailable: account.unavailable,
             cells: cpaCells(provider, definitions, accountBuckets, nowMs),
+            resets: liveResets(account.quota?.resets ?? [], nowMs),
           };
         }),
       },
@@ -638,7 +690,96 @@ function WindowCells({
   );
 }
 
-function DirectRow({ row }: { row: LimitsRow }) {
+function ResetGlyph() {
+  return (
+    <svg
+      width="9"
+      height="9"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable={false}
+    >
+      <path d="M3 12a9 9 0 1 0 2.6-6.4L3 8" />
+      <path d="M3 3v5h5" />
+    </svg>
+  );
+}
+
+/**
+ * Banked limit resets under an identity: one line per reset with its expiry
+ * date. Usable resets are buttons when the surface can spend them.
+ */
+function LimitResets({
+  resets = [],
+  ownerLabel,
+  onUse,
+}: {
+  resets: LimitReset[];
+  ownerLabel: string;
+  onUse?: (reset: LimitReset) => void;
+}) {
+  if (resets.length === 0) return null;
+  return (
+    <span className="wg-limit-resets">
+      {resets.map((reset) => {
+        const expiry = resetExpiry(reset.expires_at);
+        const description = `${reset.label ?? "Limit reset"}${
+          reset.count > 1 ? `, ${reset.count} left` : ""
+        }, ${expiry ? `expires ${expiry.full}` : "no expiry"}`;
+        // Both variants carry the full description as their accessible name.
+        const content = (
+          <>
+            <ResetGlyph />
+            <span className="wg-limit-reset-text" aria-hidden="true">
+              {expiry?.short ?? "No expiry"}
+              {reset.count > 1 && ` ×${reset.count}`}
+            </span>
+          </>
+        );
+        if (onUse && reset.usable_now) {
+          return (
+            <button
+              type="button"
+              key={reset.id}
+              className="wg-limit-reset"
+              aria-label={`Use ${ownerLabel} reset. ${description}`}
+              title={`${description}. Click to use.`}
+              onClick={() => onUse(reset)}
+            >
+              {content}
+            </button>
+          );
+        }
+        const note = onUse ? ". Not usable yet" : "";
+        return (
+          <span
+            key={reset.id}
+            className="wg-limit-reset"
+            data-usable={onUse ? "false" : undefined}
+            role="group"
+            aria-label={`${ownerLabel} reset. ${description}${note}`}
+            title={`${description}${note}`}
+          >
+            {content}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+function DirectRow({
+  row,
+  onRequestReset,
+}: {
+  row: LimitsRow;
+  onRequestReset?: RequestReset;
+}) {
   const name = providerLabel(row.provider);
   return (
     <div className="wg-limits-row" data-source="direct">
@@ -647,7 +788,23 @@ function DirectRow({ row }: { row: LimitsRow }) {
         data-provider={row.provider}
         aria-hidden="true"
       />
-      <span className="wg-limits-name">{name.toUpperCase()}</span>
+      <span className="wg-limits-identity">
+        <span className="wg-limits-name">{name.toUpperCase()}</span>
+        <LimitResets
+          resets={row.resets}
+          ownerLabel={name}
+          onUse={
+            onRequestReset &&
+            ((reset) =>
+              onRequestReset({
+                provider: row.provider,
+                accountId: null,
+                owner: name,
+                reset,
+              }))
+          }
+        />
+      </span>
 
       {row.state === "ready" && (
         <WindowCells cells={row.cells} ownerLabel={name} />
@@ -677,17 +834,14 @@ function DirectRow({ row }: { row: LimitsRow }) {
 }
 
 function AccountHealth({ state }: { state: AccountState }) {
-  if (state === "ready") return null;
+  // CPA's unavailable flag stays in row state and pool math, not on screen.
+  if (state === "ready" || state === "unavailable") return null;
   return (
     <span className="wg-cpa-account-state" data-state={state}>
-      {state !== "disabled" && (
+      {state === "cooling" && (
         <span className="wg-limits-lamp" aria-hidden="true" />
       )}
-      {state === "disabled"
-        ? "DISABLED"
-        : state === "unavailable"
-          ? "UNAVAILABLE"
-          : "COOLING"}
+      {state === "disabled" ? "DISABLED" : "COOLING"}
     </span>
   );
 }
@@ -702,10 +856,12 @@ function CpaAccount({
   account,
   provider,
   onSetAccountEnabled,
+  onRequestReset,
 }: {
   account: CpaAccountRow;
   provider: CpaProvider;
   onSetAccountEnabled?: SetAccountEnabled;
+  onRequestReset?: RequestReset;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -760,9 +916,22 @@ function CpaAccount({
         <span className="wg-cpa-account-name" title={account.label}>
           {account.label}
         </span>
+        <LimitResets
+          resets={account.resets}
+          ownerLabel={`${providerLabel(provider)} account ${account.label}`}
+          onUse={
+            onRequestReset &&
+            ((reset) =>
+              onRequestReset({
+                provider,
+                accountId: account.id,
+                owner: account.label,
+                reset,
+              }))
+          }
+        />
         <AccountHealth state={
-          account.unavailable ? "unavailable"
-            : onSetAccountEnabled && account.disabled ? "ready" : account.state
+          onSetAccountEnabled && account.disabled ? "ready" : account.state
         } />
         {error && (
           <span id={errorId} className="wg-cpa-account-error" role="alert">
@@ -785,12 +954,14 @@ function CpaRow({
   controlsId,
   onToggle,
   onSetAccountEnabled,
+  onRequestReset,
 }: {
   row: CpaLimitsRow;
   expanded: boolean;
   controlsId: string;
   onToggle: () => void;
   onSetAccountEnabled?: SetAccountEnabled;
+  onRequestReset?: RequestReset;
 }) {
   const name = providerLabel(row.provider);
   const visibleAccounts = row.accounts.slice(0, MAX_VISIBLE_ACCOUNTS);
@@ -878,6 +1049,7 @@ function CpaRow({
               account={account}
               provider={row.provider}
               onSetAccountEnabled={onSetAccountEnabled}
+              onRequestReset={onRequestReset}
             />
           ))}
           {hiddenCount > 0 && (
@@ -897,6 +1069,7 @@ interface LimitsSectionProps {
   lastSyncAt: number | null;
   onRefresh: () => Promise<void>;
   onSetAccountEnabled?: SetAccountEnabled;
+  onUseReset?: UseReset;
   webSurface?: boolean;
 }
 
@@ -909,13 +1082,53 @@ function LimitsSection({
   lastSyncAt,
   onRefresh,
   onSetAccountEnabled,
+  onUseReset,
   webSurface = false,
 }: LimitsSectionProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [expanded, setExpanded] = useState<Set<CpaProvider>>(() => new Set());
   const [elapsed, setElapsed] = useState(() => formatElapsed(lastSyncAt, Date.now()));
   const [refreshing, setRefreshing] = useState(false);
+  const [resetRequest, setResetRequest] = useState<ResetRequest | null>(null);
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
   const disclosurePrefix = useId().replace(/\W/g, "");
+  // The browser monitor stays read-only: it shows resets but cannot spend them.
+  const requestReset: RequestReset | undefined =
+    !webSurface && onUseReset
+      ? (request) => {
+          setResetError(null);
+          setResetRequest(request);
+        }
+      : undefined;
+
+  const closeReset = () => {
+    if (resetBusy) return;
+    setResetRequest(null);
+    setResetError(null);
+  };
+
+  const confirmReset = async () => {
+    if (!resetRequest || !onUseReset || resetBusy) return;
+    setResetBusy(true);
+    setResetError(null);
+    try {
+      await onUseReset(
+        resetRequest.provider,
+        resetRequest.accountId,
+        resetRequest.reset.id,
+      );
+      setResetRequest(null);
+    } catch (error) {
+      setResetError(
+        typeof error === "string"
+          ? error
+          : "Could not use the reset. Refresh Limits and retry.",
+      );
+    } finally {
+      setResetBusy(false);
+    }
+  };
 
   useEffect(() => {
     const interval = setInterval(() => setNowMs(Date.now()), TICK_MS);
@@ -1002,7 +1215,13 @@ function LimitsSection({
           (cpaPoolProviders.has(cpaRow.provider) || directRow === undefined);
 
         if (!showCpa) {
-          return directRow ? <DirectRow key={provider} row={directRow} /> : null;
+          return directRow ? (
+            <DirectRow
+              key={provider}
+              row={directRow}
+              onRequestReset={requestReset}
+            />
+          ) : null;
         }
 
         return (
@@ -1012,6 +1231,7 @@ function LimitsSection({
             expanded={expanded.has(cpaRow.provider)}
             controlsId={`${disclosurePrefix}-${cpaRow.provider}-accounts`}
             onSetAccountEnabled={webSurface ? undefined : onSetAccountEnabled}
+            onRequestReset={requestReset}
             onToggle={() =>
               setExpanded((current) => {
                 const next = new Set(current);
@@ -1026,6 +1246,25 @@ function LimitsSection({
       {otherAccountCount > 0 && (
         <div className="wg-cpa-other">+{otherAccountCount} other accounts</div>
       )}
+      <ConfirmDialog
+        open={resetRequest !== null}
+        title={
+          resetRequest
+            ? `Use ${providerLabel(resetRequest.provider)} reset?`
+            : ""
+        }
+        description={resetRequest ? resetDescription(resetRequest) : ""}
+        confirmLabel="Use reset"
+        busy={resetBusy}
+        onCancel={closeReset}
+        onConfirm={confirmReset}
+      >
+        {resetError && (
+          <p className="confirm-dialog-error" role="alert">
+            {resetError}
+          </p>
+        )}
+      </ConfirmDialog>
     </section>
   );
 }

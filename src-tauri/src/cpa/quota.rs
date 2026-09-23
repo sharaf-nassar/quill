@@ -1,13 +1,21 @@
 use super::client::{ApiCallResponse, CpaClient, CpaError};
-use crate::integrations::IntegrationProvider;
-use crate::models::{CpaCredits, UsageBucket, UsageSource};
+use crate::fetcher::{
+    RESET_UNCONFIRMED, ResetClaim, claude_claim_body, claude_claim_outcome, claude_claim_url,
+    codex_claim_outcome,
+};
+use crate::integrations::{IntegrationProvider, cpa::CpaConnection};
+use crate::models::{CpaCredits, LimitReset, UsageBucket, UsageSource};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1";
+const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_RESETS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const CODEX_RESET_CONSUME_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.76.0";
 const CLAUDE_WINDOWS: &[(&str, &str, u32)] = &[
     ("five_hour", "5 hours", 0),
@@ -23,16 +31,26 @@ pub(crate) struct QuotaReading {
     pub buckets: Vec<UsageBucket>,
     pub credits: Option<CpaCredits>,
     pub partial: bool,
+    /// `None` keeps the account's last known resets.
+    pub resets: Option<Vec<LimitReset>>,
 }
 
 pub(crate) async fn fetch_claude_usage(
     client: &CpaClient,
     auth_index: &str,
-) -> Result<Vec<UsageBucket>, CpaError> {
+) -> Result<QuotaReading, CpaError> {
     let response = client
-        .api_call(auth_index, CLAUDE_USAGE_URL, &claude_headers())
+        .api_call(auth_index, CLAUDE_USAGE_URL, &claude_headers(), None)
         .await?;
-    parse_claude_usage(auth_index, &response)
+    let buckets = parse_claude_usage(auth_index, &response)?;
+    let resets = serde_json::from_str::<Value>(&response.body)
+        .ok()
+        .map(|payload| crate::fetcher::parse_claude_resets(&payload));
+    Ok(QuotaReading {
+        buckets,
+        resets,
+        ..Default::default()
+    })
 }
 
 pub(crate) async fn fetch_codex_usage(
@@ -44,9 +62,126 @@ pub(crate) async fn fetch_codex_usage(
         return Err(account_call_error(auth_index));
     }
     let response = client
-        .api_call(auth_index, CODEX_USAGE_URL, &codex_headers(account_id))
+        .api_call(
+            auth_index,
+            CODEX_USAGE_URL,
+            &codex_headers(account_id),
+            None,
+        )
         .await?;
-    parse_codex_usage(auth_index, &response)
+    let mut reading = parse_codex_usage(auth_index, &response)?;
+    reading.resets = fetch_codex_resets(client, auth_index, account_id, &response.body).await;
+    Ok(reading)
+}
+
+/// Credit rows cost a second call, so read them only when usage reports banked
+/// credits. A failed read returns `None` and keeps the last known rows.
+async fn fetch_codex_resets(
+    client: &CpaClient,
+    auth_index: &str,
+    account_id: &str,
+    usage_body: &str,
+) -> Option<Vec<LimitReset>> {
+    let usage: Value = serde_json::from_str(usage_body).ok()?;
+    let available = usage
+        .get("rate_limit_reset_credits")
+        .and_then(|credits| credits.get("available_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if available == 0 {
+        return Some(Vec::new());
+    }
+    let response = client
+        .api_call(
+            auth_index,
+            CODEX_RESETS_URL,
+            &codex_headers(account_id),
+            None,
+        )
+        .await
+        .ok()?;
+    let list: Value = serde_json::from_str(&response.body).ok()?;
+    Some(crate::fetcher::parse_codex_resets(&list))
+}
+
+/// Spend one banked reset through CPA's `api-call`, so the account token never
+/// leaves CPA. The live inventory must list the account under `provider`, so
+/// CPA never attaches one provider's token to another provider's host.
+// @lat: [[features#Features#Live Usage View#Limit Resets]]
+pub(crate) async fn claim_reset(
+    connection: &CpaConnection,
+    provider: IntegrationProvider,
+    auth_index: &str,
+    reset_id: &str,
+    request_id: &str,
+) -> ResetClaim {
+    if !matches!(
+        provider,
+        IntegrationProvider::Claude | IntegrationProvider::Codex
+    ) {
+        return ResetClaim::Declined("Resets are available for Claude and Codex only.");
+    }
+    let Ok(client) = CpaClient::new(&connection.base_url, &connection.management_key) else {
+        return ResetClaim::Declined("CPA connection is invalid. Reconnect it in Settings.");
+    };
+    let file = match client.auth_files().await {
+        Ok(files) => files.into_iter().find(|file| {
+            file.provider.eq_ignore_ascii_case(provider.as_str()) && file.auth_index == auth_index
+        }),
+        Err(_) => {
+            return ResetClaim::Unconfirmed("CPA is unreachable. Refresh Limits, then retry.");
+        }
+    };
+    let Some(file) = file else {
+        return ResetClaim::Declined("CPA no longer lists this account. Refresh Limits.");
+    };
+    if provider == IntegrationProvider::Claude {
+        let profile = client
+            .api_call(auth_index, CLAUDE_PROFILE_URL, &claude_headers(), None)
+            .await;
+        let Some(url) = profile
+            .ok()
+            .and_then(|profile| claude_claim_url(&profile.body))
+        else {
+            return ResetClaim::Unconfirmed(
+                "Couldn't read the Claude account through CPA. Refresh Limits, then retry.",
+            );
+        };
+        let body = claude_claim_body(reset_id, request_id);
+        return match client
+            .api_call(auth_index, &url, &claude_headers(), Some(&body))
+            .await
+        {
+            Ok(response) => claude_claim_outcome(response.status_code, &response.body),
+            Err(CpaError::AccountCall {
+                status_code: Some(status),
+                ..
+            }) => claude_claim_outcome(status, ""),
+            Err(_) => ResetClaim::Unconfirmed(RESET_UNCONFIRMED),
+        };
+    }
+    let Some(account_id) = file.chatgpt_account_id else {
+        return ResetClaim::Declined("CPA did not provide the Codex account identity.");
+    };
+    let body = serde_json::json!({ "credit_id": reset_id, "redeem_request_id": request_id });
+    match client
+        .api_call(
+            auth_index,
+            CODEX_RESET_CONSUME_URL,
+            &codex_headers(&account_id),
+            Some(&body.to_string()),
+        )
+        .await
+    {
+        Ok(response) => codex_claim_outcome(
+            serde_json::from_str::<Value>(&response.body)
+                .ok()
+                .as_ref()
+                .and_then(|body| body.get("code"))
+                .and_then(Value::as_str),
+        ),
+        Err(_) => ResetClaim::Unconfirmed(RESET_UNCONFIRMED),
+    }
 }
 
 fn claude_headers() -> BTreeMap<String, String> {
@@ -54,6 +189,11 @@ fn claude_headers() -> BTreeMap<String, String> {
         ("Authorization".into(), "Bearer $TOKEN$".into()),
         ("Content-Type".into(), "application/json".into()),
         ("anthropic-beta".into(), "oauth-2025-04-20".into()),
+        // Banked resets are only reported to the Claude CLI surface.
+        (
+            "User-Agent".into(),
+            crate::config::claude_user_agent().into(),
+        ),
     ])
 }
 

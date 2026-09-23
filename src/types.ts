@@ -53,6 +53,16 @@ export interface ProviderCredits {
   balance: string | null;
 }
 
+// Mirrors `LimitReset` in src-tauri/src/models.rs: a banked usage-limit reset.
+export interface LimitReset {
+  provider: IntegrationProvider;
+  id: string;
+  label: string | null;
+  expires_at: string | null;
+  count: number;
+  usable_now: boolean;
+}
+
 export interface CpaQuotaHealth {
   state: "unknown" | "live" | "cached" | "paused";
   observed_at: string | null;
@@ -65,6 +75,7 @@ export interface CpaQuotaHealth {
     reset_available: number | null;
   } | null;
   models: { model: string; available: boolean; available_at: string | null }[];
+  resets: LimitReset[];
 }
 
 export interface CpaAccountHealth {
@@ -90,6 +101,7 @@ export interface UsageData {
   buckets: UsageBucket[];
   provider_errors: UsageProviderError[];
   provider_credits: ProviderCredits[];
+  provider_resets: LimitReset[];
   cpa_accounts: CpaAccountHealth[];
   cpa_pools: CpaPoolAggregate[];
   error: string | null;

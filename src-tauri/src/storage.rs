@@ -26142,7 +26142,7 @@ mod tests {
     /// retained row with no live coverage never showed the model its own
     /// recorded usage names — quill-ihbn's repro once a session ages out of
     /// the live window and the overlay no longer touches its row.
-    // @lat: [[backend#Backend#Tauri IPC Commands#Usage and Token Commands (15)]]
+    // @lat: [[backend#Backend#Tauri IPC Commands#Usage and Token Commands (17)]]
     #[test]
     #[serial]
     fn retained_session_breakdown_carries_its_ranked_primary_model() {

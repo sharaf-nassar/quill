@@ -372,11 +372,8 @@ mod tests {
     fn usage(buckets: Vec<UsageBucket>, cpa_pools: Vec<CpaPoolAggregate>) -> UsageData {
         UsageData {
             buckets,
-            provider_errors: Vec::new(),
-            provider_credits: Vec::new(),
-            cpa_accounts: Vec::new(),
             cpa_pools,
-            error: None,
+            ..Default::default()
         }
     }
 

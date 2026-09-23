@@ -20,6 +20,18 @@ Transport failures (DNS, connect refused, pre-response timeout) on either Claude
 
 A provider with no live buckets still gets a row stating why: `SETUP` in amber when the failure is actionable (a `config`/`auth` provider error or an unfinished install) and `UNAVAILABLE` in slate otherwise. Codex reset countdowns are derived from the direct app-server rate-limit response, which also exposes model-specific windows such as Codex Spark; a finite Codex credit balance rides the same row.
 
+### Limit Resets
+
+Banked usage-limit resets appear under the identity they refill with their expiry dates, and the desktop widget can spend one after confirmation.
+
+Claude resets are the usage API's `cedar_ember` grants. Quill requests `/api/oauth/usage?cedar_ember=1` with Claude Code's own `claude-cli/<version> (external, cli)` user agent, because the API reports grants only to that CLI surface and refuses older versions with `cli_version` (2.1.250 is refused). [[src-tauri/src/config.rs#claude_user_agent]] presents the newer of the local `claude --version` and the verified 2.1.280 floor, so a CPA-only machine with no or an outdated Claude Code still sees CPA account grants. It never sends `skip_spend=1`, which drops `extra_usage`. [[src-tauri/src/fetcher.rs#parse_claude_resets]] keeps grants with uses left and marks only an unpaused `next_grant_id` usable. Codex resets are available rate-limit reset credits: `account/rateLimits/read` returns them with expiries, and [[src-tauri/src/fetcher.rs#parse_codex_resets]] reads both that shape and the ChatGPT WHAM list.
+
+Direct resets ride `UsageData.provider_resets`. A provider served from cached buckets, or from a Codex fallback that cannot see credits, keeps the resets it last reported in the process cache. CPA accounts carry theirs in `quota.resets`, persisted with the account snapshot. Claude grants arrive in the existing usage response; a Codex account whose WHAM usage reports banked credits gets one extra `wham/rate-limit-reset-credits` read, and a failed list read keeps the last known rows. Expired resets are hidden.
+
+[[src-tauri/src/lib.rs#use_limit_reset]] spends one reset under the usage-refresh lock, then forces a usage refresh. Direct Claude claims read the organization from `/api/oauth/profile` and post `{program, grant_id, request_id}` to `/api/organizations/{org}/reset_rate_limits`, using local Claude Code credentials and then Pi's bearer when the local token is missing or rejected, like the poll. Direct Codex claims call app-server `account/rateLimitResetCredit/consume`. [[src-tauri/src/cpa/quota.rs#claim_reset]] makes the same upstream calls through CPA's `api-call`, so account tokens stay inside CPA, and only for an account the live inventory lists under the requested provider. An outcome that is not definitive keeps its idempotency key, so a retry cannot spend a second reset. Definitive refusals (already used, nothing to reset, not at a limit, cooling down, ineligible) return display-safe messages.
+
+The forced refresh can skip the source (cooldown, fallback read, or an unavailable CPA account), so a spend first decrements the reset in the process cache and, through [[src-tauri/src/cpa/poll.rs#update_account_resets]], the stored CPA account; an already-used or missing reset is removed. A spend always returns usage, falling back to the cached snapshot when the refresh fails, so the confirmation closes and cannot spend twice. The browser monitor shows resets read-only.
+
 ### CPA Pool Aggregation
 
 CPA pool rows derive mean account pressure from routing-usable account snapshots and are never persisted as independent facts.
@@ -587,7 +599,7 @@ The Integrations tab can update a stored MiniMax API key without disabling and r
 
 Desktop power-icon controls enable or disable individual CPA accounts for routing, not local visibility. Browser monitoring remains read-only.
 
-The [[lat.md/frontend#Frontend#Components#Widget Limits Band]] places a small borderless power icon to the left of each account name, with unavailable status beneath the name. Appearance, keyboard access, and pending feedback follow the widget's documented control contract.
+The [[lat.md/frontend#Frontend#Components#Widget Limits Band]] places a small borderless power icon to the left of each account name, with banked [[features#Features#Live Usage View#Limit Resets]] beneath the name and no unavailable label. Appearance, keyboard access, and pending feedback follow the widget's documented control contract.
 
 [[src-tauri/src/lib.rs#set_cpa_account_enabled]] accepts a Claude or Codex provider, auth index, and requested enabled state. The shared usage-refresh lock serializes changes against polling, reconnect, disconnect, and other toggles. A fresh inventory resolves the actual filename; no display label or caller-supplied path identifies the mutation. [[src-tauri/src/cpa/client.rs#CpaClient#set_account_disabled]] uses `PATCH /v0/management/auth-files/status` with `name`, `auth_index`, and `disabled`, reusing the loopback-only, no-proxy, no-redirect, bounded client.
 

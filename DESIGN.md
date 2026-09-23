@@ -402,7 +402,8 @@ Depth is spent on exactly one thing: a layer that has genuinely left the plane.
 - **Listbox / Popover** (`box-shadow: 0 8px 24px rgba(0,0,0,0.6)`): the view
   switcher's menu and any tooltip. The only everyday shadow.
 - **Modal** (`box-shadow: 0 24px 40px rgba(0,0,0,0.45)`): confirmation dialogs
-  in the management windows — the rare full-attention layer.
+  in the management windows and the widget's limit-reset confirmation, the
+  rare full-attention layer.
 
 ### Named Rules
 
@@ -455,7 +456,18 @@ the neutral text token; disabled uses faint. Hover brightens the icon and the
 tooltip names the action. The transparent desktop button keeps a 24×24px hit
 area, accessible switch state, and the global focus ring. Pending changes dim
 the icon and expose a Saving tooltip without changing state before confirmation.
-Unavailable status sits on its own line below the name. No animation.
+CPA's unavailable flag gets no label. No animation.
+
+### Reset Lines
+
+Banked limit resets fill the identity space under an account or provider
+name: one line per reset, a 9px reset glyph plus the 10px tabular month-day
+expiry, no box or chip. A spendable reset is a borderless button in the
+neutral text tone that brightens on hover and takes the global focus ring; a
+reset that is not usable yet is faint and inert, and the read-only browser
+keeps every reset as label-tone text. Resets carry no severity or identity
+hue. Spending one always passes through the confirmation modal because it
+cannot be undone.
 
 ### The View Switcher
 - A **listbox**, because the control has a value: `aria-haspopup="listbox"`

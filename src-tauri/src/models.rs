@@ -459,6 +459,18 @@ pub struct CpaCredits {
     pub reset_available: Option<u64>,
 }
 
+/// A banked usage-limit reset the account can spend on demand: a Claude
+/// `cedar_ember` grant or a Codex rate-limit reset credit.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct LimitReset {
+    pub provider: IntegrationProvider,
+    pub id: String,
+    pub label: Option<String>,
+    pub expires_at: Option<String>,
+    pub count: u32,
+    pub usable_now: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CpaModelAvailability {
     pub model: String,
@@ -474,6 +486,8 @@ pub struct CpaQuotaHealth {
     pub message: Option<String>,
     pub credits: Option<CpaCredits>,
     pub models: Vec<CpaModelAvailability>,
+    #[serde(default)]
+    pub resets: Vec<LimitReset>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -503,6 +517,8 @@ pub struct UsageData {
     pub buckets: Vec<UsageBucket>,
     pub provider_errors: Vec<UsageProviderError>,
     pub provider_credits: Vec<ProviderCredits>,
+    /// Direct-source resets; CPA accounts carry theirs in `quota.resets`.
+    pub provider_resets: Vec<LimitReset>,
     #[serde(default)]
     pub cpa_accounts: Vec<CpaAccountHealth>,
     #[serde(default)]

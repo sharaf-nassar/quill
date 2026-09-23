@@ -465,6 +465,13 @@ html[data-view="migration"] #root {
   line-height: 1.5;
 }
 
+.confirm-dialog-error {
+  margin-top: 10px;
+  color: var(--readout-bright);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .confirm-dialog-actions {
   display: flex;
   justify-content: flex-end;
@@ -1471,6 +1478,22 @@ html[data-view="migration"] #root {
   text-overflow: ellipsis;
 }
 
+/* Direct rows stack banked resets under the provider name inside the same
+   50px column, so every row's meters keep one left edge. */
+.wg-limits-identity {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  width: 50px;
+  flex: 0 0 50px;
+  min-width: 0;
+}
+
+.wg-limits-identity .wg-limits-name {
+  width: auto;
+  flex: none;
+}
+
 .wg-limits-cells {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(60px, 1fr));
@@ -1841,6 +1864,59 @@ html[data-view="migration"] #root {
   width: 4px;
   height: 4px;
   flex-basis: 4px;
+}
+
+/* Banked limit resets: a reset glyph plus the expiry date, one line per reset,
+   in the empty identity space under the name. Spendable resets are borderless
+   buttons in the neutral text tone; the read-only browser keeps them as text. */
+.wg-limit-resets {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2xs);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.wg-limit-reset {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--label);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.wg-limit-reset svg {
+  flex: 0 0 auto;
+}
+
+.wg-limit-reset-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wg-limit-reset[data-usable="false"] {
+  color: var(--faint);
+}
+
+button.wg-limit-reset {
+  color: var(--text);
+  cursor: pointer;
+}
+
+button.wg-limit-reset:hover {
+  color: var(--text-hi);
 }
 
 .wg-cpa-account-row .wg-limits-cells {

@@ -1,6 +1,6 @@
 use crate::config::{claude_user_agent, http_client, read_access_token};
 use crate::integrations::IntegrationProvider;
-use crate::models::{ProviderCredits, UsageBucket};
+use crate::models::{LimitReset, ProviderCredits, UsageBucket};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -234,7 +234,10 @@ mod context_fetch_tests {
 /// exists to bound a hung app-server, not to police a slow network.
 const CODEX_USAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
-const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+// `cedar_ember=1` adds Claude Code's banked-reset block to the usage payload.
+// Unlike Claude Code, never add `skip_spend=1`: it drops `extra_usage`.
+const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1";
+const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.76.0";
 const MINIMAX_USAGE_URL: &str = "https://api.minimax.io/v1/api/openplatform/coding_plan/remains";
@@ -449,6 +452,292 @@ pub(crate) fn parse_scoped_weekly_limits(
     buckets
 }
 
+/// Banked Claude limit resets from the usage payload's `cedar_ember` block. The
+/// API returns it only to a Claude CLI user agent, and only `next_grant_id` is
+/// claimable now; later grants wait their turn.
+pub(crate) fn parse_claude_resets(data: &serde_json::Value) -> Vec<LimitReset> {
+    let Some(program) = data
+        .get("cedar_ember")
+        .filter(|program| program.get("eligible").and_then(|v| v.as_bool()) == Some(true))
+    else {
+        return Vec::new();
+    };
+    let next = program.get("next_grant_id").and_then(|v| v.as_str());
+    program
+        .get("grants")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|grant| {
+            let id = grant
+                .get("id")?
+                .as_str()
+                .filter(|id| is_claude_grant_id(id))?;
+            let left = grant
+                .get("resets_left")?
+                .as_u64()
+                .filter(|left| *left > 0)?;
+            let flag = |key: &str| grant.get(key).and_then(|v| v.as_bool());
+            Some(LimitReset {
+                provider: IntegrationProvider::Claude,
+                id: id.to_string(),
+                label: text_field(grant, "label"),
+                expires_at: grant.get("ends_at").and_then(parse_resets_at),
+                count: u32::try_from(left).unwrap_or(u32::MAX),
+                usable_now: next == Some(id)
+                    && flag("usable_now") == Some(true)
+                    && flag("paused") != Some(true),
+            })
+        })
+        .collect()
+}
+
+/// Available Codex reset credits from either the app-server summary
+/// (camelCase, unix seconds) or the WHAM list (snake_case, RFC3339).
+pub(crate) fn parse_codex_resets(summary: &serde_json::Value) -> Vec<LimitReset> {
+    summary
+        .get("credits")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|credit| credit.get("status").and_then(|v| v.as_str()) == Some("available"))
+        .filter_map(|credit| {
+            let id = credit
+                .get("id")?
+                .as_str()
+                .filter(|id| is_codex_credit_id(id))?;
+            Some(LimitReset {
+                provider: IntegrationProvider::Codex,
+                id: id.to_string(),
+                label: text_field(credit, "title"),
+                expires_at: credit
+                    .get("expiresAt")
+                    .or_else(|| credit.get("expires_at"))
+                    .and_then(parse_resets_at),
+                count: 1,
+                usable_now: true,
+            })
+        })
+        .collect()
+}
+
+fn text_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// Claude Code's own grant-id shape; anything else is refused before a claim.
+pub(crate) fn is_claude_grant_id(id: &str) -> bool {
+    (1..=40).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+pub(crate) fn is_codex_credit_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Result of spending a banked reset. `Unconfirmed` keeps the attempt's
+/// idempotency key, so retrying an unknown outcome cannot spend a second reset.
+pub(crate) enum ResetClaim {
+    Reset,
+    /// The reset no longer exists upstream (already used, no credit left).
+    Gone(&'static str),
+    Declined(&'static str),
+    Unconfirmed(&'static str),
+}
+
+impl ResetClaim {
+    /// Mirror the outcome into locally held resets, so a read that skips this
+    /// account cannot keep offering a reset that is already spent.
+    pub(crate) fn apply(&self, resets: &mut Vec<LimitReset>, reset_id: &str) {
+        let gone = match self {
+            Self::Reset => false,
+            Self::Gone(_) => true,
+            Self::Declined(_) | Self::Unconfirmed(_) => return,
+        };
+        resets.retain_mut(|reset| {
+            if reset.id == reset_id {
+                reset.count = if gone {
+                    0
+                } else {
+                    reset.count.saturating_sub(1)
+                };
+            }
+            reset.count > 0
+        });
+    }
+}
+
+pub(crate) const RESET_UNCONFIRMED: &str =
+    "Couldn't confirm the reset. Refresh Limits before retrying.";
+const CLAUDE_ACCOUNT_UNREADABLE: &str =
+    "Couldn't read the Claude account. Refresh Limits, then retry.";
+const CLAUDE_CREDENTIALS_REJECTED: &str =
+    "Claude credentials are missing or expired. Open Claude Code, then retry.";
+
+pub(crate) fn claude_claim_body(grant_id: &str, request_id: &str) -> String {
+    json!({ "program": "cedar_ember", "grant_id": grant_id, "request_id": request_id }).to_string()
+}
+
+/// The claim endpoint is organization-scoped; the OAuth profile names the org.
+pub(crate) fn claude_claim_url(profile_body: &str) -> Option<String> {
+    let profile: serde_json::Value = serde_json::from_str(profile_body).ok()?;
+    let org = profile.get("organization")?.get("uuid")?.as_str()?;
+    let is_uuid = org.len() == 36
+        && org.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+    is_uuid.then(|| format!("https://api.anthropic.com/api/organizations/{org}/reset_rate_limits"))
+}
+
+pub(crate) fn claude_claim_outcome(status: u16, body: &str) -> ResetClaim {
+    match status {
+        200..=299 => {}
+        401 | 403 => return ResetClaim::Unconfirmed("Claude rejected this account's credentials."),
+        429 => return ResetClaim::Unconfirmed("Claude is rate limiting resets. Try again later."),
+        _ => return ResetClaim::Unconfirmed(RESET_UNCONFIRMED),
+    }
+    let result = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|body| body.get("result")?.as_str().map(str::to_string));
+    match result.as_deref() {
+        Some("reset") => ResetClaim::Reset,
+        Some("already_used") => ResetClaim::Gone("This reset was already used."),
+        Some("not_limited") => {
+            ResetClaim::Declined("This reset only works once a limit is reached.")
+        }
+        Some("cooldown") => ResetClaim::Declined("Resets are cooling down. Try again later."),
+        Some("ineligible") => ResetClaim::Declined("This account can't use this reset."),
+        Some("unavailable") => {
+            ResetClaim::Unconfirmed("Claude couldn't apply the reset right now. Try again later.")
+        }
+        _ => ResetClaim::Unconfirmed(RESET_UNCONFIRMED),
+    }
+}
+
+/// App-server outcomes are camelCase; WHAM consume codes are snake_case.
+pub(crate) fn codex_claim_outcome(code: Option<&str>) -> ResetClaim {
+    match code
+        .map(|code| code.replace('_', "").to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("reset") => ResetClaim::Reset,
+        Some("nothingtoreset") => {
+            ResetClaim::Declined("Nothing to reset yet. The reset stays available.")
+        }
+        Some("nocredit") => ResetClaim::Gone("No reset is available for this account."),
+        Some("alreadyredeemed") => ResetClaim::Gone("This reset was already used."),
+        _ => ResetClaim::Unconfirmed(RESET_UNCONFIRMED),
+    }
+}
+
+/// Spend a Claude grant with the same token order as the usage poll: local
+/// Claude Code credentials, then Pi's short-lived bearer when Pi is enabled
+/// and the local token is missing or rejected.
+pub(crate) async fn claim_claude_reset(
+    pi_oauth_fallback: bool,
+    grant_id: &str,
+    request_id: &str,
+) -> ResetClaim {
+    if let Ok(token) = read_access_token()
+        && let Some(claim) = claim_claude_reset_with(&token, grant_id, request_id).await
+    {
+        return claim;
+    }
+    let pi_token = if pi_oauth_fallback {
+        crate::integrations::pi::oauth_bearer_token("anthropic")
+            .await
+            .ok()
+    } else {
+        None
+    };
+    match pi_token {
+        Some(token) => claim_claude_reset_with(&token, grant_id, request_id)
+            .await
+            .unwrap_or(ResetClaim::Declined(CLAUDE_CREDENTIALS_REJECTED)),
+        None => ResetClaim::Declined(CLAUDE_CREDENTIALS_REJECTED),
+    }
+}
+
+/// `None` when Claude rejected these credentials, so nothing was spent.
+async fn claim_claude_reset_with(
+    token: &str,
+    grant_id: &str,
+    request_id: &str,
+) -> Option<ResetClaim> {
+    let request = |builder: reqwest::RequestBuilder| {
+        builder
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", claude_user_agent())
+            .header("Authorization", format!("Bearer {token}"))
+            .header("anthropic-beta", "oauth-2025-04-20")
+    };
+    let rejected = |response: &reqwest::Response| matches!(response.status().as_u16(), 401 | 403);
+    let profile = match request(http_client().get(CLAUDE_PROFILE_URL)).send().await {
+        Ok(response) if rejected(&response) => return None,
+        Ok(response) if response.status().is_success() => response.text().await.ok(),
+        _ => None,
+    };
+    let Some(url) = profile.as_deref().and_then(claude_claim_url) else {
+        return Some(ResetClaim::Unconfirmed(CLAUDE_ACCOUNT_UNREADABLE));
+    };
+    Some(
+        match request(http_client().post(url))
+            .body(claude_claim_body(grant_id, request_id))
+            .send()
+            .await
+        {
+            Ok(response) if rejected(&response) => return None,
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                claude_claim_outcome(status, &body)
+            }
+            Err(_) => ResetClaim::Unconfirmed(RESET_UNCONFIRMED),
+        },
+    )
+}
+
+/// Spend one Codex reset credit through `codex app-server`. Blocking.
+pub(crate) fn claim_codex_reset(credit_id: &str, request_id: &str) -> ResetClaim {
+    #[derive(Deserialize)]
+    struct Consumed {
+        outcome: Option<String>,
+    }
+    match crate::integrations::codex::run_app_server_request::<Consumed>(
+        crate::integrations::codex::AppServerRequest {
+            feature: "apps",
+            client_name: "quill_usage",
+            client_title: "Quill Usage",
+            codex_home: None,
+            model_provider_override: None,
+            timeout: CODEX_USAGE_TIMEOUT,
+        },
+        "account/rateLimitResetCredit/consume",
+        json!({ "idempotencyKey": request_id, "creditId": credit_id }),
+    ) {
+        Ok(consumed) => codex_claim_outcome(consumed.outcome.as_deref()),
+        Err(error) => {
+            log::warn!("Codex reset consume failed: {error}");
+            ResetClaim::Unconfirmed(RESET_UNCONFIRMED)
+        }
+    }
+}
+
 fn abbreviate_codex_model(name: &str) -> String {
     if name.ends_with("-Codex-Spark") {
         return "Spark".to_string();
@@ -492,6 +781,15 @@ fn codex_window_label(window_minutes: i64) -> String {
 struct CodexRateLimitsResponse {
     rate_limits: CodexRateLimitSnapshot,
     rate_limits_by_limit_id: Option<HashMap<String, CodexRateLimitSnapshot>>,
+    // Untyped so a reset-credit shape change can never fail the usage read.
+    rate_limit_reset_credits: Option<serde_json::Value>,
+}
+
+pub struct CodexUsage {
+    pub buckets: Vec<UsageBucket>,
+    pub credits: Option<ProviderCredits>,
+    /// `None` when the serving source cannot see reset credits.
+    pub resets: Option<Vec<LimitReset>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -723,7 +1021,7 @@ fn latest_codex_usage_in_file(path: &Path) -> Option<(DateTime<Utc>, Vec<UsageBu
     None
 }
 
-fn fetch_codex_usage_direct() -> Result<(Vec<UsageBucket>, Option<ProviderCredits>), String> {
+fn fetch_codex_usage_direct() -> Result<CodexUsage, String> {
     let response: CodexRateLimitsResponse = crate::integrations::codex::run_app_server_request(
         crate::integrations::codex::AppServerRequest {
             feature: "apps",
@@ -736,11 +1034,20 @@ fn fetch_codex_usage_direct() -> Result<(Vec<UsageBucket>, Option<ProviderCredit
         "account/rateLimits/read",
         json!({}),
     )?;
+    let resets = response
+        .rate_limit_reset_credits
+        .as_ref()
+        .map(parse_codex_resets)
+        .unwrap_or_default();
     let (buckets, credits) = parse_codex_app_server_rate_limits(response);
     if buckets.is_empty() {
         Err("Codex app-server returned no usage buckets.".to_string())
     } else {
-        Ok((buckets, credits))
+        Ok(CodexUsage {
+            buckets,
+            credits,
+            resets: Some(resets),
+        })
     }
 }
 
@@ -786,7 +1093,9 @@ fn fetch_codex_usage_from_sessions() -> Result<Vec<UsageBucket>, String> {
         })
 }
 
-async fn fetch_claude_usage_with_token(token: &str) -> Result<Vec<UsageBucket>, ClaudeUsageError> {
+async fn fetch_claude_usage_with_token(
+    token: &str,
+) -> Result<(Vec<UsageBucket>, Vec<LimitReset>), ClaudeUsageError> {
     let resp = match do_fetch(token).await {
         Ok(response) => response,
         Err(error) => {
@@ -821,7 +1130,7 @@ async fn fetch_claude_usage_with_token(token: &str) -> Result<Vec<UsageBucket>, 
         })
     } else {
         match resp.json::<serde_json::Value>().await {
-            Ok(data) => Ok(parse_buckets(&data)),
+            Ok(data) => Ok((parse_buckets(&data), parse_claude_resets(&data))),
             Err(error) => Err(ClaudeUsageError {
                 kind: ClaudeUsageErrorKind::Parse,
                 message: format!("Parse error: {error}"),
@@ -833,7 +1142,7 @@ async fn fetch_claude_usage_with_token(token: &str) -> Result<Vec<UsageBucket>, 
 
 pub async fn fetch_claude_usage(
     pi_oauth_fallback: bool,
-) -> Result<Vec<UsageBucket>, ClaudeUsageError> {
+) -> Result<(Vec<UsageBucket>, Vec<LimitReset>), ClaudeUsageError> {
     let direct_result = match read_access_token() {
         Ok(token) => fetch_claude_usage_with_token(&token).await,
         Err(message) => Err(ClaudeUsageError {
@@ -854,9 +1163,9 @@ pub async fn fetch_claude_usage(
                 }
             };
             match fetch_claude_usage_with_token(&token).await {
-                Ok(buckets) => {
+                Ok(usage) => {
                     log::info!("Claude usage served by Pi OAuth fallback");
-                    Ok(buckets)
+                    Ok(usage)
                 }
                 Err(error) => {
                     log::warn!(
@@ -981,9 +1290,7 @@ async fn fetch_codex_usage_from_pi_oauth()
     }
 }
 
-pub async fn fetch_codex_usage(
-    pi_oauth_fallback: bool,
-) -> Result<(Vec<UsageBucket>, Option<ProviderCredits>), String> {
+pub async fn fetch_codex_usage(pi_oauth_fallback: bool) -> Result<CodexUsage, String> {
     let direct_error = match tokio::task::spawn_blocking(fetch_codex_usage_direct).await {
         Ok(Ok(result)) => return Ok(result),
         Ok(Err(error)) => error,
@@ -993,9 +1300,13 @@ pub async fn fetch_codex_usage(
 
     let pi_error = if pi_oauth_fallback {
         match fetch_codex_usage_from_pi_oauth().await {
-            Ok(result) => {
+            Ok((buckets, credits)) => {
                 log::info!("Codex usage served by Pi OAuth fallback");
-                return Ok(result);
+                return Ok(CodexUsage {
+                    buckets,
+                    credits,
+                    resets: None,
+                });
             }
             Err(error) => {
                 log::debug!("Codex Pi OAuth fallback unavailable: {error}");
@@ -1010,7 +1321,11 @@ pub async fn fetch_codex_usage(
         .await
         .map_err(|error| format!("Codex transcript fallback task failed: {error}"))?;
     transcript_result
-        .map(|buckets| (buckets, None))
+        .map(|buckets| CodexUsage {
+            buckets,
+            credits: None,
+            resets: None,
+        })
         .map_err(|fallback_error| match pi_error {
             Some(pi_error) => format!(
                 "Codex usage fetch failed via app-server ({direct_error}), Pi OAuth ({pi_error}), and transcript fallback ({fallback_error})."
