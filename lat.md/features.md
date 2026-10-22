@@ -522,6 +522,18 @@ and permission edge cases; a copy that reported success while leaving the
 clipboard stale would send the user to the pair page with the wrong value, so a
 refusal raises an error toast instead of being swallowed.
 
+Below it, a "Scan to pair" row renders one QR code (`qrcode.react`) per
+non-loopback allowlist entry while the listener is running, each captioned with
+its `host:port`. The allowlist is the source rather than `reachable_urls`
+because the host gate checks the request's `Host` against the list, so a URL
+built from an interface IP the user never listed would be refused on arrival.
+Each code encodes `http://<entry>:<port>/pair#<pairing code>`: the credential
+rides in the fragment, which a browser never sends on the wire, and the pairing
+page submits it and strips it from history. The typed code remains beside it
+for a phone without a camera scanner or a browser that blocks the fragment
+handoff. With no network entry, or no listener, the row says what to turn on
+instead of showing nothing.
+
 The listener readout is two facts: State, and the socket Quill actually holds
 (`127.0.0.1:<port>` or `0.0.0.0:<port>`). Disabled reads as "no socket is
 bound". One "Last error" line shows the last typed command rejection, falling
@@ -534,7 +546,7 @@ list — to stop a server-produced URL reading as a promise that another device
 can actually get there, which no same-host check can establish. With no list to
 qualify, the disclaimer had nothing to disclaim, and a bound socket states only
 what Quill holds. The `reachable_urls` status field is still produced by Rust
-and no longer rendered.
+and no longer rendered; the QR codes derive from the allowlist instead.
 
 The bound address is itself the link, opening in the user's default browser
 through [[src/lib/openExternal.ts#handleExternalClick]], because a readout the

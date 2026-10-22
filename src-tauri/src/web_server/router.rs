@@ -357,7 +357,15 @@ form.addEventListener("submit", async (event) => {
   failure.hidden = false;
   submit.disabled = false;
   code.select();
-});"#;
+});
+// A scanned QR code carries the pairing code in the fragment, which never
+// reaches the server. Drop it from history before submitting it.
+const scanned = location.hash.slice(1);
+if (scanned) {
+  history.replaceState(null, "", location.pathname);
+  code.value = scanned;
+  form.requestSubmit();
+}"#;
 
 /// The bootstrap page an unpaired browser is allowed to see: no Quill data, no
 /// reference to any bundle chunk, and nothing beyond the pairing exchange.
@@ -378,7 +386,7 @@ static PAIR_PAGE: LazyLock<String> = LazyLock::new(|| {
 <main>\n\
 <p class=\"mark\">QUILL</p>\n\
 <h1>Pair this browser</h1>\n\
-<p class=\"note\">Open Quill on the desktop, then enter the pairing code from Settings \u{2192} Web.</p>\n\
+<p class=\"note\">On the desktop, open Quill Settings \u{2192} Web. Point your phone's camera at the QR code there, or type the pairing code below.</p>\n\
 <form id=\"pair\" method=\"post\" action=\"/api/web/pair\">\n\
 <label for=\"code\">Pairing code</label>\n\
 <input id=\"code\" name=\"code\" type=\"text\" autocomplete=\"off\" autocapitalize=\"off\" autocorrect=\"off\" spellcheck=\"false\" required>\n\

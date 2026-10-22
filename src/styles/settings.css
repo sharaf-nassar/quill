@@ -842,6 +842,33 @@
   opacity: 0.6;
 }
 
+.web-pairing-qr-list {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.web-pairing-qr {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.web-pairing-qr svg {
+  display: block;
+  border-radius: 3px;
+}
+
+.web-pairing-qr figcaption {
+  color: var(--readout-bright);
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
 .web-status {
   display: flex;
   flex-wrap: wrap;

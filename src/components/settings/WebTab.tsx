@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { QRCodeSVG } from "qrcode.react";
 import { useWebUiSettings } from "../../hooks/useWebUiSettings";
 import { useToast } from "../../hooks/useToast";
 import { handleExternalClick } from "../../lib/openExternal";
@@ -46,6 +47,20 @@ function localhostUrl(boundAddr: string | null): string | null {
   if (boundAddr === null) return null;
   const port = boundAddr.slice(boundAddr.lastIndexOf(":") + 1);
   return /^\d+$/.test(port) ? `http://127.0.0.1:${port}/` : null;
+}
+
+/**
+ * The allowlist entries a phone could put in a URL: everything the user listed
+ * that names more than this machine. Loopback names are what the listener
+ * answers to anyway, and a QR code pointing a phone at `127.0.0.1` would send
+ * it to itself. Entries are canonical IPs or hostnames, so a bare IPv6 address
+ * is the only form that needs brackets to become a URL host.
+ */
+function pairingUrls(allowlist: string[], port: number, code: string): string[] {
+  return allowlist
+    .filter((entry) => !/^(localhost|127\.|::1$)/i.test(entry))
+    .map((entry) => (entry.includes(":") ? `[${entry}]` : entry))
+    .map((host) => `http://${host}:${port}/pair#${code}`);
 }
 
 function WebTab() {
@@ -104,6 +119,12 @@ function WebTab() {
   // same-host check can answer, so the readout states the socket and no more.
   const openUrl = status.running ? localhostUrl(status.bound_addr) : null;
   const lastError = error?.message ?? status.last_error;
+  // The code rides in the URL fragment, which a browser never sends on the
+  // wire; the pairing page submits it and strips it from history.
+  const qrUrls =
+    status.running && pairingCode
+      ? pairingUrls(config.allowlist, config.port, pairingCode)
+      : [];
 
   return (
     <div className="settings-panel">
@@ -206,6 +227,36 @@ function WebTab() {
               Regenerate
             </button>
           </>
+        }
+      />
+      <SettingRow
+        label="Scan to pair"
+        description={
+          qrUrls.length > 0
+            ? "Point your phone's camera at a code. It opens the pairing page and pairs on its own. With several codes, use the address your phone can reach."
+            : status.running
+              ? "Add a network address above to get a QR code a phone can scan."
+              : "Turn the listener on to get a QR code a phone can scan."
+        }
+        control={
+          qrUrls.length > 0 && (
+            <div className="web-pairing-qr-list">
+              {qrUrls.map((url) => {
+                const label = url.slice("http://".length, url.indexOf("/pair"));
+                return (
+                  <figure key={url} className="web-pairing-qr">
+                    <QRCodeSVG
+                      value={url}
+                      size={128}
+                      marginSize={2}
+                      aria-label={`Pairing QR code for ${label}`}
+                    />
+                    <figcaption>{label}</figcaption>
+                  </figure>
+                );
+              })}
+            </div>
+          )
         }
       />
 

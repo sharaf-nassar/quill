@@ -46,7 +46,7 @@ The listener is disabled by default; its `web_ui.*` configuration, live status, 
 
 [[src/web/httpTransport.ts]] sends the exact `{ cmd, args }` envelope to `POST /api/web/invoke` and maps the closed response envelopes back to Tauri-style promise resolution or rejection. [[src-tauri/src/web_allowlist.rs#is_permitted_command]] is the only command boundary: its exact default-deny match permits the seventeen cache/local-storage monitor reads and excludes `fetch_usage_data`, `refresh_usage_data`, retry/backfill and maintenance commands, every setter, and every `plugin:*` command. No prefix, suffix, alias, or command count widens that boundary. An authenticated command denial is a JSON `403`; host, budget, and session refusals are empty-body `403`s before dispatch.
 
-Desktop configuration serializes as `{ config: { enabled, port, allowlist }, pairing_code }`; status serializes as `{ running, bound_addr, reachable_urls, last_error }`. Reachable URLs use concrete interface IPs, explicit ports, IPv6 brackets, and a trailing slash: the bare origin is correct because an unpaired `GET /` redirects to the pairing page. Settings no longer renders them — it links the bound socket instead — so `reachable_urls` is currently a produced field with no consumer, retained rather than removed because it is part of the published status contract and its round-trip fixtures. Pairing sets `quill_web_session` for 30 days with `Path=/`, `HttpOnly`, and `SameSite=Strict`, omitting `Domain`, `Secure`, and `Expires` for the intentionally plain-HTTP listener. Cross-language payloads and round-trip fixtures are normative in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
+Desktop configuration serializes as `{ config: { enabled, port, allowlist }, pairing_code }`; status serializes as `{ running, bound_addr, reachable_urls, last_error }`. Reachable URLs use concrete interface IPs, explicit ports, IPv6 brackets, and a trailing slash: the bare origin is correct because an unpaired `GET /` redirects to the pairing page. Settings no longer renders them — it links the bound socket and builds pairing QR codes from the allowlist instead — so `reachable_urls` is currently a produced field with no consumer, retained rather than removed because it is part of the published status contract and its round-trip fixtures. Pairing sets `quill_web_session` for 30 days with `Path=/`, `HttpOnly`, and `SameSite=Strict`, omitting `Domain`, `Secure`, and `Expires` for the intentionally plain-HTTP listener. Cross-language payloads and round-trip fixtures are normative in `specs/029-web-ui-server.md#web-transport-protocol-contract`.
 
 ### Web UI pairing credential
 
@@ -180,6 +180,11 @@ The pairing page is rendered by the server rather than served from the bundle,
 so an unpaired browser can bootstrap without receiving an application chunk. It
 carries its own `Content-Security-Policy` that pins its one inline script by
 sha256 hash, keeping the bundle's `script-src` guarantee with no chunk to load.
+That script also completes a scanned pairing: Settings' QR codes encode
+`/pair#<code>`, and a fragment never reaches the server or its logs, so the page
+reads it, replaces the history entry with the bare `/pair`, fills the field, and
+submits the same `POST /api/web/pair` a typed code would. A rotated code fails
+the same way and leaves the form for retyping.
 [[src-tauri/src/web_server/router.rs#pair]] refuses a body that is not the
 contracted request exactly as it refuses a wrong code, because answering them
 differently would say which half failed; a correct code returns `204` with the
