@@ -48,7 +48,15 @@ const fmtSignedLines = (value: number): string =>
 
 interface MetricDef {
   id: string;
-  key: "runtime" | "tokPerLoc" | "locPerHour" | "sessions" | "projects" | "netLines";
+  key:
+    | "tokens"
+    | "runtime"
+    | "tokPerLoc"
+    | "locPerHour"
+    | "locPerRunHour"
+    | "sessions"
+    | "projects"
+    | "netLines";
   label: string;
   color: string;
   format: (value: number) => string;
@@ -56,9 +64,11 @@ interface MetricDef {
 
 /** Hues match the widget's --metric-* tokens. */
 const METRICS: MetricDef[] = [
+  { id: "m:tokens", key: "tokens", label: "Tokens", color: "#f87171", format: formatTokenCount },
   { id: "m:runtime", key: "runtime", label: "Runtime · avg/day", color: "#22d3ee", format: formatDurationSecs },
   { id: "m:tokloc", key: "tokPerLoc", label: "Tok / LOC", color: "#a78bfa", format: (v) => formatNumber(Math.round(v)) },
   { id: "m:lochr", key: "locPerHour", label: "LOC / hr", color: "#f472b6", format: (v) => formatNumber(Math.round(v)) },
+  { id: "m:locrunhr", key: "locPerRunHour", label: "LOC / run-hr", color: "#fbbf24", format: (v) => formatNumber(Math.round(v)) },
   { id: "m:sessions", key: "sessions", label: "Sessions", color: "#818cf8", format: (v) => formatNumber(Math.round(v)) },
   { id: "m:projects", key: "projects", label: "Projects", color: "#2dd4bf", format: (v) => formatNumber(Math.round(v)) },
   { id: "m:netlines", key: "netLines", label: "Net lines", color: "#a3e635", format: fmtSignedLines },
@@ -81,7 +91,7 @@ const DIMENSIONS: ReadonlyArray<[WidgetChartDimension, string]> = [
 
 const STORAGE_KEY = "quill-explore-state";
 /** Metrics off by default so the first paint is not twelve-line spaghetti. */
-const DEFAULT_HIDDEN = ["m:tokloc", "m:lochr", "m:projects"];
+const DEFAULT_HIDDEN = ["m:tokloc", "m:lochr", "m:locrunhr", "m:projects"];
 
 interface StoredState {
   range: ExploreRange;
@@ -231,6 +241,8 @@ function ExploreWindowView() {
     const runtimeHours = (totals.runtimeSecs ?? 0) / 3600;
     const metricTotal = (key: MetricDef["key"]): string | null => {
       switch (key) {
+        case "tokens":
+          return formatTokenCount(totals.tokens);
         case "runtime":
           return totals.runtimeSecs === null ? null : formatDurationSecs(totals.runtimeSecs);
         case "tokPerLoc":
@@ -238,9 +250,11 @@ function ExploreWindowView() {
             ? formatNumber(Math.round(totals.tokens / totals.changedLines))
             : null;
         case "locPerHour":
+          return formatNumber(Math.round(totals.changedLines / (days * 24)));
+        case "locPerRunHour":
           return runtimeHours > 0
             ? formatNumber(Math.round(totals.changedLines / runtimeHours))
-            : formatNumber(Math.round(totals.changedLines / (days * 24)));
+            : null;
         case "sessions":
           return formatNumber(totals.sessionCount);
         case "projects":
@@ -333,6 +347,7 @@ function ExploreWindowView() {
   };
 
   const totalTokens = data?.totals.tokens ?? 0;
+  const pending = loading && !data;
   const scaleNote =
     scale === "norm"
       ? "each line scaled to its own min–max"
@@ -370,14 +385,20 @@ function ExploreWindowView() {
       <div className="explore-layout">
         <section className="explore-card explore-chart-card" aria-label="Overlay chart">
           <div className="explore-chart-head" aria-live="polite">
-            <span className="explore-chart-total">{formatTokenCount(totalTokens)}</span>
-            <span className="explore-chart-sub">
-              tokens · {days}d · {visible.length} series
-            </span>
-            <span className="explore-chart-note">{scaleNote}</span>
+            {pending ? (
+              <span className="explore-chart-sub">Loading {days}d of usage…</span>
+            ) : (
+              <>
+                <span className="explore-chart-total">{formatTokenCount(totalTokens)}</span>
+                <span className="explore-chart-sub">
+                  tokens · {days}d · {visible.length} series
+                </span>
+                <span className="explore-chart-note">{scaleNote}</span>
+              </>
+            )}
           </div>
 
-          {loading && !data ? (
+          {pending ? (
             <div className="explore-chart explore-chart-skeleton" aria-hidden="true" />
           ) : error && !data ? (
             <div className="explore-state" role="alert">
@@ -412,7 +433,9 @@ function ExploreWindowView() {
             <span className="explore-corr-key">
               STRONGEST CORRELATIONS · {days}D
             </span>
-            {visible.length < 2 ? (
+            {pending ? (
+              <span className="explore-corr-hint">loading…</span>
+            ) : visible.length < 2 ? (
               <span className="explore-corr-hint">
                 turn on two or more series to compare
               </span>
@@ -491,7 +514,9 @@ function ExploreWindowView() {
                   );
                 })}
               {group === "tokens" && allSeries.every((entry) => entry.group !== "tokens") && (
-                <p className="explore-group-empty">No token evidence in this range</p>
+                <p className="explore-group-empty">
+                  {pending ? "Loading…" : "No token evidence in this range"}
+                </p>
               )}
             </div>
           ))}

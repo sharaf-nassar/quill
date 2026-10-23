@@ -2412,6 +2412,19 @@ html[data-view="migration"] #root {
   border-radius: 0;
 }
 
+/* Explore is a wide overlay graph, not a 360px widget band: when it is the
+   active surface the shell takes the Manage workspace's measure instead. */
+.wg-shell--web[data-surface="explore"] {
+  max-width: 1280px;
+}
+
+/* The one header control on the web: a monitor/explore switch in the top
+   right, on the same strip as the brand. Touch sizing is handled with the
+   other strip members below. */
+.wg-web-surface-toggle {
+  margin-left: auto;
+}
+
 /* Past the cap, filling the viewport is no longer the honest shape: a capped
    column stretched to `100dvh` draws its own edges down through a bordered void
    under the footer. So above the cap the shell stops claiming the height it is
@@ -2450,11 +2463,18 @@ html[data-view="migration"] #root {
    hit-tests to the same button and reaches no other control. */
 @media (pointer: coarse), (max-width: 430px) {
   .wg-shell--web .wg-toggle,
+  .wg-shell--web .wg-web-surface-toggle,
   .wg-shell--web .wg-viewdd-btn,
   .wg-shell--web .wg-viewdd-option,
   .wg-shell--web .wg-chart-dimensions button {
     min-width: 44px;
     min-height: 44px;
+  }
+
+  /* The header strip is 40px; let the grown switch set its height. */
+  .wg-shell--web .wg-web-header {
+    height: auto;
+    min-height: 40px;
   }
 
   /* The grown grouping strip no longer fits the chart's quiet corner: in

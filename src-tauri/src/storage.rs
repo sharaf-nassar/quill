@@ -12732,10 +12732,17 @@ impl Storage {
                 let cursor_observed_at = cursor.as_ref().map(|value| value.0);
                 let cursor_provider = cursor.as_ref().map(|value| value.1.as_str());
                 let cursor_id = cursor.as_ref().map(|value| value.2);
+                // The keyset `OR` chain cannot bound the index seek, so every
+                // page would otherwise rescan from `range_end_ms` and skip the
+                // rows already consumed (quadratic over a 90d walk). Tighten
+                // the exclusive upper bound to the cursor millisecond; the
+                // chain still breaks ties inside that millisecond.
+                let page_end_ms = cursor_observed_at
+                    .map_or(range_end_ms, |observed_at| observed_at.saturating_add(1));
                 let mut rows = statement
                     .query(params![
                         range_start_ms,
-                        range_end_ms,
+                        page_end_ms,
                         selected_provider,
                         cursor_observed_at,
                         cursor_provider,

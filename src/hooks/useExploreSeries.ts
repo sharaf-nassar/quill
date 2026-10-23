@@ -35,12 +35,16 @@ export const EXPLORE_RANGE_DAYS: Record<ExploreRange, number> = {
 };
 
 export interface ExploreMetricSeries {
+  /** Total tokens per day across every provider and model. */
+  tokens: number[];
   /** Seconds of active LLM runtime per day (bucket average — see header). */
   runtime: number[];
   /** Total tokens ÷ changed lines per day; 0 where no lines changed. */
   tokPerLoc: number[];
-  /** Changed lines per wall-clock hour per day. */
+  /** Changed lines per wall-clock hour per day (÷ 24). */
   locPerHour: number[];
+  /** Changed lines per hour of LLM runtime per day; 0 where no runtime. */
+  locPerRunHour: number[];
   /** Distinct sessions per day. */
   sessions: number[];
   /** Distinct projects per day. */
@@ -131,11 +135,17 @@ function assemble(
     grid,
     activity: overview.activity,
     metrics: {
+      tokens: tokensPerDay,
       runtime: runtimePerDay,
       tokPerLoc: tokensPerDay.map((tokens, index) =>
         locPerDay[index] > 0 ? Math.round(tokens / locPerDay[index]) : 0,
       ),
       locPerHour: locPerDay.map((loc) => Math.round(loc / 24)),
+      locPerRunHour: locPerDay.map((loc, index) =>
+        runtimePerDay[index] > 0
+          ? Math.round(loc / (runtimePerDay[index] / 3600))
+          : 0,
+      ),
       sessions: pad(activitySeries.session_counts),
       projects: pad(activitySeries.project_counts),
       netLines: netPerDay,
@@ -194,7 +204,8 @@ export function useExploreSeries(range: ExploreRange): ExploreSeriesResult {
       "transcript-analytics-updated",
       "model-analytics-updated",
     ],
-    pollMs: 60_000,
+    // No poll: the invalidation events above already cover new evidence, and
+    // a timed refetch re-ran the multi-second 90d overview every minute.
   });
 
   return {
