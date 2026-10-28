@@ -1,5 +1,8 @@
 {
   "identifier": "com.quilltoolkit.app.dev",
+  "build": {
+    "beforeDevCommand": "node scripts/dev-handoff.mjs"
+  },
   "app": {
     "windows": [
       {

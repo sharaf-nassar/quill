@@ -64,6 +64,11 @@ CI (`.github/workflows/ci.yml`) enforces the same and a macOS check.
   windows can race that and drop their CSS — and a restart that fails tears
   down the whole `tauri dev` chain. Land config changes while dev is
   stopped. See `docs/solutions/environment/second-vite-server-strips-dev-css.md`.
-- Only one Quill runs at a time (fixed provider ports 19876/19877); stop an
-  installed Quill first. `QUILL_PORT`/`QUILL_CONTEXT_PORT` override.
+- Only one Quill owns the default provider ports 19876/19877. On Linux and
+  macOS the dev config gracefully stops installed Quill and restores it when
+  the Tauri CLI exits, including Ctrl+C. The detached handoff supervisor owns
+  this lifecycle across Rust rebuilds; do not kill it or start production
+  manually during dev. Validate handoff with fixture processes, not the live
+  app. Other platforms retain manual handoff. `QUILL_PORT`/`QUILL_CONTEXT_PORT`
+  override ports for explicitly isolated binary runs.
 - Sandboxed demo against dummy data: `scripts/run_quill_demo.sh`.

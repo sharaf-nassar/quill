@@ -32,6 +32,8 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[confirm-dialog-tests]] — Manage-window confirmation dialog centering test specs
 - [[manage-section-tests]] — Manage workspace section availability test specs
 - [[pi-session-parser-tests]] — narrow Pi message and header parser test specs
+- [[dev-handoff-tests]]: development lifecycle ownership and production restoration
+- [[pi-skill-load-tests]]: confirmed Pi skill loads, truncation boundaries and replay
 - [[pi-notify-index-tests]] — Pi notify and Session Search indexing test specs
 - [[session-search-tests]] — Conversation-role and bounded search response test specs
 - [[pi-live-session-tests]] — Pi bounded live-fold and token-gap test specs

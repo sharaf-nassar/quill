@@ -108,7 +108,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 49;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 50;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StartupMigrationPlan {
@@ -10757,6 +10757,21 @@ impl Storage {
                 .map_err(|error| format!("Migration 49 rejection checkpoints: {error}"))?;
             tx.commit()
                 .map_err(|error| format!("Migration 49 commit: {error}"))?;
+        }
+
+        if current_version < 50 {
+            let tx = conn
+                .transaction()
+                .map_err(|error| format!("Migration 50 begin: {error}"))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES (?1, '1')",
+                params![crate::transcript_analytics::PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER],
+            )
+            .map_err(|error| format!("Migration 50 skill load replay: {error}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (50)", [])
+                .map_err(|error| format!("Migration 50 record: {error}"))?;
+            tx.commit()
+                .map_err(|error| format!("Migration 50 commit: {error}"))?;
         }
 
         report_migration_progress(
@@ -23455,6 +23470,61 @@ mod tests {
             0,
         );
         drop(conn);
+        clear_env();
+    }
+
+    // @lat: [[pi-skill-load-tests#Pi Skill Load Tests#Pi Scoped Migration]]
+    #[test]
+    #[serial]
+    fn migration_50_replays_pi_skills_once_without_clearing_history() {
+        clear_env();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("usage.db");
+        let marker = crate::transcript_analytics::PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER;
+        let storage = Storage::init_at(path.clone(), false).unwrap();
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch(
+                "DELETE FROM schema_version WHERE version >= 50;
+                 DELETE FROM settings WHERE key IN (
+                    'pi_transcript_analytics_reingest_pending',
+                    'transcript_analytics_reingest_pending');
+                 INSERT INTO skill_usages(provider, session_id, chain_id, message_id,
+                     skill_name, skill_path, timestamp)
+                 VALUES ('pi', 'session', 'session', 'message', 'existing',
+                     '/existing/SKILL.md', '2026-10-28T12:00:00Z');",
+            )
+            .unwrap();
+        }
+        drop(storage);
+        let storage = Storage::init_at(path.clone(), false).unwrap();
+        assert_eq!(storage.get_setting(marker).unwrap().as_deref(), Some("1"));
+        assert_eq!(
+            storage
+                .get_setting("transcript_analytics_reingest_pending")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            storage
+                .get_skill_breakdown("day", Some(IntegrationProvider::Pi), true, None)
+                .unwrap()[0]
+                .total_count,
+            1
+        );
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM settings WHERE key = ?1", params![marker])
+            .unwrap();
+        drop(storage);
+        let storage = Storage::init_at(path, false).unwrap();
+        assert_eq!(
+            storage.get_setting(marker).unwrap(),
+            None,
+            "ordinary reopen must not rearm replay"
+        );
         clear_env();
     }
 

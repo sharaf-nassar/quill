@@ -209,6 +209,7 @@ pub(crate) struct OwnedToolRowIdentity<'a> {
 pub(crate) fn owned_tool_rows(
     identity: &OwnedToolRowIdentity<'_>,
     messages: &[ExtractedMessage],
+    loads: &[crate::sessions::SkillLoad],
 ) -> (Vec<OwnedToolAction>, Vec<OwnedSkillUsage>) {
     let mut tool_actions = Vec::new();
     let mut skill_usages = Vec::new();
@@ -265,6 +266,26 @@ pub(crate) fn owned_tool_rows(
                 });
             }
         }
+    }
+    let mut seen = HashSet::new();
+    for load in loads {
+        if !seen.insert((&load.message_id, &load.access)) {
+            continue;
+        }
+        skill_usages.push(OwnedSkillUsage {
+            provider: identity.provider,
+            source_key: identity.source_key.to_owned(),
+            session_id: identity.session_id.to_owned(),
+            chain_id: identity.chain_id.to_owned(),
+            parent_chain_id: identity.parent_chain_id.map(str::to_owned),
+            message_id: load.message_id.clone(),
+            skill_name: load.access.skill_name.clone(),
+            skill_path: load.access.skill_path.clone(),
+            timestamp: load.timestamp.clone(),
+            tool_name: load.tool_name.clone(),
+            cwd: Some(load.cwd.clone()),
+            hostname: identity.hostname.to_owned(),
+        });
     }
     (tool_actions, skill_usages)
 }
@@ -2820,6 +2841,7 @@ fn parse_transcript_analytics_source_bytes_inner(
             hostname,
         },
         &extracted.messages,
+        &extracted.skill_loads,
     );
     let hook_invocations = extracted
         .hook_invocations
@@ -4216,6 +4238,106 @@ mod tests {
             "timestamp": "2026-08-14T08:00:00.000Z",
             "cwd": "/work/quill"
         })
+    }
+
+    // @lat: [[pi-skill-load-tests#Pi Skill Load Tests#Owned Replay And Analytics Neutrality]]
+    #[test]
+    #[serial]
+    fn pi_skill_loads_replay_without_duplicate_or_synthetic_activity() {
+        clear_env();
+        let data_dir = TempDir::new().unwrap();
+        let transcript_dir = TempDir::new().unwrap();
+        let storage = init_storage_in(&data_dir);
+        let session_id = "skill-loads";
+        let skill = "<skill name=\"manual\" location=\"/skills/manual/SKILL.md\">\nbody\n</skill>";
+        let result = json!({
+            "type":"message", "id":"result", "timestamp":"2026-08-14T08:00:02Z",
+            "message":{"role":"toolResult", "toolName":"skill_context", "toolCallId":"call", "isError":false,
+                "details":{"skills":[{"name":"loaded", "location":"/skills/loaded/SKILL.md"}]}}
+        });
+        let records = vec![
+            pi_session_header(session_id),
+            json!({"type":"message", "id":"call-entry", "timestamp":"2026-08-14T08:00:01Z",
+                "message":{"role":"assistant", "content":[{"type":"toolCall", "id":"call", "name":"skill_context", "arguments":{"action":"load", "names":["loaded"]}}]}}),
+            result.clone(),
+            result,
+            json!({"type":"custom", "id":"manual", "timestamp":"2026-08-14T08:00:03Z",
+                "customType":"proper-base-skill-context", "data":{"action":"load", "blocks":[skill]}}),
+            json!({"type":"message", "id":"native", "timestamp":"2026-08-14T08:00:04Z",
+                "message":{"role":"user", "content":skill}}),
+        ];
+        let source = pi_source_from_lines(transcript_dir.path(), session_id, &records);
+        for _ in 0..2 {
+            let generation = storage
+                .begin_transcript_analytics_generation(
+                    IntegrationProvider::Pi,
+                    source.source_root_key,
+                )
+                .unwrap();
+            let snapshot = stamp_analytics_root(
+                parse_transcript_analytics_source(&source, TEST_HOSTNAME).unwrap(),
+                session_id,
+                generation,
+            )
+            .unwrap();
+            assert_eq!(snapshot.skill_usages.len(), 3);
+            assert_eq!(
+                snapshot.tool_actions.len(),
+                1,
+                "manual loads must not fabricate tool calls"
+            );
+            assert_eq!(
+                snapshot.session_events.len(),
+                3,
+                "manual loads must not fabricate turns"
+            );
+            assert!(
+                snapshot
+                    .skill_usages
+                    .iter()
+                    .all(|load| load.source_key == source.source_key
+                        && load.cwd.as_deref() == Some("/work/quill")
+                        && load.hostname == TEST_HOSTNAME)
+            );
+            storage
+                .replace_transcript_analytics_snapshot(&snapshot)
+                .unwrap();
+            let rows = storage
+                .get_skill_breakdown("day", Some(IntegrationProvider::Pi), true, None)
+                .unwrap();
+            assert_eq!(rows.iter().map(|row| row.total_count).sum::<i64>(), 3);
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.skill_name == "manual")
+                    .unwrap()
+                    .pi_count,
+                2
+            );
+        }
+        let empty = pi_source_from_lines(
+            transcript_dir.path(),
+            session_id,
+            &[pi_session_header(session_id)],
+        );
+        let generation = storage
+            .begin_transcript_analytics_generation(IntegrationProvider::Pi, empty.source_root_key)
+            .unwrap();
+        let snapshot = stamp_analytics_root(
+            parse_transcript_analytics_source(&empty, TEST_HOSTNAME).unwrap(),
+            session_id,
+            generation,
+        )
+        .unwrap();
+        storage
+            .replace_transcript_analytics_snapshot(&snapshot)
+            .unwrap();
+        assert!(
+            storage
+                .get_skill_breakdown("day", Some(IntegrationProvider::Pi), true, None)
+                .unwrap()
+                .is_empty()
+        );
+        clear_env();
     }
 
     fn pi_span_line(id: &str, timestamp: &str, session_id: &str, span: Value) -> String {
@@ -6551,6 +6673,7 @@ mod tests {
                 hostname: TEST_HOSTNAME,
             },
             &messages,
+            &[],
         );
         let pi_source_key = crate::storage::pi_source_key(TEST_HOSTNAME, "pi-session")
             .expect("canonical Pi source key");

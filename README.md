@@ -306,9 +306,16 @@ exist: run `npm run build:web` once before `cargo check`, `cargo clippy`, or
 `cargo test`.
 
 This loads `src-tauri/tauri.dev.conf.json`, so a dev run identifies as
-`com.quilltoolkit.app.dev` and keeps its database, auth secret, session index,
-and single-instance lock separate from an installed Quill. Invoking the Tauri
-CLI directly (`cargo tauri dev`) skips that and writes to production state.
+`com.quilltoolkit.app.dev` and keeps its database, session index, and
+single-instance lock separate from an installed Quill. A direct CLI invocation
+must name that configuration explicitly:
+
+```bash
+npx tauri dev --config src-tauri/tauri.dev.conf.json
+```
+
+Omitting the dev configuration from a direct CLI invocation writes to
+production state.
 
 A dev run keeps its own database, context store, learned rules, and app caches
 (`~/.config/quill-dev/` and its identity-specific data root). Startup repairs
@@ -318,10 +325,22 @@ current provider integrations—including Pi—for live validation. Set
 What it does *not* move is the provider handshake: every build listens on
 19876/19877 and publishes the same `~/.config/quill/config.json` with the same
 auth secret, because a provider resolves one contract from one fixed path and
-cannot tell which Quill wrote it. Only one Quill can run at a time — the second
-one finds the port taken, says so in a dialog, and quits. Stop the installed app
-before `npm run tauri -- dev`. `QUILL_PORT` and `QUILL_CONTEXT_PORT` still
-override the ports when you really do want two.
+cannot tell which Quill wrote it. Only one Quill can own those ports.
+
+On Linux and macOS, the dev configuration automatically hands production over
+to dev. It builds the web assets while production remains available, asks the
+installed app to quit gracefully, then starts the frontend dev server. When
+you quit dev or press Ctrl+C, a separate supervisor stops the frontend, waits
+for Quill's ports to be released, and relaunches production. Rust rebuilds keep
+the same handoff session. Concurrent dev sessions are rejected.
+
+Linux uses `busctl` and Quill's native tray Quit action; macOS uses the native
+AppleScript quit event and `open`. If macOS requests Automation permission,
+allow the terminal to control Quill. No process-name kill or forced production
+termination is used. Missing quit support aborts startup without killing
+production. With no installed Quill, dev still runs but cannot restore it.
+Windows retains the existing manual handoff. `QUILL_PORT` and
+`QUILL_CONTEXT_PORT` remain available for explicitly isolated binary runs.
 
 ### Refresh documentation screenshots
 

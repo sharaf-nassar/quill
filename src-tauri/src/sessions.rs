@@ -2586,6 +2586,16 @@ pub struct SkillAccess {
     pub skill_path: String,
 }
 
+/// Confirmed skill evidence independent of tool calls or searchable messages.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkillLoad {
+    pub message_id: String,
+    pub timestamp: String,
+    pub tool_name: String,
+    pub access: SkillAccess,
+    pub cwd: String,
+}
+
 /// Event-kind classification used by the runtime-event pipeline. Five
 /// variants matching specs/008-runtime-redesign/contracts/session-events.md
 /// (EVT-CL-2..EVT-CL-5 and EVT-CX-1).
@@ -2673,6 +2683,7 @@ pub struct ExtractedSession {
     /// Codex hook data arrives live via the
     /// `POST /api/v1/hooks/observed` endpoint instead.
     pub hook_invocations: Vec<HookInvocation>,
+    pub skill_loads: Vec<SkillLoad>,
 }
 
 /// Owned form of a hook fire extracted from a Claude transcript
@@ -3115,9 +3126,8 @@ fn codex_custom_change_lines(tool_name: &str, input: &str) -> Option<(i64, i64)>
 pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<SkillAccess> {
     let mut paths = Vec::new();
 
-    // Pi names the same two tools in lowercase (`read`, `bash`) and has no
-    // `Skill` tool at all — a Pi skill is loaded by reading its SKILL.md, so
-    // the read arm is the only one that can ever attribute one.
+    // Pi's confirmed skill-context and native invocation loads are extracted
+    // separately, before persisted tool output is truncated.
     match action.tool_name.as_str() {
         "Read" | "read" => {
             if let Some(file_path) = action.file_path.as_deref() {
@@ -3199,6 +3209,7 @@ pub(crate) fn pi_transcript_tool_rows(
             hostname,
         },
         messages,
+        &[],
     )
 }
 
@@ -4221,6 +4232,7 @@ pub(crate) fn extract_pi_session(
         messages,
         events,
         hook_invocations: Vec::new(),
+        skill_loads: session.skill_loads,
     }
 }
 
@@ -4374,6 +4386,7 @@ fn unsupported_extracted_session() -> ExtractedSession {
         messages: Vec::new(),
         events: Vec::new(),
         hook_invocations: Vec::new(),
+        skill_loads: Vec::new(),
     }
 }
 
@@ -4792,6 +4805,7 @@ fn extract_claude_messages_from_jsonl_records(
         messages,
         events,
         hook_invocations,
+        skill_loads: Vec::new(),
     }
 }
 
@@ -4810,6 +4824,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                 messages,
                 events,
                 hook_invocations: Vec::new(),
+                skill_loads: Vec::new(),
             };
         }
     };
@@ -5248,6 +5263,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
         messages,
         events,
         hook_invocations: Vec::new(),
+        skill_loads: Vec::new(),
     }
 }
 

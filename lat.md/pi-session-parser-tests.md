@@ -8,7 +8,7 @@ These tests pin the shared persisted Pi parser used by search indexing and sourc
 
 Production Pi reads stream physical JSONL records instead of buffering the whole file. Original bytes, including ignored payloads and malformed lines, feed SHA-256; open-handle and path stability are checked before acceptance. Limits are 4 GiB input, 256 MiB per record, 100000 records, and 256 MiB serialized retained evidence. Exceeding a limit rejects the new version without truncating conversation text or replacing last-good rows. These limits bound input and retained representation, not an exact allocator-byte ceiling.
 
-Tool output retains its existing 10 KiB preview, oversized tool details remain absent under the existing rule, and image payloads and thinking bodies are discarded after their type evidence is recorded. Native usage, tools, summaries, ordinals, and complete user/assistant text remain available.
+Tool output retains its existing 10 KiB preview, oversized tool details remain absent under the existing rule, and image payloads and thinking bodies are discarded after their type evidence is recorded. Native usage, tools, summaries, ordinals, and complete user/assistant text remain available. Confirmed skill loads are extracted before these payload caps and included in retained memory accounting; [[pi-skill-load-tests#Pi Skill Load Tests#Evidence Before Truncation]] covers that boundary.
 
 ## V3 Message Entries
 
@@ -33,6 +33,8 @@ V1 sessions return an explicit unsupported-version error because they lack stabl
 ## Malformed And Unknown Input
 
 Malformed lines, unknown custom entries, and invalid native messages do not prevent later valid evidence from parsing.
+
+Exact `proper-base-skill-context` load entries contribute only normalized skill evidence; controls and malformed skill data are ignored.
 
 Exact `quill-tracking` entries are different: malformed or unsupported tracking schemas fail the source rather than silently dropping durable lifecycle evidence.
 

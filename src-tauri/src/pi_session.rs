@@ -16,6 +16,8 @@ use serde_json::Value;
 
 use crate::models::{PiProtocolV2ErrorCode, PiProtocolV2SpanReceipt, PiProtocolV2TrackingEntry};
 
+mod skills;
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PiSessionHeader {
@@ -136,6 +138,7 @@ pub(crate) struct PiSession {
     pub(crate) thinking_level_changes: Vec<PiThinkingLevelChangeEntry>,
     pub(crate) session_infos: Vec<PiSessionInfoEntry>,
     pub(crate) custom_messages: Vec<PiCustomMessageEntry>,
+    pub(crate) skill_loads: Vec<crate::sessions::SkillLoad>,
 }
 
 #[derive(Debug)]
@@ -384,8 +387,22 @@ pub(crate) fn parse_pi_session_records(
     let mut thinking_level_changes = Vec::new();
     let mut session_infos = Vec::new();
     let mut custom_messages = Vec::new();
+    let mut skill_loads = Vec::new();
     let mut retained = 0usize;
     for (source_ordinal, value) in records {
+        let loads = skills::extract_skill_loads(&value, &header.cwd);
+        for load in &loads {
+            retained = retained.saturating_add(
+                std::mem::size_of_val(load)
+                    + load.message_id.len()
+                    + load.timestamp.len()
+                    + load.tool_name.len()
+                    + load.access.skill_name.len()
+                    + load.access.skill_path.len()
+                    + load.cwd.len(),
+            );
+        }
+        skill_loads.extend(loads);
         if matches!(
             value.get("type").and_then(Value::as_str),
             Some(
@@ -542,6 +559,7 @@ pub(crate) fn parse_pi_session_records(
         thinking_level_changes,
         session_infos,
         custom_messages,
+        skill_loads,
     }))
 }
 

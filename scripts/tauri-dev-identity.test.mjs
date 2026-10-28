@@ -12,7 +12,9 @@ test("the dev config claims a non-production Tauri identity", () => {
 
 	assert.equal(base.identifier, "com.quilltoolkit.app");
 	assert.equal(dev.identifier, "com.quilltoolkit.app.dev");
-	assert.deepEqual(Object.keys(dev).sort(), ["app", "identifier"], "dev must not alter release config beyond identity and window focus");
+	assert.deepEqual(Object.keys(dev).sort(), ["app", "build", "identifier"], "dev overrides identity, focus and its lifecycle hook only");
+	assert.deepEqual(dev.build, { beforeDevCommand: "node scripts/dev-handoff.mjs" });
+	assert.equal(base.build.beforeDevCommand, "npm run build:web && npm run dev", "the production config retains its original dev hook");
 });
 
 // @lat: [[infrastructure#Infrastructure#Build Configuration#Tauri Configuration#Development Identity]]
