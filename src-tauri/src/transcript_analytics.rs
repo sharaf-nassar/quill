@@ -798,9 +798,14 @@ fn classify_transcript_source_identity_inner(
             let discovered = source.clone();
             let (native_identity, diagnostics) = crate::transcript_work::decode(move || {
                 if let Some(path) = changed.pi_path {
-                    let (session, _, _) = crate::pi_session::read_stable_pi_session(&path)?;
+                    // Pi's graph identity lives entirely in its bounded header.
+                    // Full validation still runs before any source rows commit.
+                    let header = match crate::pi_session::read_pi_session_header(&path) {
+                        Some(header) => header,
+                        None => crate::pi_session::read_stable_pi_session(&path)?.0.header,
+                    };
                     Ok((
-                        resolve_pi_native_identity(&session)?,
+                        resolve_pi_native_identity(&header)?,
                         TranscriptRecordDiagnostics::default(),
                     ))
                 } else {
@@ -1228,6 +1233,17 @@ fn reconcile_transcript_source_root(
         }
     }
     let graph = SourceRootGraph::from_metadata(graph_metadata);
+    // Publish recent activity before replaying dormant historical sessions.
+    identities.sort_by_cached_key(|identity| {
+        (
+            std::cmp::Reverse(
+                std::fs::metadata(&identity.discovered.canonical_path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok(),
+            ),
+            identity.discovered.source_key.clone(),
+        )
+    });
 
     for identity in identities {
         if identity.suppressed {
@@ -2745,7 +2761,7 @@ fn parse_transcript_analytics_source_bytes_inner(
     let (native_identity, diagnostics, extracted, setting_events, session_name, pi_evidence) =
         if let Some(session) = pi_session {
             drop(bytes);
-            let native_identity = resolve_pi_native_identity(&session)?;
+            let native_identity = resolve_pi_native_identity(&session.header)?;
             let mut diagnostics = TranscriptRecordDiagnostics::default();
             let spans = pi_span_durations(&session, &mut diagnostics);
             let pi_evidence = build_pi_persisted_evidence(
@@ -4336,6 +4352,122 @@ mod tests {
                 .get_skill_breakdown("day", Some(IntegrationProvider::Pi), true, None)
                 .unwrap()
                 .is_empty()
+        );
+        clear_env();
+    }
+
+    // @lat: [[pi-skill-load-tests#Pi Skill Load Tests#Bounded Identity Discovery]]
+    #[test]
+    fn pi_identity_inventory_reads_only_the_header_but_commit_validates_the_body() {
+        let dir = TempDir::new().unwrap();
+        let source = pi_source_from_lines(
+            dir.path(),
+            "header-only",
+            &[
+                pi_session_header("header-only"),
+                json!({"type":"custom", "customType":"quill-tracking", "data":{"invalid":true}}),
+            ],
+        );
+        let classified = classify_transcript_source_identity(&source, None, 1, true).unwrap();
+        let RootSourceClassification::Identity(identity) = classified else {
+            panic!("expected native identity");
+        };
+        assert_eq!(identity.native_identity.unwrap().chain_id, "header-only");
+        assert!(
+            parse_transcript_analytics_source(&source, TEST_HOSTNAME).is_err(),
+            "header-only inventory must never bypass full validation before commit"
+        );
+    }
+
+    // @lat: [[pi-skill-load-tests#Pi Skill Load Tests#Recent First Resumable Replay]]
+    #[test]
+    #[serial]
+    fn pi_replay_commits_recent_sources_first_and_does_not_repeat_successes() {
+        clear_env();
+        let data_dir = TempDir::new().unwrap();
+        let transcripts = TempDir::new().unwrap();
+        let storage = init_storage_in(&data_dir);
+        let conn = rusqlite::Connection::open(storage.database_path()).unwrap();
+        conn.execute_batch(
+            "DELETE FROM settings WHERE key IN (
+                'transcript_analytics_reingest_pending', 'pi_transcript_analytics_reingest_pending',
+                'pi_persisted_source_reconciliation_pending');
+            CREATE TABLE replay_commits (skill TEXT);
+            CREATE TRIGGER record_replay AFTER INSERT ON skill_usages
+            BEGIN INSERT INTO replay_commits VALUES (NEW.skill_name); END;",
+        )
+        .unwrap();
+        let source = |name: &str| {
+            pi_source_from_lines(
+                transcripts.path(),
+                name,
+                &[
+                    pi_session_header(name),
+                    json!({"type":"custom", "id":"load", "timestamp":"2026-08-14T08:00:01Z",
+                    "customType":"proper-base-skill-context", "data":{"action":"load", "blocks":[
+                        format!("<skill name=\"{name}\" location=\"/skills/{name}/SKILL.md\">\nbody\n</skill>")
+                    ]}}),
+                ],
+            )
+        };
+        let old = source("old");
+        let recent = source("recent");
+        set_mtime_ns(&recent.canonical_path, FIXED_MTIME_NS + 1_000_000);
+        let root = ProviderSourceRoot {
+            provider: IntegrationProvider::Pi,
+            source_root_key: source_root_key(IntegrationProvider::Pi),
+            resolved_root_path: transcripts.path().to_path_buf(),
+            canonical_root_path: Some(transcripts.path().to_path_buf()),
+            outcome: ProviderRootEnumerationOutcome::Complete,
+            sources: vec![old.clone(), recent],
+        };
+        let reconcile = || {
+            run_transcript_analytics_reconciliation(
+                &storage,
+                TEST_HOSTNAME,
+                std::slice::from_ref(&root),
+            )
+            .unwrap()
+        };
+        assert_eq!(reconcile().replaced_sources, 2);
+        let commits = || {
+            conn.prepare("SELECT skill FROM replay_commits ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(commits(), ["recent", "old"]);
+        conn.execute(
+            "UPDATE transcript_analytics_sources SET mtime_ns=NULL, size_bytes=NULL,
+            content_sha256=NULL WHERE source_key=?1",
+            [&old.source_key],
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_old_replay BEFORE INSERT ON skill_usages
+            WHEN NEW.skill_name = 'old' BEGIN SELECT RAISE(ABORT, 'transient replay failure'); END;").unwrap();
+        let failed = reconcile();
+        assert_eq!(failed.failed_sources, 1);
+        assert_eq!(failed.replaced_sources, 0);
+        assert_eq!(
+            commits(),
+            ["recent", "old"],
+            "failure must retain progress and last-good rows"
+        );
+        assert_eq!(
+            storage
+                .get_skill_breakdown("day", Some(IntegrationProvider::Pi), true, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        conn.execute_batch("DROP TRIGGER fail_old_replay;").unwrap();
+        assert_eq!(reconcile().replaced_sources, 1);
+        assert_eq!(
+            commits(),
+            ["recent", "old", "old"],
+            "only the unfinished source retries"
         );
         clear_env();
     }

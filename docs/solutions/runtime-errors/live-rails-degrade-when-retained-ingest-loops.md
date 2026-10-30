@@ -83,6 +83,30 @@ See `retained-transcript-rejections-and-streaming.md` in this directory.
 it is deliberately blocked on the two above, because the fallback only looks
 wrong while model evidence is arriving minutes late.
 
+## Pi skill replay and empty dev analytics
+
+Migration 50 exposed a related failure in October 2026. Production had current
+Pi analytics, but dev had been idle for over 24 hours. Its separate database
+therefore showed an empty 24-hour range while the migration forced a complete
+Pi replay. The root permit blocked live ingestion behind historical work,
+and transient database-lock failures kept the marker armed for another full
+pass. Live pushes updated registry timestamps without updating retained
+fingerprints, so a recent `last_success_at_ms` alone did not prove fresh rows.
+
+Migration 51 converts the pending Pi marker to durable per-source fingerprint
+invalidation. Successful sources regain fingerprints independently, preserving
+progress after a sibling fails. Pi graph discovery reads only the bounded
+header, and the commit pass processes recently modified files first. Complete
+body validation and source identity checks still run before every commit;
+root ownership remains held through pruning. Snapshot replacement reserves
+SQLite's writer slot with `BEGIN IMMEDIATE` before reading generation guards,
+so concurrent ingestion cannot turn a deferred read-to-write upgrade into an
+immediate `database is locked` failure.
+
+For this symptom, compare the active database path, the selected time range,
+row timestamps, and source fingerprints against filesystem metadata. Do not
+copy production's database into dev or erase historical rows to fill the UI.
+
 ## Prevention
 
 When live-derived UI shows a fallback value, ask which producer feeds that

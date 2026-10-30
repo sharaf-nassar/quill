@@ -108,7 +108,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 50;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 51;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StartupMigrationPlan {
@@ -6689,8 +6689,10 @@ impl Storage {
             return Err("Transcript analytics source identity is incomplete".into());
         }
         let mut conn = self.conn.lock().unwrap();
+        // Reserve the writer before reading guards; WAL read-to-write upgrades
+        // cannot wait when another connection has already committed a write.
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("Begin transcript analytics replacement: {e}"))?;
         let source_project = source.project.clone();
         let source_cwd = source
@@ -10772,6 +10774,27 @@ impl Storage {
                 .map_err(|error| format!("Migration 50 record: {error}"))?;
             tx.commit()
                 .map_err(|error| format!("Migration 50 commit: {error}"))?;
+        }
+
+        if current_version < 51 {
+            let tx = conn
+                .transaction()
+                .map_err(|error| format!("Migration 51 begin: {error}"))?;
+            // Successful sources regain fingerprints individually, so a failed
+            // source cannot force the whole Pi corpus to replay on every retry.
+            tx.execute_batch(
+                "UPDATE transcript_analytics_sources
+                 SET mtime_ns = NULL, size_bytes = NULL, content_sha256 = NULL
+                 WHERE provider = 'pi' AND source_kind = 'transcript'
+                   AND processing_status != 'suppressed' AND suppressed_sha256 IS NULL
+                   AND EXISTS (SELECT 1 FROM settings
+                               WHERE key = 'pi_transcript_analytics_reingest_pending');
+                 DELETE FROM settings WHERE key = 'pi_transcript_analytics_reingest_pending';
+                 INSERT INTO schema_version (version) VALUES (51);",
+            )
+            .map_err(|error| format!("Migration 51 resumable Pi skill replay: {error}"))?;
+            tx.commit()
+                .map_err(|error| format!("Migration 51 commit: {error}"))?;
         }
 
         report_migration_progress(
@@ -23476,7 +23499,7 @@ mod tests {
     // @lat: [[pi-skill-load-tests#Pi Skill Load Tests#Pi Scoped Migration]]
     #[test]
     #[serial]
-    fn migration_50_replays_pi_skills_once_without_clearing_history() {
+    fn migration_51_replays_pi_skills_once_without_clearing_history() {
         clear_env();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("usage.db");
@@ -23485,10 +23508,17 @@ mod tests {
         {
             let conn = storage.conn.lock().unwrap();
             conn.execute_batch(
-                "DELETE FROM schema_version WHERE version >= 50;
-                 DELETE FROM settings WHERE key IN (
-                    'pi_transcript_analytics_reingest_pending',
-                    'transcript_analytics_reingest_pending');
+                "DELETE FROM schema_version WHERE version >= 51;
+                 DELETE FROM settings WHERE key = 'transcript_analytics_reingest_pending';
+                 INSERT OR REPLACE INTO settings(key, value)
+                 VALUES ('pi_transcript_analytics_reingest_pending', '1');
+                 INSERT INTO transcript_analytics_sources
+                    (provider, source_key, source_root_key, source_path, source_kind,
+                     processing_status, mtime_ns, size_bytes, content_sha256)
+                 VALUES ('pi', 'replay', 'pi:sessions', '/replay', 'transcript', 'ok', 1, 2, 'old'),
+                        ('pi', 'suppressed', 'pi:sessions', '/suppressed', 'transcript', 'suppressed', 1, 2, 'old'),
+                        ('pi', 'live', 'pi:sessions', '/live', 'live', 'ok', 1, 2, 'old'),
+                        ('claude', 'other', 'claude:projects', '/other', 'transcript', 'ok', 1, 2, 'old');
                  INSERT INTO skill_usages(provider, session_id, chain_id, message_id,
                      skill_name, skill_path, timestamp)
                  VALUES ('pi', 'session', 'session', 'message', 'existing',
@@ -23498,7 +23528,25 @@ mod tests {
         }
         drop(storage);
         let storage = Storage::init_at(path.clone(), false).unwrap();
-        assert_eq!(storage.get_setting(marker).unwrap().as_deref(), Some("1"));
+        assert_eq!(storage.get_setting(marker).unwrap(), None);
+        {
+            let conn = storage.conn.lock().unwrap();
+            assert_eq!(
+                scalar_count(
+                    &conn,
+                    "SELECT COUNT(*) FROM transcript_analytics_sources WHERE source_key = 'replay'
+                 AND mtime_ns IS NULL AND size_bytes IS NULL AND content_sha256 IS NULL"
+                ),
+                1
+            );
+            assert_eq!(
+                scalar_count(
+                    &conn,
+                    "SELECT COUNT(*) FROM transcript_analytics_sources WHERE content_sha256 = 'old'"
+                ),
+                3
+            );
+        }
         assert_eq!(
             storage
                 .get_setting("transcript_analytics_reingest_pending")
@@ -23516,14 +23564,25 @@ mod tests {
             .conn
             .lock()
             .unwrap()
-            .execute("DELETE FROM settings WHERE key = ?1", params![marker])
+            .execute_batch(
+                "UPDATE transcript_analytics_sources SET mtime_ns = 3, size_bytes = 4,
+                      content_sha256 = 'rebuilt' WHERE source_key = 'replay';
+                      DELETE FROM schema_version WHERE version = 51;",
+            )
             .unwrap();
         drop(storage);
         let storage = Storage::init_at(path, false).unwrap();
         assert_eq!(
             storage.get_setting(marker).unwrap(),
             None,
-            "ordinary reopen must not rearm replay"
+            "an already-completed version-50 replay must not be rearmed"
+        );
+        assert_eq!(
+            scalar_count(
+                &storage.conn.lock().unwrap(),
+                "SELECT COUNT(*) FROM transcript_analytics_sources WHERE content_sha256 = 'rebuilt'"
+            ),
+            1
         );
         clear_env();
     }
@@ -23757,8 +23816,10 @@ mod tests {
                 params![crate::transcript_analytics::PI_TRANSCRIPT_ANALYTICS_REINGEST_MARKER],
                 |row| row.get::<_, String>(0),
             )
+            .optional()
             .expect("read Pi reingest marker"),
-            "1"
+            None,
+            "migration 51 converts the Pi marker to durable per-source replay"
         );
         assert_eq!(
             conn.query_row(
@@ -33423,6 +33484,61 @@ mod tests {
         for (table, count, _) in owned_source_rows(&storage, provider, vanished.source_key) {
             assert_eq!(count, 0, "{table} must lose the vanished source's rows");
         }
+        clear_env();
+    }
+
+    // @lat: [[pi-skill-load-tests#Pi Skill Load Tests#Snapshot Writer Admission]]
+    #[test]
+    #[serial]
+    fn transcript_snapshot_waits_for_writer_before_reading_generation_guards() {
+        static BUSY_SIGNAL: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+            std::sync::Mutex::new(None);
+        clear_env();
+        let dir = TempDir::new().unwrap();
+        let storage = init_storage_in(&dir);
+        let snapshot = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "writer-root",
+            source_key: "writer-source",
+            session_id: "writer-session",
+            generation: 1,
+            marker: "writer",
+            rows: 1,
+        }
+        .snapshot();
+        let (send, receive) = std::sync::mpsc::channel();
+        *BUSY_SIGNAL.lock().unwrap() = Some(send);
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .busy_handler(Some(|_| {
+                if let Some(send) = BUSY_SIGNAL.lock().unwrap().take() {
+                    send.send(()).unwrap();
+                }
+                std::thread::yield_now();
+                true
+            }))
+            .unwrap();
+        let writer = Connection::open(storage.database_path()).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE; INSERT INTO settings(key, value) VALUES ('competing-writer', '1');").unwrap();
+        let (waited, result) = std::thread::scope(|scope| {
+            let replacement =
+                scope.spawn(|| storage.replace_transcript_analytics_snapshot(&snapshot));
+            let waited = receive.recv_timeout(std::time::Duration::from_secs(5));
+            writer.execute_batch("COMMIT").unwrap();
+            (waited, replacement.join().unwrap())
+        });
+        *BUSY_SIGNAL.lock().unwrap() = None;
+        storage.conn.lock().unwrap().busy_handler(None).unwrap();
+        assert!(
+            waited.is_ok(),
+            "replacement must wait for writer admission, not fail a deferred upgrade"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            TranscriptAnalyticsReplacement::Replaced(_)
+        ));
         clear_env();
     }
 

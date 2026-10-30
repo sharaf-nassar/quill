@@ -508,9 +508,9 @@ pub(crate) fn resolve_codex_native_identity(
 
 /// Resolve one persisted Pi source from its native session header.
 pub(crate) fn resolve_pi_native_identity(
-    session: &crate::pi_session::PiSession,
+    header: &crate::pi_session::PiSessionHeader,
 ) -> Result<NativeChainIdentity, IdentityError> {
-    let source_session_id = session.header.id.trim();
+    let source_session_id = header.id.trim();
     if source_session_id.is_empty() {
         return Err(IdentityError::MissingNativeIdentity);
     }
@@ -523,8 +523,7 @@ pub(crate) fn resolve_pi_native_identity(
         is_sidechain: false,
         agent_id: None,
         agent_nickname: None,
-        cwd: (!session.header.cwd.trim().is_empty())
-            .then(|| PathBuf::from(session.header.cwd.trim())),
+        cwd: (!header.cwd.trim().is_empty()).then(|| PathBuf::from(header.cwd.trim())),
     })
 }
 

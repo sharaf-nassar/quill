@@ -24,6 +24,18 @@ Retained snapshots attribute loads to their source, host and project.
 
 Repeated event IDs and repeated snapshot replacement do not inflate counts; separate explicit invocations count separately. Replacement removes vanished evidence without synthetic tool activity.
 
+## Bounded Identity Discovery
+
+Pi inventory reads the native header without decoding the body. Malformed tracking evidence still fails full parsing before a snapshot can commit, so faster inventory never weakens validation.
+
+## Recent First Resumable Replay
+
+Recovery commits recently modified sources before old history. A transient failure retains last-good rows and completed-source fingerprints; a later pass retries only unfinished work rather than restarting the corpus.
+
+## Snapshot Writer Admission
+
+A competing SQLite writer makes snapshot replacement wait before reading generation guards. It then commits successfully rather than failing a deferred read-to-write upgrade and leaving current analytics stale.
+
 ## Pi Scoped Migration
 
-Migration 50 preserves existing skill rows and arms only Pi analytics replay. Reopening after the marker is consumed does not rearm it, so recovery uses the existing bounded reconciliation lifecycle.
+Migration 51 converts an unfinished Pi marker into per-source fingerprint invalidation without clearing skill rows. Suppressed/live sources and other providers remain untouched. A completed version-50 replay does not rearm.
