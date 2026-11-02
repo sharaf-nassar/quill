@@ -57,6 +57,37 @@ test("CPA failure and scoped identities remain distinct and visible", () => {
   assert.match(markup, /100%/);
 });
 
+// @lat: [[widget-limits-tests#Widget Limits Tests#Claude 5-hour cell follows the data]]
+test("Claude CPA rows show a 5-hour cell only when an account returns one", () => {
+  const bucket = (account, key, label, utilization) => ({
+    key: `cpa/${account}/${key}`, label, utilization, provider: "claude", source: "cpa",
+    account_id: account, account_label: account, resets_at: null, sort_order: 0,
+  });
+  const account = (id) => ({
+    provider: "claude", auth_index: id, label: id, status: "ready", disabled: false, unavailable: false, quota: null,
+  });
+  const rows = (buckets) => cpaRows({
+    buckets, provider_errors: [], cpa_accounts: [account("ultra"), account("max")],
+    cpa_pools: [{ provider: "claude", healthy: 2, total: 2, buckets: [] }],
+  }, Date.now());
+  const keys = (cells) => cells.map((cell) => cell.key);
+
+  // Verified Ultra only: weekly windows, no seeded 5-hour dash.
+  const ultraOnly = rows([bucket("ultra", "seven_day", "7 days", 30)]);
+  assert.deepEqual(keys(ultraOnly[0].cells), ["seven_day"]);
+  assert.deepEqual(keys(ultraOnly[0].accounts[0].cells), ["seven_day"]);
+
+  // A Max sibling with a 5-hour window restores the shared cell for both rows.
+  const mixed = rows([
+    bucket("ultra", "seven_day", "7 days", 30),
+    bucket("max", "five_hour", "5 hours", 62),
+    bucket("max", "seven_day", "7 days", 10),
+  ]);
+  assert.deepEqual(keys(mixed[0].cells), ["five_hour", "seven_day"]);
+  assert.equal(mixed[0].accounts.find((a) => a.id === "max").cells[0].percent, 62);
+  assert.equal(mixed[0].accounts.find((a) => a.id === "ultra").cells[0].percent, null);
+});
+
 function renderRow(states, expanded = false) {
   return renderToStaticMarkup(
     createElement(CpaRow, {

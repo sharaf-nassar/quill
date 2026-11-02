@@ -1187,7 +1187,7 @@ Live usage ingestion stores native and CPA-sourced buckets in the same tables. M
 
 Codex `rate_limits.resets_at` values are normalized from transcript epoch timestamps into RFC3339 strings before storage so the live pane can show the same reset countdown semantics as Claude. Migration 14 backfills older Claude-only rows by deriving stable bucket keys from legacy labels, and startup creates provider-only indexes after migrations so older databases can still boot before those columns exist. The generic `settings` table also stores Claude live-usage fetch metadata such as the last attempted poll time, any active 429 cooldown, and the configured indicator primary-provider preference used by the tray and indicator window.
 
-The startup path restores recent live buckets from `usage_snapshots` through [[src-tauri/src/storage.rs#Storage#get_latest_usage_buckets]]. That lookup now uses a grouped latest-timestamp join instead of a correlated subquery because the older form could take tens of seconds once `usage_snapshots` grew large, which left the live pane stuck on `Loading…` during app startup.
+The startup path restores recent live buckets from `usage_snapshots` through [[src-tauri/src/storage.rs#Storage#get_latest_usage_buckets]]. That lookup now uses a grouped latest-timestamp join instead of a correlated subquery because the older form could take tens of seconds once `usage_snapshots` grew large, which left the live pane stuck on `Loading…` during app startup. It returns only the keys stored at the provider's newest snapshot timestamp: every bucket of one fetch shares that timestamp, so an older key is a window the provider stopped reporting (the per-model weekly keys Anthropic moved into `limits[]`, or the `five_hour` window a verified Claude Ultra account no longer has) and must not resurface as a live tile.
 
 ##### Usage Snapshot Source Test Specs
 
@@ -1834,6 +1834,8 @@ Storage and blocking-task failures stay in local logs. All four commands return 
 `get_indicator_primary_provider` and `set_indicator_primary_provider` keep one backend-owned indicator model shared across the tray title, tray summary rows, and the integrations menu.
 
 `set_indicator_primary_provider` persists the configured provider in the settings table, recomputes the resolved indicator state from the shared usage cache or fallback rows, and emits `indicator-updated` so the tray summary and integrations menu stay synchronized without a second polling path.
+
+A Claude reading with a weekly window and no 5-hour window is complete, not degraded: verified Ultra accounts have no 5-hour limit and the usage API omits it. [[src-tauri/src/indicator.rs#state_is_weekly_only]] identifies that state so the title reads `63% · <weekly reset>` instead of `-- · -- · 63%`, the status stays `ready` with no short-window warning, and the tray summary rows read `Now: no 5-hour limit` and `Resets: <weekly reset>`. Codex and MiniMax always carry a short window, so its absence there remains degraded.
 
 ### Project and Session Management (3)
 

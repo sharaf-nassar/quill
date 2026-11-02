@@ -17,7 +17,10 @@ averaged exhausted, quota-readable snapshots.
 Exclude disabled, unavailable, and quota-exhausted snapshots before counting
 healthy contributors or selecting the fallback. An account-wide window at or
 above 100% excludes the entire account from every aggregate window and reset.
-For Claude, only `five_hour` and `seven_day` are account-wide. Exhausted Fable,
+For Claude, only `five_hour` and `seven_day` are account-wide, and only when
+returned: verified Ultra accounts have no 5-hour limit (since 2026-10-30) and
+the usage API omits `five_hour` for them, which is a complete reading, not a
+missing window. Never infer the schema from a plan name. Exhausted Fable,
 Sonnet, Opus, or surface-scoped quotas must not suppress general Claude totals.
 Codex's returned rate-limit windows are account-wide. Keep all accounts in the
 inventory total and individual disclosure rows.

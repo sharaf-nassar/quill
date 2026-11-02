@@ -22,6 +22,10 @@ A configured provider resolves from its CPA pool even when its native status is 
 
 Auto selects an available CPA pool when no enabled native provider has indicator metrics.
 
+## Claude Weekly-Only Is Healthy
+
+A Claude reading with `seven_day` and no `five_hour` resolves `ready` with no warning and a weekly-only title, while the same shape for Codex stays `degraded`.
+
 ## Direct Native Fallback
 
 Direct Claude buckets remain the indicator source only when no matching CPA pool exists and native status is enabled.

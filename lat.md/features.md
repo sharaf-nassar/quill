@@ -8,6 +8,8 @@ Live provider-aware rate-limit pressure, rendered as the widget's LIMITS band ab
 
 Each provider gets one identity row whose visible window cells evenly divide the fluid meter region and reflow at their legible minimum. Direct rows show their nearest reset; CPA rows place each visible canonical reset inside its matching meter cell. A CPA pool replaces that provider's direct row while present; without one, the direct row remains. Severity follows the 50/80 thresholds. Component detail lives in [[frontend#Frontend#Components#Widget Limits Band]].
 
+Claude rows show exactly the windows the account's usage data returns; Quill never assumes a 5-hour window exists. Verified Ultra accounts have no 5-hour limit (Anthropic removed it on 2026-10-30, rolling out per account as verification completes), the usage API omits `five_hour` for them, and the row then carries the weekly windows alone with the weekly reset as its countdown. Plan names are never consulted: an unverified Ultra account still has a 5-hour wall and still reports the window.
+
 When a bucket's `resets_at` has passed, the cell renders as stale — muted percentage and a neutral slate bar — so bygone utilization never reads as a live severity. Direct rows exclude it from their nearest reset; a dated CPA window keeps a neutral `now` reset while a missing reset renders a dash.
 
 Without CPA configured, Claude rows come from the Anthropic OAuth usage API, with Pi's short-lived Anthropic bearer as a fallback when Pi is enabled. Codex rows come from `codex app-server` `account/rateLimits/read`, then Pi's short-lived `openai-codex` bearer and the ChatGPT WHAM usage API when Pi is enabled, with transcript `token_count` data as the final compatibility fallback. MiniMax rows come from the MiniMax coding plan API at `api.minimax.io`. A configured CPA connection becomes the exclusive live usage source, suppressing every native provider request until disconnected. MiniMax is a service-only provider that requires an API key (stored in SQLite) rather than a local CLI; its rows keep the plan-level bucket filter (M\*, coding-plan-search, coding-plan-vlm) because the per-model long tail does not fit a 360px row. The backend can keep serving cached rows for a provider whose live poll fails so other providers do not blank the band. Its in-memory usage cache is keyed only by provider identity and enabled state so transient detection churn does not dislodge a fresh snapshot. Claude reuses recently persisted snapshots across window reopens and app restarts, and a 429 response arms a short-lived rate-limit cooldown so Quill serves the last snapshot without retrying the live endpoint on every remount.
@@ -42,7 +44,7 @@ CPA pool rows derive mean account pressure from routing-usable account snapshots
 
 The widget renders each aggregate as that provider's sole top-level row while the pool exists: fixed provider identity, inline healthy/total count, mean window cells, and reset readouts for visible canonical windows. Each reset uses only its matching aggregate window's earliest contributing timestamp; missing timestamps show a dash and elapsed timestamps show neutral `now`. A semantic disclosure reveals at most six account rows plus a remainder count.
 
-Claude always projects its canonical 5-hour and 7-day schema so missing data remains explicit. Fable and other `weekly_scoped` model windows join that shared schema when any pool or account returns them, keeping the aggregate and disclosed account cells aligned. Codex projects only durations returned by its pool or accounts; an absent 300-minute window therefore removes the 5-hour cell and reset from the pool and every disclosed account row.
+Claude always projects its canonical 7-day window so missing weekly data remains explicit. Its 5-hour window, Fable, and other `weekly_scoped` model windows join that shared schema only when any pool or account returns them, keeping the aggregate and disclosed account cells aligned: a pool of verified Ultra accounts has no 5-hour cell at all, while one Max sibling restores the shared cell and the Ultra account row shows a dash in it. Codex projects only durations returned by its pool or accounts; an absent 300-minute window therefore removes the 5-hour cell and reset from the pool and every disclosed account row.
 
 #### Usable lifecycle compatibility
 
@@ -169,6 +171,10 @@ Claude and Codex requests use CPA token substitution plus each upstream's requir
 #### Claude windows fixture
 
 The researched Anthropic response maps known and additional windows to account-qualified CPA buckets with normalized resets.
+
+#### Claude weekly-only windows
+
+A response with `five_hour` null and only weekly windows (verified Ultra) parses as a complete reading of the `seven_day` and scoped Fable buckets, never as a failure.
 
 #### Claude malformed windows
 

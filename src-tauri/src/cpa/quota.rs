@@ -573,6 +573,25 @@ mod tests {
         assert_eq!(buckets[2].key, "cpa/a/weekly_scoped_fable");
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Quota Parser Test Specs#Claude weekly-only windows]]
+    #[test]
+    fn parses_anthropic_windows_without_five_hour() {
+        // Verified Ultra: no 5-hour limit, so the API reports the weekly
+        // windows alone. That is a complete reading, not a malformed one.
+        let buckets = parse_claude_usage(
+            "a",
+            &response(json!({
+                "five_hour":null,
+                "seven_day":{"utilization":30.0,"resets_at":"2030-01-01T00:00:00Z"},
+                "limits":[{"kind":"weekly_scoped","percent":5.0,
+                    "scope":{"model":{"display_name":"Fable"}}}]
+            })),
+        )
+        .unwrap();
+        let keys: Vec<&str> = buckets.iter().map(|bucket| bucket.key.as_str()).collect();
+        assert_eq!(keys, ["cpa/a/seven_day", "cpa/a/weekly_scoped_fable"]);
+    }
+
     // @lat: [[features#Features#Live Usage View#CPA Quota Parser Test Specs#Claude malformed windows]]
     #[test]
     fn rejects_malformed_anthropic_windows() {

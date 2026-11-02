@@ -270,15 +270,15 @@ function directCells(
     .map((bucket) => numericCell(provider, bucket, nowMs));
 }
 
+/**
+ * Claude always has a weekly window, so its absence is explicit missing data.
+ * The 5-hour window is not seeded: verified Ultra accounts have no 5-hour
+ * limit and the usage API omits it, so it joins the schema only when a pool
+ * or account actually returns it.
+ */
 function seededWindows(provider: CpaProvider): WindowDefinition[] {
   if (provider !== "claude") return [];
   return [
-    {
-      key: "five_hour",
-      fullLabel: "5 hours",
-      shortLabel: "5 HOURS",
-      sortOrder: 0,
-    },
     {
       key: "seven_day",
       fullLabel: "7 days",

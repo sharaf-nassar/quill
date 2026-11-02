@@ -102,6 +102,28 @@ fn resolve_metrics_for_provider(
     }
 }
 
+/// Claude accounts without a 5-hour limit (verified Ultra) report `seven_day`
+/// alone, and that is a complete healthy reading, not a missing short window.
+/// Only Claude: Codex and MiniMax always carry a short window, so its absence
+/// there is still degraded data.
+fn weekly_only_is_complete(
+    provider: Option<IntegrationProvider>,
+    short_window: Option<&IndicatorMetric>,
+    weekly_window: Option<&IndicatorMetric>,
+) -> bool {
+    provider == Some(IntegrationProvider::Claude)
+        && short_window.is_none()
+        && weekly_window.is_some()
+}
+
+pub fn state_is_weekly_only(state: &StatusIndicatorState) -> bool {
+    weekly_only_is_complete(
+        state.resolved_primary_provider,
+        state.short_window.as_ref(),
+        state.weekly_window.as_ref(),
+    )
+}
+
 fn build_title_text(
     provider: Option<IntegrationProvider>,
     short_window: Option<&IndicatorMetric>,
@@ -110,6 +132,14 @@ fn build_title_text(
     match provider {
         Some(provider) if short_window.is_none() && weekly_window.is_none() => {
             format!("{} indicator data unavailable", provider_label(provider))
+        }
+        Some(_) if weekly_only_is_complete(provider, short_window, weekly_window) => {
+            let weekly = weekly_window.expect("weekly-only state has a weekly window");
+            let reset_text = weekly
+                .display_reset_time
+                .clone()
+                .unwrap_or_else(|| "--".to_string());
+            format!("{} · {reset_text}", format_utilization(weekly.utilization))
         }
         Some(_) => {
             let now_text = short_window
@@ -162,7 +192,11 @@ fn build_warning(
         (false, false, true) => {
             warnings.push("No indicator usage windows are available.".to_string())
         }
-        (false, true, true) => warnings.push("Short-window usage is unavailable.".to_string()),
+        (false, true, true)
+            if !weekly_only_is_complete(resolved_provider, short_window, weekly_window) =>
+        {
+            warnings.push("Short-window usage is unavailable.".to_string())
+        }
         (true, false, true) => warnings.push("Weekly usage is unavailable.".to_string()),
         _ => {}
     }
@@ -509,6 +543,46 @@ mod tests {
 
         assert_eq!(state.resolved_primary_provider, Some(provider));
         assert_eq!(state.short_window.unwrap().utilization, 31.0);
+    }
+
+    // @lat: [[indicator-tests#Indicator Tests#Claude Weekly-Only Is Healthy]]
+    #[test]
+    fn claude_without_five_hour_window_is_ready_not_degraded() {
+        let provider = IntegrationProvider::Claude;
+        let weekly_reset = "2030-02-02T00:20:00Z";
+        let mut weekly = bucket(provider, "seven_day", 63.0, UsageSource::Direct);
+        weekly.resets_at = Some(weekly_reset.to_string());
+
+        let state = resolve_indicator_state(
+            Some(provider),
+            &[status(provider)],
+            &usage(vec![weekly], Vec::new()),
+        );
+
+        assert_eq!(state.status, "ready");
+        assert_eq!(state.warning, None);
+        assert!(state.short_window.is_none());
+        assert_eq!(
+            state.title_text,
+            format!(
+                "63% · {}",
+                format_local_reset_time(Some(weekly_reset)).unwrap()
+            )
+        );
+        assert!(state_is_weekly_only(&state));
+
+        // Codex keeps the degraded verdict: its short window is never optional.
+        let codex = IntegrationProvider::Codex;
+        let state = resolve_indicator_state(
+            Some(codex),
+            &[status(codex)],
+            &usage(
+                vec![bucket(codex, "codex_10080m", 20.0, UsageSource::Direct)],
+                Vec::new(),
+            ),
+        );
+        assert_eq!(state.status, "degraded");
+        assert!(!state_is_weekly_only(&state));
     }
 
     // @lat: [[indicator-tests#Indicator Tests#Direct Native Fallback]]

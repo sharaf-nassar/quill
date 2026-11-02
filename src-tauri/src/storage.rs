@@ -15047,25 +15047,22 @@ impl Storage {
 
         // Prune ghost buckets. `MAX(timestamp) GROUP BY bucket_key` keeps the
         // last snapshot of a key forever, so a limit the provider stopped
-        // returning — e.g. the per-model weekly keys Anthropic moved into
-        // `limits[]` and now sends as `null` — lingers as a stale tile in the
-        // live view. Drop any bucket whose newest snapshot is far older than
-        // the provider's most recent fetch. Buckets from one fetch share a
-        // timestamp, so a paused/rate-limited provider prunes nothing (all its
-        // keys age together); only keys absent from recent fetches fall off.
+        // returning (the per-model weekly keys Anthropic moved into `limits[]`,
+        // or the `five_hour` window a verified Claude Ultra account no longer
+        // has) would linger as a live tile. Every bucket of one fetch is stored
+        // under one timestamp, so the provider's newest timestamp is exactly
+        // the window set its last successful fetch returned; any older key is
+        // one the provider stopped reporting. A paused/rate-limited provider
+        // stores nothing, so its keys age together and nothing is pruned.
         // History and stats queries read snapshots directly and are unaffected.
-        const USAGE_BUCKET_STALE_AFTER_SECS: i64 = 60 * 60;
         let newest = rows_with_ts.iter().filter_map(|(_, ts)| *ts).max();
 
         let buckets = match newest {
-            Some(newest) => {
-                let cutoff = newest - TimeDelta::seconds(USAGE_BUCKET_STALE_AFTER_SECS);
-                rows_with_ts
-                    .into_iter()
-                    .filter(|(_, ts)| ts.is_none_or(|parsed| parsed >= cutoff))
-                    .map(|(bucket, _)| bucket)
-                    .collect()
-            }
+            Some(newest) => rows_with_ts
+                .into_iter()
+                .filter(|(_, ts)| ts.is_none_or(|parsed| parsed >= newest))
+                .map(|(bucket, _)| bucket)
+                .collect(),
             None => rows_with_ts.into_iter().map(|(bucket, _)| bucket).collect(),
         };
 

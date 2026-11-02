@@ -1573,6 +1573,9 @@ fn wait_for_predecessor_exit() {
 }
 
 fn indicator_now_text(state: &StatusIndicatorState) -> String {
+    if indicator::state_is_weekly_only(state) {
+        return "Now: no 5-hour limit".to_string();
+    }
     let value = state
         .short_window
         .as_ref()
@@ -1582,9 +1585,13 @@ fn indicator_now_text(state: &StatusIndicatorState) -> String {
 }
 
 fn indicator_reset_text(state: &StatusIndicatorState) -> String {
-    let value = state
-        .short_window
-        .as_ref()
+    // Without a 5-hour window the only reset that matters is the weekly one.
+    let window = if indicator::state_is_weekly_only(state) {
+        state.weekly_window.as_ref()
+    } else {
+        state.short_window.as_ref()
+    };
+    let value = window
         .and_then(|metric| metric.display_reset_time.as_deref())
         .unwrap_or("--");
     format!("Resets: {value}")
